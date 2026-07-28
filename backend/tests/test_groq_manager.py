@@ -348,11 +348,12 @@ def test_unexpected_error_sanitization(caplog):
         client_factory=make_client
     )
     
-    with pytest.raises(GroqRequestError) as excinfo:
+    # Generic Exception is now treated as transient; when all keys exhausted,
+    # GroqPoolExhaustedError is raised (not GroqRequestError).
+    with pytest.raises(GroqPoolExhaustedError) as excinfo:
         manager.chat_completion(messages=[{"role": "user", "content": "user-sensitive-message"}], model="test")
         
     # Assert public exception message is sanitized
-    assert "Falha ao executar requisição Groq" in str(excinfo.value)
     assert "very-secret-error-marker" not in str(excinfo.value)
     assert "key-one" not in str(excinfo.value)
     

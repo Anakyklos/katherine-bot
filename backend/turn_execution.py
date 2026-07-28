@@ -11,12 +11,16 @@ The only standard library imports allowed are ``dataclasses``, ``enum``,
 
 from __future__ import annotations
 
+import asyncio
 import math
 import random as _random
 import time as _real_time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Optional
+from typing import Callable, Optional, TypeVar, Any
+
+
+T = TypeVar("T")
 
 
 # ─── Failure codes ───────────────────────────────────────────────────────────
@@ -86,6 +90,79 @@ def compute_effective_attempt_timeout(
     * remaining budget before commit reserve
     """
     return min(config.provider_attempt_timeout, budget.remaining_before_reserve)
+
+
+# ─── Bounded blocking operation helper ───────────────────────────────────────
+
+
+async def run_blocking_with_deadline(
+    stage_label: str,
+    budget: TurnBudget,
+    supabase_timeout: float,
+    func: Callable[..., T],
+    *args: Any,
+    **kwargs: Any,
+) -> T:
+    """Run a blocking (thread-bound) operation with deadline enforcement.
+
+    The operation is dispatched via ``asyncio.to_thread()`` and the coroutine
+    waits for it with a timeout derived from the remaining budget. This
+    ensures that no thread operation runs indefinitely.
+
+    The effective timeout is ``min(budget.remaining, supabase_timeout)``.
+    We use ``supabase_timeout`` as an upper bound because the underlying
+    Supabase/PostgREST transport already respects that timeout, and waiting
+    longer than that would be wasteful.
+
+    On **timeout**: raises ``DeadlineExceeded`` (``TurnErrorCode.turn_timeout``).
+    On **cancellation**: propagates ``asyncio.CancelledError``.
+    On **any other exception**: wraps into ``TurnExecutionError(persistence_unavailable)``.
+
+    The underlying thread may continue executing after a timeout. This is
+    acceptable for read operations (``load_user_state``, ``get_context``)
+    because there is no state to corrupt. For write operations (``save_turn``,
+    ``sync_state``), callers must ensure the lock is retained until the write
+    is known to have completed (see commit section in engine.py).
+
+    Args:
+        stage_label: Stage name for observability (e.g. ``"load_user_state"``).
+        budget: ``TurnBudget`` from ``turn_execution`` — provides remaining time.
+        supabase_timeout: Per-call timeout for Supabase operations.
+        func: Synchronous callable to invoke in a thread.
+        *args: Positional arguments forwarded to *func*.
+        **kwargs: Keyword arguments forwarded to *func*.
+
+    Returns:
+        The return value of *func*.
+
+    Raises:
+        DeadlineExceeded: When the operation times out.
+        TurnExecutionError(persistence_unavailable): On operation failure.
+        asyncio.CancelledError: When the coroutine is cancelled.
+    """
+    remaining = budget.remaining
+    timeout = min(remaining, supabase_timeout)
+
+    if timeout <= 0.0:
+        raise DeadlineExceeded()
+
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(func, *args, **kwargs),
+            timeout=timeout,
+        )
+        return result
+    except asyncio.TimeoutError:
+        raise DeadlineExceeded()
+    except asyncio.CancelledError:
+        raise
+    except TurnExecutionError:
+        raise
+    except Exception:
+        raise TurnExecutionError(
+            TurnErrorCode.persistence_unavailable,
+            f"Stage {stage_label} failed.",
+        )
 
 
 # ─── Turn stage enum for observability ──────────────────────────────────────
@@ -223,12 +300,16 @@ class TurnExecutionConfig:
             raise ValueError("max_attempts must be an int, not bool.")
         if self.max_attempts < 1:
             raise ValueError("max_attempts must be >= 1.")
+        if self.max_attempts > 5:
+            raise ValueError("max_attempts must be <= 5 (safety limit).")
 
         # frontend_timeout_ms
         if isinstance(self.frontend_timeout_ms, bool) or not isinstance(self.frontend_timeout_ms, int):
             raise ValueError("frontend_timeout_ms must be an int.")
         if self.frontend_timeout_ms < 1000:
             raise ValueError("frontend_timeout_ms must be >= 1000.")
+        if self.frontend_timeout_ms > 300_000:
+            raise ValueError("frontend_timeout_ms must be <= 300_000 (safety limit).")
 
         # Invariant: connect_timeout <= provider_attempt_timeout
         if self.connect_timeout > self.provider_attempt_timeout:
@@ -259,6 +340,18 @@ class TurnExecutionConfig:
         # Invariant: max_jitter in [0, 1]
         if not (0.0 <= self.max_jitter <= 1.0):
             raise ValueError("max_jitter must be in [0.0, 1.0].")
+
+        # Sanity limits on timeouts
+        if self.total_deadline > 300.0:
+            raise ValueError("total_deadline must be <= 300 seconds (safety limit).")
+        if self.connect_timeout > 30.0:
+            raise ValueError("connect_timeout must be <= 30 seconds (safety limit).")
+        if self.provider_attempt_timeout > 120.0:
+            raise ValueError("provider_attempt_timeout must be <= 120 seconds (safety limit).")
+        if self.supabase_timeout > 30.0:
+            raise ValueError("supabase_timeout must be <= 30 seconds (safety limit).")
+        if self.commit_reserve > 120.0:
+            raise ValueError("commit_reserve must be <= 120 seconds (safety limit).")
 
     @staticmethod
     def _assert_finite_positive(name: str, value: object) -> None:
@@ -396,6 +489,9 @@ def compute_backoff(
     ``attempt`` is 0-indexed (first retry is attempt 0).
     Returns a value in [0, cap].
 
+    The total (delay + jitter) is capped at ``cap``, so jitter never pushes
+    the actual delay past the configured maximum.
+
     Values are validated: base > 0, cap > 0, base <= cap, jitter_fraction in [0,1].
     """
     if attempt < 0:
@@ -403,7 +499,7 @@ def compute_backoff(
     delay = base * (2 ** attempt)
     delay = min(delay, cap)
     jitter = delay * jitter_fraction * random_source()
-    return delay + jitter
+    return min(delay + jitter, cap)
 
 
 def compute_backoff_from_params(attempt: int, params: GroqCallParams, random_source: Callable[[], float] = _random.random) -> float:

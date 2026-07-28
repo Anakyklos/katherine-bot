@@ -583,7 +583,7 @@ class TestTimeoutBeforeCommit:
         engine.memory_manager.save_turn = MagicMock()
         engine.memory_manager.sync_state = MagicMock()
 
-        with pytest.raises((TurnExecutionError, DeadlineExceeded)):
+        with pytest.raises((TurnExecutionError, DeadlineExceeded, GroqPoolExhaustedError)):
             asyncio.run(engine.process_turn("user", "Hello"))
 
         engine.memory_manager.save_turn.assert_not_called()
@@ -796,7 +796,7 @@ class TestCommitSection:
         engine.memory_manager.save_turn = MagicMock()
         engine.memory_manager.sync_state = MagicMock()
 
-        with pytest.raises((TurnExecutionError, DeadlineExceeded)):
+        with pytest.raises((TurnExecutionError, DeadlineExceeded, GroqPoolExhaustedError)):
             asyncio.run(engine.process_turn("user", "Hello"))
 
         engine.memory_manager.save_turn.assert_not_called()

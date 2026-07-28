@@ -41,6 +41,7 @@ from .turn_execution import (
     TurnExecutionError,
     DeadlineExceeded,
     create_budget,
+    run_blocking_with_deadline,
 )
 
 logger = logging.getLogger(__name__)
@@ -73,14 +74,32 @@ class ConversationEngine:
     async def run_archival_extraction(self, turn_ref: PersistedTurnRef):
         if not self.archival_extraction_enabled:
             return
+        
+        # Use a short budget-limited approach for archival extraction.
+        # We run it as a fire-and-forget background task, but each step
+        # is bounded by a small timeout to prevent hanging.
+        # commit_reserve must be >= 2 * supabase_timeout per invariants.
+        budget = create_budget(TurnExecutionConfig(
+            total_deadline=15.0,
+            supabase_timeout=3.0,
+            commit_reserve=8.0,
+            provider_attempt_timeout=10.0,
+            connect_timeout=2.0,
+            max_attempts=1,
+        ), now_provider=self._monotonic)
+
+        supabase_timeout = self._turn_config.supabase_timeout
+        
         try:
-            user_message = await asyncio.to_thread(
+            user_message = await run_blocking_with_deadline(
+                "archival_load_message", budget, supabase_timeout,
                 self.memory_manager.load_persisted_user_message,
                 turn_ref.user_id, turn_ref.source_chat_log_id
             )
         except Exception:
             logger.error("Event: archival_extraction_load_failed")
             return
+
         prompt = f"""
         Extract facts from this user message for archival memory.
         Facts should be significant, long-term personal details.
@@ -88,9 +107,9 @@ class ConversationEngine:
         Maximum of 5 facts. If no relevant facts, return empty facts list.
         User message: "{user_message}"
         """
+        
         try:
-            chat_completion = await asyncio.to_thread(
-                self.groq_manager.chat_completion,
+            chat_completion = self.groq_manager.chat_completion(
                 messages=[{"role": "user", "content": prompt}],
                 model=self.model_fast, temperature=0.0,
                 response_format={"type": "json_object"}
@@ -99,25 +118,36 @@ class ConversationEngine:
         except Exception:
             logger.error("Event: archival_extraction_llm_failed")
             return
+
         try:
             raw_envelope = json.loads(response_text)
         except Exception:
             logger.warning("Event: archival_extraction_invalid")
             return
+
         try:
             envelope = parse_archival_extraction(raw_envelope)
         except Exception:
             logger.warning("Event: archival_extraction_invalid")
             return
+
         idempotency_key = compute_idempotency_key(
             turn_ref.user_id, turn_ref.source_chat_log_id, EXTRACTOR_VERSION
         )
+        
+        # Use direct bounded thread call instead of run_blocking_with_deadline
+        # because we need ArchivalDuplicateError to propagate as-is.
         try:
-            await asyncio.to_thread(
-                self.memory_manager.store_archival_extraction,
-                turn_ref.user_id, turn_ref.source_chat_log_id,
-                idempotency_key, envelope
+            await asyncio.wait_for(
+                asyncio.to_thread(
+                    self.memory_manager.store_archival_extraction,
+                    turn_ref.user_id, turn_ref.source_chat_log_id,
+                    idempotency_key, envelope,
+                ),
+                timeout=supabase_timeout,
             )
+        except asyncio.TimeoutError:
+            logger.error("Event: archival_extraction_store_failed")
         except ArchivalDuplicateError:
             logger.info("Event: archival_extraction_duplicate")
         except Exception:
@@ -173,6 +203,8 @@ class ConversationEngine:
     async def _run_under_lock(self, user_id, user_message, background_tasks, budget):
         current_time = self._clock()
 
+        supabase_timeout = self._turn_config.supabase_timeout
+
         # Budget check before any stage — no artificial minimum
         if budget.remaining_before_reserve <= 0.0:
             await self._emit_stage_event(StageEvent(
@@ -183,14 +215,20 @@ class ConversationEngine:
         # ── 1. Load State ────────────────────────────────────────────────────
         t0 = self._monotonic()
         try:
-            user_state = await asyncio.to_thread(
-                self.memory_manager.load_user_state, user_id, default_timestamp=current_time
+            user_state = await run_blocking_with_deadline(
+                "load_user_state", budget, supabase_timeout,
+                self.memory_manager.load_user_state, user_id, default_timestamp=current_time,
             )
-        except Exception:
+        except DeadlineExceeded:
+            await self._emit_stage_event(StageEvent(
+                stage=TurnStage.load_state, outcome=StageOutcome.timeout, code=TurnErrorCode.turn_timeout,
+            ))
+            raise
+        except TurnExecutionError:
             await self._emit_stage_event(StageEvent(
                 stage=TurnStage.load_state, outcome=StageOutcome.failed, code=TurnErrorCode.persistence_unavailable,
             ))
-            raise TurnExecutionError(TurnErrorCode.persistence_unavailable, "Failed to load user state.")
+            raise
 
         await self._emit_stage_event(StageEvent(
             stage=TurnStage.load_state, outcome=StageOutcome.success,
@@ -215,14 +253,20 @@ class ConversationEngine:
 
         t0 = self._monotonic()
         try:
-            context = await asyncio.to_thread(
+            context = await run_blocking_with_deadline(
+                "get_context", budget, supabase_timeout,
                 self.memory_manager.get_context, user_id, user_message, user_state
             )
-        except Exception:
+        except DeadlineExceeded:
+            await self._emit_stage_event(StageEvent(
+                stage=TurnStage.load_context, outcome=StageOutcome.timeout, code=TurnErrorCode.turn_timeout,
+            ))
+            raise
+        except TurnExecutionError:
             await self._emit_stage_event(StageEvent(
                 stage=TurnStage.load_context, outcome=StageOutcome.failed, code=TurnErrorCode.persistence_unavailable,
             ))
-            raise TurnExecutionError(TurnErrorCode.persistence_unavailable, "Failed to load context.")
+            raise
 
         await self._emit_stage_event(StageEvent(
             stage=TurnStage.load_context, outcome=StageOutcome.success,
@@ -318,20 +362,33 @@ class ConversationEngine:
 
         # Named commit task — protected by asyncio.shield.
         #
-        # When the outer task is cancelled while commit is in flight:
-        # 1. Catch CancelledError (shield already protects commit_task)
-        # 2. Continue waiting for commit_task under shield, using budget.remaining
-        # 3. Hold the user lock during this wait (we are inside _run_turn_locked)
-        # 4. Re-raise CancelledError after commit completes or times out
+        # Cancellation protocol:
+        # 1. We create a commit_task that runs save_turn + sync_state with
+        #    bounded thread operations (using supabase_timeout per call).
+        # 2. If cancellation arrives during commit, we catch CancelledError,
+        #    record it, and continue waiting for commit_task under shield.
+        # 3. The budget.remaining (without artificial max/extension) bounds
+        #    this post-cancel wait.
+        # 4. Repeated cancellations during step 3 are shielded: shield()
+        #    prevents cancellation of commit_task, and CancelledError from
+        #    wait_for is caught and re-raised as a fresh wait.
+        # 5. Once commit_task finishes (success or failure), we propagate
+        #    the original cancellation.
+        # 6. The lock remains held throughout (we are inside _run_turn_locked).
         #
-        # Repeated cancellations during step 2 are consumed harmlessly because
-        # shield prevents them from cancelling commit_task and we catch them.
+        # Key invariants:
+        # - No max(...) that silently extends the deadline.
+        # - No user_id in the task name.
+        # - Lock is held during entire post-cancel wait.
+
         async def commit_section() -> tuple:
             t0 = self._monotonic()
-            turn_ref = await asyncio.to_thread(
+            turn_ref = await run_blocking_with_deadline(
+                "save_turn", budget, supabase_timeout,
                 self.memory_manager.save_turn, user_id, user_message, response_text
             )
-            await asyncio.to_thread(
+            await run_blocking_with_deadline(
+                "sync_state", budget, supabase_timeout,
                 self.memory_manager.sync_state, user_id, new_state, relationship
             )
             await self._emit_stage_event(StageEvent(
@@ -340,30 +397,45 @@ class ConversationEngine:
             ))
             return turn_ref
 
-        commit_task = asyncio.create_task(commit_section(), name=f"commit-{user_id}")
+        commit_task = asyncio.create_task(commit_section(), name="turn-commit")
 
         try:
             turn_ref = await asyncio.shield(commit_task)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as original_cancel:
             await self._emit_stage_event(StageEvent(
                 stage=TurnStage.commit, outcome=StageOutcome.cancelled,
             ))
-            # Wait for commit to finish using budget.remaining as timeout.
-            # The double-shield means wait_for's timeout won't cancel commit_task.
-            commit_wait = max(budget.remaining, self._turn_config.supabase_timeout * 2 + 1.0)
-            try:
-                turn_ref = await asyncio.wait_for(
-                    asyncio.shield(commit_task), timeout=commit_wait
-                )
-            except (asyncio.TimeoutError, asyncio.CancelledError):
-                logger.error("event=commit_timeout_after_cancel")
-                turn_ref = None
-            except Exception:
-                logger.error("event=commit_failed_after_cancel")
-                turn_ref = None
-            # Re-raise CancelledError after commit completes/abandons.
-            # The lock remains held until this coroutine exits _run_turn_locked.
-            raise asyncio.CancelledError()
+            # Compute a fixed deadline for the post-cancel commit wait.
+            # Using budget.remaining once avoids recomputing it on every
+            # repeated cancellation (which could return the same value and
+            # cause an infinite loop if cancellations arrive faster than
+            # the clock advances).
+            commit_deadline = self._monotonic() + budget.remaining
+            while True:
+                remaining = max(0.0, commit_deadline - self._monotonic())
+                try:
+                    turn_ref = await asyncio.wait_for(
+                        asyncio.shield(commit_task), timeout=remaining
+                    )
+                    break
+                except asyncio.TimeoutError:
+                    # The wait timed out. The commit_task may still be
+                    # running in the background. Log and abandon.
+                    logger.error("event=commit_timeout_after_cancel")
+                    turn_ref = None
+                    break
+                except asyncio.CancelledError:
+                    # A repeated cancellation arrived. The shield() prevents
+                    # it from canceling commit_task. If the deadline is
+                    # exhausted, abandon the wait.
+                    if remaining <= 0.0:
+                        logger.error("event=commit_timeout_after_cancel")
+                        turn_ref = None
+                        break
+                    continue
+
+            # Propagate the original cancellation, preserving context.
+            raise original_cancel
 
         except (TurnPersistenceError, StatePersistenceError) as exc:
             await self._emit_stage_event(StageEvent(

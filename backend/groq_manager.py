@@ -129,9 +129,10 @@ class GroqClientManager:
     ):
         self._time_provider = time_provider or time.time
         self._groq_params = groq_params or GroqCallParams()
-        self._client_factory = client_factory or (lambda k: Groq(api_key=k))
+        # Sync client factory: validate at construction time, check None
+        self._client_factory = client_factory
 
-        # Build async client factory with httpx.Timeout for connect + read
+        # Build default async client factory with httpx.Timeout for connect + read
         default_params = self._groq_params
 
         def _default_async_factory(key: str) -> AsyncGroq:
@@ -149,8 +150,22 @@ class GroqClientManager:
 
         self._async_client_factory = async_client_factory or _default_async_factory
 
-        # Reusable async clients per key (closed on deactivation or shutdown)
-        self._async_clients: Dict[str, AsyncGroq] = {}
+        # Build default sync client factory with bounded transport timeout
+        def _default_sync_factory(key: str) -> Groq:
+            timeout = HttpxTimeout(
+                connect=default_params.connect_timeout,
+                read=default_params.provider_attempt_timeout,
+                write=default_params.connect_timeout,
+                pool=default_params.connect_timeout,
+            )
+            return Groq(
+                api_key=key,
+                max_retries=0,
+                timeout=timeout,
+            )
+
+        if client_factory is None:
+            self._client_factory = _default_sync_factory
 
         # Load and validate keys
         raw_keys = groq_keys.get_groq_api_keys() if keys is None else keys
@@ -164,18 +179,25 @@ class GroqClientManager:
         self._cooldown_duration = 10
         self._index = 0
 
-    def _get_or_create_async_client(self, api_key: str) -> AsyncGroq:
-        """Get reusable async client for a key, or create and cache it."""
-        if api_key not in self._async_clients:
-            self._async_clients[api_key] = self._async_client_factory(api_key)
-        return self._async_clients[api_key]
+    # ─── Request-scoped async clients ───────────────────────────────────────
+    #
+    # We use request-scoped AsyncGroq clients instead of a shared cache:
+    # - No concurrent access to a shared dict (thread-safe by design)
+    # - No lifecycle management (created per call, closed after)
+    # - No risk of closing a client while another call is using it
+    # - No need for asyncio.create_task() from a non-event-loop thread
+    #
+    # The httpx client creation overhead is negligible compared to API call latency.
 
-    def _close_async_client(self, api_key: str) -> None:
-        """Close and remove the async client for a deactivated key."""
-        client = self._async_clients.pop(api_key, None)
+    async def _create_async_client(self, api_key: str) -> AsyncGroq:
+        """Create a new request-scoped async client."""
+        return self._async_client_factory(api_key)
+
+    async def _close_async_client(self, client: Optional[AsyncGroq]) -> None:
+        """Safely close an async client if it has an ``aclose`` method."""
         if client is not None and hasattr(client, 'aclose'):
             try:
-                asyncio.create_task(client.aclose())
+                await client.aclose()
             except Exception:
                 pass
 
@@ -238,29 +260,41 @@ class GroqClientManager:
     def _deactivate_key(self, key: str):
         with self._lock:
             self._deactivated.add(key)
-            self._close_async_client(key)
+            # Sync path only — no async client to close (request-scoped)
             logger.error("event=groq_key_disabled")
 
     def chat_completion(self, messages: List[dict], model: str, **kwargs) -> Any:
         """Synchronous completion — kept for archival extraction and backward compat.
 
-        Uses the sync Groq client. Only SDK-internal retries apply here
-        (they are minimal since ``max_retries`` is not set on the sync client).
-        """
-        tried_keys: Set[str] = set()
+        Uses the sync Groq client with:
+        - ``max_retries=0`` (SDK retries disabled)
+        - Bounded transport timeout (connect + read via httpx.Timeout)
+        - Finite attempts (``min(max_attempts, key_count)``)
+        - Key rotation on transient failures
+        - Cooldown on rate limits
+        - Deactivation on auth errors
 
-        while True:
+        Raises:
+            GroqPoolExhaustedError: All eligible keys exhausted.
+            GroqRequestError: Non-retryable client or server error.
+        """
+        params = self._groq_params
+        tried_keys: Set[str] = set()
+        active = [k for k in self._keys if k not in self._deactivated]
+        max_attempts = min(params.max_attempts, len(active))
+        if max_attempts < 1:
+            max_attempts = 1
+
+        for attempt in range(max_attempts):
             api_key = self._acquire_next_key(tried_keys)
 
             try:
-                # Factory call protected against leakage and exceptions escaping
                 client = self._client_factory(api_key)
-            except Exception as e:
+            except Exception:
                 logger.error("event=groq_request_failed")
-                raise GroqRequestError("Falha ao executar requisição Groq.") from e
+                raise GroqRequestError("Falha ao executar requisição Groq.")
 
             try:
-                # Execution happens outside of the lock
                 return client.chat.completions.create(
                     messages=messages,
                     model=model,
@@ -284,10 +318,23 @@ class GroqClientManager:
                     tried_keys.add(api_key)
                 else:
                     logger.error("event=groq_request_failed")
-                    raise GroqRequestError("Falha ao executar requisição Groq.") from e
-            except Exception as e:
+                    raise GroqRequestError("Falha ao executar requisição Groq.")
+            except Exception:
+                # Unknown exception — treat as transient, log, try next key.
                 logger.error("event=groq_request_failed")
-                raise GroqRequestError("Falha ao executar requisição Groq.") from e
+                tried_keys.add(api_key)
+
+            if attempt < max_attempts - 1:
+                # Brief sleep before next attempt (no budget tracking in sync path)
+                import time as _sync_time
+                backoff = compute_backoff_from_params(attempt, params)
+                _sync_time.sleep(backoff)
+
+        # All attempts exhausted
+        raise GroqPoolExhaustedError(
+            "Provider unavailable after all attempts.",
+            code=ProviderFailure.connection_failed,
+        )
 
     async def chat_completion_async(
         self,
@@ -299,7 +346,7 @@ class GroqClientManager:
     ) -> Any:
         """Async completion with deadline-based budget and bounded retries.
 
-        * Uses ``AsyncGroq`` with ``max_retries=0`` (SDK retries disabled).
+        * Uses request-scoped ``AsyncGroq`` clients with ``max_retries=0``.
         * Each key is tried at most once per logical call.
         * Total attempts: ``min(max_attempts, eligible_key_count)``.
         * Timeout per attempt uses ``compute_effective_attempt_timeout()``
@@ -313,6 +360,9 @@ class GroqClientManager:
           produces ``ProviderFailure.timeout`` → ``TurnErrorCode.turn_timeout``.
         * When all eligible keys exhausted, raises ``GroqPoolExhaustedError``
           with the specific ``ProviderFailure.code``.
+        * The async client is closed after each attempt (request-scoped).
+          Closing happens in a ``finally`` block so non-retryable failures
+          still release the client.
 
         Args:
             messages: Chat messages for the completion.
@@ -352,25 +402,21 @@ class GroqClientManager:
                 )
 
             api_key = self._acquire_next_key(tried_keys)
+            # Request-scoped client: created per attempt, closed in finally
+            client: Optional[AsyncGroq] = None
 
             try:
-                client = self._get_or_create_async_client(api_key)
+                client = await self._create_async_client(api_key)
             except Exception:
                 logger.error("event=groq_request_failed")
                 raise GroqRequestError("Falha ao executar requisição Groq.")
 
             try:
-                # Only SDK-supported params are forwarded.
-                # The httpx.Timeout is set at client creation time.
                 sanitised_kwargs = {
                     k: v for k, v in kwargs.items()
                     if k not in ("max_attempts", "attempt_timeout", "stage",
                                  "base_backoff", "max_backoff", "max_jitter")
                 }
-                # Wrap the actual provider call with asyncio.wait_for using
-                # the effective timeout so the coroutine is cancelled when the
-                # budget is exhausted.  This is the primary timeout mechanism;
-                # the httpx client-level timeout is a secondary safety net.
                 result = await asyncio.wait_for(
                     client.chat.completions.create(
                         messages=messages,
@@ -383,9 +429,6 @@ class GroqClientManager:
             except asyncio.CancelledError:
                 raise
             except asyncio.TimeoutError:
-                # Effective-timeout expiry — map to timeout failure.
-                # The httpx read timeout may also fire independently, but we
-                # treat both as the same classification here.
                 last_failure = ProviderFailure.timeout
                 tried_keys.add(api_key)
             except APITimeoutError:
@@ -412,23 +455,28 @@ class GroqClientManager:
                     tried_keys.add(api_key)
                 else:
                     # Non-retryable 4xx
-                    raise GroqRequestError("Falha ao executar requisição Groq.")
+                    tried_keys.add(api_key)
+                    last_failure = ProviderFailure.invalid_response
             except TurnExecutionError:
                 raise
             except Exception:
-                raise GroqRequestError("Falha ao executar requisição Groq.")
+                # Unknown exception — treat as transient, log, try next key.
+                logger.error("event=groq_request_failed")
+                tried_keys.add(api_key)
+                last_failure = ProviderFailure.connection_failed
+            finally:
+                # Always close the request-scoped client after each attempt.
+                if client is not None:
+                    await self._close_async_client(client)
 
-            # If we have more attempts and this wasn't a terminal failure,
-            # compute backoff and sleep (if budget allows)
+            # Backoff before next attempt (if budget allows)
             if attempt < max_attempts - 1:
                 remaining_eff = compute_effective_attempt_timeout(params, budget)
                 backoff = compute_backoff_from_params(attempt, params)
                 if backoff < remaining_eff:
                     await asyncio.sleep(backoff)
 
-        # All attempts exhausted — the GroqPoolExhaustedError from
-        # _acquire_next_key already carries the correct ProviderFailure code.
-        # If we reach here (shouldn't normally), raise based on last_failure.
+        # All attempts exhausted
         if last_failure == ProviderFailure.rate_limited:
             raise GroqPoolExhaustedError("All keys rate limited.", code=last_failure)
         if last_failure == ProviderFailure.timeout:

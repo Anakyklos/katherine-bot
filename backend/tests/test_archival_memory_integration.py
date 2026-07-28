@@ -230,11 +230,24 @@ async def test_process_turn_schedules_background_task(backend):
     engine.memory_manager.save_turn = MagicMock(side_effect=mock_save_turn)
     engine.memory_manager.sync_state = MagicMock(side_effect=mock_sync_state)
     
-    # Mock groq chat completion
-    m = MagicMock()
-    m.choices = [MagicMock()]
-    m.choices[0].message.content = "assistant reply"
-    engine.groq_manager.chat_completion = MagicMock(return_value=m)
+    from unittest.mock import AsyncMock
+    
+    # Responses: first for appraisal (JSON), then for generation (text)
+    responses = [
+        MagicMock(choices=[MagicMock(message=MagicMock(content=json.dumps({
+            "valence": 0.1, "arousal_shift": 0.0, "dominance_shift": 0.0,
+            "triggered_emotions": {"joy": 0.5},
+        })))]),
+        MagicMock(choices=[MagicMock(message=MagicMock(content="assistant reply"))]),
+    ]
+    
+    async def async_create(**kwargs):
+        return responses.pop(0)
+    
+    # Override the groq manager's async factory to return a mock client
+    engine.groq_manager._async_client_factory = lambda k: AsyncMock(**{
+        "chat.completions.create": async_create
+    })
     
     bg_tasks = MagicMock(spec=BackgroundTasks)
     
@@ -277,10 +290,23 @@ async def test_process_turn_does_not_schedule_when_extraction_disabled(backend):
     ))
     engine.memory_manager.sync_state = MagicMock()
     
-    m = MagicMock()
-    m.choices = [MagicMock()]
-    m.choices[0].message.content = "reply"
-    engine.groq_manager.chat_completion = MagicMock(return_value=m)
+    from unittest.mock import AsyncMock
+    
+    # Responses: first for appraisal (JSON), then for generation (text)
+    responses = [
+        MagicMock(choices=[MagicMock(message=MagicMock(content=json.dumps({
+            "valence": 0.1, "arousal_shift": 0.0, "dominance_shift": 0.0,
+            "triggered_emotions": {"joy": 0.5},
+        })))]),
+        MagicMock(choices=[MagicMock(message=MagicMock(content="reply"))]),
+    ]
+    
+    async def async_create(**kwargs):
+        return responses.pop(0)
+    
+    engine.groq_manager._async_client_factory = lambda k: AsyncMock(**{
+        "chat.completions.create": async_create
+    })
     
     bg_tasks = MagicMock(spec=BackgroundTasks)
     
