@@ -759,7 +759,7 @@ class TestArchivalScheduling:
             )
             bg_tasks.add_task = MagicMock(side_effect=mock_schedule)
 
-            with pytest.raises(StatePersistenceError):
+            with pytest.raises(TurnExecutionError):
                 await engine.process_turn("user", "Hello", background_tasks=bg_tasks)
 
             # schedule must NOT be in call_order; add_task must not be called
@@ -1144,7 +1144,7 @@ class TestLegacyFlowNotUsed:
             engine.memory_manager.supabase.table.return_value.select.return_value.eq.return_value.execute.side_effect = Exception("DB down")
             engine.groq_manager.chat_completion_async = MagicMock()
 
-            with pytest.raises(StateLoadError):
+            with pytest.raises(TurnExecutionError):
                 await engine.process_turn("user", "Msg")
 
         asyncio.run(run())
@@ -1164,7 +1164,7 @@ class TestLegacyFlowNotUsed:
             engine = _make_engine()
             engine.memory_manager.sync_state = MagicMock(side_effect=StatePersistenceError())
 
-            with pytest.raises(StatePersistenceError):
+            with pytest.raises(TurnExecutionError):
                 await engine.process_turn("user", "Msg")
 
         asyncio.run(run())

@@ -144,6 +144,7 @@ class ConversationEngine:
                 self.memory_manager.store_archival_extraction,
                 turn_ref.user_id, turn_ref.source_chat_log_id,
                 idempotency_key, envelope,
+                allowlist_exceptions=(ArchivalDuplicateError,),
             )
         except ArchivalDuplicateError:
             logger.info("Event: archival_extraction_duplicate")

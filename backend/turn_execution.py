@@ -172,6 +172,7 @@ async def run_blocking_write(
     supabase_timeout: float,
     func: Callable[..., T],
     *args: Any,
+    allowlist_exceptions: tuple = (),
     **kwargs: Any,
 ) -> T:
     """Run a **write** blocking operation that must not be abandoned.
@@ -195,7 +196,9 @@ async def run_blocking_write(
     must retain the user lock until the task completes (see commit
     cancellation protocol in engine.py).
 
-    On **any exception**: wraps into ``TurnExecutionError(persistence_unavailable)``.
+    On **any exception**: wraps into ``TurnExecutionError(persistence_unavailable)``,
+    unless the exception type is in *allowlist_exceptions* (those are
+    re-raised as-is for the caller to handle).
 
     Returns:
         The return value of *func*.
@@ -204,6 +207,7 @@ async def run_blocking_write(
         DeadlineExceeded: When the budget is exhausted before starting.
         TurnExecutionError(persistence_unavailable): On operation failure.
         asyncio.CancelledError: When the coroutine is cancelled.
+        Exception subtypes from *allowlist_exceptions*: Propagated as-is.
     """
     # Check budget before starting — uses full remaining (including reserve)
     # because writes run inside the commit section.
@@ -217,7 +221,9 @@ async def run_blocking_write(
         raise
     except TurnExecutionError:
         raise
-    except Exception:
+    except Exception as exc:
+        if allowlist_exceptions and isinstance(exc, allowlist_exceptions):
+            raise
         raise TurnExecutionError(
             TurnErrorCode.persistence_unavailable,
             f"Stage {stage_label} failed.",

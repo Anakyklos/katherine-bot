@@ -92,7 +92,7 @@ async def test_run_archival_extraction_llm_failure(backend, caplog):
     engine.memory_manager.load_persisted_user_message = MagicMock(return_value="Hello")
     
     # Mock Groq client failure
-    engine.groq_manager.chat_completion = MagicMock(side_effect=Exception("Groq error"))
+    engine.groq_manager.chat_completion_async = MagicMock(side_effect=Exception("Groq error"))
     
     ref = backend.PersistedTurnRef(user_id="user123", source_chat_log_id=1, assistant_chat_log_id=2)
     
@@ -114,12 +114,14 @@ async def test_run_archival_extraction_validation_failure(backend, caplog):
     engine.memory_manager.load_persisted_user_message = MagicMock(return_value="Hello")
     
     # Mock Groq client returning invalid fact payload (importance is bool)
-    m = MagicMock()
-    m.choices = [MagicMock()]
-    m.choices[0].message.content = json.dumps({
+    mock_resp = MagicMock()
+    mock_resp.choices = [MagicMock()]
+    mock_resp.choices[0].message.content = json.dumps({
         "facts": [{"content": "hello", "importance": True, "tags": []}]
     })
-    engine.groq_manager.chat_completion = MagicMock(return_value=m)
+    async def mock_async(*args, **kwargs):
+        return mock_resp
+    engine.groq_manager.chat_completion_async = MagicMock(side_effect=mock_async)
     
     ref = backend.PersistedTurnRef(user_id="user123", source_chat_log_id=1, assistant_chat_log_id=2)
     
@@ -144,7 +146,9 @@ async def test_run_archival_extraction_duplicate(backend, caplog):
         "schema_version": 1,
         "extractor_version": 1
     })
-    engine.groq_manager.chat_completion = MagicMock(return_value=m)
+    async def _async_return(*args, **kwargs):
+        return m
+    engine.groq_manager.chat_completion_async = MagicMock(side_effect=_async_return)
     
     # Simulate unique constraint failure treated as duplicate success
     engine.memory_manager.store_archival_extraction.side_effect = backend.ArchivalDuplicateError("Duplicate")
@@ -171,7 +175,9 @@ async def test_run_archival_extraction_store_failed(backend, caplog):
         "schema_version": 1,
         "extractor_version": 1
     })
-    engine.groq_manager.chat_completion = MagicMock(return_value=m)
+    async def _async_return(*args, **kwargs):
+        return m
+    engine.groq_manager.chat_completion_async = MagicMock(side_effect=_async_return)
     
     # Simulate general database failure
     engine.memory_manager.store_archival_extraction.side_effect = Exception("DB connection failed secret token")
