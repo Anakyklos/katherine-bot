@@ -1,12 +1,13 @@
 """
-Turn execution domain — pure, infrastructure-free bounded execution primitives.
+Turn execution domain — bounded execution primitives with minimal stdlib deps.
 
 This module defines the typed configuration, monotonic deadline tracking, failure
-codes, and domain exceptions for bounded turn execution. It has no dependency on
-FastAPI, Groq, Supabase, sentence_transformers, or network I/O.
+codes, domain exceptions, and the bounded blocking operation helper for bounded
+turn execution. It has no dependency on FastAPI, Groq, Supabase,
+sentence_transformers, or network I/O.
 
-The only standard library imports allowed are ``dataclasses``, ``enum``,
-``math``, ``time``, and ``typing``.
+The only standard library modules allowed are ``asyncio``, ``dataclasses``,
+``enum``, ``math``, ``time``, and ``typing``.
 """
 
 from __future__ import annotations
