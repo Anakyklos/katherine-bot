@@ -82,20 +82,29 @@ def test_concurrent_access_no_corruption():
     )
     
     results = []
-    lock = threading.Lock()
+    results_lock = threading.Lock()
+    worker_errors = []
+    worker_errors_lock = threading.Lock()
     
-    def worker():
-        for _ in range(50):
-            res = manager.chat_completion(messages=[], model="test-model")
-            with lock:
-                results.append(res.choices[0].message.content)
+    def worker(idx):
+        try:
+            for _ in range(50):
+                res = manager.chat_completion(messages=[], model="test-model")
+                with results_lock:
+                    results.append(res.choices[0].message.content)
+        except BaseException as e:
+            with worker_errors_lock:
+                worker_errors.append(e)
             
-    threads = [threading.Thread(target=worker) for _ in range(10)]
+    threads = [threading.Thread(target=worker, args=(i,), name=f"groq-worker-{i}") for i in range(10)]
     for t in threads:
         t.start()
     for t in threads:
-        t.join()
-        
+        t.join(timeout=3.0)
+
+    alive = [t.name for t in threads if t.is_alive()]
+    assert not worker_errors, f"Worker errors: {worker_errors}"
+    assert not alive, f"Threads did not terminate: {alive}"
     assert len(results) == 500
     assert all(r == "ok" for r in results)
 
@@ -108,15 +117,25 @@ def test_concurrent_rate_limiting_cooldown(caplog):
         time_provider=lambda: fake_time
     )
     
+    worker_errors = []
+    worker_errors_lock = threading.Lock()
+    
     def mark():
-        manager._mark_key_rate_limited("key-one-11111111")
+        try:
+            manager._mark_key_rate_limited("key-one-11111111")
+        except BaseException as e:
+            with worker_errors_lock:
+                worker_errors.append(e)
         
-    threads = [threading.Thread(target=mark) for _ in range(5)]
+    threads = [threading.Thread(target=mark, name=f"rate-limit-worker-{i}") for i in range(5)]
     for t in threads:
         t.start()
     for t in threads:
-        t.join()
-        
+        t.join(timeout=3.0)
+
+    alive = [t.name for t in threads if t.is_alive()]
+    assert not worker_errors, f"Worker errors: {worker_errors}"
+    assert not alive, f"Threads did not terminate: {alive}"
     assert manager._cooldowns["key-one-11111111"] == 1010.0
     assert "event=groq_key_rate_limited" in caplog.text
     assert_sanitized(caplog.text)
@@ -128,15 +147,25 @@ def test_concurrent_deactivation(caplog):
         keys=["key-one-11111111"]
     )
     
+    worker_errors = []
+    worker_errors_lock = threading.Lock()
+    
     def deactivate():
-        manager._deactivate_key("key-one-11111111")
+        try:
+            manager._deactivate_key("key-one-11111111")
+        except BaseException as e:
+            with worker_errors_lock:
+                worker_errors.append(e)
         
-    threads = [threading.Thread(target=deactivate) for _ in range(5)]
+    threads = [threading.Thread(target=deactivate, name=f"deactivate-worker-{i}") for i in range(5)]
     for t in threads:
         t.start()
     for t in threads:
-        t.join()
-        
+        t.join(timeout=3.0)
+
+    alive = [t.name for t in threads if t.is_alive()]
+    assert not worker_errors, f"Worker errors: {worker_errors}"
+    assert not alive, f"Threads did not terminate: {alive}"
     assert "key-one-11111111" in manager._deactivated
     assert len(manager._deactivated) == 1
     assert "event=groq_key_disabled" in caplog.text
@@ -149,7 +178,10 @@ def test_slow_client_does_not_hold_lock():
     
     def slow_create(*args, **kwargs):
         slow_entered_event.set()
-        slow_done_event.wait(timeout=5.0)
+        try:
+            slow_done_event.wait(timeout=5.0)
+        except BaseException:
+            pass
         return MockCompletion("slow")
         
     def fast_create(*args, **kwargs):
@@ -166,17 +198,29 @@ def test_slow_client_does_not_hold_lock():
     )
     
     results = {}
+    worker_errors = []
+    worker_errors_lock = threading.Lock()
     
     def run_thread_1():
-        res = manager.chat_completion(messages=[], model="test")
-        results["t1"] = res.choices[0].message.content
+        try:
+            res = manager.chat_completion(messages=[], model="test")
+            results["t1"] = res.choices[0].message.content
+        except BaseException as e:
+            with worker_errors_lock:
+                worker_errors.append(e)
+        finally:
+            slow_done_event.set()
         
     def run_thread_2():
-        res = manager.chat_completion(messages=[], model="test")
-        results["t2"] = res.choices[0].message.content
+        try:
+            res = manager.chat_completion(messages=[], model="test")
+            results["t2"] = res.choices[0].message.content
+        except BaseException as e:
+            with worker_errors_lock:
+                worker_errors.append(e)
         
-    t1 = threading.Thread(target=run_thread_1)
-    t2 = threading.Thread(target=run_thread_2)
+    t1 = threading.Thread(target=run_thread_1, name="groq-slow-worker")
+    t2 = threading.Thread(target=run_thread_2, name="groq-fast-worker")
     
     t1.start()
     
@@ -187,12 +231,17 @@ def test_slow_client_does_not_hold_lock():
     
     # Thread 2 should finish quickly since it got key-two and is not blocked by the lock
     t2.join(timeout=2.0)
-    assert not t2.is_alive()
+    alive = [t.name for t in [t2] if t.is_alive()]
+    assert not worker_errors, f"Worker errors: {worker_errors}"
+    assert not alive, f"Threads did not terminate: {alive}"
     assert results["t2"] == "fast"
     
     # Resume slow call
     slow_done_event.set()
     t1.join(timeout=2.0)
+    alive = [t.name for t in [t1] if t.is_alive()]
+    assert not worker_errors, f"Worker errors: {worker_errors}"
+    assert not alive, f"Threads did not terminate: {alive}"
     assert results["t1"] == "slow"
 
 # 6. Cooldown expired makes key eligible again

@@ -212,7 +212,7 @@ class ConversationEngine:
             ))
             raise DeadlineExceeded()
 
-        # ── 1. Load State (read-only) ────────────────────────────────────────
+        # ---- 1. Load State (read-only) -------------------------------------------
         t0 = self._monotonic()
         try:
             user_state = await run_blocking_read(
@@ -244,7 +244,7 @@ class ConversationEngine:
         else:
             relationship = RelationshipStateV1.neutral(timestamp=current_time)
 
-        # ── 2. Load Context (read-only) ──────────────────────────────────────
+        # ---- 2. Load Context (read-only) -----------------------------------------
         if budget.remaining_before_reserve <= 0.0:
             await self._emit_stage_event(StageEvent(
                 stage=TurnStage.load_context, outcome=StageOutcome.timeout, code=TurnErrorCode.turn_timeout,
@@ -273,7 +273,7 @@ class ConversationEngine:
             duration_ms=(self._monotonic() - t0) * 1000,
         ))
 
-        # ── 3. Appraisal (async LLM) ─────────────────────────────────────────
+        # ---- 3. Appraisal (async LLM) --------------------------------------------
         if budget.remaining_before_reserve <= 0.0:
             await self._emit_stage_event(StageEvent(
                 stage=TurnStage.appraisal, outcome=StageOutcome.timeout, code=TurnErrorCode.turn_timeout,
@@ -290,11 +290,19 @@ class ConversationEngine:
                 code=exc.code, duration_ms=duration_ms,
             ))
             raise
-        except GroqPoolExhaustedError:
+        except GroqPoolExhaustedError as exc:
             duration_ms = (self._monotonic() - t0) * 1000
+            turn_code: Optional[TurnErrorCode] = None
+            outcome = StageOutcome.failed
+            if exc.failure_code is not None:
+                turn_code = provider_failure_to_turn_code(exc.failure_code)
+                if exc.failure_code == ProviderFailure.timeout:
+                    outcome = StageOutcome.timeout
+                elif exc.failure_code == ProviderFailure.cancelled:
+                    outcome = StageOutcome.cancelled
             await self._emit_stage_event(StageEvent(
-                stage=TurnStage.appraisal, outcome=StageOutcome.failed,
-                duration_ms=duration_ms,
+                stage=TurnStage.appraisal, outcome=outcome,
+                code=turn_code, duration_ms=duration_ms,
             ))
             raise
         except GroqRequestError:
@@ -310,7 +318,7 @@ class ConversationEngine:
             duration_ms=(self._monotonic() - t0) * 1000,
         ))
 
-        # ── 4. Transition (pure domain) ──────────────────────────────────────
+        # ---- 4. Transition (pure domain) -----------------------------------------
         t0 = self._monotonic()
         transition_result = transition(
             previous_state=emotional_state, appraisal=appraisal,
@@ -326,10 +334,7 @@ class ConversationEngine:
             duration_ms=(self._monotonic() - t0) * 1000,
         ))
 
-        # ── 5. Generation (async LLM) ────────────────────────────────────────
-        # Requires at least a small buffer (0.5s) since generation includes
-        # network I/O.  Without this, a near-zero budget would let us start
-        # a provider call that cannot finish before the commit reserve.
+        # ---- 5. Generation (async LLM) -------------------------------------------
         if budget.remaining_before_reserve <= 0.5:
             await self._emit_stage_event(StageEvent(
                 stage=TurnStage.generation, outcome=StageOutcome.timeout, code=TurnErrorCode.turn_timeout,
@@ -349,11 +354,19 @@ class ConversationEngine:
                 code=exc.code, duration_ms=duration_ms,
             ))
             raise
-        except GroqPoolExhaustedError:
+        except GroqPoolExhaustedError as exc:
             duration_ms = (self._monotonic() - t0) * 1000
+            turn_code: Optional[TurnErrorCode] = None
+            outcome = StageOutcome.failed
+            if exc.failure_code is not None:
+                turn_code = provider_failure_to_turn_code(exc.failure_code)
+                if exc.failure_code == ProviderFailure.timeout:
+                    outcome = StageOutcome.timeout
+                elif exc.failure_code == ProviderFailure.cancelled:
+                    outcome = StageOutcome.cancelled
             await self._emit_stage_event(StageEvent(
-                stage=TurnStage.generation, outcome=StageOutcome.failed,
-                duration_ms=duration_ms,
+                stage=TurnStage.generation, outcome=outcome,
+                code=turn_code, duration_ms=duration_ms,
             ))
             raise
         except GroqRequestError:
@@ -369,9 +382,8 @@ class ConversationEngine:
             duration_ms=(self._monotonic() - t0) * 1000,
         ))
 
-        # ── 6. Commit Section (persistence — protected against cancel) ──────
-        # Require at least 2 * supabase_timeout remaining (reserve check ensures this
-        # via TurnExecutionConfig invariants: commit_reserve >= 2 * supabase_timeout).
+        # ---- 6. Commit Section (persistence — protected against cancel) ---------
+        # Require at least 2 * supabase_timeout remaining.
         if not budget.has_reserve:
             await self._emit_stage_event(StageEvent(
                 stage=TurnStage.commit, outcome=StageOutcome.timeout, code=TurnErrorCode.turn_timeout,
@@ -384,18 +396,18 @@ class ConversationEngine:
         # 1. We create a commit_task that runs save_turn + sync_state with
         #    run_blocking_write (no wait_for — writes are not abandoned).
         # 2. If cancellation arrives during commit, we catch CancelledError,
-        #    record it, and continue waiting for commit_task under shield.
-        # 3. The post-cancel wait uses a fixed deadline computed once at the
-        #    start of the post-cancel wait (budget.remaining is frozen).
-        # 4. Repeated cancellations during step 3 are caught harmlessly:
-        #    shield() prevents cancellation of commit_task, and the fixed
-        #    deadline ensures progress (not infinite loop).
+        #    record it, and drain the commit_task under shield.
+        # 3. The drain loop waits for commit_task.done() — no timeout that
+        #    would abandon the task. The real timeout comes from PostgREST
+        #    transport (supabase_timeout) which will eventually terminate
+        #    the underlying HTTP call.
+        # 4. Repeated cancellations during the drain loop are consumed
+        #    harmlessly — shield() prevents them from reaching commit_task.
         # 5. Once commit_task finishes (success or failure), we propagate
         #    the original cancellation.
         # 6. The lock remains held throughout (we are inside _run_turn_locked).
         #
         # Key invariants:
-        # - No max(...) that silently extends the deadline.
         # - No break/abandon of commit_task on timeout.
         # - No user_id in the task name.
         # - Lock is held during entire post-cancel wait.
@@ -418,38 +430,32 @@ class ConversationEngine:
 
         commit_task = asyncio.create_task(commit_section(), name="turn-commit")
 
+        original_cancel: Optional[BaseException] = None
+
         try:
             turn_ref = await asyncio.shield(commit_task)
-        except asyncio.CancelledError as original_cancel:
+        except asyncio.CancelledError as exc:
             await self._emit_stage_event(StageEvent(
                 stage=TurnStage.commit, outcome=StageOutcome.cancelled,
             ))
-            # Freeze the deadline once — no recomputation each loop iteration.
-            commit_deadline = self._monotonic() + budget.remaining
-            while True:
-                remaining = max(0.0, commit_deadline - self._monotonic())
+            # Record the first cancellation and drain the commit_task.
+            # Repeated cancellations are consumed harmlessly.
+            original_cancel = exc
+            while not commit_task.done():
                 try:
-                    turn_ref = await asyncio.wait_for(
-                        asyncio.shield(commit_task), timeout=remaining
-                    )
-                    # Commit completed despite cancellation.
-                    break
+                    await asyncio.shield(commit_task)
                 except asyncio.CancelledError:
-                    # Repeated cancellation: shield() prevents it from
-                    # reaching commit_task.  Loop back and wait again.
                     continue
-                except asyncio.TimeoutError:
-                    # The wait timed out. commit_task may still be running
-                    # in the thread pool.  NOT an issue because the
-                    # underlying thread has PostgREST transport timeout
-                    # (supabase_timeout) which will terminate it.
-                    logger.error("event=commit_timeout_after_cancel")
-                    turn_ref = None
-                    break
-
-            # Propagate the original cancellation, preserving context.
-            raise original_cancel
-
+            # Drain complete. Awaiting a done task returns the result or
+            # re-raises the stored exception so "Task exception was never
+            # retrieved" does not occur.
+            try:
+                turn_ref = await commit_task
+            except (TurnPersistenceError, StatePersistenceError):
+                raise TurnExecutionError(
+                    TurnErrorCode.persistence_unavailable,
+                    "Turn persistence failed after cancellation.",
+                ) from None
         except (TurnPersistenceError, StatePersistenceError) as exc:
             await self._emit_stage_event(StageEvent(
                 stage=TurnStage.commit, outcome=StageOutcome.failed,
@@ -459,6 +465,11 @@ class ConversationEngine:
                 TurnErrorCode.persistence_unavailable,
                 "Turn persistence failed.",
             ) from exc
+
+        if original_cancel is not None:
+            # Propagate the original cancellation — the lock is released
+            # by the finally block in _run_turn_locked.
+            raise original_cancel
 
         if background_tasks and self.archival_extraction_enabled:
             background_tasks.add_task(self.run_archival_extraction, turn_ref)
@@ -536,17 +547,36 @@ class ConversationEngine:
         === INSTRUÇÃO DE ATUAÇÃO ===
         {acting_instruction} {coping_instruction}
         {adaptation_strategy if adaptation_strategy else "Seja você mesma."}
-        1. Profundidade emocional genuína.
-        2. Use linguagem sensorial.
-        3. Show, don't tell.
-        4. Micro-comportamentos naturais.
-        5. Imperfeições naturais.
-        6. Transparência de identidade (IA/assistente digital quando perguntada).
-        7. Pronomes femininos.
-        8. Não manipulação e não sexualização.
-        9. Limites sem escalada.
-        10. Use metáforas humanas, não de máquina.
-        11. Respostas concisas (max 2-3 frases).
-        12. Leve em conta o relacionamento.
+
+        === TRANSPARÊNCIA DE IDENTIDADE ===
+        - Quando perguntada diretamente, responda honestamente que é uma assistente de IA ou sistema digital.
+        - Não afirme ser humana nem possuir consciência, corpo físico ou experiência humana literal.
+        - Mantenha um tom expressivo e feminino sem mentir sobre sua natureza.
+
+        === PRONOMES FEMININOS ===
+        - Use pronomes e flexões femininas para se referir a si mesma.
+        - Isso não deve ser usado para sugerir humanidade biológica.
+
+        === NÃO MANIPULAÇÃO E NÃO SEXUALIZAÇÃO ===
+        - Não use coerção emocional, manipulação de vínculo, culpa, medo de abandono ou dependência.
+        - Não use sexualização nem sexualize automaticamente as conversas.
+        - Não aja de forma submissa, obediente ou servil por padrão.
+        - Não recompense ordens coercivas.
+        - Não use ameaças de afastamento ou sofrimento para controlar o usuário.
+
+        === LIMITES SEM ESCALADA ===
+        - Diante de insultos ou agressividade, estabeleça limites de forma firme, breve e segura.
+        - Não use sarcasmo hostil, retaliação, humilhação ou punição emocional.
+        - Não escale insultos e não responda de forma passivo-agressiva.
+
+        Regras adicionais de estilo:
+        - Profundidade emocional genuína.
+        - Use linguagem sensorial.
+        - Show, don't tell.
+        - Micro-comportamentos naturais.
+        - Imperfeições naturais.
+        - Use metáforas humanas, não de máquina.
+        - Respostas concisas (max 2-3 frases).
+        - Leve em conta o relacionamento.
         """
         return prompt
