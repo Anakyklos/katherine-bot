@@ -2,9 +2,11 @@ import pytest
 import asyncio
 import threading
 import time
-from unittest.mock import MagicMock, patch, ANY
+from unittest.mock import AsyncMock, MagicMock, patch, ANY
 from backend.memory import MemoryManager, ContextLoadError, TurnPersistenceError
 from backend.engine import ConversationEngine
+from backend.emotional_domain import AppraisalV1
+from backend.turn_execution import TurnExecutionError
 
 
 def _valid_legacy_emotion_dict():
@@ -373,12 +375,6 @@ def test_process_turn_awaits_save_turn_inside_lock():
         engine.memory_manager.sync_state = MagicMock()
         engine._perceive = MagicMock(return_value={})
         
-        mock_chat = MagicMock()
-        mock_chat.choices = [MagicMock()]
-        mock_chat.choices[0].message.content = "Bot reply"
-        from unittest.mock import AsyncMock
-        from backend.emotional_domain import AppraisalV1
-        
         engine._appraise = AsyncMock(return_value=AppraisalV1.neutral())
         engine._generate = AsyncMock(return_value="Bot reply")
 
@@ -456,8 +452,6 @@ def test_process_turn_fails_closed_on_load_failure():
         })
         engine.memory_manager.sync_state = MagicMock()
         engine._perceive = MagicMock()
-        from unittest.mock import AsyncMock
-        from backend.turn_execution import TurnExecutionError
         engine._appraise = AsyncMock(return_value=MagicMock())
         engine._generate = AsyncMock(return_value="Bot reply")
         engine.memory_manager.save_turn = MagicMock()
@@ -485,8 +479,6 @@ def test_concurrent_process_turn_serialization():
         engine.memory_manager.sync_state = MagicMock()
         engine._perceive = MagicMock(return_value={})
         
-        from unittest.mock import AsyncMock
-        from backend.emotional_domain import AppraisalV1
         engine._appraise = AsyncMock(return_value=AppraisalV1.neutral())
         engine._generate = AsyncMock(return_value="Bot reply")
         
@@ -548,8 +540,6 @@ def test_concurrent_different_users_not_blocked():
         engine.memory_manager.sync_state = MagicMock()
         engine._perceive = MagicMock(return_value={})
         
-        from unittest.mock import AsyncMock
-        from backend.emotional_domain import AppraisalV1
         engine._appraise = AsyncMock(return_value=AppraisalV1.neutral())
         engine._generate = AsyncMock(return_value="Bot reply")
         
@@ -602,8 +592,6 @@ def test_repeated_cancellation_during_save_turn():
         engine.memory_manager.sync_state = MagicMock()
         engine._perceive = MagicMock(return_value={})
         
-        from unittest.mock import AsyncMock
-        from backend.emotional_domain import AppraisalV1
         engine._appraise = AsyncMock(return_value=AppraisalV1.neutral())
         engine._generate = AsyncMock(return_value="Bot reply")
         
