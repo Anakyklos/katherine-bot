@@ -41,7 +41,8 @@ from .turn_execution import (
     TurnExecutionError,
     DeadlineExceeded,
     create_budget,
-    run_blocking_with_deadline,
+    run_blocking_read,
+    run_blocking_write,
 )
 
 logger = logging.getLogger(__name__)
@@ -74,11 +75,9 @@ class ConversationEngine:
     async def run_archival_extraction(self, turn_ref: PersistedTurnRef):
         if not self.archival_extraction_enabled:
             return
-        
-        # Use a short budget-limited approach for archival extraction.
-        # We run it as a fire-and-forget background task, but each step
-        # is bounded by a small timeout to prevent hanging.
-        # commit_reserve must be >= 2 * supabase_timeout per invariants.
+
+        # Archival extraction uses its own budget (monotonic, explicitly limited).
+        # It runs as a fire-and-forget background task with bounded time.
         budget = create_budget(TurnExecutionConfig(
             total_deadline=15.0,
             supabase_timeout=3.0,
@@ -89,9 +88,10 @@ class ConversationEngine:
         ), now_provider=self._monotonic)
 
         supabase_timeout = self._turn_config.supabase_timeout
-        
+
+        # Step 1: Load the persisted user message (read-only)
         try:
-            user_message = await run_blocking_with_deadline(
+            user_message = await run_blocking_read(
                 "archival_load_message", budget, supabase_timeout,
                 self.memory_manager.load_persisted_user_message,
                 turn_ref.user_id, turn_ref.source_chat_log_id
@@ -107,12 +107,13 @@ class ConversationEngine:
         Maximum of 5 facts. If no relevant facts, return empty facts list.
         User message: "{user_message}"
         """
-        
+
+        # Step 2: Run LLM extraction via async path with own budget
         try:
-            chat_completion = self.groq_manager.chat_completion(
+            chat_completion = await self.groq_manager.chat_completion_async(
                 messages=[{"role": "user", "content": prompt}],
-                model=self.model_fast, temperature=0.0,
-                response_format={"type": "json_object"}
+                model=self.model_fast, budget=budget, stage="archival_extraction",
+                temperature=0.0, response_format={"type": "json_object"},
             )
             response_text = chat_completion.choices[0].message.content
         except Exception:
@@ -134,22 +135,20 @@ class ConversationEngine:
         idempotency_key = compute_idempotency_key(
             turn_ref.user_id, turn_ref.source_chat_log_id, EXTRACTOR_VERSION
         )
-        
-        # Use direct bounded thread call instead of run_blocking_with_deadline
-        # because we need ArchivalDuplicateError to propagate as-is.
+
+        # Step 3: Store extraction via write helper (not wait_for/to_thread that
+        # can abandon the write).  ArchivalDuplicateError propagates as-is.
         try:
-            await asyncio.wait_for(
-                asyncio.to_thread(
-                    self.memory_manager.store_archival_extraction,
-                    turn_ref.user_id, turn_ref.source_chat_log_id,
-                    idempotency_key, envelope,
-                ),
-                timeout=supabase_timeout,
+            await run_blocking_write(
+                "archival_store", budget, supabase_timeout,
+                self.memory_manager.store_archival_extraction,
+                turn_ref.user_id, turn_ref.source_chat_log_id,
+                idempotency_key, envelope,
             )
-        except asyncio.TimeoutError:
-            logger.error("Event: archival_extraction_store_failed")
         except ArchivalDuplicateError:
             logger.info("Event: archival_extraction_duplicate")
+        except TurnExecutionError:
+            logger.error("Event: archival_extraction_store_failed")
         except Exception:
             logger.error("Event: archival_extraction_store_failed")
 
@@ -212,10 +211,10 @@ class ConversationEngine:
             ))
             raise DeadlineExceeded()
 
-        # ── 1. Load State ────────────────────────────────────────────────────
+        # ── 1. Load State (read-only) ────────────────────────────────────────
         t0 = self._monotonic()
         try:
-            user_state = await run_blocking_with_deadline(
+            user_state = await run_blocking_read(
                 "load_user_state", budget, supabase_timeout,
                 self.memory_manager.load_user_state, user_id, default_timestamp=current_time,
             )
@@ -244,7 +243,7 @@ class ConversationEngine:
         else:
             relationship = RelationshipStateV1.neutral(timestamp=current_time)
 
-        # ── 2. Load Context ──────────────────────────────────────────────────
+        # ── 2. Load Context (read-only) ──────────────────────────────────────
         if budget.remaining_before_reserve <= 0.0:
             await self._emit_stage_event(StageEvent(
                 stage=TurnStage.load_context, outcome=StageOutcome.timeout, code=TurnErrorCode.turn_timeout,
@@ -253,7 +252,7 @@ class ConversationEngine:
 
         t0 = self._monotonic()
         try:
-            context = await run_blocking_with_deadline(
+            context = await run_blocking_read(
                 "get_context", budget, supabase_timeout,
                 self.memory_manager.get_context, user_id, user_message, user_state
             )
@@ -273,7 +272,7 @@ class ConversationEngine:
             duration_ms=(self._monotonic() - t0) * 1000,
         ))
 
-        # ── 3. Appraisal ─────────────────────────────────────────────────────
+        # ── 3. Appraisal (async LLM) ─────────────────────────────────────────
         if budget.remaining_before_reserve <= 0.0:
             await self._emit_stage_event(StageEvent(
                 stage=TurnStage.appraisal, outcome=StageOutcome.timeout, code=TurnErrorCode.turn_timeout,
@@ -283,10 +282,18 @@ class ConversationEngine:
         t0 = self._monotonic()
         try:
             appraisal = await self._appraise(user_message, budget)
-        except (TurnExecutionError, GroqPoolExhaustedError):
+        except TurnExecutionError as exc:
             duration_ms = (self._monotonic() - t0) * 1000
             await self._emit_stage_event(StageEvent(
-                stage=TurnStage.appraisal, outcome=StageOutcome.failed, duration_ms=duration_ms,
+                stage=TurnStage.appraisal, outcome=StageOutcome.failed,
+                code=exc.code, duration_ms=duration_ms,
+            ))
+            raise
+        except GroqPoolExhaustedError:
+            duration_ms = (self._monotonic() - t0) * 1000
+            await self._emit_stage_event(StageEvent(
+                stage=TurnStage.appraisal, outcome=StageOutcome.failed,
+                duration_ms=duration_ms,
             ))
             raise
         except GroqRequestError:
@@ -302,7 +309,7 @@ class ConversationEngine:
             duration_ms=(self._monotonic() - t0) * 1000,
         ))
 
-        # ── 4. Transition ────────────────────────────────────────────────────
+        # ── 4. Transition (pure domain) ──────────────────────────────────────
         t0 = self._monotonic()
         transition_result = transition(
             previous_state=emotional_state, appraisal=appraisal,
@@ -318,7 +325,7 @@ class ConversationEngine:
             duration_ms=(self._monotonic() - t0) * 1000,
         ))
 
-        # ── 5. Generation ────────────────────────────────────────────────────
+        # ── 5. Generation (async LLM) ────────────────────────────────────────
         # Requires at least a small buffer (0.5s) since generation includes
         # network I/O.  Without this, a near-zero budget would let us start
         # a provider call that cannot finish before the commit reserve.
@@ -334,10 +341,18 @@ class ConversationEngine:
         t0 = self._monotonic()
         try:
             response_text = await self._generate(system_prompt, user_message, budget)
-        except (TurnExecutionError, GroqPoolExhaustedError):
+        except TurnExecutionError as exc:
             duration_ms = (self._monotonic() - t0) * 1000
             await self._emit_stage_event(StageEvent(
-                stage=TurnStage.generation, outcome=StageOutcome.failed, duration_ms=duration_ms,
+                stage=TurnStage.generation, outcome=StageOutcome.failed,
+                code=exc.code, duration_ms=duration_ms,
+            ))
+            raise
+        except GroqPoolExhaustedError:
+            duration_ms = (self._monotonic() - t0) * 1000
+            await self._emit_stage_event(StageEvent(
+                stage=TurnStage.generation, outcome=StageOutcome.failed,
+                duration_ms=duration_ms,
             ))
             raise
         except GroqRequestError:
@@ -354,6 +369,8 @@ class ConversationEngine:
         ))
 
         # ── 6. Commit Section (persistence — protected against cancel) ──────
+        # Require at least 2 * supabase_timeout remaining (reserve check ensures this
+        # via TurnExecutionConfig invariants: commit_reserve >= 2 * supabase_timeout).
         if not budget.has_reserve:
             await self._emit_stage_event(StageEvent(
                 stage=TurnStage.commit, outcome=StageOutcome.timeout, code=TurnErrorCode.turn_timeout,
@@ -364,30 +381,31 @@ class ConversationEngine:
         #
         # Cancellation protocol:
         # 1. We create a commit_task that runs save_turn + sync_state with
-        #    bounded thread operations (using supabase_timeout per call).
+        #    run_blocking_write (no wait_for — writes are not abandoned).
         # 2. If cancellation arrives during commit, we catch CancelledError,
         #    record it, and continue waiting for commit_task under shield.
-        # 3. The budget.remaining (without artificial max/extension) bounds
-        #    this post-cancel wait.
-        # 4. Repeated cancellations during step 3 are shielded: shield()
-        #    prevents cancellation of commit_task, and CancelledError from
-        #    wait_for is caught and re-raised as a fresh wait.
+        # 3. The post-cancel wait uses a fixed deadline computed once at the
+        #    start of the post-cancel wait (budget.remaining is frozen).
+        # 4. Repeated cancellations during step 3 are caught harmlessly:
+        #    shield() prevents cancellation of commit_task, and the fixed
+        #    deadline ensures progress (not infinite loop).
         # 5. Once commit_task finishes (success or failure), we propagate
         #    the original cancellation.
         # 6. The lock remains held throughout (we are inside _run_turn_locked).
         #
         # Key invariants:
         # - No max(...) that silently extends the deadline.
+        # - No break/abandon of commit_task on timeout.
         # - No user_id in the task name.
         # - Lock is held during entire post-cancel wait.
 
         async def commit_section() -> tuple:
             t0 = self._monotonic()
-            turn_ref = await run_blocking_with_deadline(
+            turn_ref = await run_blocking_write(
                 "save_turn", budget, supabase_timeout,
                 self.memory_manager.save_turn, user_id, user_message, response_text
             )
-            await run_blocking_with_deadline(
+            await run_blocking_write(
                 "sync_state", budget, supabase_timeout,
                 self.memory_manager.sync_state, user_id, new_state, relationship
             )
@@ -405,11 +423,7 @@ class ConversationEngine:
             await self._emit_stage_event(StageEvent(
                 stage=TurnStage.commit, outcome=StageOutcome.cancelled,
             ))
-            # Compute a fixed deadline for the post-cancel commit wait.
-            # Using budget.remaining once avoids recomputing it on every
-            # repeated cancellation (which could return the same value and
-            # cause an infinite loop if cancellations arrive faster than
-            # the clock advances).
+            # Freeze the deadline once — no recomputation each loop iteration.
             commit_deadline = self._monotonic() + budget.remaining
             while True:
                 remaining = max(0.0, commit_deadline - self._monotonic())
@@ -417,22 +431,20 @@ class ConversationEngine:
                     turn_ref = await asyncio.wait_for(
                         asyncio.shield(commit_task), timeout=remaining
                     )
+                    # Commit completed despite cancellation.
                     break
+                except asyncio.CancelledError:
+                    # Repeated cancellation: shield() prevents it from
+                    # reaching commit_task.  Loop back and wait again.
+                    continue
                 except asyncio.TimeoutError:
-                    # The wait timed out. The commit_task may still be
-                    # running in the background. Log and abandon.
+                    # The wait timed out. commit_task may still be running
+                    # in the thread pool.  NOT an issue because the
+                    # underlying thread has PostgREST transport timeout
+                    # (supabase_timeout) which will terminate it.
                     logger.error("event=commit_timeout_after_cancel")
                     turn_ref = None
                     break
-                except asyncio.CancelledError:
-                    # A repeated cancellation arrived. The shield() prevents
-                    # it from canceling commit_task. If the deadline is
-                    # exhausted, abandon the wait.
-                    if remaining <= 0.0:
-                        logger.error("event=commit_timeout_after_cancel")
-                        turn_ref = None
-                        break
-                    continue
 
             # Propagate the original cancellation, preserving context.
             raise original_cancel

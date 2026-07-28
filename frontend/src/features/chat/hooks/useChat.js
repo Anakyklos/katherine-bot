@@ -24,6 +24,10 @@ export const useChat = () => {
     const abortControllerRef = useRef(null);
     const timerIdRef = useRef(null);
     const requestTokenRef = useRef(0);
+    // Synchronous in-flight guard: prevents double submission before rerender.
+    // isLoading depends on rerender, but the ref is synchronous, so a second
+    // handleSend() call in the same microtask is rejected immediately.
+    const inFlightRef = useRef(false);
 
     const cleanupRequest = useCallback(() => {
         if (timerIdRef.current !== null) {
@@ -69,10 +73,14 @@ export const useChat = () => {
     }, [messages, isLoading]);
 
     const handleSend = useCallback(async () => {
-        if (!input.trim() || isLoading) return;
+        // Synchronous guard: reject second call before any optimistic effects.
+        if (!input.trim() || isLoading || inFlightRef.current) return;
 
         const userMessageText = input.trim();
         const newUserMessage = { role: 'user', content: userMessageText };
+
+        // Mark in-flight synchronously BEFORE any side effects.
+        inFlightRef.current = true;
 
         // Optimistic update
         setMessages(prev => [...prev, newUserMessage]);
@@ -138,9 +146,10 @@ export const useChat = () => {
                 setMessages(prev => [...prev, errorMessage]);
             }
         } finally {
-            // Guard: only the owning request may clear refs and loading state
+            // Guard: only the owning request may clear refs, inFlight, and loading state
             if (token === requestTokenRef.current) {
                 setIsLoading(false);
+                inFlightRef.current = false;
                 abortControllerRef.current = null;
                 timerIdRef.current = null;
                 // Focus back on input

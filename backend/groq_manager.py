@@ -66,6 +66,7 @@ class ProviderFailure(str, Enum):
     connection_failed = "connection_failed"
     server_error = "server_error"
     invalid_response = "invalid_response"
+    invalid_request = "invalid_request"
     timeout = "timeout"            # APITimeoutError or effective-timeout expiry
     cancelled = "cancelled"
 
@@ -89,8 +90,8 @@ def classify_provider_error(exc: BaseException) -> ProviderFailure:
             return ProviderFailure.auth_failed
         if exc.status_code >= 500:
             return ProviderFailure.server_error
-        # 4xx non-recoverable
-        return ProviderFailure.invalid_response
+        # 4xx non-recoverable (invalid request)
+        return ProviderFailure.invalid_request
     if isinstance(exc, asyncio.CancelledError):
         return ProviderFailure.cancelled
     if isinstance(exc, asyncio.TimeoutError):
@@ -107,6 +108,7 @@ def provider_failure_to_turn_code(failure: ProviderFailure) -> TurnErrorCode:
     mapping = {
         ProviderFailure.rate_limited: TurnErrorCode.upstream_rate_limited,
         ProviderFailure.auth_failed: TurnErrorCode.provider_invalid_request,
+        ProviderFailure.invalid_request: TurnErrorCode.provider_invalid_request,
         ProviderFailure.connection_failed: TurnErrorCode.provider_unavailable,
         ProviderFailure.server_error: TurnErrorCode.provider_unavailable,
         ProviderFailure.timeout: TurnErrorCode.turn_timeout,

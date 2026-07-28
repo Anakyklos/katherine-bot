@@ -93,10 +93,28 @@ def compute_effective_attempt_timeout(
     return min(config.provider_attempt_timeout, budget.remaining_before_reserve)
 
 
-# ─── Bounded blocking operation helper ───────────────────────────────────────
+# ─── Read/Write blocking helpers ────────────────────────────────────────────
+#
+# Two semantically distinct helpers for thread-bound I/O:
+#
+#   run_blocking_read  – for read-only operations (load_user_state, get_context,
+#                        load_persisted_user_message).  Uses wait_for(to_thread())
+#                        because a read that continues past the timeout does not
+#                        corrupt state.
+#
+#   run_blocking_write – for write operations (save_turn, sync_state,
+#                        store_archival_extraction).  Does NOT use
+#                        wait_for(to_thread()) to avoid abandoning the thread.
+#                        Instead the real timeout comes from the PostgREST
+#                        transport configuration.  The coroutine waits for the
+#                        thread to complete via a referenced task.
+#
+# Both helpers check budget before starting.  Read helpers use
+# ``remaining_before_reserve`` so they never consume the commit reserve.
+# Write helpers require sufficient remaining budget (including reserve).
 
 
-async def run_blocking_with_deadline(
+async def run_blocking_read(
     stage_label: str,
     budget: TurnBudget,
     supabase_timeout: float,
@@ -104,44 +122,26 @@ async def run_blocking_with_deadline(
     *args: Any,
     **kwargs: Any,
 ) -> T:
-    """Run a blocking (thread-bound) operation with deadline enforcement.
+    """Run a **read-only** blocking operation with deadline enforcement.
 
     The operation is dispatched via ``asyncio.to_thread()`` and the coroutine
-    waits for it with a timeout derived from the remaining budget. This
-    ensures that no thread operation runs indefinitely.
+    waits for it with a timeout derived from ``remaining_before_reserve`` (so
+    the commit reserve is never consumed by reads).
 
-    The effective timeout is ``min(budget.remaining, supabase_timeout)``.
-    We use ``supabase_timeout`` as an upper bound because the underlying
-    Supabase/PostgREST transport already respects that timeout, and waiting
-    longer than that would be wasteful.
+    The effective timeout is ``min(remaining_before_reserve, supabase_timeout)``.
+    Because this is a read-only operation, the thread continuing after timeout
+    is acceptable — there is no state to corrupt.
 
-    On **timeout**: raises ``DeadlineExceeded`` (``TurnErrorCode.turn_timeout``).
+    On **timeout**: raises ``DeadlineExceeded`` (``turn_timeout``).
     On **cancellation**: propagates ``asyncio.CancelledError``.
     On **any other exception**: wraps into ``TurnExecutionError(persistence_unavailable)``.
 
-    The underlying thread may continue executing after a timeout. This is
-    acceptable for read operations (``load_user_state``, ``get_context``)
-    because there is no state to corrupt. For write operations (``save_turn``,
-    ``sync_state``), callers must ensure the lock is retained until the write
-    is known to have completed (see commit section in engine.py).
-
-    Args:
-        stage_label: Stage name for observability (e.g. ``"load_user_state"``).
-        budget: ``TurnBudget`` from ``turn_execution`` — provides remaining time.
-        supabase_timeout: Per-call timeout for Supabase operations.
-        func: Synchronous callable to invoke in a thread.
-        *args: Positional arguments forwarded to *func*.
-        **kwargs: Keyword arguments forwarded to *func*.
-
-    Returns:
-        The return value of *func*.
-
     Raises:
-        DeadlineExceeded: When the operation times out.
+        DeadlineExceeded: When the budget is exhausted before or during the operation.
         TurnExecutionError(persistence_unavailable): On operation failure.
         asyncio.CancelledError: When the coroutine is cancelled.
     """
-    remaining = budget.remaining
+    remaining = budget.remaining_before_reserve
     timeout = min(remaining, supabase_timeout)
 
     if timeout <= 0.0:
@@ -155,6 +155,64 @@ async def run_blocking_with_deadline(
         return result
     except asyncio.TimeoutError:
         raise DeadlineExceeded()
+    except asyncio.CancelledError:
+        raise
+    except TurnExecutionError:
+        raise
+    except Exception:
+        raise TurnExecutionError(
+            TurnErrorCode.persistence_unavailable,
+            f"Stage {stage_label} failed.",
+        )
+
+
+async def run_blocking_write(
+    stage_label: str,
+    budget: TurnBudget,
+    supabase_timeout: float,
+    func: Callable[..., T],
+    *args: Any,
+    **kwargs: Any,
+) -> T:
+    """Run a **write** blocking operation that must not be abandoned.
+
+    Unlike ``run_blocking_read``, this helper **does not** use
+    ``asyncio.wait_for`` with a timeout that could abandon the underlying
+    thread.  Instead:
+
+    1. The operation is dispatched via ``asyncio.to_thread()`` and wrapped
+       in an ``asyncio.Task`` that is explicitly referenced.
+    2. The real timeout is provided by the PostgREST transport configuration
+       (``supabase_timeout``), which will cause the HTTP client to
+       eventually time out server-side.
+    3. The coroutine **awaits the task** (not a timed wait) so the write
+       is never abandoned.
+    4. ``budget.remaining`` is checked before starting — the caller must
+       ensure sufficient remaining budget (reserve included).
+
+    On **cancellation**: the underlying thread continues (it's not
+    cancellable) but the coroutine stops waiting for it.  The caller
+    must retain the user lock until the task completes (see commit
+    cancellation protocol in engine.py).
+
+    On **any exception**: wraps into ``TurnExecutionError(persistence_unavailable)``.
+
+    Returns:
+        The return value of *func*.
+
+    Raises:
+        DeadlineExceeded: When the budget is exhausted before starting.
+        TurnExecutionError(persistence_unavailable): On operation failure.
+        asyncio.CancelledError: When the coroutine is cancelled.
+    """
+    # Check budget before starting — uses full remaining (including reserve)
+    # because writes run inside the commit section.
+    if budget.remaining <= 0.0:
+        raise DeadlineExceeded()
+
+    try:
+        result = await asyncio.to_thread(func, *args, **kwargs)
+        return result
     except asyncio.CancelledError:
         raise
     except TurnExecutionError:
@@ -429,8 +487,28 @@ class TurnExecutionConfig:
                 raise ValueError(f"Environment variable {key!r} has invalid value {val!r}.")
             if not math.isfinite(f):
                 raise ValueError(f"Environment variable {key!r} must be finite, got {f!r}.")
-            if f <= 0:
-                raise ValueError(f"Environment variable {key!r} must be positive, got {f!r}.")
+            return f
+
+        def _parse_nonnegative_float(key: str, default: float) -> float:
+            """Like _parse_float but allows zero (for jitter)."""
+            val = source.get(key)
+            if val is None:
+                return default
+            val = val.strip()
+            if not val:
+                raise ValueError(f"Environment variable {key!r} is empty.")
+            if val.lower() in ("true", "false", "yes", "no"):
+                raise ValueError(f"Environment variable {key!r} cannot be a boolean string ({val!r}).")
+            try:
+                f = float(val)
+            except (ValueError, TypeError):
+                raise ValueError(f"Environment variable {key!r} has invalid value {val!r}.")
+            if not math.isfinite(f):
+                raise ValueError(f"Environment variable {key!r} must be finite, got {f!r}.")
+            if f < 0:
+                raise ValueError(f"Environment variable {key!r} must be non-negative, got {f!r}.")
+            if f > 1.0:
+                raise ValueError(f"Environment variable {key!r} must be <= 1.0, got {f!r}.")
             return f
 
         def _parse_int(key: str, default: int) -> int:
@@ -457,7 +535,7 @@ class TurnExecutionConfig:
         kwargs["commit_reserve"] = _parse_float("TURN_COMMIT_RESERVE", 10.0)
         kwargs["base_backoff"] = _parse_float("TURN_BASE_BACKOFF", 0.25)
         kwargs["max_backoff"] = _parse_float("TURN_MAX_BACKOFF", 0.75)
-        kwargs["max_jitter"] = _parse_float("TURN_MAX_JITTER", 0.10)
+        kwargs["max_jitter"] = _parse_nonnegative_float("TURN_MAX_JITTER", 0.10)
         kwargs["max_attempts"] = _parse_int("TURN_MAX_ATTEMPTS", 2)
         kwargs["frontend_timeout_ms"] = _parse_int("TURN_FRONTEND_TIMEOUT_MS", 50_000)
 
