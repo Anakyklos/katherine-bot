@@ -802,6 +802,213 @@ class TestCommitSection:
         engine.memory_manager.save_turn.assert_not_called()
         engine.memory_manager.sync_state.assert_not_called()
 
+    async def _run_multiple_cancel_during_save_turn(self):
+        """Multiple cancellations during save_turn — task retains lock until save completes."""
+        provider = FakeAsyncProvider()
+        provider.responses = [
+            FakeCompletion(json.dumps({"valence": 0.1, "arousal_shift": 0.0,
+                                       "dominance_shift": 0.0, "triggered_emotions": {}})),
+            FakeCompletion("Hi there!"),
+        ]
+        config = TurnExecutionConfig(
+            total_deadline=30.0,
+            connect_timeout=2.0,
+            provider_attempt_timeout=10.0,
+            commit_reserve=10.0,
+            supabase_timeout=5.0,
+        )
+        engine = _make_engine(turn_config=config, fake_provider=provider)
+
+        import threading
+        save_started = threading.Event()
+        save_can_proceed = threading.Event()
+        save_completed = threading.Event()
+
+        def blocking_save(user_id, user_msg, bot_msg):
+            save_started.set()
+            save_can_proceed.wait(timeout=10.0)
+            save_completed.set()
+            from unittest.mock import MagicMock
+            return MagicMock()
+
+        engine.memory_manager.save_turn = blocking_save
+        engine.memory_manager.sync_state = MagicMock()
+
+        task = asyncio.create_task(engine.process_turn("user_mc", "Hello"))
+        save_started.wait(timeout=5.0)
+        await asyncio.sleep(0.05)
+
+        # Second request should be blocked
+        second_task = asyncio.create_task(engine.process_turn("user_mc", "World"))
+        await asyncio.sleep(0.1)
+        assert not second_task.done()
+
+        # Cancel twice while save is in progress
+        task.cancel()
+        await asyncio.sleep(0.05)
+        task.cancel()
+        await asyncio.sleep(0.05)
+
+        # Second request still blocked (lock retained by drain loop)
+        assert not second_task.done()
+        # save_turn has not completed yet
+        assert not save_completed.is_set()
+
+        # Release the save
+        save_can_proceed.set()
+
+        # Task propagates CancelledError only after save_turn completes
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # save_turn completed
+        assert save_completed.is_set()
+
+        # Second request can now acquire lock
+        try:
+            await asyncio.wait_for(second_task, timeout=5.0)
+        except (asyncio.TimeoutError, TurnExecutionError, GroqPoolExhaustedError):
+            pass
+
+    def test_multiple_cancel_during_save_turn(self):
+        asyncio.run(self._run_multiple_cancel_during_save_turn())
+
+    async def _run_cancel_during_sync_state(self):
+        """Cancel during sync_state — lock held until sync completes."""
+        provider = FakeAsyncProvider()
+        provider.responses = [
+            FakeCompletion(json.dumps({"valence": 0.1, "arousal_shift": 0.0,
+                                       "dominance_shift": 0.0, "triggered_emotions": {}})),
+            FakeCompletion("Hi there!"),
+        ]
+        config = TurnExecutionConfig(
+            total_deadline=30.0,
+            connect_timeout=2.0,
+            provider_attempt_timeout=10.0,
+            commit_reserve=10.0,
+            supabase_timeout=5.0,
+        )
+        engine = _make_engine(turn_config=config, fake_provider=provider)
+
+        import threading
+        sync_started = threading.Event()
+        sync_can_proceed = threading.Event()
+        sync_completed = threading.Event()
+
+        def blocking_sync(user_id, state, rel):
+            sync_started.set()
+            sync_can_proceed.wait(timeout=10.0)
+            sync_completed.set()
+
+        engine.memory_manager.save_turn = MagicMock(return_value=MagicMock())
+        engine.memory_manager.sync_state = blocking_sync
+
+        task = asyncio.create_task(engine.process_turn("user_sc", "Hello"))
+        sync_started.wait(timeout=5.0)
+        await asyncio.sleep(0.05)
+
+        # Second request should be blocked
+        second_task = asyncio.create_task(engine.process_turn("user_sc", "World"))
+        await asyncio.sleep(0.1)
+        assert not second_task.done()
+
+        # Cancel while sync is in progress
+        task.cancel()
+        await asyncio.sleep(0.05)
+
+        # Second request still blocked (lock retained)
+        assert not second_task.done()
+
+        # Release sync
+        sync_can_proceed.set()
+
+        # Task propagates CancelledError only after sync completes
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert sync_completed.is_set()
+
+        # Second request can now proceed
+        try:
+            await asyncio.wait_for(second_task, timeout=5.0)
+        except (asyncio.TimeoutError, TurnExecutionError, GroqPoolExhaustedError):
+            pass
+
+    def test_cancel_during_sync_state(self):
+        asyncio.run(self._run_cancel_during_sync_state())
+
+    async def _run_deadline_post_cancel(self):
+        """Clock advanced while commit is active — lock not released, task not abandoned."""
+        provider = FakeAsyncProvider()
+        provider.responses = [
+            FakeCompletion(json.dumps({"valence": 0.1, "arousal_shift": 0.0,
+                                       "dominance_shift": 0.0, "triggered_emotions": {}})),
+            FakeCompletion("Hi there!"),
+        ]
+
+        # Use a mutable list as a fake monotonic clock so we can advance it
+        fake_now = [0.0]
+        def fake_monotonic():
+            return fake_now[0]
+
+        config = TurnExecutionConfig(
+            total_deadline=10.0,
+            connect_timeout=0.5,
+            provider_attempt_timeout=5.0,
+            commit_reserve=4.0,
+            supabase_timeout=0.5,
+        )
+        engine = _make_engine(turn_config=config, fake_provider=provider)
+        # Override the monotonic clock so budget creation uses our fake
+        engine._monotonic = fake_monotonic
+
+        import threading
+        save_started = threading.Event()
+        save_done = threading.Event()
+
+        def blocking_save(user_id, user_msg, bot_msg):
+            save_started.set()
+            save_done.wait(timeout=10.0)
+            from unittest.mock import MagicMock
+            return MagicMock()
+
+        engine.memory_manager.save_turn = blocking_save
+        engine.memory_manager.sync_state = MagicMock()
+
+        task = asyncio.create_task(engine.process_turn("user_dead", "Hello"))
+        save_started.wait(timeout=5.0)
+        await asyncio.sleep(0.05)
+
+        # Advance clock moderately (budget still has reserve: remaining=6.0 >= 4.0)
+        # This makes the second request's lock timeout shorter.
+        fake_now[0] = 2.0
+
+        # Cancel while save is active
+        task.cancel()
+        await asyncio.sleep(0.05)
+
+        # Second request attempts lock acquisition — lock is still held by task1
+        # (draining commit_task), so second request is blocked.
+        second_task = asyncio.create_task(engine.process_turn("user_dead", "World"))
+        await asyncio.sleep(0.1)
+        assert not second_task.done()
+
+        # Release save
+        save_done.set()
+
+        # Task propagates CancelledError only after save completes
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # Second request can now acquire lock
+        try:
+            await asyncio.wait_for(second_task, timeout=5.0)
+        except (asyncio.TimeoutError, TurnExecutionError, GroqPoolExhaustedError):
+            pass
+
+    def test_deadline_post_cancel(self):
+        asyncio.run(self._run_deadline_post_cancel())
+
 
 class TestPersistenceErrors:
     """Persistence errors mapped to persistence_unavailable."""
