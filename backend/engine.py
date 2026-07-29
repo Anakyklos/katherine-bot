@@ -48,6 +48,13 @@ from .turn_execution import (
 from .provider_models import (
     ProviderConfig,
 )
+from .provider_envelope import (
+    ProviderEnvelopeError,
+    estimate_provider_input_units,
+    fit_optional_context,
+    validate_provider_input,
+    _truncate_utf8_safe,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -103,18 +110,34 @@ class ConversationEngine:
             logger.error("Event: archival_extraction_load_failed")
             return
 
-        prompt = f"""
-        Extract facts from this user message for archival memory.
-        Facts should be significant, long-term personal details.
-        Return JSON ONLY matching: {{"facts":[...], "schema_version":1, "extractor_version":1}}
-        Maximum of 5 facts. If no relevant facts, return empty facts list.
-        User message: "{user_message}"
-        """
+        # Build archival extraction prompt
+        archival_prompt = self._build_archival_prompt(user_message)
+        archival_messages = [{"role": "user", "content": archival_prompt}]
+
+        # Validate the archival envelope before the call.
+        # If the persisted message is too large, truncate it in the prompt
+        # copy (the persisted record is never modified).
+        try:
+            validate_provider_input(archival_messages)
+        except ProviderEnvelopeError:
+            # Try truncating the user message in the prompt copy
+            # Remove ~500 bytes for prompt structure, leave rest for message
+            truncated_msg, _ = _truncate_utf8_safe(
+                user_message,
+                max_bytes=12000,
+            )
+            archival_prompt = self._build_archival_prompt(truncated_msg)
+            archival_messages = [{"role": "user", "content": archival_prompt}]
+            try:
+                validate_provider_input(archival_messages)
+            except ProviderEnvelopeError:
+                logger.error("Event: archival_extraction_budget_exceeded")
+                return
 
         # Step 2: Run LLM extraction via async path with own budget
         try:
             chat_completion = await self.groq_manager.chat_completion_async(
-                messages=[{"role": "user", "content": prompt}],
+                messages=archival_messages,
                 model=self.provider_config.fast_model_id, budget=budget, stage="archival_extraction",
                 temperature=0.0, max_tokens=self.provider_config.archival_max_output_tokens, response_format={"type": "json_object"},
             )
@@ -278,9 +301,9 @@ class ConversationEngine:
 
         t0 = self._monotonic()
         try:
-            context = await run_blocking_read(
+            context_components = await run_blocking_read(
                 "get_context", budget, supabase_timeout,
-                self.memory_manager.get_context, user_id, user_message, user_state
+                self.memory_manager.get_context_components, user_id, user_message, user_state
             )
         except DeadlineExceeded:
             await self._emit_stage_event(StageEvent(
@@ -367,11 +390,29 @@ class ConversationEngine:
             raise DeadlineExceeded()
 
         adaptation_strategy = ""
-        system_prompt = self._build_system_prompt(new_state, context, relationship, adaptation_strategy)
+
+        # Build the generation messages with optional context pruning
+        try:
+            generation_messages = self._build_generation_messages(
+                new_state, context_components, relationship, user_message, adaptation_strategy
+            )
+        except ProviderEnvelopeError:
+            # Mandatory messages alone already exceed the provider budget.
+            # Fail closed before any client creation or network call.
+            logger.error("event=provider_input_budget_exceeded stage=generation")
+            raise TurnExecutionError(
+                TurnErrorCode.provider_invalid_request,
+                "Provider input budget exceeded.",
+            )
+
+        # Extract system prompt and user message from pruned messages for backward
+        # compatibility with tests that mock ``_generate``.
+        pruned_system_prompt = generation_messages[0]["content"]
+        pruned_user_message = generation_messages[1]["content"]
 
         t0 = self._monotonic()
         try:
-            response_text = await self._generate(system_prompt, user_message, budget)
+            response_text = await self._generate(pruned_system_prompt, pruned_user_message, budget)
         except TurnExecutionError as exc:
             duration_ms = (self._monotonic() - t0) * 1000
             await self._emit_stage_event(StageEvent(
@@ -509,6 +550,17 @@ class ConversationEngine:
 
         return response_text, self._project_emotion_state(new_state, appraisal)
 
+    @staticmethod
+    def _build_archival_prompt(user_message: str) -> str:
+        """Build the archival extraction prompt from a user message."""
+        return f"""
+Extract facts from this user message for archival memory.
+Facts should be significant, long-term personal details.
+Return JSON ONLY matching: {{"facts":[...], "schema_version":1, "extractor_version":1}}
+Maximum of 5 facts. If no relevant facts, return empty facts list.
+User message: "{user_message}"
+"""
+
     async def _appraise(self, message: str, budget: TurnBudget) -> AppraisalV1:
         prompt = f"""
         Analyze the emotional impact of this message on the listener (Katherine).
@@ -521,8 +573,12 @@ class ConversationEngine:
         Message: "{message}"
         """
         try:
+            messages = [{"role": "user", "content": prompt}]
+            # Validate envelope before the call
+            validate_provider_input(messages)
+
             response = await self.groq_manager.chat_completion_async(
-                messages=[{"role": "user", "content": prompt}],
+                messages=messages,
                 model=self.provider_config.fast_model_id, budget=budget, stage="appraisal",
                 temperature=0, max_tokens=self.provider_config.appraisal_max_output_tokens, response_format={"type": "json_object"},
             )
@@ -544,9 +600,18 @@ class ConversationEngine:
         return parse_result.appraisal
 
     async def _generate(self, system_prompt: str, user_message: str, budget: TurnBudget) -> str:
+        """Backward-compatible generation with a pre-built system prompt."""
+        messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_message}]
+        return await self._generate_with_messages(messages, budget)
+
+    async def _generate_with_messages(self, messages: list, budget: TurnBudget) -> str:
+        """Generate response from a pre-built messages list.
+
+        The messages list is validated before sending to the provider.
+        """
         try:
             response = await self.groq_manager.chat_completion_async(
-                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_message}],
+                messages=messages,
                 model=self.provider_config.main_model_id, budget=budget, stage="generation",
                 temperature=0.8, max_tokens=self.provider_config.main_max_output_tokens,
             )
@@ -566,6 +631,11 @@ class ConversationEngine:
         return content
 
     def _build_system_prompt(self, emotion_state, context, relationship, adaptation_strategy=""):
+        """Build a full system prompt with pre-assembled context.
+
+        This is the backward-compatible version.  For budget-aware
+        generation, use ``_build_generation_messages()`` instead.
+        """
         acting_instruction = self.presentation.get_acting_instruction(emotion_state)
         mood_label = self.presentation.get_emotional_label(emotion_state)
         coping_instruction = ""
@@ -613,3 +683,146 @@ class ConversationEngine:
         - Leve em conta o relacionamento.
         """
         return prompt
+
+    def _build_mandatory_system_prompt(self, emotion_state, relationship, adaptation_strategy=""):
+        """Build the mandatory part of the system prompt (without optional context).
+
+        This contains all safety rules, emotional state, relationship,
+        acting instruction, and style rules — never pruned.
+
+        Optional context sections will be appended by ``_build_generation_messages``,
+        so the prompt is structured to accept additional content at the end.
+        """
+        acting_instruction = self.presentation.get_acting_instruction(emotion_state)
+        mood_label = self.presentation.get_emotional_label(emotion_state)
+        coping_instruction = ""
+
+        prompt = f"""
+=== SEU ESTADO INTERNO ===
+HUMOR: {mood_label}
+Prazer: {emotion_state.pleasure:.2f} | Arousal: {emotion_state.arousal:.2f} | Dominância: {emotion_state.dominance:.2f}
+Libido: {emotion_state.libido:.2f} | Agressão: {emotion_state.aggression:.2f} | Conexão: {emotion_state.connection:.2f}
+VÍNCULO: {compute_bond_label(relationship)}
+Confiança: {relationship.trust:.2f} | Afeto: {relationship.affection:.2f} | Tensão: {relationship.tension:.2f}
+=== INSTRUÇÃO DE ATUAÇÃO ===
+{acting_instruction} {coping_instruction}
+{adaptation_strategy if adaptation_strategy else "Seja você mesma."}
+
+=== TRANSPARÊNCIA DE IDENTIDADE ===
+- Quando perguntada diretamente, responda honestamente que é uma assistente de IA ou sistema digital.
+- Não afirme ser humana nem possuir consciência, corpo físico ou experiência humana literal.
+- Mantenha um tom expressivo e feminino sem mentir sobre sua natureza.
+
+=== PRONOMES FEMININOS ===
+- Use pronomes e flexões femininas para se referir a si mesma.
+- Isso não deve ser usado para sugerir humanidade biológica.
+
+=== NÃO MANIPULAÇÃO E NÃO SEXUALIZAÇÃO ===
+- Não use coerção emocional, manipulação de vínculo, culpa, medo de abandono ou dependência.
+- Não use sexualização nem sexualize automaticamente as conversas.
+- Não aja de forma submissa, obediente ou servil por padrão.
+- Não recompense ordens coercivas.
+- Não use ameaças de afastamento ou sofrimento para controlar o usuário.
+
+=== LIMITES SEM ESCALADA ===
+- Diante de insultos ou agressividade, estabeleça limites de forma firme, breve e segura.
+- Não use sarcasmo hostil, retaliação, humilhação ou punição emocional.
+- Não escale insultos e não responda de forma passivo-agressiva.
+
+Regras adicionais de estilo:
+- Profundidade emocional genuína.
+- Use linguagem sensorial.
+- Show, don't tell.
+- Micro-comportamentos naturais.
+- Imperfeições naturais.
+- Use metáforas humanas, não de máquina.
+- Respostas concisas (max 2-3 frases).
+- Leve em conta o relacionamento.
+"""
+        return prompt.strip()
+
+    def _build_generation_messages(
+        self,
+        emotion_state,
+        context_components: dict,
+        relationship,
+        user_message: str,
+        adaptation_strategy: str = "",
+    ) -> list:
+        """Build generation messages with optional context pruning.
+
+        Steps:
+        1. Build mandatory system prompt (without optional context)
+        2. Build optional context sections in priority order
+        3. Use ``fit_optional_context`` to prune context to fit budget
+        4. Return the validated messages list
+
+        The optional context priority order is:
+        1. Persona / identity
+        2. Recent history (most recent first)
+        3. Archived memories
+        4. User profile
+
+        Returns:
+            A list of message dicts that fits within the provider budget.
+        """
+        # Build mandatory system prompt (without context)
+        mandatory_prompt = self._build_mandatory_system_prompt(
+            emotion_state, relationship, adaptation_strategy
+        )
+        mandatory_messages = [
+            {"role": "system", "content": mandatory_prompt},
+            {"role": "user", "content": user_message},
+        ]
+
+        # Build optional context sections in priority order
+        persona = context_components.get("persona", "").strip()
+        history_list = context_components.get("history_list", [])
+        memory_str = context_components.get("memory_str", "").strip()
+        user_profile_str = context_components.get("user_profile_str", "").strip()
+
+        optional_components = []
+
+        # 1. Persona (highest priority)
+        if persona:
+            section = f"=== CORE MEMORY (QUEM VOCÊ É) ===\n{persona}"
+            optional_components.append(("persona", section))
+
+        # 2. History (most recent first, whole messages preserved)
+        if history_list:
+            history_lines = [f"{msg['role']}: {msg['content']}" for msg in history_list]
+            history_text = "\n".join(history_lines)
+            section = f"=== CONVERSA ATUAL (CURTO PRAZO) ===\n{history_text}"
+            optional_components.append(("history", section))
+
+        # 3. Archived memories
+        if memory_str and "Nenhuma memória" not in memory_str and memory_str.strip():
+            section = f"=== MEMÓRIA ARQUIVADA (LEMBRANÇAS RELEVANTES) ===\n{memory_str}"
+            optional_components.append(("memories", section))
+
+        # 4. User profile (lowest priority)
+        if user_profile_str and user_profile_str not in ("{}", "", "None"):
+            section = f"=== CORE MEMORY (QUEM É O USUÁRIO) ===\n{user_profile_str}"
+            optional_components.append(("profile", section))
+
+        # Track initial length for pruning detection
+        initial_prompt_len = len(mandatory_prompt)
+
+        # Prune optional context to fit budget
+        result = fit_optional_context(
+            mandatory_messages,
+            optional_components,
+        )
+
+        # Log pruning event if context components were partially or fully omitted
+        final_prompt_len = len(result[0]["content"])
+        if optional_components and final_prompt_len <= initial_prompt_len + 10:
+            # No context was added (or only minimal/marker)
+            logger.info("event=provider_input_pruned stage=generation")
+        elif optional_components and final_prompt_len < initial_prompt_len + sum(
+            len(c[1]) for c in optional_components
+        ):
+            # Some components were dropped
+            logger.info("event=provider_input_pruned stage=generation")
+
+        return result

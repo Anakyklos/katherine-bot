@@ -89,7 +89,7 @@ def test_concurrent_access_no_corruption():
     def worker(idx):
         try:
             for _ in range(50):
-                res = manager.chat_completion(messages=[], model="test-model")
+                res = manager.chat_completion(messages=[{"role": "user", "content": "hello"}], model="test-model")
                 with results_lock:
                     results.append(res.choices[0].message.content)
         except BaseException as e:
@@ -201,9 +201,10 @@ def test_slow_client_does_not_hold_lock():
     worker_errors = []
     worker_errors_lock = threading.Lock()
     
+    VALID_MSG = [{"role": "user", "content": "hello"}]
     def run_thread_1():
         try:
-            res = manager.chat_completion(messages=[], model="test")
+            res = manager.chat_completion(messages=VALID_MSG, model="test")
             results["t1"] = res.choices[0].message.content
         except BaseException as e:
             with worker_errors_lock:
@@ -213,7 +214,7 @@ def test_slow_client_does_not_hold_lock():
         
     def run_thread_2():
         try:
-            res = manager.chat_completion(messages=[], model="test")
+            res = manager.chat_completion(messages=VALID_MSG, model="test")
             results["t2"] = res.choices[0].message.content
         except BaseException as e:
             with worker_errors_lock:
@@ -257,17 +258,18 @@ def test_clock_progression_cooldown():
     )
     
     manager._mark_key_rate_limited("key-one-11111111")
+    VALID_MSG = [{"role": "user", "content": "hello"}]
     
     # Cooled down
     with pytest.raises(GroqPoolExhaustedError):
-        manager.chat_completion(messages=[], model="test")
+        manager.chat_completion(messages=VALID_MSG, model="test")
         
     fake_time = 1009.0
     with pytest.raises(GroqPoolExhaustedError):
-        manager.chat_completion(messages=[], model="test")
+        manager.chat_completion(messages=VALID_MSG, model="test")
         
     fake_time = 1010.0
-    res = manager.chat_completion(messages=[], model="test")
+    res = manager.chat_completion(messages=VALID_MSG, model="test")
     assert res.choices[0].message.content == "ok"
 
 # 7. Bounded attempts per call
@@ -286,8 +288,9 @@ def test_bounded_attempts():
         client_factory=make_client
     )
     
+    VALID_MSG = [{"role": "user", "content": "hello"}]
     with pytest.raises(GroqPoolExhaustedError):
-        manager.chat_completion(messages=[], model="test")
+        manager.chat_completion(messages=VALID_MSG, model="test")
         
     assert len(calls) == 2
     assert "key-one-11111111" in calls
@@ -310,8 +313,8 @@ def test_rate_limit_rotation():
         keys=["key-one-11111111", "key-two-22222222"],
         client_factory=make_client
     )
-    
-    res = manager.chat_completion(messages=[], model="test")
+    VALID_MSG = [{"role": "user", "content": "hello"}]
+    res = manager.chat_completion(messages=VALID_MSG, model="test")
     assert res.choices[0].message.content == "success"
     assert len(calls) == 2
     assert calls == ["key-one-11111111", "key-two-22222222"]
@@ -328,8 +331,9 @@ def test_all_keys_unavailable(caplog):
     manager._deactivate_key("key-one-11111111")
     manager._deactivate_key("key-two-22222222")
     
+    VALID_MSG = [{"role": "user", "content": "hello"}]
     with pytest.raises(GroqPoolExhaustedError) as excinfo:
-        manager.chat_completion(messages=[], model="test")
+        manager.chat_completion(messages=VALID_MSG, model="test")
         
     assert "deactivated" in str(excinfo.value)
     assert "key-one" not in str(excinfo.value)
@@ -353,8 +357,8 @@ def test_structured_401_authentication_error():
         keys=["key-one-11111111", "key-two-22222222"],
         client_factory=make_client
     )
-    
-    res = manager.chat_completion(messages=[], model="test")
+    VALID_MSG = [{"role": "user", "content": "hello"}]
+    res = manager.chat_completion(messages=VALID_MSG, model="test")
     assert res.choices[0].message.content == "success"
     assert "key-one-11111111" in manager._deactivated
     assert "key-two-22222222" not in manager._deactivated
@@ -376,8 +380,8 @@ def test_structured_401_api_status_error():
         keys=["key-one-11111111", "key-two-22222222"],
         client_factory=make_client
     )
-    
-    res = manager.chat_completion(messages=[], model="test")
+    VALID_MSG = [{"role": "user", "content": "hello"}]
+    res = manager.chat_completion(messages=VALID_MSG, model="test")
     assert res.choices[0].message.content == "success"
     assert "key-one-11111111" in manager._deactivated
     assert "key-two-22222222" not in manager._deactivated
@@ -427,7 +431,8 @@ def test_transient_connection_error_rotation():
         client_factory=make_client
     )
 
-    res = manager.chat_completion(messages=[], model="test")
+    VALID_MSG = [{"role": "user", "content": "hello"}]
+    res = manager.chat_completion(messages=VALID_MSG, model="test")
     assert res.choices[0].message.content == "success"
     assert calls == ["key-one-11111111", "key-two-22222222"]
 
@@ -449,7 +454,8 @@ def test_transient_5xx_status_error_rotation():
         client_factory=make_client
     )
 
-    res = manager.chat_completion(messages=[], model="test")
+    VALID_MSG = [{"role": "user", "content": "hello"}]
+    res = manager.chat_completion(messages=VALID_MSG, model="test")
     assert res.choices[0].message.content == "success"
     assert calls == ["key-one-11111111", "key-two-22222222"]
 
@@ -469,8 +475,9 @@ def test_all_keys_failing_transient():
         client_factory=make_client
     )
 
+    VALID_MSG = [{"role": "user", "content": "hello"}]
     with pytest.raises(GroqPoolExhaustedError) as excinfo:
-        manager.chat_completion(messages=[], model="test")
+        manager.chat_completion(messages=VALID_MSG, model="test")
 
     assert len(calls) == 2
     assert "key-one" not in str(excinfo.value)
@@ -487,7 +494,7 @@ def test_client_factory_leak_sanitization(caplog):
     )
 
     with pytest.raises(GroqRequestError) as excinfo:
-        manager.chat_completion(messages=[], model="test")
+        manager.chat_completion(messages=[{"role": "user", "content": "hello"}], model="test")
 
     assert "Falha ao executar requisição Groq" in str(excinfo.value)
     assert "very-secret-error-marker" not in str(excinfo.value)
@@ -511,7 +518,7 @@ def test_non_retryable_http_error_fails_immediately():
     )
 
     with pytest.raises(GroqRequestError):
-        manager.chat_completion(messages=[], model="test")
+        manager.chat_completion(messages=[{"role": "user", "content": "hello"}], model="test")
 
     assert len(calls) == 1
     assert calls == ["key-one-11111111"]
@@ -557,6 +564,13 @@ async def test_async_4xx_produces_invalid_request():
     engine.memory_manager.sync_state = MagicMock()
     engine.memory_manager.save_turn = MagicMock()
     engine.memory_manager.get_context = MagicMock(return_value="[mocked context]")
+    engine.memory_manager.get_context_components = MagicMock(return_value={
+        "persona": "Katherine...",
+        "user_profile_str": "{}",
+        "memory_str": "",
+        "history_list": [],
+        "assembled": "[mocked context]",
+    })
     engine.memory_manager.load_recent_history = MagicMock(return_value=[])
 
     mgr = GroqClientManager(

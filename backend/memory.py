@@ -262,15 +262,33 @@ class MemoryManager:
             raise ContextLoadError("Falha ao carregar histórico de conversação.") from None
 
     def get_context(self, user_id: str, current_message: str, user_state: dict):
+        """Return a single assembled context string (backward compat)."""
+        components = self.get_context_components(user_id, current_message, user_state)
+        return components.get("assembled", "")
+
+    def get_context_components(self, user_id: str, current_message: str, user_state: dict) -> dict:
+        """Return structured context components for pruning.
+
+        Returns a dict with:
+        - ``persona``: persona_config string.
+        - ``user_profile_str``: serialised user profile string.
+        - ``memory_str``: retrieved relevant memories string.
+        - ``history_list``: list of recent history message dicts.
+        - ``assembled``: the full assembled context string (backward compat).
+        """
         history = self.load_recent_history(user_id, limit=10)
         short_term_str = "\n".join([f"{msg['role']}: {msg['content']}" for msg in history])
         relevant_memories = self._retrieve_relevant(user_id, current_message)
+
+        persona = str(user_state.get('persona_config', 'Katherine...'))
+        user_profile_str = str(user_state.get('user_profile', {}))
+
         context_str = f"""
         === CORE MEMORY (QUEM VOCÊ É) ===
-        {user_state.get('persona_config', 'Katherine...')}
+        {persona}
 
         === CORE MEMORY (QUEM É O USUÁRIO) ===
-        {user_state.get('user_profile', {})}
+        {user_profile_str}
 
         === MEMÓRIA ARQUIVADA (LEMBRANÇAS RELEVANTES) ===
         {relevant_memories}
@@ -278,7 +296,14 @@ class MemoryManager:
         === CONVERSA ATUAL (CURTO PRAZO) ===
         {short_term_str}
         """
-        return context_str
+
+        return {
+            "persona": persona,
+            "user_profile_str": user_profile_str,
+            "memory_str": relevant_memories,
+            "history_list": history,
+            "assembled": context_str,
+        }
 
     def save_turn(self, user_id: str, user_msg: str, bot_msg: str) -> PersistedTurnRef:
         if not self.supabase:

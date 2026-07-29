@@ -24,6 +24,10 @@ from .turn_execution import (
     compute_backoff_from_params,
     compute_effective_attempt_timeout,
 )
+from .provider_envelope import (
+    ProviderEnvelopeError,
+    validate_provider_input,
+)
 
 # Configure logging without basicConfig to satisfy "remova logging.basicConfig(...)"
 logger = logging.getLogger("GroqManager")
@@ -268,6 +272,7 @@ class GroqClientManager:
     def chat_completion(self, messages: List[dict], model: str, **kwargs) -> Any:
         """Synchronous completion — kept for archival extraction and backward compat.
 
+        Validates the input envelope before attempting any provider call.
         Uses the sync Groq client with:
         - ``max_retries=0`` (SDK retries disabled)
         - Bounded transport timeout (connect + read via httpx.Timeout)
@@ -280,6 +285,16 @@ class GroqClientManager:
             GroqPoolExhaustedError: All eligible keys exhausted.
             GroqRequestError: Non-retryable client or server error.
         """
+        # Validate envelope before any key acquisition, client creation, or network
+        try:
+            validate_provider_input(messages)
+        except ProviderEnvelopeError as exc:
+            if exc.code == "budget_exceeded":
+                logger.error("event=provider_input_budget_exceeded stage=generation")
+            else:
+                logger.error("event=provider_input_invalid stage=generation")
+            raise GroqRequestError("Falha ao executar requisição Groq.")
+
         params = self._groq_params
         tried_keys: Set[str] = set()
         active = [k for k in self._keys if k not in self._deactivated]
@@ -348,7 +363,8 @@ class GroqClientManager:
     ) -> Any:
         """Async completion with deadline-based budget and bounded retries.
 
-        * Uses request-scoped ``AsyncGroq`` clients with ``max_retries=0``.
+        Validates the input envelope before attempting any provider call.
+        Uses request-scoped ``AsyncGroq`` clients with ``max_retries=0``.
         * Each key is tried at most once per logical call.
         * Total attempts: ``min(max_attempts, eligible_key_count)``.
         * Timeout per attempt uses ``compute_effective_attempt_timeout()``
@@ -380,9 +396,21 @@ class GroqClientManager:
 
         Raises:
             GroqPoolExhaustedError: All eligible keys exhausted (with .failure_code).
+            GroqRequestError: Invalid or oversized input envelope.
             TurnExecutionError: Budget exhaustion before attempt.
             asyncio.CancelledError: Operation was cancelled.
         """
+        # Validate envelope before any key acquisition, client creation,
+        # retry attempt, cooldown calculation, or network call.
+        try:
+            validate_provider_input(messages)
+        except ProviderEnvelopeError as exc:
+            if exc.code == "budget_exceeded":
+                logger.error("event=provider_input_budget_exceeded stage=%s", stage or "generation")
+            else:
+                logger.error("event=provider_input_invalid stage=%s", stage or "generation")
+            raise GroqRequestError("Falha ao executar requisição Groq.")
+
         params = self._groq_params
 
         # Determine max attempts: bounded by config and eligible key count
