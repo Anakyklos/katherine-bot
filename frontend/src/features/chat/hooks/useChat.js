@@ -110,6 +110,7 @@ export const useChat = () => {
         const userMessageText = input.trim();
         const randomUUID = globalThis.crypto?.randomUUID;
         if (typeof randomUUID !== 'function') {
+            localMessagesVersionRef.current += 1;
             setMessages(prev => [...prev, {
                 role: 'system',
                 content: SYSTEM_MESSAGES.REQUEST_ID_UNAVAILABLE,
@@ -121,6 +122,7 @@ export const useChat = () => {
         try {
             requestId = randomUUID.call(globalThis.crypto);
         } catch {
+            localMessagesVersionRef.current += 1;
             setMessages(prev => [...prev, {
                 role: 'system',
                 content: SYSTEM_MESSAGES.REQUEST_ID_UNAVAILABLE,
