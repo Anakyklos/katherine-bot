@@ -515,3 +515,70 @@ def test_non_retryable_http_error_fails_immediately():
 
     assert len(calls) == 1
     assert calls == ["key-one-11111111"]
+
+
+# 18. Async 4xx (e.g. 400, 422) produces invalid_request through full chain
+@pytest.mark.anyio
+async def test_async_4xx_produces_invalid_request():
+    """Verify APIStatusError 4xx (terminal) in async path produces invalid_request.
+
+    Full chain: GroqClientManager → ConversationEngine → _map_turn_error → HTTP 503
+    """
+    import json
+    from unittest.mock import AsyncMock, MagicMock
+    from backend.engine import ConversationEngine
+    from backend.turn_execution import TurnExecutionConfig, TurnErrorCode, TurnExecutionError
+    from backend.emotional_domain import EmotionalStateV1
+    from backend.relationship import RelationshipStateV1
+    from backend.main import _map_turn_error
+
+    async def always_400(**kwargs):
+        mock_request = httpx.Request("POST", "https://api.groq.com")
+        response_400 = httpx.Response(400, request=mock_request)
+        raise APIStatusError("400 Bad Request", response=response_400, body=None)
+
+    config = TurnExecutionConfig(
+        total_deadline=30.0,
+        connect_timeout=2.0,
+        provider_attempt_timeout=10.0,
+        supabase_timeout=5.0,
+        commit_reserve=12.0,
+        max_attempts=1,
+    )
+    engine = ConversationEngine(
+        clock=lambda: 1700000000.0,
+        turn_config=config,
+    )
+    # Mock memory
+    engine.memory_manager.load_user_state = MagicMock(return_value={
+        "emotional_state": EmotionalStateV1.neutral(timestamp=1700000000.0).to_dict(),
+        "relationship_state": RelationshipStateV1.neutral(timestamp=1700000000.0).to_dict(),
+    })
+    engine.memory_manager.sync_state = MagicMock()
+    engine.memory_manager.save_turn = MagicMock()
+    engine.memory_manager.get_context = MagicMock(return_value="[mocked context]")
+    engine.memory_manager.load_recent_history = MagicMock(return_value=[])
+
+    mgr = GroqClientManager(
+        keys=["key-1-alpha", "key-2-beta"],
+        async_client_factory=lambda k: AsyncMock(**{"chat.completions.create": always_400}),
+        groq_params=config.to_groq_params(),
+    )
+    engine.groq_manager = mgr
+
+    # The 4xx terminal error is classified as invalid_request and raises
+    # GroqPoolExhaustedError (not TurnExecutionError) because the pool
+    # exhausts all keys with this failure code.
+    from backend.groq_manager import GroqPoolExhaustedError
+    with pytest.raises(GroqPoolExhaustedError) as exc_info:
+        await engine.process_turn("user", "Hello")
+    assert exc_info.value.failure_code is not None
+    from backend.groq_manager import ProviderFailure, provider_failure_to_turn_code
+    turn_code = provider_failure_to_turn_code(exc_info.value.failure_code)
+    assert turn_code == TurnErrorCode.provider_invalid_request
+
+    # Now verify HTTP mapping produces 503
+    http_exc = _map_turn_error(exc_info.value)
+    assert http_exc.status_code == 503
+    detail = http_exc.detail
+    assert detail["code"] == TurnErrorCode.provider_invalid_request.value

@@ -53,6 +53,12 @@ from backend.groq_manager import (
     provider_failure_to_turn_code,
 )
 
+# Patch SentenceTransformer at module load time to prevent 3.5s model loading
+# on every engine creation (the model is not needed for these tests).
+from unittest.mock import MagicMock
+import backend.memory
+backend.memory.SentenceTransformer = MagicMock(return_value=MagicMock())
+
 
 # ─── Fixed clock ─────────────────────────────────────────────────────────────
 FIXED_CLOCK = 1_700_000_000.0
@@ -583,7 +589,8 @@ class TestTimeoutBeforeCommit:
         engine.memory_manager.save_turn = MagicMock()
         engine.memory_manager.sync_state = MagicMock()
 
-        with pytest.raises((TurnExecutionError, DeadlineExceeded, GroqPoolExhaustedError)):
+        # Provider timeout exhausts the pool → GroqPoolExhaustedError
+        with pytest.raises(GroqPoolExhaustedError):
             asyncio.run(engine.process_turn("user", "Hello"))
 
         engine.memory_manager.save_turn.assert_not_called()
@@ -644,6 +651,11 @@ class TestTimeoutBeforeCommit:
         with pytest.raises(asyncio.CancelledError):
             await task
 
+        # Set the block event so the provider no longer blocks.
+        # This allows the second request's provider call to proceed
+        # (it will fail with no responses configured, but it won't hang).
+        provider.block_event.set()
+
         # Lock should be released; second request can proceed
         with pytest.raises((TurnExecutionError, GroqPoolExhaustedError)):
             await engine.process_turn("user1", "Hello")
@@ -674,16 +686,28 @@ class TestTimeoutBeforeCommit:
 
 
 class TestCommitSection:
-    """25-26+ : Commit lock and cancellation behavior."""
+    """25-26+ : Commit lock and cancellation behavior.
+
+    Critical invariants:
+    - CancelledError during commit drains the write to completion before
+      propagating the cancellation.
+    - The lock is held throughout the drain (second request is blocked).
+    - Multiple cancellations are consumed without abandoning the write.
+    - Deadline expiry during drain does not abandon the write.
+    - No worker thread is left running after the test completes.
+    """
 
     async def _run_cancel_during_commit_holds_lock(self):
         """Cancel during commit — lock held until commit completes."""
         provider = FakeAsyncProvider()
-        # Pre-load valid responses: first for appraisal (JSON), then for generation (text)
+        # 4 responses: 2 for first task (appraisal + generation), 2 for second
         provider.responses = [
             FakeCompletion(json.dumps({"valence": 0.1, "arousal_shift": 0.0,
                                        "dominance_shift": 0.0, "triggered_emotions": {}})),
             FakeCompletion("Hi there!"),
+            FakeCompletion(json.dumps({"valence": 0.1, "arousal_shift": 0.0,
+                                       "dominance_shift": 0.0, "triggered_emotions": {}})),
+            FakeCompletion("Hello back!"),
         ]
         config = TurnExecutionConfig(
             total_deadline=30.0,
@@ -697,41 +721,43 @@ class TestCommitSection:
         import threading
         commit_started = threading.Event()
         commit_can_proceed = threading.Event()
-        
-        def blocking_save(user_id, user_msg, bot_msg):
-            commit_started.set()
-            commit_can_proceed.wait(timeout=10.0)
-            from unittest.mock import MagicMock
-            return MagicMock()
+        try:
+            def blocking_save(user_id, user_msg, bot_msg):
+                commit_started.set()
+                commit_can_proceed.wait(timeout=10.0)
+                from unittest.mock import MagicMock
+                return MagicMock()
 
-        def blocking_sync(user_id, state, rel):
-            pass
+            def blocking_sync(user_id, state, rel):
+                pass
 
-        engine.memory_manager.save_turn = blocking_save
-        engine.memory_manager.sync_state = blocking_sync
+            engine.memory_manager.save_turn = blocking_save
+            engine.memory_manager.sync_state = blocking_sync
 
-        task = asyncio.create_task(engine.process_turn("user_c", "Hello"))
-        commit_started.wait(timeout=5.0)
-        await asyncio.sleep(0.05)
+            task = asyncio.create_task(engine.process_turn("user_c", "Hello"))
 
-        # Cancel during commit
-        task.cancel()
+            # Wait for save_turn to start in its thread (non-blocking to event loop)
+            started_ok = await asyncio.to_thread(commit_started.wait, 5.0)
+            assert started_ok, "save_turn did not start within timeout"
 
-        # Second request to same user should be blocked
-        second_task = asyncio.create_task(engine.process_turn("user_c", "World"))
-        await asyncio.sleep(0.1)
-        assert not second_task.done(), "Second request should be blocked by lock"
+            # Cancel during commit
+            task.cancel()
 
-        # Release commit
-        commit_can_proceed.set()
+            # Second request to same user should be blocked (lock held)
+            second_task = asyncio.create_task(engine.process_turn("user_c", "World"))
+            await asyncio.sleep(0.1)
+            assert not second_task.done(), "Second request should be blocked by lock"
+        finally:
+            # Always release the blocking save so the thread can terminate
+            commit_can_proceed.set()
 
         with pytest.raises(asyncio.CancelledError):
             await task
 
-        try:
-            await asyncio.wait_for(second_task, timeout=5.0)
-        except (asyncio.TimeoutError, TurnExecutionError, GroqPoolExhaustedError):
-            pass
+        # Second request should eventually acquire lock — use wait_for directly
+        # without catching TimeoutError. If the lock is never released, this
+        # test will fail with TimeoutError (as it should).
+        await asyncio.wait_for(second_task, timeout=5.0)
 
     def test_cancel_during_commit_holds_lock(self):
         asyncio.run(self._run_cancel_during_commit_holds_lock())
@@ -756,25 +782,26 @@ class TestCommitSection:
         import threading
         save_started = threading.Event()
         save_done = threading.Event()
+        try:
+            def thread_save(user_id, user_msg, bot_msg):
+                save_started.set()
+                save_done.wait(timeout=10.0)
+                from unittest.mock import MagicMock
+                return MagicMock()
 
-        def thread_save(user_id, user_msg, bot_msg):
-            save_started.set()
-            save_done.wait(timeout=10.0)
-            from unittest.mock import MagicMock
-            return MagicMock()
+            engine.memory_manager.save_turn = thread_save
+            engine.memory_manager.sync_state = MagicMock()
 
-        engine.memory_manager.save_turn = thread_save
-        engine.memory_manager.sync_state = MagicMock()
+            task = asyncio.create_task(engine.process_turn("user_d", "Hello"))
 
-        task = asyncio.create_task(engine.process_turn("user_d", "Hello"))
-        save_started.wait(timeout=5.0)
-        await asyncio.sleep(0.05)
+            started_ok = await asyncio.to_thread(save_started.wait, 5.0)
+            assert started_ok, "save_turn did not start within timeout"
 
-        # Cancel while save is in progress
-        task.cancel()
-
-        # Release the save thread (let save complete)
-        save_done.set()
+            # Cancel while save is in progress
+            task.cancel()
+        finally:
+            # Always release the save thread so it can terminate
+            save_done.set()
 
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -796,7 +823,7 @@ class TestCommitSection:
         engine.memory_manager.save_turn = MagicMock()
         engine.memory_manager.sync_state = MagicMock()
 
-        with pytest.raises((TurnExecutionError, DeadlineExceeded, GroqPoolExhaustedError)):
+        with pytest.raises(TurnExecutionError):
             asyncio.run(engine.process_turn("user", "Hello"))
 
         engine.memory_manager.save_turn.assert_not_called()
@@ -805,10 +832,14 @@ class TestCommitSection:
     async def _run_multiple_cancel_during_save_turn(self):
         """Multiple cancellations during save_turn — task retains lock until save completes."""
         provider = FakeAsyncProvider()
+        # 4 responses: 2 for first task (appraisal + generation), 2 for second
         provider.responses = [
             FakeCompletion(json.dumps({"valence": 0.1, "arousal_shift": 0.0,
                                        "dominance_shift": 0.0, "triggered_emotions": {}})),
             FakeCompletion("Hi there!"),
+            FakeCompletion(json.dumps({"valence": 0.1, "arousal_shift": 0.0,
+                                       "dominance_shift": 0.0, "triggered_emotions": {}})),
+            FakeCompletion("Hello back!"),
         ]
         config = TurnExecutionConfig(
             total_deadline=30.0,
@@ -823,39 +854,40 @@ class TestCommitSection:
         save_started = threading.Event()
         save_can_proceed = threading.Event()
         save_completed = threading.Event()
+        try:
+            def blocking_save(user_id, user_msg, bot_msg):
+                save_started.set()
+                save_can_proceed.wait(timeout=10.0)
+                save_completed.set()
+                from unittest.mock import MagicMock
+                return MagicMock()
 
-        def blocking_save(user_id, user_msg, bot_msg):
-            save_started.set()
-            save_can_proceed.wait(timeout=10.0)
-            save_completed.set()
-            from unittest.mock import MagicMock
-            return MagicMock()
+            engine.memory_manager.save_turn = blocking_save
+            engine.memory_manager.sync_state = MagicMock()
 
-        engine.memory_manager.save_turn = blocking_save
-        engine.memory_manager.sync_state = MagicMock()
+            task = asyncio.create_task(engine.process_turn("user_mc", "Hello"))
 
-        task = asyncio.create_task(engine.process_turn("user_mc", "Hello"))
-        save_started.wait(timeout=5.0)
-        await asyncio.sleep(0.05)
+            started_ok = await asyncio.to_thread(save_started.wait, 5.0)
+            assert started_ok, "save_turn did not start within timeout"
 
-        # Second request should be blocked
-        second_task = asyncio.create_task(engine.process_turn("user_mc", "World"))
-        await asyncio.sleep(0.1)
-        assert not second_task.done()
+            # Second request should be blocked
+            second_task = asyncio.create_task(engine.process_turn("user_mc", "World"))
+            await asyncio.sleep(0.1)
+            assert not second_task.done()
 
-        # Cancel twice while save is in progress
-        task.cancel()
-        await asyncio.sleep(0.05)
-        task.cancel()
-        await asyncio.sleep(0.05)
+            # Cancel twice while save is in progress
+            task.cancel()
+            await asyncio.sleep(0.05)
+            task.cancel()
+            await asyncio.sleep(0.05)
 
-        # Second request still blocked (lock retained by drain loop)
-        assert not second_task.done()
-        # save_turn has not completed yet
-        assert not save_completed.is_set()
-
-        # Release the save
-        save_can_proceed.set()
+            # Second request still blocked (lock retained by drain loop)
+            assert not second_task.done()
+            # save_turn has not completed yet
+            assert not save_completed.is_set()
+        finally:
+            # Always release the save so the thread can terminate
+            save_can_proceed.set()
 
         # Task propagates CancelledError only after save_turn completes
         with pytest.raises(asyncio.CancelledError):
@@ -864,11 +896,8 @@ class TestCommitSection:
         # save_turn completed
         assert save_completed.is_set()
 
-        # Second request can now acquire lock
-        try:
-            await asyncio.wait_for(second_task, timeout=5.0)
-        except (asyncio.TimeoutError, TurnExecutionError, GroqPoolExhaustedError):
-            pass
+        # Second request can now acquire lock — await directly without catching TimeoutError
+        await asyncio.wait_for(second_task, timeout=5.0)
 
     def test_multiple_cancel_during_save_turn(self):
         asyncio.run(self._run_multiple_cancel_during_save_turn())
@@ -876,10 +905,14 @@ class TestCommitSection:
     async def _run_cancel_during_sync_state(self):
         """Cancel during sync_state — lock held until sync completes."""
         provider = FakeAsyncProvider()
+        # 4 responses: 2 for first task (appraisal + generation), 2 for second
         provider.responses = [
             FakeCompletion(json.dumps({"valence": 0.1, "arousal_shift": 0.0,
                                        "dominance_shift": 0.0, "triggered_emotions": {}})),
             FakeCompletion("Hi there!"),
+            FakeCompletion(json.dumps({"valence": 0.1, "arousal_shift": 0.0,
+                                       "dominance_shift": 0.0, "triggered_emotions": {}})),
+            FakeCompletion("Hello back!"),
         ]
         config = TurnExecutionConfig(
             total_deadline=30.0,
@@ -894,33 +927,34 @@ class TestCommitSection:
         sync_started = threading.Event()
         sync_can_proceed = threading.Event()
         sync_completed = threading.Event()
+        try:
+            def blocking_sync(user_id, state, rel):
+                sync_started.set()
+                sync_can_proceed.wait(timeout=10.0)
+                sync_completed.set()
 
-        def blocking_sync(user_id, state, rel):
-            sync_started.set()
-            sync_can_proceed.wait(timeout=10.0)
-            sync_completed.set()
+            engine.memory_manager.save_turn = MagicMock(return_value=MagicMock())
+            engine.memory_manager.sync_state = blocking_sync
 
-        engine.memory_manager.save_turn = MagicMock(return_value=MagicMock())
-        engine.memory_manager.sync_state = blocking_sync
+            task = asyncio.create_task(engine.process_turn("user_sc", "Hello"))
 
-        task = asyncio.create_task(engine.process_turn("user_sc", "Hello"))
-        sync_started.wait(timeout=5.0)
-        await asyncio.sleep(0.05)
+            started_ok = await asyncio.to_thread(sync_started.wait, 5.0)
+            assert started_ok, "sync_state did not start within timeout"
 
-        # Second request should be blocked
-        second_task = asyncio.create_task(engine.process_turn("user_sc", "World"))
-        await asyncio.sleep(0.1)
-        assert not second_task.done()
+            # Second request should be blocked
+            second_task = asyncio.create_task(engine.process_turn("user_sc", "World"))
+            await asyncio.sleep(0.1)
+            assert not second_task.done()
 
-        # Cancel while sync is in progress
-        task.cancel()
-        await asyncio.sleep(0.05)
+            # Cancel while sync is in progress
+            task.cancel()
+            await asyncio.sleep(0.05)
 
-        # Second request still blocked (lock retained)
-        assert not second_task.done()
-
-        # Release sync
-        sync_can_proceed.set()
+            # Second request still blocked (lock retained)
+            assert not second_task.done()
+        finally:
+            # Always release sync so the thread can terminate
+            sync_can_proceed.set()
 
         # Task propagates CancelledError only after sync completes
         with pytest.raises(asyncio.CancelledError):
@@ -928,22 +962,28 @@ class TestCommitSection:
 
         assert sync_completed.is_set()
 
-        # Second request can now proceed
-        try:
-            await asyncio.wait_for(second_task, timeout=5.0)
-        except (asyncio.TimeoutError, TurnExecutionError, GroqPoolExhaustedError):
-            pass
+        # Second request can now proceed — await directly without catching TimeoutError
+        await asyncio.wait_for(second_task, timeout=5.0)
 
     def test_cancel_during_sync_state(self):
         asyncio.run(self._run_cancel_during_sync_state())
 
     async def _run_deadline_post_cancel(self):
-        """Clock advanced while commit is active — lock not released, task not abandoned."""
+        """Clock advanced past deadline while commit is active — lock not released.
+
+        Even when the budget is exhausted, the write must complete before the
+        lock is released.  The monotonic clock is pushed past the total_deadline
+        to verify that the lock remains held through the drain.
+        """
         provider = FakeAsyncProvider()
+        # 4 responses: 2 for first task (appraisal + generation), 2 for second
         provider.responses = [
             FakeCompletion(json.dumps({"valence": 0.1, "arousal_shift": 0.0,
                                        "dominance_shift": 0.0, "triggered_emotions": {}})),
             FakeCompletion("Hi there!"),
+            FakeCompletion(json.dumps({"valence": 0.1, "arousal_shift": 0.0,
+                                       "dominance_shift": 0.0, "triggered_emotions": {}})),
+            FakeCompletion("Hello back!"),
         ]
 
         # Use a mutable list as a fake monotonic clock so we can advance it
@@ -965,46 +1005,47 @@ class TestCommitSection:
         import threading
         save_started = threading.Event()
         save_done = threading.Event()
+        try:
+            def blocking_save(user_id, user_msg, bot_msg):
+                save_started.set()
+                save_done.wait(timeout=10.0)
+                from unittest.mock import MagicMock
+                return MagicMock()
 
-        def blocking_save(user_id, user_msg, bot_msg):
-            save_started.set()
-            save_done.wait(timeout=10.0)
-            from unittest.mock import MagicMock
-            return MagicMock()
+            engine.memory_manager.save_turn = blocking_save
+            engine.memory_manager.sync_state = MagicMock()
 
-        engine.memory_manager.save_turn = blocking_save
-        engine.memory_manager.sync_state = MagicMock()
+            task = asyncio.create_task(engine.process_turn("user_dead", "Hello"))
 
-        task = asyncio.create_task(engine.process_turn("user_dead", "Hello"))
-        save_started.wait(timeout=5.0)
-        await asyncio.sleep(0.05)
+            started_ok = await asyncio.to_thread(save_started.wait, 5.0)
+            assert started_ok, "save_turn did not start within timeout"
 
-        # Advance clock moderately (budget still has reserve: remaining=6.0 >= 4.0)
-        # This makes the second request's lock timeout shorter.
-        fake_now[0] = 2.0
+            # Advance clock PAST the total_deadline (10.0).  The budget started
+            # at fake_now=0.0, so remaining <= 0.0.  The commit is already running
+            # under shield, so this does not affect the write itself.
+            fake_now[0] = 20.0
 
-        # Cancel while save is active
-        task.cancel()
-        await asyncio.sleep(0.05)
+            # Cancel while save is active
+            task.cancel()
+            await asyncio.sleep(0.05)
 
-        # Second request attempts lock acquisition — lock is still held by task1
-        # (draining commit_task), so second request is blocked.
-        second_task = asyncio.create_task(engine.process_turn("user_dead", "World"))
-        await asyncio.sleep(0.1)
-        assert not second_task.done()
-
-        # Release save
-        save_done.set()
+            # Second request attempts lock acquisition — lock is still held by task1
+            # (draining commit_task), so second request is blocked.  Even though
+            # the budget is exhausted, the lock is still held because we are inside
+            # _run_turn_locked's drain of the commit_task.
+            second_task = asyncio.create_task(engine.process_turn("user_dead", "World"))
+            await asyncio.sleep(0.1)
+            assert not second_task.done()
+        finally:
+            # Always release the save so the thread can terminate
+            save_done.set()
 
         # Task propagates CancelledError only after save completes
         with pytest.raises(asyncio.CancelledError):
             await task
 
-        # Second request can now acquire lock
-        try:
-            await asyncio.wait_for(second_task, timeout=5.0)
-        except (asyncio.TimeoutError, TurnExecutionError, GroqPoolExhaustedError):
-            pass
+        # Second request can now attempt lock — await directly without catching TimeoutError
+        await asyncio.wait_for(second_task, timeout=5.0)
 
     def test_deadline_post_cancel(self):
         asyncio.run(self._run_deadline_post_cancel())
@@ -1077,6 +1118,66 @@ class TestErrorContract:
         http_exc = _map_turn_error(exc)
         assert http_exc.status_code == 500
 
+    # ── GroqPoolExhaustedError HTTP mapping ───────────────────────────
+
+    def test_groq_pool_timeout_maps_to_504(self):
+        """GroqPoolExhaustedError(timeout) → HTTP 504, code=turn_timeout."""
+        from backend.main import _map_turn_error
+        exc = GroqPoolExhaustedError("timeout", code=ProviderFailure.timeout)
+        http_exc = _map_turn_error(exc)
+        assert http_exc.status_code == 504
+        assert http_exc.detail["code"] == TurnErrorCode.turn_timeout.value
+
+    def test_groq_pool_rate_limited_maps_to_429(self):
+        """GroqPoolExhaustedError(rate_limited) → HTTP 429, code=upstream_rate_limited."""
+        from backend.main import _map_turn_error
+        exc = GroqPoolExhaustedError("rate limited", code=ProviderFailure.rate_limited)
+        http_exc = _map_turn_error(exc)
+        assert http_exc.status_code == 429
+        assert http_exc.detail["code"] == TurnErrorCode.upstream_rate_limited.value
+
+    def test_groq_pool_connection_failed_maps_to_503(self):
+        """GroqPoolExhaustedError(connection_failed) → HTTP 503, code=provider_unavailable."""
+        from backend.main import _map_turn_error
+        exc = GroqPoolExhaustedError("connection failed", code=ProviderFailure.connection_failed)
+        http_exc = _map_turn_error(exc)
+        assert http_exc.status_code == 503
+        assert http_exc.detail["code"] == TurnErrorCode.provider_unavailable.value
+
+    def test_groq_pool_invalid_request_maps_to_503(self):
+        """GroqPoolExhaustedError(invalid_request) → HTTP 503, code=provider_invalid_request."""
+        from backend.main import _map_turn_error
+        exc = GroqPoolExhaustedError("invalid request", code=ProviderFailure.invalid_request)
+        http_exc = _map_turn_error(exc)
+        assert http_exc.status_code == 503
+        assert http_exc.detail["code"] == TurnErrorCode.provider_invalid_request.value
+
+    # ── Same codes via TurnExecutionError ─────────────────────────────
+
+    def test_turn_execution_timeout_same_as_groq_pool_timeout(self):
+        """TurnExecutionError(turn_timeout) produces same 504 as GroqPoolExhaustedError(timeout)."""
+        from backend.main import _map_turn_error
+        pool_exc = _map_turn_error(GroqPoolExhaustedError("", code=ProviderFailure.timeout))
+        turn_exc = _map_turn_error(TurnExecutionError(TurnErrorCode.turn_timeout))
+        assert pool_exc.status_code == turn_exc.status_code == 504
+        assert pool_exc.detail["code"] == turn_exc.detail["code"] == TurnErrorCode.turn_timeout.value
+
+    def test_turn_execution_rate_limited_same_as_groq_pool_rate_limited(self):
+        """Both sources produce same 429/detail.code."""
+        from backend.main import _map_turn_error
+        pool_exc = _map_turn_error(GroqPoolExhaustedError("", code=ProviderFailure.rate_limited))
+        turn_exc = _map_turn_error(TurnExecutionError(TurnErrorCode.upstream_rate_limited))
+        assert pool_exc.status_code == turn_exc.status_code == 429
+        assert pool_exc.detail["code"] == turn_exc.detail["code"] == TurnErrorCode.upstream_rate_limited.value
+
+    def test_turn_execution_invalid_request_same_as_groq_pool(self):
+        """Both sources produce same 503/detail.code for invalid_request."""
+        from backend.main import _map_turn_error
+        pool_exc = _map_turn_error(GroqPoolExhaustedError("", code=ProviderFailure.invalid_request))
+        turn_exc = _map_turn_error(TurnExecutionError(TurnErrorCode.provider_invalid_request))
+        assert pool_exc.status_code == turn_exc.status_code == 503
+        assert pool_exc.detail["code"] == turn_exc.detail["code"] == TurnErrorCode.provider_invalid_request.value
+
     def test_cancelled_not_http500(self):
         """CancelledError propagates, not converted to HTTP 500."""
         with pytest.raises(asyncio.CancelledError):
@@ -1102,7 +1203,7 @@ class TestErrorContract:
         # "token" is too broad — would match "tokenizer" in model file URLs.
         # Instead, check for sensitive patterns that indicate a real leak:
         assert "Bearer" not in caplog.text
-        assert "authorization" not in caplog.text.lower() or "authorization" not in caplog.text
+        assert "authorization" not in caplog.text
 
 
 class TestSupabaseTimeout:

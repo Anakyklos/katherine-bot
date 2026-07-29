@@ -11,6 +11,7 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import math
 import time as _real_time
 from unittest.mock import patch
@@ -28,6 +29,7 @@ from backend.turn_execution import (
     DeadlineExceeded,
     create_budget,
     compute_backoff,
+    run_blocking_write,
 )
 
 
@@ -296,3 +298,195 @@ class TestDomainErrors:
         err = DeadlineExceeded()
         assert isinstance(err, TurnExecutionError)
         assert err.code == TurnErrorCode.turn_timeout
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 7. run_blocking_write() unit test
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestRunBlockingWrite:
+    """Direct unit tests for run_blocking_write safe-by-contract behavior."""
+
+    async def _test_normal_completion(self):
+        budget = TurnBudget(deadline=100.0, reserve=10.0, now_provider=lambda: 0.0)
+
+        def sync_func(x: int) -> int:
+            return x * 2
+
+        result = await run_blocking_write(
+            "test", budget, 5.0, sync_func, 21,
+        )
+        assert result == 42
+
+    def test_normal_completion(self):
+        """run_blocking_write returns normally when not cancelled."""
+        asyncio.run(self._test_normal_completion())
+
+    async def _test_cancel_budget_exhausted(self):
+        budget = TurnBudget(deadline=0.0, reserve=0.0, now_provider=lambda: 100.0)
+
+        def never_called():
+            return 42
+
+        with pytest.raises(DeadlineExceeded):
+            await run_blocking_write("test", budget, 5.0, never_called)
+
+    def test_cancel_budget_exhausted(self):
+        """DeadlineExceeded raised when budget is already exhausted."""
+        asyncio.run(self._test_cancel_budget_exhausted())
+
+    async def _test_single_cancel_drains_worker(self):
+        """A single CancelledError during the write is drained and propagated."""
+        import threading
+        started = threading.Event()
+        can_finish = threading.Event()
+
+        def sync_worker():
+            started.set()
+            assert can_finish.wait(timeout=10.0), "timeout waiting for release"
+            return 42
+
+        budget = TurnBudget(deadline=100.0, reserve=10.0, now_provider=lambda: 0.0)
+
+        task = asyncio.create_task(
+            run_blocking_write("test", budget, 5.0, sync_worker)
+        )
+
+        # Wait for worker to start in thread
+        started_ok = await asyncio.to_thread(started.wait, 5.0)
+        assert started_ok, "sync_worker did not start"
+        await asyncio.sleep(0.05)
+
+        # Cancel the task
+        task.cancel()
+        await asyncio.sleep(0.05)
+
+        # Worker should still be running (draining)
+        can_finish.set()
+
+        # Task should raise CancelledError after worker completes
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # No "Task exception was never retrieved" will occur
+
+    def test_single_cancel_drains_worker(self):
+        """Single cancel drains worker then propagates CancelledError."""
+        asyncio.run(self._test_single_cancel_drains_worker())
+
+    async def _test_double_cancel_drains_worker(self):
+        """Two CancelledErrors during the write: both consumed, worker drains."""
+        import threading
+        started = threading.Event()
+        can_finish = threading.Event()
+        completed = threading.Event()
+
+        def sync_worker():
+            started.set()
+            assert can_finish.wait(timeout=10.0), "timeout waiting for release"
+            completed.set()
+            return 42
+
+        budget = TurnBudget(deadline=100.0, reserve=10.0, now_provider=lambda: 0.0)
+
+        task = asyncio.create_task(
+            run_blocking_write("test", budget, 5.0, sync_worker)
+        )
+
+        started_ok = await asyncio.to_thread(started.wait, 5.0)
+        assert started_ok, "sync_worker did not start"
+        await asyncio.sleep(0.05)
+
+        # Cancel twice
+        task.cancel()
+        await asyncio.sleep(0.05)
+        task.cancel()
+        await asyncio.sleep(0.05)
+
+        # Worker should still be running
+        assert not completed.is_set(), "worker completed before release"
+
+        # Release worker
+        can_finish.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # Worker completed
+        assert completed.is_set(), "worker did not complete"
+
+    def test_double_cancel_drains_worker(self):
+        """Two cancels during write are consumed, worker drains to completion."""
+        asyncio.run(self._test_double_cancel_drains_worker())
+
+    async def _test_worker_exception_converted(self):
+        """Worker exception (not allowlisted) converts to persistence_unavailable."""
+        budget = TurnBudget(deadline=100.0, reserve=10.0, now_provider=lambda: 0.0)
+
+        def failing_worker():
+            raise ValueError("something bad")
+
+        with pytest.raises(TurnExecutionError) as exc_info:
+            await run_blocking_write("test", budget, 5.0, failing_worker)
+        assert exc_info.value.code == TurnErrorCode.persistence_unavailable
+
+    def test_worker_exception_converted(self):
+        """Non-allowlisted worker exception → persistence_unavailable."""
+        asyncio.run(self._test_worker_exception_converted())
+
+    async def _test_worker_allowlisted_exception(self):
+        """Allowlisted exception propagates as-is."""
+        class MyAllowlistedError(Exception):
+            pass
+
+        budget = TurnBudget(deadline=100.0, reserve=10.0, now_provider=lambda: 0.0)
+
+        def failing_worker():
+            raise MyAllowlistedError("expected")
+
+        with pytest.raises(MyAllowlistedError):
+            await run_blocking_write(
+                "test", budget, 5.0, failing_worker,
+                allowlist_exceptions=(MyAllowlistedError,),
+            )
+
+    def test_worker_allowlisted_exception(self):
+        asyncio.run(self._test_worker_allowlisted_exception())
+
+    async def _test_cancel_with_allowlisted_exception(self):
+        """Cancellation takes priority even when worker raises allowlisted error."""
+        import threading
+        started = threading.Event()
+        can_finish = threading.Event()
+
+        class MyAllowlistedError(Exception):
+            pass
+
+        def sync_worker():
+            started.set()
+            assert can_finish.wait(timeout=10.0), "timeout"
+            raise MyAllowlistedError("expected")
+
+        budget = TurnBudget(deadline=100.0, reserve=10.0, now_provider=lambda: 0.0)
+
+        task = asyncio.create_task(
+            run_blocking_write(
+                "test", budget, 5.0, sync_worker,
+                allowlist_exceptions=(MyAllowlistedError,),
+            )
+        )
+
+        started_ok = await asyncio.to_thread(started.wait, 5.0)
+        assert started_ok
+        await asyncio.sleep(0.05)
+
+        task.cancel()
+        await asyncio.sleep(0.05)
+        can_finish.set()
+
+        # Cancellation should propagate, not the allowlisted error
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    def test_cancel_with_allowlisted_exception(self):
+        asyncio.run(self._test_cancel_with_allowlisted_exception())

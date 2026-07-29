@@ -105,65 +105,72 @@ class ChatResponse(BaseModel):
 
 # ─── Error mapping ───────────────────────────────────────────────────────────
 
+def _turn_code_to_http(code: TurnErrorCode) -> int:
+    """Map a ``TurnErrorCode`` to an HTTP status code.
+
+    Centralised single-entry mapping so both ``TurnExecutionError`` and
+    ``GroqPoolExhaustedError`` produce identical status codes for the
+    same logical failure.
+    """
+    mapping = {
+        TurnErrorCode.turn_timeout: 504,
+        TurnErrorCode.upstream_rate_limited: 429,
+        TurnErrorCode.provider_unavailable: 503,
+        TurnErrorCode.provider_invalid_request: 503,
+        TurnErrorCode.provider_invalid_response: 500,
+        TurnErrorCode.persistence_unavailable: 503,
+        TurnErrorCode.internal_error: 500,
+    }
+    return mapping.get(code, 500)
+
+
+def _turn_code_to_message(code: TurnErrorCode) -> str:
+    """Map a ``TurnErrorCode`` to a public, sanitised message."""
+    mapping = {
+        TurnErrorCode.turn_timeout: "Turn deadline exceeded.",
+        TurnErrorCode.upstream_rate_limited: "Upstream rate limited.",
+        TurnErrorCode.provider_unavailable: "Service temporarily unavailable.",
+        TurnErrorCode.provider_invalid_request: "Service temporarily unavailable.",
+        TurnErrorCode.provider_invalid_response: "Invalid response from provider.",
+        TurnErrorCode.persistence_unavailable: "Persistence service unavailable.",
+        TurnErrorCode.internal_error: "Internal server error.",
+    }
+    return mapping.get(code, "Internal server error.")
+
+
 def _map_turn_error(exc: Exception) -> HTTPException:
     """Map domain exceptions to stable HTTP error responses.
 
     Never exposes: model name, provider details, exception text, prompt,
     infrastructure details, stack trace, or user content.
     Uses ``detail.code`` for structured error responses.
+    Both ``TurnExecutionError`` and ``GroqPoolExhaustedError`` go through
+    the same ``_turn_code_to_http`` / ``_turn_code_to_message`` helpers.
     """
     if isinstance(exc, DeadlineExceeded):
+        code = TurnErrorCode.turn_timeout
         return HTTPException(
-            status_code=504,
-            detail={"code": TurnErrorCode.turn_timeout.value, "message": "Turn deadline exceeded."},
+            status_code=_turn_code_to_http(code),
+            detail={"code": code.value, "message": _turn_code_to_message(code)},
         )
 
     if isinstance(exc, TurnExecutionError):
         code = exc.code
-        if code == TurnErrorCode.turn_timeout:
-            return HTTPException(
-                status_code=504,
-                detail={"code": code.value, "message": "Turn deadline exceeded."},
-            )
-        if code == TurnErrorCode.upstream_rate_limited:
-            return HTTPException(
-                status_code=429,
-                detail={"code": code.value, "message": "Upstream rate limited."},
-            )
-        if code in (TurnErrorCode.provider_unavailable, TurnErrorCode.provider_invalid_request):
-            return HTTPException(
-                status_code=503,
-                detail={"code": code.value, "message": "Service temporarily unavailable."},
-            )
-        if code == TurnErrorCode.provider_invalid_response:
-            return HTTPException(
-                status_code=500,
-                detail={"code": code.value, "message": "Invalid response from provider."},
-            )
-        if code == TurnErrorCode.persistence_unavailable:
-            return HTTPException(
-                status_code=503,
-                detail={"code": code.value, "message": "Persistence service unavailable."},
-            )
-        # Fallback
         return HTTPException(
-            status_code=500,
-            detail={"code": TurnErrorCode.internal_error.value, "message": "Internal server error."},
+            status_code=_turn_code_to_http(code),
+            detail={"code": code.value, "message": _turn_code_to_message(code)},
         )
 
     if isinstance(exc, GroqPoolExhaustedError):
         # Map the failure code if available
         from .groq_manager import provider_failure_to_turn_code
-        code = provider_failure_to_turn_code(exc.failure_code) if exc.failure_code else TurnErrorCode.provider_unavailable
-        if code == TurnErrorCode.upstream_rate_limited:
-            status = 429
-        elif code == TurnErrorCode.provider_unavailable:
-            status = 503
-        else:
-            status = 500
+        turn_code = (
+            provider_failure_to_turn_code(exc.failure_code) if exc.failure_code
+            else TurnErrorCode.provider_unavailable
+        )
         return HTTPException(
-            status_code=status,
-            detail={"code": code.value, "message": "Provider unavailable."},
+            status_code=_turn_code_to_http(turn_code),
+            detail={"code": turn_code.value, "message": _turn_code_to_message(turn_code)},
         )
 
     if isinstance(exc, GroqRequestError):

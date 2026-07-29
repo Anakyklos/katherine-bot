@@ -431,6 +431,7 @@ class ConversationEngine:
         commit_task = asyncio.create_task(commit_section(), name="turn-commit")
 
         original_cancel: Optional[BaseException] = None
+        commit_error: Optional[BaseException] = None
 
         try:
             turn_ref = await asyncio.shield(commit_task)
@@ -438,24 +439,35 @@ class ConversationEngine:
             await self._emit_stage_event(StageEvent(
                 stage=TurnStage.commit, outcome=StageOutcome.cancelled,
             ))
-            # Record the first cancellation and drain the commit_task.
-            # Repeated cancellations are consumed harmlessly.
             original_cancel = exc
+            # Drain commit_task under shield — repeated cancellations
+            # are consumed harmlessly.
             while not commit_task.done():
                 try:
                     await asyncio.shield(commit_task)
                 except asyncio.CancelledError:
                     continue
-            # Drain complete. Awaiting a done task returns the result or
-            # re-raises the stored exception so "Task exception was never
-            # retrieved" does not occur.
+                except BaseException:
+                    break
+            # Recover the task result or exception so "Task exception was
+            # never retrieved" does not occur.
             try:
                 turn_ref = await commit_task
-            except (TurnPersistenceError, StatePersistenceError):
-                raise TurnExecutionError(
-                    TurnErrorCode.persistence_unavailable,
-                    "Turn persistence failed after cancellation.",
-                ) from None
+            except BaseException as exc:
+                commit_error = exc
+
+            if commit_error is not None:
+                # Emit sanitised observance of the commit failure, but
+                # do NOT replace the cancellation with a persistence error.
+                await self._emit_stage_event(StageEvent(
+                    stage=TurnStage.commit, outcome=StageOutcome.failed,
+                    code=TurnErrorCode.persistence_unavailable,
+                ))
+
+            # Propagate the original cancellation after draining.
+            # The lock is released by the finally block in _run_turn_locked.
+            raise original_cancel
+
         except (TurnPersistenceError, StatePersistenceError) as exc:
             await self._emit_stage_event(StageEvent(
                 stage=TurnStage.commit, outcome=StageOutcome.failed,
@@ -466,10 +478,8 @@ class ConversationEngine:
                 "Turn persistence failed.",
             ) from exc
 
-        if original_cancel is not None:
-            # Propagate the original cancellation — the lock is released
-            # by the finally block in _run_turn_locked.
-            raise original_cancel
+        # No cancellation — commit completed (possibly with failure that
+        # was already raised above)
 
         if background_tasks and self.archival_extraction_enabled:
             background_tasks.add_task(self.run_archival_extraction, turn_ref)

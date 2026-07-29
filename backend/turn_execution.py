@@ -177,28 +177,30 @@ async def run_blocking_write(
 ) -> T:
     """Run a **write** blocking operation that must not be abandoned.
 
-    Unlike ``run_blocking_read``, this helper **does not** use
-    ``asyncio.wait_for`` with a timeout that could abandon the underlying
-    thread.  Instead:
+    1. Checks budget before starting.
+    2. Creates an explicitly referenced ``asyncio.Task`` for
+       ``asyncio.to_thread(...)`` with a sanitised constant name.
+    3. Awaits the task normally (no ``wait_for`` — writes are never
+       abandoned).
+    4. On **first ``CancelledError``**: records the cancellation, enters
+       a drain loop using ``asyncio.shield()`` that consumes repeated
+       cancellations without letting them reach the worker.
+    5. Once the worker completes (or fails), retrieves the result or
+       exception.
+    6. Classifies the worker exception:
+       * Allowlisted exceptions propagate as-is.
+       * ``TurnExecutionError`` propagates.
+       * All other exceptions convert to ``persistence_unavailable``.
+    7. If cancellation was originally received, **propagates the original
+       ``CancelledError``** after draining — never substitutes it with
+       ``DeadlineExceeded`` or a persistence error.
+    8. Never exits while the worker task is pending.
+    9. Never uses ``wait_for()`` or artificial timeout that would abandon
+       the worker.
 
-    1. The operation is dispatched via ``asyncio.to_thread()`` and wrapped
-       in an ``asyncio.Task`` that is explicitly referenced.
-    2. The real timeout is provided by the PostgREST transport configuration
-       (``supabase_timeout``), which will cause the HTTP client to
-       eventually time out server-side.
-    3. The coroutine **awaits the task** (not a timed wait) so the write
-       is never abandoned.
-    4. ``budget.remaining`` is checked before starting — the caller must
-       ensure sufficient remaining budget (reserve included).
-
-    On **cancellation**: the underlying thread continues (it's not
-    cancellable) but the coroutine stops waiting for it.  The caller
-    must retain the user lock until the task completes (see commit
-    cancellation protocol in engine.py).
-
-    On **any exception**: wraps into ``TurnExecutionError(persistence_unavailable)``,
-    unless the exception type is in *allowlist_exceptions* (those are
-    re-raised as-is for the caller to handle).
+    The real I/O timeout comes from the PostgREST transport configuration
+    (``supabase_timeout``), which will cause the HTTP client to eventually
+    time out server-side.
 
     Returns:
         The return value of *func*.
@@ -206,7 +208,8 @@ async def run_blocking_write(
     Raises:
         DeadlineExceeded: When the budget is exhausted before starting.
         TurnExecutionError(persistence_unavailable): On operation failure.
-        asyncio.CancelledError: When the coroutine is cancelled.
+        asyncio.CancelledError: When the coroutine is cancelled (only
+            after the worker has been drained to completion).
         Exception subtypes from *allowlist_exceptions*: Propagated as-is.
     """
     # Check budget before starting — uses full remaining (including reserve)
@@ -214,20 +217,61 @@ async def run_blocking_write(
     if budget.remaining <= 0.0:
         raise DeadlineExceeded()
 
-    try:
-        result = await asyncio.to_thread(func, *args, **kwargs)
-        return result
-    except asyncio.CancelledError:
-        raise
-    except TurnExecutionError:
-        raise
-    except Exception as exc:
-        if allowlist_exceptions and isinstance(exc, allowlist_exceptions):
-            raise
+    # Create an explicitly referenced task with a sanitised constant name.
+    # The task wraps asyncio.to_thread() which dispatches the function to
+    # a thread pool.  We keep a reference so it can be drained on cancel.
+    worker_task = asyncio.create_task(
+        asyncio.to_thread(func, *args, **kwargs),
+        name="blocking-write",
+    )
+
+    original_cancel: Optional[BaseException] = None
+    worker_exc: Optional[BaseException] = None
+    worker_result: Any = None
+
+    # Phase 1: Await the worker, handling cancellation and shielding.
+    # When no cancellation arrives, this is a simple await.
+    while not worker_task.done():
+        try:
+            worker_result = await asyncio.shield(worker_task)
+        except asyncio.CancelledError as exc:
+            if original_cancel is None:
+                original_cancel = exc
+            # Repeated cancellations are consumed — the shield prevents
+            # them from reaching the worker.
+            continue
+        except BaseException as exc:
+            worker_exc = exc
+            break
+
+    # Phase 2: If the worker finished but we didn't retrieve the result
+    # above (e.g. it completed between iterations), retrieve it now.
+    if worker_task.done() and worker_exc is None and original_cancel is None:
+        try:
+            worker_result = worker_task.result()
+        except BaseException as exc:
+            worker_exc = exc
+
+    # Phase 3: Propagate cancellation after draining — cancellation takes
+    # priority over worker exceptions (including allowlisted ones).
+    if original_cancel is not None:
+        raise original_cancel
+
+    # Phase 4: Classify worker exception (only reached if no cancellation).
+    if worker_exc is not None:
+        if allowlist_exceptions and isinstance(worker_exc, allowlist_exceptions):
+            # Allowlisted exception propagates as-is.
+            raise worker_exc
+        if isinstance(worker_exc, TurnExecutionError):
+            # TurnExecutionError propagates as-is.
+            raise worker_exc
+        # All other exceptions convert to persistence_unavailable.
         raise TurnExecutionError(
             TurnErrorCode.persistence_unavailable,
             f"Stage {stage_label} failed.",
-        )
+        ) from worker_exc
+
+    return worker_result
 
 
 # ─── Turn stage enum for observability ──────────────────────────────────────

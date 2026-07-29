@@ -452,6 +452,71 @@ def test_no_real_external_dependencies_proof():
     assert isinstance(sys.modules.get('supabase'), MagicMock)
 
 
+@pytest.mark.anyio
+async def test_run_archival_extraction_cancelled_during_store(backend, caplog):
+    """Cancel during archival store — write is not abandoned.
+
+    When the background archival extraction task is cancelled while
+    store_archival_extraction is running, the write helper must drain
+    the worker to completion before propagating the cancellation.
+    """
+    import threading
+    import asyncio
+
+    engine = backend.ConversationEngine(archival_extraction_enabled=True)
+    engine.memory_manager = MagicMock()
+    engine.memory_manager.load_persisted_user_message = MagicMock(return_value="Hello")
+
+    m = MagicMock()
+    m.choices = [MagicMock()]
+    m.choices[0].message.content = json.dumps({
+        "facts": [{"content": "likes coding", "importance": 0.9, "tags": []}],
+        "schema_version": 1,
+        "extractor_version": 1
+    })
+    async def _async_return(*args, **kwargs):
+        return m
+    engine.groq_manager.chat_completion_async = MagicMock(side_effect=_async_return)
+
+    # Block store_archival_extraction in a thread so we can verify drain
+    store_started = threading.Event()
+    store_can_proceed = threading.Event()
+    store_completed = threading.Event()
+
+    def blocking_store(user_id, source_chat_log_id, idempotency_key, envelope):
+        store_started.set()
+        store_can_proceed.wait(timeout=10.0)
+        store_completed.set()
+
+    engine.memory_manager.store_archival_extraction = blocking_store
+
+    ref = backend.PersistedTurnRef(
+        user_id="user123", source_chat_log_id=1, assistant_chat_log_id=2
+    )
+
+    task = asyncio.create_task(engine.run_archival_extraction(ref))
+
+    # Wait for store_archival_extraction to start in its thread
+    started_ok = await asyncio.to_thread(store_started.wait, 5.0)
+    assert started_ok, "store_archival_extraction did not start"
+
+    # Cancel the task while store is in progress
+    task.cancel()
+    await asyncio.sleep(0.05)
+
+    # Store should not have completed yet (blocked by event)
+    assert not store_completed.is_set(), "store should still be blocked"
+
+    # Release store to complete
+    store_can_proceed.set()
+
+    # Task should propagate CancelledError after draining
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert store_completed.is_set(), "store must have completed (drained)"
+
+
 def test_sql_guarantees_mock():
     # Verify RLS and composite FK setup exists in the migration schema
     schema_path = "supabase_schema.sql"

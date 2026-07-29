@@ -456,9 +456,9 @@ class GroqClientManager:
                     last_failure = ProviderFailure.server_error
                     tried_keys.add(api_key)
                 else:
-                    # Non-retryable 4xx
+                    # Non-retryable 4xx (terminal) → invalid_request
                     tried_keys.add(api_key)
-                    last_failure = ProviderFailure.invalid_response
+                    last_failure = ProviderFailure.invalid_request
             except TurnExecutionError:
                 raise
             except Exception:
