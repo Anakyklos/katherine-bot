@@ -60,7 +60,12 @@ def anon_client(supabase_url: str, anon_key: str) -> Client:
 
 
 def _run_sql(sql: str) -> list[dict]:
-    """Execute trusted test SQL through the pinned local Supabase CLI."""
+    """Execute trusted test SQL through the pinned local Supabase CLI.
+
+    SELECT statements are emitted as JSON. PostgreSQL command tags such as
+    ``TRUNCATE TABLE`` are successful commands without a row result and map to
+    an empty list instead of being treated as JSON.
+    """
     result = subprocess.run(
         [
             "supabase",
@@ -76,7 +81,12 @@ def _run_sql(sql: str) -> list[dict]:
         check=False,
     )
     assert result.returncode == 0, "sanitized admission test SQL operation failed"
-    return json.loads(result.stdout or "[]")
+    output = result.stdout.strip()
+    if not output or output[0] not in "[{":
+        return []
+    parsed = json.loads(output)
+    assert isinstance(parsed, list)
+    return parsed
 
 
 def _truncate_ledger() -> None:
