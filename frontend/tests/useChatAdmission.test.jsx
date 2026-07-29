@@ -24,6 +24,7 @@ vi.mock('../src/shared/services/apiClient', () => ({
 }));
 
 import { useChat } from '../src/features/chat/hooks/useChat';
+import { SYSTEM_MESSAGES } from '../src/features/chat/constants';
 
 const UUID_A = '550e8400-e29b-41d4-a716-446655440000';
 const UUID_B = '550e8400-e29b-41d4-a716-446655440001';
@@ -108,7 +109,33 @@ describe('useChat admission identity', () => {
 
         expect(mockSendMessage).not.toHaveBeenCalled();
         expect(result.current.messages).toEqual([
-            expect.objectContaining({ role: 'system' }),
+            {
+                role: 'system',
+                content: SYSTEM_MESSAGES.REQUEST_ID_UNAVAILABLE,
+            },
+        ]);
+        expect(result.current.isLoading).toBe(false);
+        expect(result.current.input).toBe('hello');
+    });
+
+    it('does not call the API when Web Crypto randomUUID throws', async () => {
+        const failingRandomUUID = vi.fn(() => {
+            throw new Error('randomUUID failure');
+        });
+        vi.stubGlobal('crypto', { randomUUID: failingRandomUUID });
+        const { result } = renderHook(() => useChat());
+
+        await act(async () => { result.current.setInput('hello'); });
+        await waitFor(() => expect(result.current.input).toBe('hello'));
+        await act(async () => { await result.current.handleSend(); });
+
+        expect(failingRandomUUID).toHaveBeenCalledTimes(1);
+        expect(mockSendMessage).not.toHaveBeenCalled();
+        expect(result.current.messages).toEqual([
+            {
+                role: 'system',
+                content: SYSTEM_MESSAGES.REQUEST_ID_UNAVAILABLE,
+            },
         ]);
         expect(result.current.isLoading).toBe(false);
         expect(result.current.input).toBe('hello');
