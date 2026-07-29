@@ -44,6 +44,20 @@ describe('chat admission service contract', () => {
         expect(mockPost).not.toHaveBeenCalled();
     });
 
+    it('rethrows an existing ChatError without wrapping it', async () => {
+        const existing = new ChatError('validation', 'safe existing error');
+        mockPost.mockRejectedValue(existing);
+
+        let received;
+        try {
+            await sendMessage('hello', {}, REQUEST_ID);
+        } catch (error) {
+            received = error;
+        }
+
+        expect(received).toBe(existing);
+    });
+
     it('classifies replay and conflict as distinct safe errors', () => {
         expect(classifyHttpError(409, 'request_replay_unavailable')).toBe('request_replay');
         expect(classifyHttpError(409, 'request_id_conflict')).toBe('request_conflict');
