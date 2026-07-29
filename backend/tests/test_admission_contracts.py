@@ -23,6 +23,16 @@ Covers (1–20):
 18. ≤ 4 000 chars but > 6 000 bytes rejected with ``message_budget_exceeded``
 19. Content and invalid UUID absent from ``str(exc)``, ``repr(exc)``, public attributes
 20. No shared mutable state
+
+Additional coverage for code-review corrections:
+
+21. Direct constructor with valid lowercase UUID
+22. Direct constructor with valid uppercase UUID (normalised)
+23. Direct constructor with invalid UUID
+24. Direct constructor with no-hyphens format
+25. ``parse()`` and constructor produce equivalent objects
+26. Impossible to mutate after construction
+27. Real purity test with env, socket, import guards before import
 """
 
 import subprocess
@@ -51,24 +61,81 @@ from backend.admission_contracts import (
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 1. Pure importability
+# 1. Pure importability  (code-review correction: real purity guards)
 # ═══════════════════════════════════════════════════════════════════════
 
 class TestImportability:
-    """Import the module in an isolated subprocess and verify no heavy
-    dependencies are pulled in."""
+    """Import module in a subprocess with env, socket, and import hooks
+    that **fail** if the module touches forbidden resources."""
 
-    HEAVY_DEPS = {"fastapi", "groq", "supabase", "sentence_transformers", "pydantic"}
-
-    @staticmethod
-    def _check_script() -> str:
-        dep_names = ", ".join(repr(d) for d in TestImportability.HEAVY_DEPS)
-        return f"""
+    # NOTE: single-quote outer delimiter to avoid conflict with inner
+    #       triple-double-quote docstrings in the generated script.
+    _PURITY_SCRIPT = '''
 import sys
+
+# -- Pre-import ONLY stdlib needed for guards --------------------------
+import os as _os
+import socket as _socket
+
+# -- Guard 1: os.environ raises on any read ---------------------------
+class _FailEnv:
+    """Mapping proxy that fails on every read operation."""
+    def __getitem__(self, key):
+        raise RuntimeError(f"os.environ read attempted: key={key!r}")
+    def get(self, key, default=None):
+        raise RuntimeError(f"os.environ.get read attempted: key={key!r}")
+    def __contains__(self, key):
+        raise RuntimeError(f"os.environ.__contains__ read attempted: key={key!r}")
+    def __setitem__(self, key, value):
+        pass
+    def __delitem__(self, key):
+        pass
+    def __repr__(self):
+        return "_FailEnv()"
+    def __iter__(self):
+        return iter([])
+    def __len__(self):
+        return 0
+    def __bool__(self):
+        return True
+
+_os.environ = _FailEnv()
+
+# -- Guard 2: os.getenv raises unconditionally -------------------------
+def _raise_getenv(key, default=None):
+    raise RuntimeError(f"os.getenv read attempted: key={key!r}")
+_os.getenv = _raise_getenv
+
+# -- Guard 3: socket.socket / create_connection raise ------------------
+def _raise_socket(*args, **kwargs):
+    raise OSError("socket.socket blocked")
+def _raise_create_connection(*args, **kwargs):
+    raise OSError("socket.create_connection blocked")
+_socket.socket = _raise_socket
+_socket.create_connection = _raise_create_connection
+
+# -- Guard 4: import hook blocks forbidden modules --------------------
+_BLOCKED_TOP = frozenset({
+    "fastapi", "groq", "supabase", "sentence_transformers",
+    "pydantic", "httpx", "httpcore", "anyio",
+})
+_BLOCKED_FULL = frozenset({
+    "backend.engine", "backend.memory",
+})
+
+class _BlockImport:
+    def find_spec(self, fullname, path, target=None):
+        if fullname in _BLOCKED_FULL:
+            raise ImportError(f"blocked: {fullname}")
+        top = fullname.split(".")[0]
+        if top in _BLOCKED_TOP:
+            raise ImportError(f"blocked: {fullname}")
+        return None
+
+sys.meta_path.insert(0, _BlockImport())
+
+# -- Import the module under test --------------------------------------
 sys.path.insert(0, ".")
-
-_BLOCKED = {{{dep_names}}}
-
 from backend.admission_contracts import (
     NEW_MESSAGE_MAX_CHARS,
     AdmissionConfig,
@@ -77,17 +144,23 @@ from backend.admission_contracts import (
     validate_new_message,
 )
 
-for mod_name in _BLOCKED:
-    assert mod_name not in sys.modules, (
-        f"{{mod_name}} was loaded during import")
+# -- Verify the module actually works ----------------------------------
+assert NEW_MESSAGE_MAX_CHARS == 4000
+assert estimate_text_units("hello") == 5
+ident = RequestIdentity.parse("550e8400-e29b-41d4-a716-446655440000")
+assert ident.request_id == "550e8400-e29b-41d4-a716-446655440000"
+config = AdmissionConfig()
+assert config.new_message_max_chars == 4000
 
 print("OK")
-"""
+'''
 
-    def test_importable_without_heavy_deps(self):
-        code = self._check_script()
+    def test_pure_import_with_guards(self):
+        """Subprocess with env, socket, and import guards active *before*
+        the module import.  Fails if the module touches any forbidden
+        resource."""
         proc = subprocess.run(
-            [sys.executable, "-c", code],
+            [sys.executable, "-c", self._PURITY_SCRIPT],
             capture_output=True, text=True,
             cwd=os.getcwd(),
             env={
@@ -99,7 +172,8 @@ print("OK")
             },
         )
         assert proc.returncode == 0, (
-            f"Subprocess failed:\nstdout:{proc.stdout}\nstderr:{proc.stderr}"
+            f"Subprocess failed (guard triggered?):\n"
+            f"stdout:{proc.stdout}\nstderr:{proc.stderr}"
         )
         assert "OK" in proc.stdout
 
@@ -112,13 +186,7 @@ class TestNoEnv:
     """The module does not read environment variables at import time."""
 
     def test_no_post_init(self):
-        # ``AdmissionConfig`` has no ``__post_init__`` that might read env
         assert not hasattr(AdmissionConfig, "__post_init__")
-
-    def test_importability_proof(self):
-        """Already proven by the subprocess test above — the module imported
-        successfully even with empty GROQ_API_KEY / SUPABASE_URL."""
-        pass
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -184,7 +252,7 @@ class TestConfigMatchesConstants:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 6–12. RequestIdentity parsing
+# 6–12 + 21–26. RequestIdentity (parse + direct constructor)
 # ═══════════════════════════════════════════════════════════════════════
 
 _CANONICAL_LOWER = "550e8400-e29b-41d4-a716-446655440000"
@@ -192,21 +260,17 @@ _CANONICAL_UPPER = "550E8400-E29B-41D4-A716-446655440000"
 
 
 class TestRequestIdentity:
-    """Request identity parsing and validation."""
+    """Request identity: parse() and direct constructor."""
 
-    # -- 6. Canonical lowercase --
+    # ── Original parse-based tests (6–12) ─────────────────────────
 
-    def test_canonical_lowercase(self):
+    def test_parse_canonical_lowercase(self):
         ident = RequestIdentity.parse(_CANONICAL_LOWER)
         assert ident.request_id == _CANONICAL_LOWER
 
-    # -- 7. Canonical uppercase normalised to lowercase --
-
-    def test_canonical_uppercase_normalised(self):
+    def test_parse_canonical_uppercase_normalised(self):
         ident = RequestIdentity.parse(_CANONICAL_UPPER)
         assert ident.request_id == _CANONICAL_LOWER
-
-    # -- 8. Whitespace rejection --
 
     @pytest.mark.parametrize("raw", [
         f" {_CANONICAL_LOWER}",
@@ -214,48 +278,40 @@ class TestRequestIdentity:
         f"  {_CANONICAL_LOWER}  ",
         f"\t{_CANONICAL_LOWER}",
     ])
-    def test_rejects_whitespace(self, raw):
+    def test_parse_rejects_whitespace(self, raw):
         with pytest.raises(AdmissionError, match="invalid_request_id"):
             RequestIdentity.parse(raw)
-
-    # -- 9. Curly-brace rejection --
 
     @pytest.mark.parametrize("raw", [
-        f"{{{_CANONICAL_LOWER}}}",   # 38 chars
-        f"{{{_CANONICAL_LOWER}",      # 37 chars
-        f"{_CANONICAL_LOWER}}}",      # 38 chars
+        f"{{{_CANONICAL_LOWER}}}",
+        f"{{{_CANONICAL_LOWER}",
+        f"{_CANONICAL_LOWER}}}",
     ])
-    def test_rejects_braces(self, raw):
+    def test_parse_rejects_braces(self, raw):
         with pytest.raises(AdmissionError, match="invalid_request_id"):
             RequestIdentity.parse(raw)
-
-    # -- 10. URN rejection --
 
     @pytest.mark.parametrize("raw", [
         f"urn:uuid:{_CANONICAL_LOWER}",
         f"URN:UUID:{_CANONICAL_LOWER}",
     ])
-    def test_rejects_urn(self, raw):
+    def test_parse_rejects_urn(self, raw):
         with pytest.raises(AdmissionError, match="invalid_request_id"):
             RequestIdentity.parse(raw)
 
-    # -- 11. No hyphens --
-
-    def test_rejects_no_hyphens(self):
+    def test_parse_rejects_no_hyphens(self):
         raw = _CANONICAL_LOWER.replace("-", "")
         with pytest.raises(AdmissionError, match="invalid_request_id"):
             RequestIdentity.parse(raw)
 
-    # -- 12. Empty, invalid text, and non-string types --
-
     @pytest.mark.parametrize("raw", [
         "",
         "not-a-uuid",
-        f"{_CANONICAL_LOWER}x",          # 37 chars
-        f"{_CANONICAL_LOWER[:-1]}",      # 35 chars
-        "gggggggg-gggg-gggg-gggg-gggggggggggg",  # not hex
+        f"{_CANONICAL_LOWER}x",
+        f"{_CANONICAL_LOWER[:-1]}",
+        "gggggggg-gggg-gggg-gggg-gggggggggggg",
     ])
-    def test_rejects_invalid_text(self, raw):
+    def test_parse_rejects_invalid_text(self, raw):
         with pytest.raises(AdmissionError, match="invalid_request_id"):
             RequestIdentity.parse(raw)
 
@@ -265,9 +321,58 @@ class TestRequestIdentity:
         ["not-a-string"],
         {"key": "value"},
     ])
-    def test_rejects_non_string_types(self, raw):
+    def test_parse_rejects_non_string_types(self, raw):
         with pytest.raises(AdmissionError, match="invalid_request_id"):
             RequestIdentity.parse(raw)  # type: ignore[arg-type]
+
+    # ── Direct constructor tests (code-review corrections 21–26) ──
+
+    def test_constructor_valid_lowercase(self):
+        """21. Direct constructor with valid lowercase UUID."""
+        ident = RequestIdentity(_CANONICAL_LOWER)
+        assert ident.request_id == _CANONICAL_LOWER
+
+    def test_constructor_valid_uppercase_normalised(self):
+        """22. Direct constructor with valid uppercase UUID."""
+        ident = RequestIdentity(_CANONICAL_UPPER)
+        assert ident.request_id == _CANONICAL_LOWER
+
+    def test_constructor_invalid_raises(self):
+        """23. Direct constructor with invalid UUID raises."""
+        with pytest.raises(AdmissionError, match="invalid_request_id"):
+            RequestIdentity("not-a-uuid")
+
+    def test_constructor_no_hyphens_raises(self):
+        """24. Direct constructor with no-hyphens format."""
+        raw = _CANONICAL_LOWER.replace("-", "")
+        with pytest.raises(AdmissionError, match="invalid_request_id"):
+            RequestIdentity(raw)
+
+    def test_parse_and_constructor_equivalent(self):
+        """25. ``parse()`` and constructor produce equal objects."""
+        ident1 = RequestIdentity.parse(_CANONICAL_LOWER)
+        ident2 = RequestIdentity(_CANONICAL_LOWER)
+        assert ident1 == ident2
+        assert ident1.request_id == ident2.request_id
+
+    def test_parse_and_constructor_equivalent_uppercase(self):
+        """25b. Both paths normalise uppercase identically."""
+        ident1 = RequestIdentity.parse(_CANONICAL_UPPER)
+        ident2 = RequestIdentity(_CANONICAL_UPPER)
+        assert ident1 == ident2
+        assert ident1.request_id == _CANONICAL_LOWER
+
+    def test_immutable_after_construction(self):
+        """26. Impossible to mutate after construction."""
+        ident = RequestIdentity(_CANONICAL_LOWER)
+        with pytest.raises(FrozenInstanceError):
+            ident.request_id = "other"  # type: ignore[assignment]
+
+    def test_constructor_rejects_non_string(self):
+        with pytest.raises(AdmissionError, match="invalid_request_id"):
+            RequestIdentity(12345)  # type: ignore[arg-type]
+        with pytest.raises(AdmissionError, match="invalid_request_id"):
+            RequestIdentity(None)  # type: ignore[arg-type]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -275,37 +380,25 @@ class TestRequestIdentity:
 # ═══════════════════════════════════════════════════════════════════════
 
 class TestEstimateTextUnits:
-    """``estimate_text_units`` — byte-based input cost estimation."""
-
-    # -- 13. Empty string returns 1 --
-
     def test_empty_returns_one(self):
         assert estimate_text_units("") == 1
-
-    # -- 14. ASCII counted as one byte per character --
 
     def test_ascii_one_byte_per_char(self):
         assert estimate_text_units("hello") == 5
         assert estimate_text_units("a" * 100) == 100
         assert estimate_text_units("a" * 4000) == 4000
 
-    # -- 15. Multibyte counted by real UTF-8 bytes --
-
     def test_two_byte_char(self):
-        # "ñ" is 2 bytes in UTF-8
-        assert estimate_text_units("ñ") == 2
+        assert estimate_text_units("\u00f1") == 2
 
     def test_three_byte_chars(self):
-        # "你好" is 6 bytes (3 each)
-        assert estimate_text_units("你好") == 6
+        assert estimate_text_units("\u4f60\u597d") == 6
 
     def test_four_byte_char(self):
-        # emoji "😀" is 4 bytes
-        assert estimate_text_units("😀") == 4
+        assert estimate_text_units("\U0001f600") == 4
 
     def test_mixed_lengths(self):
-        # "a" is 1 byte, "ñ" is 2, "😀" is 4 → total 7
-        assert estimate_text_units("añ😀") == 7
+        assert estimate_text_units("a\u00f1\U0001f600") == 7
 
     def test_rejects_non_string(self):
         with pytest.raises(TypeError):
@@ -319,20 +412,13 @@ class TestEstimateTextUnits:
 # ═══════════════════════════════════════════════════════════════════════
 
 class TestValidateNewMessage:
-    """Message validation with deterministic precedence."""
-
-    # -- 16. 4 000 ASCII chars accepted --
-
     def test_4000_ascii_chars_accepted(self):
-        text = "a" * 4000
-        validate_new_message(text)  # should not raise
+        validate_new_message("a" * 4000)
 
     def test_under_4000_chars_accepted(self):
         validate_new_message("hello")
         validate_new_message("")
-        validate_new_message("ñ" * 100)  # 200 units, well under 6000
-
-    # -- 17. 4 001 chars rejected with ``message_too_long`` --
+        validate_new_message("\u00f1" * 100)
 
     def test_4001_chars_rejected(self):
         text = "a" * 4001
@@ -344,16 +430,12 @@ class TestValidateNewMessage:
         assert excinfo.value.actual_units == 0
 
     def test_5000_chars_rejected(self):
-        text = "a" * 5000
         with pytest.raises(AdmissionError) as excinfo:
-            validate_new_message(text)
+            validate_new_message("a" * 5000)
         assert excinfo.value.code == "message_too_long"
 
-    # -- 18. ≤ 4 000 chars but > 6 000 units → ``message_budget_exceeded`` --
-
     def test_over_6000_units_rejected(self):
-        # "ñ" is 2 bytes, so 3001 chars × 2 = 6002 units > 6000
-        text = "ñ" * 3001
+        text = "\u00f1" * 3001
         with pytest.raises(AdmissionError) as excinfo:
             validate_new_message(text)
         assert excinfo.value.code == "message_budget_exceeded"
@@ -363,8 +445,7 @@ class TestValidateNewMessage:
         assert excinfo.value.max_units == 6000
 
     def test_4000_multi_byte_over_6000_units(self):
-        # 4000 chars × 2 bytes = 8000 units
-        text = "ñ" * 4000
+        text = "\u00f1" * 4000
         with pytest.raises(AdmissionError) as excinfo:
             validate_new_message(text)
         assert excinfo.value.code == "message_budget_exceeded"
@@ -373,24 +454,16 @@ class TestValidateNewMessage:
         assert excinfo.value.max_units == 6000
 
     def test_exactly_6000_units_accepted(self):
-        # 6000 ASCII chars = 6000 bytes → accepted (len > 4000 fails first)
-        # But 3000 "ñ" chars = 6000 bytes, and 3000 < 4000 chars → accepted
-        text = "ñ" * 3000
-        validate_new_message(text)
+        validate_new_message("\u00f1" * 3000)
 
     def test_exactly_6001_units_rejected(self):
-        # 3000 "ñ" chars + 1 extra byte → 6001 units
-        text = "ñ" * 3000 + "a"  # 3001 chars, 6001 bytes
         with pytest.raises(AdmissionError) as excinfo:
-            validate_new_message(text)
+            validate_new_message("\u00f1" * 3000 + "a")
         assert excinfo.value.code == "message_budget_exceeded"
 
     def test_precedence_chars_before_units(self):
-        # 4001 chars × 1 byte = 4001 units (well under 6000)
-        # But chars check fires first → message_too_long
-        text = "a" * 4001
         with pytest.raises(AdmissionError) as excinfo:
-            validate_new_message(text)
+            validate_new_message("a" * 4001)
         assert excinfo.value.code == "message_too_long"
 
     def test_precedence_invalid_type_before_chars(self):
@@ -404,11 +477,6 @@ class TestValidateNewMessage:
 # ═══════════════════════════════════════════════════════════════════════
 
 class TestErrorHidesSensitiveData:
-    """``str(exc)``, ``repr(exc)``, and public attributes must never expose
-    the original content or invalid UUID."""
-
-    # -- message_too_long hides content --
-
     def test_message_too_long_hides_content(self):
         secret = "p4ssw0rd-sensitive-content"
         try:
@@ -421,18 +489,14 @@ class TestErrorHidesSensitiveData:
                 for attr in dir(exc)
                 if not attr.startswith("_")
             )
-            # Confirm the code is visible
             assert exc.code == "message_too_long"
         else:
             pytest.fail("Expected AdmissionError")
 
-    # -- message_budget_exceeded hides content --
-
     def test_message_budget_exceeded_hides_content(self):
         secret = "c0nf1d3ntial-data"
-        text = secret + "ñ" * 3000  # well over 6000 units
         try:
-            validate_new_message(text)
+            validate_new_message(secret + "\u00f1" * 3000)
         except AdmissionError as exc:
             assert secret not in str(exc)
             assert secret not in repr(exc)
@@ -445,9 +509,7 @@ class TestErrorHidesSensitiveData:
         else:
             pytest.fail("Expected AdmissionError")
 
-    # -- invalid_request_id hides raw UUID --
-
-    def test_invalid_request_id_hides_raw(self):
+    def test_parse_invalid_hides_raw(self):
         secret_uuid = "th1s-1s-4-s3cr3t-1d-1234567890ab"
         try:
             RequestIdentity.parse(secret_uuid)
@@ -463,8 +525,24 @@ class TestErrorHidesSensitiveData:
         else:
             pytest.fail("Expected AdmissionError")
 
+    def test_constructor_invalid_hides_raw(self):
+        """Direct constructor also hides the raw invalid UUID."""
+        secret_uuid = "th1s-1s-4-s3cr3t-1d-1234567890ab"
+        try:
+            RequestIdentity(secret_uuid)
+        except AdmissionError as exc:
+            assert secret_uuid not in str(exc)
+            assert secret_uuid not in repr(exc)
+            assert not any(
+                getattr(exc, attr, None) == secret_uuid
+                for attr in dir(exc)
+                if not attr.startswith("_")
+            )
+            assert exc.code == "invalid_request_id"
+        else:
+            pytest.fail("Expected AdmissionError")
+
     def test_valid_identity_has_no_exception(self):
-        # Happy path: parsing succeeds, no exception
         ident = RequestIdentity.parse("550e8400-e29b-41d4-a716-446655440000")
         assert ident.request_id == "550e8400-e29b-41d4-a716-446655440000"
 
@@ -474,14 +552,10 @@ class TestErrorHidesSensitiveData:
 # ═══════════════════════════════════════════════════════════════════════
 
 class TestImmutability:
-    """Verify that no shared mutable state exists."""
-
     def test_admission_config_is_independent(self):
         c1 = AdmissionConfig()
         c2 = AdmissionConfig()
         assert c1 == c2
-        # Both are frozen, so they cannot be mutated; no shared object
-        # inside can be mutated either (all fields are ints / str).
 
     def test_request_identity_is_frozen(self):
         ident = RequestIdentity.parse("550e8400-e29b-41d4-a716-446655440000")
@@ -489,14 +563,11 @@ class TestImmutability:
             ident.request_id = "other"  # type: ignore[assignment]
 
     def test_no_module_level_mutable_defaults(self):
-        # ``AdmissionError`` defaults are all zero / empty, not mutables
         exc = AdmissionError("test")
         assert exc.code == "test"
         assert exc.actual_chars == 0
         assert exc.actual_units == 0
 
     def test_functions_are_pure(self):
-        # Calling estimate_text_units twice on same input returns same result
         assert estimate_text_units("hello") == 5
         assert estimate_text_units("hello") == 5
-        # No side effects observable

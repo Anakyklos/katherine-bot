@@ -24,7 +24,8 @@ Usage::
         AdmissionConfig,
     )
 
-    identity = RequestIdentity.parse("550e8400-e29b-41d4-a716-446655440000")
+    identity = RequestIdentity("550e8400-e29b-41d4-a716-446655440000")
+    identity = RequestIdentity.parse("550E8400-E29B-41D4-A716-446655440000")
     units = estimate_text_units("Hello, world!")
     validate_new_message("Hello!")   # raises AdmissionError on failure
 """
@@ -176,35 +177,55 @@ def _validate_canonical_uuid(raw: str) -> str:
     return normalized
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, init=False)
 class RequestIdentity:
     """Immutable, validated request identity.
 
-    The ``.request_id`` attribute holds the normalised canonical UUID string
-    (lowercase, with hyphens).  No UUID is generated automatically, and
+    Every instance is guaranteed to hold a validated, normalised canonical
+    UUID string — it is **impossible** to construct an invalid identity,
+    whether via the direct constructor or via ``.parse()``.
+
+    The ``.request_id`` attribute holds the normalised lowercase form
+    (8-4-4-4-12 with hyphens).  No UUID is generated automatically, and
     the identity is not associated with any user.
+
+    Because ``init=False``, there is no auto-generated ``__init__``; the
+    custom ``__init__`` validates before the attribute is stored, so an
+    invalid input can never leak into ``str()``, ``repr()``, or any public
+    attribute of a constructed instance.
 
     Usage::
 
-        identity = RequestIdentity.parse("550e8400-e29b-41d4-a716-446655440000")
+        identity = RequestIdentity("550e8400-e29b-41d4-a716-446655440000")
+        identity = RequestIdentity.parse("550E8400-E29B-41D4-A716-446655440000")
         assert identity.request_id == "550e8400-e29b-41d4-a716-446655440000"
     """
 
     request_id: str
 
-    @staticmethod
-    def parse(raw: str) -> RequestIdentity:
-        """Parse and validate a request ID from a raw string.
+    def __init__(self, raw: str) -> None:
+        """Construct and validate a request identity.
 
-        Raises ``AdmissionError(code="invalid_request_id")`` if the value
-        is not a valid canonical UUID.  The invalid value is **never**
-        exposed in the exception, its ``str()``, ``repr()``, or any public
-        attribute.
+        Raises ``AdmissionError(code="invalid_request_id")`` if *raw* is
+        not a valid canonical UUID.  The invalid input is **never** exposed
+        in the exception, its ``str()``, ``repr()``, or any public attribute.
         """
         if not isinstance(raw, str):
             raise AdmissionError(code="invalid_request_id")
         normalized = _validate_canonical_uuid(raw)
-        return RequestIdentity(request_id=normalized)
+        # Frozen dataclass requires object.__setattr__ for direct field writes.
+        object.__setattr__(self, "request_id", normalized)
+
+    @staticmethod
+    def parse(raw: str) -> RequestIdentity:
+        """Parse and validate a request ID from a raw string.
+
+        This is a named alternative to the direct constructor.  Both paths
+        enforce the identical invariant::
+
+            RequestIdentity.parse(s) == RequestIdentity(s)
+        """
+        return RequestIdentity(raw)
 
 
 # ---------------------------------------------------------------------------
