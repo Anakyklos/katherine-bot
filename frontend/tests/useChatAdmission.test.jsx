@@ -140,4 +140,28 @@ describe('useChat admission identity', () => {
         expect(result.current.isLoading).toBe(false);
         expect(result.current.input).toBe('hello');
     });
+
+    it('does not let late history overwrite a local Web Crypto failure', async () => {
+        let resolveHistory;
+        mockApiGet.mockReturnValue(new Promise(resolve => { resolveHistory = resolve; }));
+        vi.stubGlobal('crypto', {});
+        const { result } = renderHook(() => useChat());
+
+        await waitFor(() => expect(mockApiGet).toHaveBeenCalledTimes(1));
+        await act(async () => { result.current.setInput('hello'); });
+        await act(async () => { await result.current.handleSend(); });
+
+        await act(async () => {
+            resolveHistory({ data: [{ role: 'user', content: 'stale history' }] });
+        });
+        await act(async () => {});
+
+        expect(result.current.messages).toEqual([
+            {
+                role: 'system',
+                content: SYSTEM_MESSAGES.REQUEST_ID_UNAVAILABLE,
+            },
+        ]);
+        expect(result.current.input).toBe('hello');
+    });
 });
