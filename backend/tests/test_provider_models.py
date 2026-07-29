@@ -3,7 +3,7 @@ Behavioral tests for ``backend/provider_models.py`` and its integration into
 ``ConversationEngine`` (appraisal, generation, archival extraction).
 
 Coverage map (13 behavioural requirements):
-─────────────────────────────────────────────────────────────────────────────
+──────────────────────────────────────────────────────────────────────────────
  1. Pure importability — no FastAPI, Groq, Supabase, sentence_transformers,
     env vars, network, or ConversationEngine.
  2. Configuration is immutable (frozen dataclass).
@@ -27,11 +27,14 @@ Coverage map (13 behavioural requirements):
 from __future__ import annotations
 
 import asyncio
+import builtins
 import io
 import json
 import logging
 import os
+import socket
 import sys
+import time
 from unittest.mock import MagicMock, AsyncMock, patch
 
 import pytest
@@ -39,9 +42,102 @@ import pytest
 from backend.engine import ConversationEngine
 from backend.groq_manager import GroqRequestError
 from backend.turn_execution import (
-    TurnExecutionError,
+    TurnExecutionConfig,
     TurnErrorCode,
+    TurnExecutionError,
+    create_budget,
 )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Helpers — defined before test classes so they are available everywhere
+# ═══════════════════════════════════════════════════════════════════════════════
+
+FIXED_CLOCK = 1_700_000_000.0
+
+
+def _make_engine(archival_extraction_enabled=False, clock=FIXED_CLOCK):
+    """Create a ConversationEngine with fully mocked dependencies.
+
+    Patches ``__init__`` on ``GroqClientManager`` and ``MemoryManager``
+    **before** construction so no real Groq client, Supabase client, or
+    SentenceTransformer model is ever instantiated.  The patch operates
+    on the class object directly (not a module reference), so it works
+    reliably regardless of import order or namespace package quirks.
+
+    After construction, specific attributes used by tests are replaced
+    with MagicMock / AsyncMock for test control.
+    """
+    from backend.groq_manager import GroqClientManager
+    from backend.memory import MemoryManager
+
+    _orig_groq_init = GroqClientManager.__init__
+    _orig_mem_init = MemoryManager.__init__
+    _orig_mem_st = None
+
+    # Patch SentenceTransformer on the memory module so MemoryManager.__init__
+    # never loads the real model.
+    import backend.memory as memory_module
+    _orig_mem_st = memory_module.SentenceTransformer
+
+    try:
+        GroqClientManager.__init__ = MagicMock(return_value=None)
+        MemoryManager.__init__ = MagicMock(return_value=None)
+        memory_module.SentenceTransformer = MagicMock()
+
+        engine = ConversationEngine(
+            clock=lambda: clock,
+            archival_extraction_enabled=archival_extraction_enabled,
+        )
+    finally:
+        GroqClientManager.__init__ = _orig_groq_init
+        MemoryManager.__init__ = _orig_mem_init
+        if _orig_mem_st is not None:
+            memory_module.SentenceTransformer = _orig_mem_st
+
+    # ---- Memory manager mocks ----
+    engine.memory_manager.load_user_state = MagicMock(return_value={
+        "emotional_state": {
+            "pleasure": 0.0, "arousal": 0.0, "dominance": 0.0,
+            "libido": 0.0, "aggression": 0.0, "connection": 0.5,
+            "energy": 0.8, "tension": 0.0, "coping_mode": "HEALTHY",
+            "last_update": clock,
+        },
+    })
+    engine.memory_manager.sync_state = MagicMock()
+    engine.memory_manager.save_turn = MagicMock()
+    engine.memory_manager.get_context = MagicMock(return_value="[mocked context]")
+    engine.memory_manager.load_recent_history = MagicMock(return_value=[])
+
+    # ---- Groq manager mocks ----
+    sync_m = MagicMock()
+    sync_m.choices = [MagicMock()]
+    sync_m.choices[0].message.content = "Hi"
+    engine.groq_manager.chat_completion = MagicMock(return_value=sync_m)
+    engine.groq_manager.chat_completion_async = AsyncMock()
+
+    return engine
+
+
+def _mock_async_result(content: str):
+    """Create a MagicMock that resembles a Groq async completion response."""
+    mock_resp = MagicMock()
+    mock_resp.choices = [MagicMock()]
+    mock_resp.choices[0].message.content = content
+    return mock_resp
+
+
+def _inject_ok_turn(engine):
+    """Set up ``chat_completion_async`` with two valid responses
+    (appraisal + generation) so a full turn succeeds.
+    """
+    engine.groq_manager.chat_completion_async.side_effect = [
+        _mock_async_result(json.dumps({
+            "valence": 0.2, "arousal_shift": 0.1, "dominance_shift": 0.0,
+            "triggered_emotions": {"joy": 0.5},
+        })),
+        _mock_async_result("Hi there!"),
+    ]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -53,11 +149,10 @@ class TestPureImportability:
 
     def test_importable_without_heavy_deps(self):
         """Import provider_models using an import hook that blocks heavy deps."""
-        import builtins
         original_import = builtins.__import__
         blocked = {"fastapi", "groq", "supabase", "sentence_transformers",
                    "httpx", "httpcore", "anyio", "websockets"}
-        hit_blocked = []
+        hit_blocked: list[str] = []
 
         def _blocking_import(name, *args, **kwargs):
             top = name.split(".")[0]
@@ -66,10 +161,8 @@ class TestPureImportability:
                 raise ImportError(f"blocked: {name}")
             return original_import(name, *args, **kwargs)
 
-        # The module may already be cached — force a clean reload
-        for mod in list(sys.modules.keys()):
-            if "provider_models" in mod:
-                del sys.modules[mod]
+        # Save and remove ONLY the module under test
+        saved = sys.modules.pop("backend.provider_models", None)
 
         builtins.__import__ = _blocking_import
         try:
@@ -80,49 +173,63 @@ class TestPureImportability:
             assert config.main_model_id == "openai/gpt-oss-120b"
         finally:
             builtins.__import__ = original_import
+            if saved is not None:
+                sys.modules["backend.provider_models"] = saved
+            elif "backend.provider_models" in sys.modules:
+                del sys.modules["backend.provider_models"]
 
-        # The blocked deps should never have been triggered during the import
         assert hit_blocked == [], f"Unexpected imports from blocked deps: {hit_blocked}"
 
     def test_importable_without_env(self):
         """provider_models does not read env vars."""
-        old = os.environ.pop("GROQ_API_KEY", None)
-        old2 = os.environ.pop("GROQ_API_KEY_2", None)
+        saved = sys.modules.pop("backend.provider_models", None)
+        old_key = os.environ.pop("GROQ_API_KEY", None)
+        old_key2 = os.environ.pop("GROQ_API_KEY_2", None)
         try:
-            for mod in list(sys.modules.keys()):
-                if "provider_models" in mod:
-                    del sys.modules[mod]
             from backend.provider_models import MAIN_MODEL_ID, FAST_MODEL_ID, ProviderConfig
             assert MAIN_MODEL_ID == "openai/gpt-oss-120b"
             assert FAST_MODEL_ID == "openai/gpt-oss-20b"
         finally:
-            if old is not None:
-                os.environ["GROQ_API_KEY"] = old
-            if old2 is not None:
-                os.environ["GROQ_API_KEY_2"] = old2
+            if saved is not None:
+                sys.modules["backend.provider_models"] = saved
+            elif "backend.provider_models" in sys.modules:
+                del sys.modules["backend.provider_models"]
+            if old_key is not None:
+                os.environ["GROQ_API_KEY"] = old_key
+            if old_key2 is not None:
+                os.environ["GROQ_API_KEY_2"] = old_key2
 
     def test_importable_without_network(self):
         """provider_models does not perform network calls."""
-        import socket
-        original = socket.socket
+        original_socket = socket.socket
+        saved = sys.modules.pop("backend.provider_models", None)
+
+        def _blocking_socket(*args, **kwargs):
+            raise OSError("network blocked")
+
+        socket.socket = _blocking_socket
         try:
-            socket.socket = MagicMock(side_effect=OSError("network blocked"))
-            for mod in list(sys.modules.keys()):
-                if "provider_models" in mod:
-                    del sys.modules[mod]
             from backend.provider_models import MAIN_MODEL_ID
             assert MAIN_MODEL_ID == "openai/gpt-oss-120b"
         finally:
-            socket.socket = original
+            socket.socket = original_socket
+            if saved is not None:
+                sys.modules["backend.provider_models"] = saved
+            elif "backend.provider_models" in sys.modules:
+                del sys.modules["backend.provider_models"]
 
     def test_importable_without_conversation_engine(self):
         """provider_models is importable without referencing ConversationEngine."""
-        for mod in list(sys.modules.keys()):
-            if "provider_models" in mod or "engine" in mod:
-                del sys.modules[mod]
-        from backend.provider_models import ProviderConfig
-        cfg = ProviderConfig()
-        assert cfg.main_model_id == "openai/gpt-oss-120b"
+        saved = sys.modules.pop("backend.provider_models", None)
+        try:
+            from backend.provider_models import ProviderConfig
+            cfg = ProviderConfig()
+            assert cfg.main_model_id == "openai/gpt-oss-120b"
+        finally:
+            if saved is not None:
+                sys.modules["backend.provider_models"] = saved
+            elif "backend.provider_models" in sys.modules:
+                del sys.modules["backend.provider_models"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -176,61 +283,25 @@ class TestSingleSourceOfTruth:
         assert "llama" not in MAIN_MODEL_ID
         assert "llama" not in FAST_MODEL_ID
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# Helpers
-# ═══════════════════════════════════════════════════════════════════════════════
-
-FIXED_CLOCK = 1_700_000_000.0
-
-
-def _make_engine(archival_extraction_enabled=False, clock=FIXED_CLOCK):
-    """Create a ConversationEngine with mocked dependencies.
-
-    After calling this, ``engine.groq_manager.chat_completion_async`` is an
-    ``AsyncMock`` ready for setting ``side_effect`` or ``return_value``.
-    """
-    engine = ConversationEngine(clock=lambda: clock, archival_extraction_enabled=archival_extraction_enabled)
-    engine.memory_manager.load_user_state = MagicMock(return_value={
-        "emotional_state": {
-            "pleasure": 0.0, "arousal": 0.0, "dominance": 0.0,
-            "libido": 0.0, "aggression": 0.0, "connection": 0.5,
-            "energy": 0.8, "tension": 0.0, "coping_mode": "HEALTHY",
-            "last_update": FIXED_CLOCK,
-        },
-    })
-    engine.memory_manager.sync_state = MagicMock()
-    engine.memory_manager.save_turn = MagicMock()
-    engine.memory_manager.get_context = MagicMock(return_value="[mocked context]")
-    engine.memory_manager.load_recent_history = MagicMock(return_value=[])
-    # Stub for sync path
-    sync_m = MagicMock()
-    sync_m.choices = [MagicMock()]
-    sync_m.choices[0].message.content = "Hi"
-    engine.groq_manager.chat_completion = MagicMock(return_value=sync_m)
-    # Replace async method with AsyncMock for test control
-    engine.groq_manager.chat_completion_async = AsyncMock()
-    return engine
-
-
-def _mock_async_result(content: str):
-    """Create a MagicMock that resembles a Groq async completion response."""
-    mock_resp = MagicMock()
-    mock_resp.choices = [MagicMock()]
-    mock_resp.choices[0].message.content = content
-    return mock_resp
-
-
-def _inject_ok_turn(engine):
-    """Set up ``chat_completion_async`` with two valid responses
-    (appraisal + generation) so a full turn succeeds."""
-    engine.groq_manager.chat_completion_async.side_effect = [
-        _mock_async_result(json.dumps({
-            "valence": 0.2, "arousal_shift": 0.1, "dominance_shift": 0.0,
-            "triggered_emotions": {"joy": 0.5},
-        })),
-        _mock_async_result("Hi there!"),
-    ]
+    def test_exact_numeric_output_token_limits(self):
+        """Module constants, dataclass defaults, and engine config all match exact values."""
+        from backend.provider_models import (
+            MAIN_MAX_OUTPUT_TOKENS, APPRAISAL_MAX_OUTPUT_TOKENS,
+            ARCHIVAL_MAX_OUTPUT_TOKENS, ProviderConfig,
+        )
+        # Module-level constants
+        assert MAIN_MAX_OUTPUT_TOKENS == 200
+        assert APPRAISAL_MAX_OUTPUT_TOKENS == 256
+        assert ARCHIVAL_MAX_OUTPUT_TOKENS == 512
+        # Dataclass defaults
+        assert ProviderConfig().main_max_output_tokens == 200
+        assert ProviderConfig().appraisal_max_output_tokens == 256
+        assert ProviderConfig().archival_max_output_tokens == 512
+        # Engine propagates
+        engine = _make_engine()
+        assert engine.provider_config.main_max_output_tokens == 200
+        assert engine.provider_config.appraisal_max_output_tokens == 256
+        assert engine.provider_config.archival_max_output_tokens == 512
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -238,20 +309,36 @@ def _inject_ok_turn(engine):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TestAppraisalParams:
-    """_appraise() must use the correct model, temperature, max_tokens, and JSON mode."""
+    """_appraise() must use the correct model, temperature, max_tokens, and JSON mode.
+
+    Tests call ``_appraise()`` **directly** rather than going through
+    ``process_turn()`` so the assertion path is unambiguous — no try/except
+    is needed because any unexpected exception will fail the test immediately.
+    """
+
+    @staticmethod
+    def _setup_appraisal(engine):
+        """Set a single valid appraisal response and return a TurnBudget."""
+        budget = create_budget(
+            TurnExecutionConfig.defaults(),
+            now_provider=lambda: time.monotonic(),
+        )
+        engine.groq_manager.chat_completion_async.side_effect = [
+            _mock_async_result(json.dumps({
+                "valence": 0.2, "arousal_shift": 0.1, "dominance_shift": 0.0,
+                "triggered_emotions": {"joy": 0.5},
+            })),
+        ]
+        return budget
 
     def test_appraisal_uses_fast_model(self):
         async def run():
             engine = _make_engine()
-            _inject_ok_turn(engine)
+            budget = self._setup_appraisal(engine)
 
-            try:
-                await engine.process_turn("user", "Hello")
-            except Exception:
-                pass
+            await engine._appraise("Hello", budget)
 
-            # First call is appraisal
-            assert engine.groq_manager.chat_completion_async.call_count >= 1
+            assert engine.groq_manager.chat_completion_async.call_count == 1
             params = engine.groq_manager.chat_completion_async.call_args_list[0][1]
             assert params["model"] == "openai/gpt-oss-20b"
             assert params["temperature"] == 0
@@ -263,14 +350,10 @@ class TestAppraisalParams:
     def test_appraisal_stage_label(self):
         async def run():
             engine = _make_engine()
-            _inject_ok_turn(engine)
+            budget = self._setup_appraisal(engine)
 
-            try:
-                await engine.process_turn("user", "Hello")
-            except Exception:
-                pass
+            await engine._appraise("Hello", budget)
 
-            assert engine.groq_manager.chat_completion_async.call_count >= 1
             params = engine.groq_manager.chat_completion_async.call_args_list[0][1]
             assert params["stage"] == "appraisal"
 
@@ -297,7 +380,7 @@ class TestGenerationParams:
             assert gen_params["model"] == "openai/gpt-oss-120b"
             assert gen_params["temperature"] == 0.8
             assert gen_params["max_tokens"] == engine.provider_config.main_max_output_tokens
-            assert "response_format" not in gen_params  # generation doesn't use JSON mode
+            assert "response_format" not in gen_params
 
         asyncio.run(run())
 
@@ -320,15 +403,13 @@ class TestGenerationParams:
 
 class TestArchivalExtractionParams:
     """run_archival_extraction() must use the correct model, temperature,
-    max_tokens, and JSON mode."""
+    max_tokens, and JSON mode.
+    """
 
     def test_archival_extraction_uses_fast_model(self):
-        """Verify run_archival_extraction sends the right model params by
-        calling it directly (it is a fire-and-forget background task normally)."""
         async def run():
             engine = _make_engine(archival_extraction_enabled=True)
 
-            # Set up a single call for archival extraction
             engine.groq_manager.chat_completion_async.side_effect = [
                 _mock_async_result(json.dumps({
                     "facts": [{"content": "User likes cats.", "importance": 0.7, "tags": ["interest"]}],
@@ -336,8 +417,9 @@ class TestArchivalExtractionParams:
                     "extractor_version": 1,
                 })),
             ]
-
-            engine.memory_manager.load_persisted_user_message = MagicMock(return_value="I love cats.")
+            engine.memory_manager.load_persisted_user_message = MagicMock(
+                return_value="I love cats."
+            )
             engine.memory_manager.store_archival_extraction = MagicMock()
 
             from backend.archival_memory import PersistedTurnRef
@@ -362,7 +444,6 @@ class TestArchivalExtractionParams:
 
             await engine.process_turn("user", "Hello")
 
-            # Only 2 calls: appraisal + generation
             assert engine.groq_manager.chat_completion_async.call_count == 2
 
         asyncio.run(run())
@@ -378,7 +459,6 @@ class TestValidAppraisalAccepted:
     def test_valid_appraisal_succeeds(self):
         async def run():
             engine = _make_engine()
-
             engine.groq_manager.chat_completion_async.side_effect = [
                 _mock_async_result(json.dumps({
                     "valence": 0.3, "arousal_shift": 0.1, "dominance_shift": -0.1,
@@ -389,7 +469,6 @@ class TestValidAppraisalAccepted:
 
             resp, emotions = await engine.process_turn("user", "You're amazing!")
             assert resp == "That's nice of you!"
-            # Public response has schema_version and pad attributes
             assert emotions.schema_version == 1
             assert emotions.mood_label is not None
 
@@ -493,8 +572,8 @@ class TestInvalidAppraisalFails:
 
 class TestArchivalExtractionBehaviour:
     """Archival extraction preserves existing parsing, validation, and
-    idempotency behaviour.  Tests call ``run_archival_extraction()`` directly
-    since it runs as a fire-and-forget background task in production."""
+    idempotency behaviour.
+    """
 
     VALID_EXTRACTION = json.dumps({
         "facts": [{"content": "User likes cats.", "importance": 0.8, "tags": ["pets"]}],
@@ -503,11 +582,12 @@ class TestArchivalExtractionBehaviour:
     })
 
     async def _run_archival(self, engine, content):
-        """Run run_archival_extraction directly with a single mock response."""
         engine.groq_manager.chat_completion_async.side_effect = [
             _mock_async_result(content),
         ]
-        engine.memory_manager.load_persisted_user_message = MagicMock(return_value="I love cats.")
+        engine.memory_manager.load_persisted_user_message = MagicMock(
+            return_value="I love cats."
+        )
         engine.memory_manager.store_archival_extraction = MagicMock()
 
         from backend.archival_memory import PersistedTurnRef
@@ -515,7 +595,6 @@ class TestArchivalExtractionBehaviour:
         await engine.run_archival_extraction(ref)
 
     def test_archival_extraction_valid(self):
-        """Valid archival extraction JSON is processed and stored."""
         async def run():
             engine = _make_engine(archival_extraction_enabled=True)
             await self._run_archival(engine, self.VALID_EXTRACTION)
@@ -524,7 +603,6 @@ class TestArchivalExtractionBehaviour:
         asyncio.run(run())
 
     def test_archival_extraction_invalid_json(self):
-        """Non-JSON response from archival extraction is handled gracefully."""
         async def run():
             engine = _make_engine(archival_extraction_enabled=True)
             await self._run_archival(engine, "not valid json")
@@ -533,7 +611,6 @@ class TestArchivalExtractionBehaviour:
         asyncio.run(run())
 
     def test_archival_extraction_validation_failure(self):
-        """Invalid envelope structure is handled gracefully."""
         async def run():
             engine = _make_engine(archival_extraction_enabled=True)
             await self._run_archival(engine, json.dumps({
@@ -549,8 +626,12 @@ class TestArchivalExtractionBehaviour:
         """Provider failure during archival extraction is logged, not fatal."""
         async def run():
             engine = _make_engine(archival_extraction_enabled=True)
-            engine.groq_manager.chat_completion_async.side_effect = RuntimeError("Provider failed")
-            engine.memory_manager.load_persisted_user_message = MagicMock(return_value="I love cats.")
+            engine.groq_manager.chat_completion_async.side_effect = RuntimeError(
+                "Provider failed"
+            )
+            engine.memory_manager.load_persisted_user_message = MagicMock(
+                return_value="I love cats."
+            )
             engine.memory_manager.store_archival_extraction = MagicMock()
 
             from backend.archival_memory import PersistedTurnRef
@@ -573,9 +654,6 @@ class TestProviderFailuresSanitised:
         async def run():
             engine = _make_engine()
 
-            # First call (appraisal) succeeds, second (generation) raises
-            # a GroqRequestError, which _generate() catches and maps to
-            # TurnExecutionError(provider_unavailable).
             engine.groq_manager.chat_completion_async.side_effect = [
                 _mock_async_result(json.dumps({
                     "valence": 0.0, "arousal_shift": 0.0, "dominance_shift": 0.0,
@@ -586,7 +664,6 @@ class TestProviderFailuresSanitised:
 
             with pytest.raises(TurnExecutionError) as exc_info:
                 await engine.process_turn("user", "Hello")
-            # Engine maps GroqRequestError to provider_unavailable
             assert exc_info.value.code == TurnErrorCode.provider_unavailable
 
         asyncio.run(run())
@@ -596,7 +673,6 @@ class TestProviderFailuresSanitised:
         async def run():
             engine = _make_engine()
 
-            # Unknown top-level key triggers fallback with sanitised logging.
             engine.groq_manager.chat_completion_async.side_effect = [
                 _mock_async_result(json.dumps({
                     "valence": 0.0, "arousal_shift": 0.0, "dominance_shift": 0.0,
@@ -619,7 +695,6 @@ class TestProviderFailuresSanitised:
             log_text = stream.getvalue()
             assert "event=emotional_appraisal_fallback" in log_text
             assert "code=" in log_text
-            # Sensitive marker must not leak into logs
             assert "SENSITIVE_EXTRA_KEY_92841" not in log_text
 
         asyncio.run(run())
@@ -633,7 +708,7 @@ class TestNoOldLlamaModels:
     """Deprecated Llama model IDs are not used anywhere in active paths."""
 
     def test_no_llama_models_in_config(self):
-        """Engine and ProviderConfig never reference deprecated Llama models."""
+        """ProviderConfig never references deprecated Llama models."""
         from backend.provider_models import MAIN_MODEL_ID, FAST_MODEL_ID
         assert MAIN_MODEL_ID == "openai/gpt-oss-120b"
         assert FAST_MODEL_ID == "openai/gpt-oss-20b"
@@ -641,8 +716,8 @@ class TestNoOldLlamaModels:
         assert "llama" not in FAST_MODEL_ID
 
     def test_no_fallback_to_old_models_in_engine(self):
-        """Ensure engine does not have fallback variables for old models."""
-        engine = ConversationEngine(clock=lambda: FIXED_CLOCK)
+        """Engine does not have fallback attributes for old models."""
+        engine = _make_engine()
         assert not hasattr(engine, "model_main")
         assert not hasattr(engine, "model_fast")
         assert engine.provider_config.main_model_id == "openai/gpt-oss-120b"
@@ -650,7 +725,7 @@ class TestNoOldLlamaModels:
 
     def test_engine_provider_config_has_no_llama(self):
         """The active model IDs from the engine's provider_config never contain 'llama'."""
-        engine = ConversationEngine(clock=lambda: FIXED_CLOCK)
+        engine = _make_engine()
         main_id = engine.provider_config.main_model_id
         fast_id = engine.provider_config.fast_model_id
         assert "llama" not in main_id
@@ -664,10 +739,17 @@ class TestNoOldLlamaModels:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TestNoExternalServices:
-    """All tests use mocks; no real Groq, Supabase, or embeddings."""
+    """All tests use mocks; no real Groq, Supabase, or embeddings.
+
+    These tests use ``with patch(...)`` **around** ``ConversationEngine()`` to
+    verify isolation rather than relying on ``_make_engine()``, because
+    ``_make_engine`` replaces specific attributes after construction and does
+    not guarantee that the manager class is patched (import order can affect
+    whether ``patch`` sees the same module identity).
+    """
 
     def test_all_engine_deps_are_mocked_here(self):
-        """Smoke: the _make_engine helper creates a fully mocked engine."""
+        """_make_engine creates an engine whose deps are Mock instances."""
         engine = _make_engine()
         assert isinstance(engine.groq_manager.chat_completion, MagicMock)
         assert isinstance(engine.groq_manager.chat_completion_async, AsyncMock)
@@ -675,6 +757,24 @@ class TestNoExternalServices:
         assert isinstance(engine.memory_manager.sync_state, MagicMock)
         assert isinstance(engine.memory_manager.save_turn, MagicMock)
         assert isinstance(engine.memory_manager.get_context, MagicMock)
+
+    def test_sentence_transformer_not_loaded(self):
+        """Verify SentenceTransformer constructor is never called during engine setup.
+
+        Uses an explicit guard on ``backend.memory.SentenceTransformer``
+        that raises if the real constructor is invoked.  ``_make_engine``
+        patches ``SentenceTransformer`` before constructing the engine,
+        so the guard should never fire.
+        """
+        from backend import memory as memory_module
+        original = memory_module.SentenceTransformer
+        try:
+            memory_module.SentenceTransformer = MagicMock(
+                side_effect=RuntimeError("SentenceTransformer constructed!")
+            )
+            engine = _make_engine()
+        finally:
+            memory_module.SentenceTransformer = original
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
