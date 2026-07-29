@@ -203,7 +203,7 @@ class TestStructuralValidation:
 class TestBudgetLimits:
     """Budget enforcement at the 16 000-unit boundary."""
 
-    def test_exactly_16000_accepted(self):
+    def test_under_16000_accepted(self):
         # Build a messages list whose estimated input units fit within 16000
         # The JSON for [{"content":"...","role":"user"}] adds ~32 bytes overhead.
         # Content of 15900 ASCII chars should produce ~15932 units < 16000.
@@ -213,15 +213,6 @@ class TestBudgetLimits:
         assert units < 16000, f"Expected < 16000, got {units}"
         # Must not raise
         validate_provider_input(messages, max_units=16000)
-
-    def test_16001_rejected(self):
-        # Content that exceeds 16000 units
-        content = "x" * 20000
-        messages = [{"role": "user", "content": content}]
-        with pytest.raises(ProviderEnvelopeError) as excinfo:
-            validate_provider_input(messages, max_units=16000)
-        assert excinfo.value.code == "budget_exceeded"
-        assert excinfo.value.actual_units > 16000
 
     def test_large_content_rejected(self):
         content = "x" * 20000
