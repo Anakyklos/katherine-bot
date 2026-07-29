@@ -116,7 +116,7 @@ class ConversationEngine:
             chat_completion = await self.groq_manager.chat_completion_async(
                 messages=[{"role": "user", "content": prompt}],
                 model=self.provider_config.fast_model_id, budget=budget, stage="archival_extraction",
-                temperature=0.0, max_tokens=512, response_format={"type": "json_object"},
+                temperature=0.0, max_tokens=self.provider_config.archival_max_output_tokens, response_format={"type": "json_object"},
             )
             response_text = chat_completion.choices[0].message.content
         except Exception:
@@ -524,7 +524,7 @@ class ConversationEngine:
             response = await self.groq_manager.chat_completion_async(
                 messages=[{"role": "user", "content": prompt}],
                 model=self.provider_config.fast_model_id, budget=budget, stage="appraisal",
-                temperature=0, max_tokens=256, response_format={"type": "json_object"},
+                temperature=0, max_tokens=self.provider_config.appraisal_max_output_tokens, response_format={"type": "json_object"},
             )
             raw = response.choices[0].message.content
             if not raw or not isinstance(raw, str) or not raw.strip():
@@ -548,7 +548,7 @@ class ConversationEngine:
             response = await self.groq_manager.chat_completion_async(
                 messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_message}],
                 model=self.provider_config.main_model_id, budget=budget, stage="generation",
-                temperature=0.8, max_tokens=200,
+                temperature=0.8, max_tokens=self.provider_config.main_max_output_tokens,
             )
         except GroqPoolExhaustedError:
             raise

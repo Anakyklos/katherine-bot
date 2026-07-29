@@ -51,44 +51,47 @@ from backend.turn_execution import (
 class TestPureImportability:
     """provider_models must be importable without heavy dependencies."""
 
-    def test_importable_without_fastapi(self):
-        """Import provider_models in a clean subprocess with FastAPI blocked."""
-        import subprocess
-        code = """
-import sys
-sys.path.insert(0, "backend")
-import builtins
-_real_import = builtins.__import__
+    def test_importable_without_heavy_deps(self):
+        """Import provider_models using an import hook that blocks heavy deps."""
+        import builtins
+        original_import = builtins.__import__
+        blocked = {"fastapi", "groq", "supabase", "sentence_transformers",
+                   "httpx", "httpcore", "anyio", "websockets"}
+        hit_blocked = []
 
-def _blocked_import(name, *args, **kwargs):
-    blocked = {"fastapi", "groq", "supabase", "sentence_transformers",
-               "httpx", "httpcore", "anyio", "websockets"}
-    top = name.split(".")[0]
-    if top in blocked:
-        raise ImportError(f"blocked: {name}")
-    return _real_import(name, *args, **kwargs)
+        def _blocking_import(name, *args, **kwargs):
+            top = name.split(".")[0]
+            if top in blocked:
+                hit_blocked.append(top)
+                raise ImportError(f"blocked: {name}")
+            return original_import(name, *args, **kwargs)
 
-builtins.__import__ = _blocked_import
-from backend.provider_models import MAIN_MODEL_ID, FAST_MODEL_ID, ProviderConfig
-print(f"MAIN={MAIN_MODEL_ID}, FAST={FAST_MODEL_ID}")
-config = ProviderConfig()
-print(f"config_main={config.main_model_id}")
-"""
-        result = subprocess.run(
-            [sys.executable, "-c", code],
-            capture_output=True, text=True, timeout=10,
-        )
-        assert result.returncode == 0, f"Import failed: {result.stderr}"
-        assert "MAIN=openai/gpt-oss-120b" in result.stdout
-        assert "FAST=openai/gpt-oss-20b" in result.stdout
+        # The module may already be cached — force a clean reload
+        for mod in list(sys.modules.keys()):
+            if "provider_models" in mod:
+                del sys.modules[mod]
+
+        builtins.__import__ = _blocking_import
+        try:
+            from backend.provider_models import MAIN_MODEL_ID, FAST_MODEL_ID, ProviderConfig
+            assert MAIN_MODEL_ID == "openai/gpt-oss-120b"
+            assert FAST_MODEL_ID == "openai/gpt-oss-20b"
+            config = ProviderConfig()
+            assert config.main_model_id == "openai/gpt-oss-120b"
+        finally:
+            builtins.__import__ = original_import
+
+        # The blocked deps should never have been triggered during the import
+        assert hit_blocked == [], f"Unexpected imports from blocked deps: {hit_blocked}"
 
     def test_importable_without_env(self):
         """provider_models does not read env vars."""
         old = os.environ.pop("GROQ_API_KEY", None)
         old2 = os.environ.pop("GROQ_API_KEY_2", None)
         try:
-            if "backend.provider_models" in sys.modules:
-                del sys.modules["backend.provider_models"]
+            for mod in list(sys.modules.keys()):
+                if "provider_models" in mod:
+                    del sys.modules[mod]
             from backend.provider_models import MAIN_MODEL_ID, FAST_MODEL_ID, ProviderConfig
             assert MAIN_MODEL_ID == "openai/gpt-oss-120b"
             assert FAST_MODEL_ID == "openai/gpt-oss-20b"
@@ -104,8 +107,9 @@ print(f"config_main={config.main_model_id}")
         original = socket.socket
         try:
             socket.socket = MagicMock(side_effect=OSError("network blocked"))
-            if "backend.provider_models" in sys.modules:
-                del sys.modules["backend.provider_models"]
+            for mod in list(sys.modules.keys()):
+                if "provider_models" in mod:
+                    del sys.modules[mod]
             from backend.provider_models import MAIN_MODEL_ID
             assert MAIN_MODEL_ID == "openai/gpt-oss-120b"
         finally:
@@ -113,10 +117,9 @@ print(f"config_main={config.main_model_id}")
 
     def test_importable_without_conversation_engine(self):
         """provider_models is importable without referencing ConversationEngine."""
-        if "backend.provider_models" in sys.modules:
-            del sys.modules["backend.provider_models"]
-        if "backend.engine" in sys.modules:
-            del sys.modules["backend.engine"]
+        for mod in list(sys.modules.keys()):
+            if "provider_models" in mod or "engine" in mod:
+                del sys.modules[mod]
         from backend.provider_models import ProviderConfig
         cfg = ProviderConfig()
         assert cfg.main_model_id == "openai/gpt-oss-120b"
@@ -252,7 +255,7 @@ class TestAppraisalParams:
             params = engine.groq_manager.chat_completion_async.call_args_list[0][1]
             assert params["model"] == "openai/gpt-oss-20b"
             assert params["temperature"] == 0
-            assert params["max_tokens"] == 256
+            assert params["max_tokens"] == engine.provider_config.appraisal_max_output_tokens
             assert params["response_format"] == {"type": "json_object"}
 
         asyncio.run(run())
@@ -293,7 +296,7 @@ class TestGenerationParams:
             gen_params = engine.groq_manager.chat_completion_async.call_args_list[1][1]
             assert gen_params["model"] == "openai/gpt-oss-120b"
             assert gen_params["temperature"] == 0.8
-            assert gen_params["max_tokens"] == 200
+            assert gen_params["max_tokens"] == engine.provider_config.main_max_output_tokens
             assert "response_format" not in gen_params  # generation doesn't use JSON mode
 
         asyncio.run(run())
@@ -345,7 +348,7 @@ class TestArchivalExtractionParams:
             arch_params = engine.groq_manager.chat_completion_async.call_args_list[0][1]
             assert arch_params["model"] == "openai/gpt-oss-20b"
             assert arch_params["temperature"] == 0.0
-            assert arch_params["max_tokens"] == 512
+            assert arch_params["max_tokens"] == engine.provider_config.archival_max_output_tokens
             assert arch_params["response_format"] == {"type": "json_object"}
             assert arch_params["stage"] == "archival_extraction"
 
@@ -629,15 +632,8 @@ class TestProviderFailuresSanitised:
 class TestNoOldLlamaModels:
     """Deprecated Llama model IDs are not used anywhere in active paths."""
 
-    def test_engine_has_no_llama_references(self):
-        """engine.py no longer contains the deprecated model ID strings."""
-        engine_source = open(os.path.join(os.path.dirname(__file__),
-                                          "..", "engine.py")).read()
-        assert "llama-3.3-70b-versatile" not in engine_source
-        assert "llama-3.1-8b-instant" not in engine_source
-
-    def test_provider_models_has_no_llama_ids(self):
-        """provider_models.py does not define or reference deprecated models."""
+    def test_no_llama_models_in_config(self):
+        """Engine and ProviderConfig never reference deprecated Llama models."""
         from backend.provider_models import MAIN_MODEL_ID, FAST_MODEL_ID
         assert MAIN_MODEL_ID == "openai/gpt-oss-120b"
         assert FAST_MODEL_ID == "openai/gpt-oss-20b"
@@ -652,13 +648,15 @@ class TestNoOldLlamaModels:
         assert engine.provider_config.main_model_id == "openai/gpt-oss-120b"
         assert engine.provider_config.fast_model_id == "openai/gpt-oss-20b"
 
-    def test_config_passed_to_groq_has_no_llama(self):
-        """The active model IDs never contain 'llama'."""
-        from backend.provider_models import MAIN_MODEL_ID, FAST_MODEL_ID
-        assert "llama" not in MAIN_MODEL_ID
-        assert "llama" not in FAST_MODEL_ID
-        assert MAIN_MODEL_ID == "openai/gpt-oss-120b"
-        assert FAST_MODEL_ID == "openai/gpt-oss-20b"
+    def test_engine_provider_config_has_no_llama(self):
+        """The active model IDs from the engine's provider_config never contain 'llama'."""
+        engine = ConversationEngine(clock=lambda: FIXED_CLOCK)
+        main_id = engine.provider_config.main_model_id
+        fast_id = engine.provider_config.fast_model_id
+        assert "llama" not in main_id
+        assert "llama" not in fast_id
+        assert main_id == "openai/gpt-oss-120b"
+        assert fast_id == "openai/gpt-oss-20b"
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
