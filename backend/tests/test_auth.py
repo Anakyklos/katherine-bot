@@ -4,6 +4,13 @@ import logging
 import pytest
 from unittest.mock import patch, MagicMock, ANY
 
+REQUEST_ID = "550e8400-e29b-41d4-a716-446655440000"
+
+
+def _chat_payload(message, **extra):
+    return {"request_id": REQUEST_ID, "message": message, **extra}
+
+
 @pytest.fixture(autouse=True, scope="module")
 def mock_external_dependencies():
     _original_modules = dict(sys.modules)
@@ -12,7 +19,9 @@ def mock_external_dependencies():
     mock_env = {
         'GROQ_API_KEY': 'mock_key',
         'SUPABASE_URL': 'http://mock',
-        'SUPABASE_SERVICE_ROLE_KEY': 'mock_key'
+        'SUPABASE_SERVICE_ROLE_KEY': 'mock_key',
+        'ADMISSION_HMAC_SECRET': 'test-admission-secret-that-is-at-least-32-bytes',
+        'TRUSTED_PROXY_CIDRS': '',
     }
     os.environ.update(mock_env)
 
@@ -51,11 +60,16 @@ def client_app(mock_external_dependencies):
     from backend.main import app
     return TestClient(app)
 
+
 @pytest.fixture
 def mock_supabase():
     from backend.main import engine
     with patch.object(engine.memory_manager, 'supabase', MagicMock()) as mock_sb:
+        mock_sb.rpc.return_value.execute.return_value.data = [
+            {"decision": "admitted", "retry_after_seconds": 0}
+        ]
         yield mock_sb
+
 
 @pytest.fixture
 def mock_engine_process():
@@ -71,18 +85,22 @@ def mock_engine_process():
     with patch.object(engine, 'process_turn', return_value=("Mock response", fake_emotion)) as mock_process:
         yield mock_process
 
+
 class MockUser:
     def __init__(self, id):
         self.id = id
+
 
 class MockAuthResponse:
     def __init__(self, user):
         self.user = user
 
+
 from supabase_auth.errors import AuthApiError, AuthRetryableError
 
+
 def test_missing_token(client_app, mock_supabase, mock_engine_process):
-    response = client_app.post("/chat", json={"message": "Hello"})
+    response = client_app.post("/chat", json=_chat_payload("Hello"))
     assert response.status_code == 401
     assert "Not authenticated" in response.json()["detail"]
     assert response.headers.get("WWW-Authenticate") == "Bearer"
@@ -94,10 +112,11 @@ def test_missing_token(client_app, mock_supabase, mock_engine_process):
     mock_engine_process.assert_not_called()
     mock_supabase.table.assert_not_called()
 
+
 def test_invalid_scheme(client_app, mock_supabase, mock_engine_process):
     response = client_app.post(
         "/chat",
-        json={"message": "Hello"},
+        json=_chat_payload("Hello"),
         headers={"Authorization": "Basic x"}
     )
     assert response.status_code == 401
@@ -105,12 +124,13 @@ def test_invalid_scheme(client_app, mock_supabase, mock_engine_process):
     mock_engine_process.assert_not_called()
     mock_supabase.table.assert_not_called()
 
+
 def test_invalid_token(client_app, mock_supabase, mock_engine_process):
     mock_supabase.auth.get_user.side_effect = AuthApiError("Internal Mock JWT SDK Error", 400, "")
 
     response = client_app.post(
         "/chat",
-        json={"message": "Hello"},
+        json=_chat_payload("Hello"),
         headers={"Authorization": "Bearer invalid_token"}
     )
     assert response.status_code == 401
@@ -121,6 +141,7 @@ def test_invalid_token(client_app, mock_supabase, mock_engine_process):
     mock_engine_process.assert_not_called()
     mock_supabase.table.assert_not_called()
 
+
 def test_user_is_none(client_app, mock_supabase, mock_engine_process):
     mock_supabase.auth.get_user.return_value = MockAuthResponse(user=None)
     response = client_app.get("/history", headers={"Authorization": "Bearer token"})
@@ -130,14 +151,20 @@ def test_user_is_none(client_app, mock_supabase, mock_engine_process):
     mock_engine_process.assert_not_called()
     mock_supabase.table.assert_not_called()
 
+
 def test_service_unavailable(client_app, mock_supabase, mock_engine_process):
     from backend.main import engine
     with patch.object(engine.memory_manager, 'supabase', None):
-        response = client_app.post("/chat", json={"message": "Hi"}, headers={"Authorization": "Bearer t"})
+        response = client_app.post(
+            "/chat",
+            json=_chat_payload("Hi"),
+            headers={"Authorization": "Bearer t"},
+        )
         assert response.status_code == 503
         assert response.json()["detail"] == "Authentication service unavailable"
         mock_engine_process.assert_not_called()
     mock_supabase.table.assert_not_called()
+
 
 def test_valid_token(client_app, mock_supabase, mock_engine_process):
     mock_user = MockUser(id="user123")
@@ -145,13 +172,14 @@ def test_valid_token(client_app, mock_supabase, mock_engine_process):
 
     response = client_app.post(
         "/chat",
-        json={"message": "Hello"},
+        json=_chat_payload("Hello"),
         headers={"Authorization": "Bearer valid_token"}
     )
 
     assert response.status_code == 200
     assert response.json()["response"] == "Mock response"
-    mock_engine_process.assert_called_once_with("user123", "Hello", ANY)
+    mock_engine_process.assert_called_once_with("user123", "Hello", ANY, budget=ANY)
+
 
 def test_spoofing_user_id_in_chat(client_app, mock_supabase, mock_engine_process):
     mock_user = MockUser(id="user123")
@@ -159,13 +187,15 @@ def test_spoofing_user_id_in_chat(client_app, mock_supabase, mock_engine_process
 
     response = client_app.post(
         "/chat",
-        json={"user_id": "other_user", "message": "Hello"},
+        json=_chat_payload("Hello", user_id="other_user"),
         headers={"Authorization": "Bearer valid_token"}
     )
 
     assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "invalid_request"
     mock_engine_process.assert_not_called()
     mock_supabase.table.assert_not_called()
+
 
 def test_history_valid_token(client_app, mock_supabase):
     mock_user = MockUser(id="user123")
@@ -200,6 +230,7 @@ def test_history_valid_token(client_app, mock_supabase):
     # Verify that it strictly uses current_user.id
     mock_select.eq.assert_called_once_with("user_id", "user123")
 
+
 def test_history_legacy_route_removed(client_app, mock_supabase, mock_engine_process):
     mock_user = MockUser(id="user123")
     mock_supabase.auth.get_user.return_value = MockAuthResponse(user=mock_user)
@@ -211,6 +242,7 @@ def test_history_legacy_route_removed(client_app, mock_supabase, mock_engine_pro
 
     assert response.status_code == 404
 
+
 def test_credential_rejection_401(client_app, mock_supabase, mock_engine_process, caplog):
     error = AuthApiError("SENSITIVE_AUTH_MARKER", 400, "error_code")
     mock_supabase.auth.get_user.side_effect = error
@@ -218,7 +250,7 @@ def test_credential_rejection_401(client_app, mock_supabase, mock_engine_process
     with caplog.at_level(logging.ERROR):
         response = client_app.post(
             "/chat",
-            json={"message": "Hello"},
+            json=_chat_payload("Hello"),
             headers={"Authorization": "Bearer invalid_token"}
         )
 
@@ -229,6 +261,7 @@ def test_credential_rejection_401(client_app, mock_supabase, mock_engine_process
     mock_engine_process.assert_not_called()
     mock_supabase.table.assert_not_called()
 
+
 def test_transport_timeout_503(client_app, mock_supabase, mock_engine_process, caplog):
     error = AuthRetryableError("SENSITIVE_AUTH_MARKER_TIMEOUT", 503)
     mock_supabase.auth.get_user.side_effect = error
@@ -236,7 +269,7 @@ def test_transport_timeout_503(client_app, mock_supabase, mock_engine_process, c
     with caplog.at_level(logging.ERROR):
         response = client_app.post(
             "/chat",
-            json={"message": "Hello"},
+            json=_chat_payload("Hello"),
             headers={"Authorization": "Bearer some_token"}
         )
 
@@ -246,6 +279,7 @@ def test_transport_timeout_503(client_app, mock_supabase, mock_engine_process, c
     assert "SENSITIVE_AUTH_MARKER" not in response.text
     mock_engine_process.assert_not_called()
     mock_supabase.table.assert_not_called()
+
 
 def test_service_error_5xx(client_app, mock_supabase, mock_engine_process, caplog):
     error = AuthApiError("SENSITIVE_AUTH_MARKER_500", 500, "error_code")
@@ -254,7 +288,7 @@ def test_service_error_5xx(client_app, mock_supabase, mock_engine_process, caplo
     with caplog.at_level(logging.ERROR):
         response = client_app.post(
             "/chat",
-            json={"message": "Hello"},
+            json=_chat_payload("Hello"),
             headers={"Authorization": "Bearer some_token"}
         )
 
@@ -265,6 +299,7 @@ def test_service_error_5xx(client_app, mock_supabase, mock_engine_process, caplo
     mock_engine_process.assert_not_called()
     mock_supabase.table.assert_not_called()
 
+
 def test_unexpected_error_503(client_app, mock_supabase, mock_engine_process, caplog):
     error = Exception("SENSITIVE_AUTH_MARKER_UNKNOWN")
     mock_supabase.auth.get_user.side_effect = error
@@ -272,7 +307,7 @@ def test_unexpected_error_503(client_app, mock_supabase, mock_engine_process, ca
     with caplog.at_level(logging.ERROR):
         response = client_app.post(
             "/chat",
-            json={"message": "Hello"},
+            json=_chat_payload("Hello"),
             headers={"Authorization": "Bearer some_token"}
         )
 
@@ -302,7 +337,7 @@ def test_http_chat_load_failure_sanitization(client_app, mock_supabase, caplog):
     with caplog.at_level(logging.ERROR):
         response = client_app.post(
             "/chat",
-            json={"message": "Hello"},
+            json=_chat_payload("Hello"),
             headers={"Authorization": "Bearer some_token"}
         )
 
@@ -340,7 +375,7 @@ def test_http_chat_persistence_failure_sanitization(client_app, mock_supabase, c
     with caplog.at_level(logging.ERROR):
         response = client_app.post(
             "/chat",
-            json={"message": "Hello"},
+            json=_chat_payload("Hello"),
             headers={"Authorization": "Bearer some_token"}
         )
 
@@ -351,33 +386,37 @@ def test_http_chat_persistence_failure_sanitization(client_app, mock_supabase, c
     assert "user123" not in response.text
     assert "user123" not in caplog.text
 
+
 def test_chat_message_exactly_at_limit(client_app, mock_supabase, mock_engine_process):
-    from backend.memory import MAX_MESSAGE_LENGTH
+    from backend.admission_contracts import NEW_MESSAGE_MAX_CHARS
     mock_user = MockUser(id="user123")
     mock_supabase.auth.get_user.return_value = MockAuthResponse(user=mock_user)
+    message = "a" * NEW_MESSAGE_MAX_CHARS
 
     response = client_app.post(
         "/chat",
-        json={"message": "a" * MAX_MESSAGE_LENGTH},
+        json=_chat_payload(message),
         headers={"Authorization": "Bearer valid_token"}
     )
 
     assert response.status_code == 200
     assert response.json()["response"] == "Mock response"
-    mock_engine_process.assert_called_once_with("user123", "a" * MAX_MESSAGE_LENGTH, ANY)
+    mock_engine_process.assert_called_once_with("user123", message, ANY, budget=ANY)
+
 
 def test_chat_message_exceeds_limit(client_app, mock_supabase, mock_engine_process):
-    from backend.memory import MAX_MESSAGE_LENGTH
+    from backend.admission_contracts import NEW_MESSAGE_MAX_CHARS
     mock_user = MockUser(id="user123")
     mock_supabase.auth.get_user.return_value = MockAuthResponse(user=mock_user)
 
     response = client_app.post(
         "/chat",
-        json={"message": "a" * (MAX_MESSAGE_LENGTH + 1)},
+        json=_chat_payload("a" * (NEW_MESSAGE_MAX_CHARS + 1)),
         headers={"Authorization": "Bearer valid_token"}
     )
 
     assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "message_too_long"
     mock_engine_process.assert_not_called()
 
 
