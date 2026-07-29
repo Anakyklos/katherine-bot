@@ -32,8 +32,8 @@ from .admission import (
     resolve_network_identity,
 )
 from .admission_contracts import AdmissionError, RequestIdentity, validate_new_message
+from .chat_engine import ChatConversationEngine
 from .emotion_presentation import EmotionStateResponse
-from .engine import ConversationEngine
 from .groq_manager import GroqPoolExhaustedError, GroqRequestError
 from .memory import StatePersistenceError
 from .turn_execution import (
@@ -79,7 +79,7 @@ _turn_config = TurnExecutionConfig.from_env()
 _admission_config = AdmissionRuntimeConfig.from_env()
 
 # Initialize Engine with containment-aware configuration
-engine = ConversationEngine(
+engine = ChatConversationEngine(
     archival_extraction_enabled=_archival_extraction_enabled,
     turn_config=_turn_config,
 )
