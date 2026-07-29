@@ -17,10 +17,6 @@ ALLOWED_OPS = frozenset({
     "legacy_baseline_reset",
     "legacy_hardening_apply",
     "legacy_state_query",
-    "admission_reset",
-    "admission_up",
-    "admission_query",
-    "admission_concurrent",
 })
 
 
