@@ -350,7 +350,7 @@ async def test_run_archival_extraction_disabled_returns_early(backend):
     engine.groq_manager.chat_completion.assert_not_called()
 
 
-def test_chat_response_format(client_app, mock_supabase):
+def test_chat_response_format(client_app, mock_supabase, monkeypatch):
     from backend.main import engine
     from backend.relationship import RelationshipStateV1
     
@@ -365,7 +365,7 @@ def test_chat_response_format(client_app, mock_supabase):
     
     from backend.emotion_presentation import EmotionStateResponse, PublicPAD, PublicDominantEmotion
     
-    # Mock process_turn to return valid EmotionStateResponse
+    # Mock process_turn to return valid EmotionStateResponse and restore it after the test.
     mock_emotion = EmotionStateResponse(
         schema_version=1,
         mood_label="NEUTRA",
@@ -375,7 +375,11 @@ def test_chat_response_format(client_app, mock_supabase):
         ],
         timestamp=1700000000.0,
     )
-    engine.process_turn = AsyncMock(return_value=("My response text", mock_emotion))
+    monkeypatch.setattr(
+        engine,
+        "process_turn",
+        AsyncMock(return_value=("My response text", mock_emotion)),
+    )
     
     response = client_app.post(
         "/chat",
