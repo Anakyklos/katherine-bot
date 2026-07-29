@@ -115,6 +115,7 @@ jobs:
 
   backend:
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
 
@@ -149,10 +150,13 @@ jobs:
           HF_HUB_OFFLINE: "1"
           TRANSFORMERS_OFFLINE: "1"
           PYTHONPATH: "."
+          PYTHONFAULTHANDLER: "1"
         run: |
-          python -m pytest backend/tests \
-            --ignore=backend/tests/test_database_authorization_integration.py \
-            --ignore=backend/tests/test_legacy_upgrade.py
+          timeout --signal=TERM --kill-after=30s 20m \
+            python -m pytest backend/tests \
+              --ignore=backend/tests/test_database_authorization_integration.py \
+              --ignore=backend/tests/test_legacy_upgrade.py \
+              -ra
 
   frontend:
     runs-on: ubuntu-latest

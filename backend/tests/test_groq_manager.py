@@ -82,20 +82,29 @@ def test_concurrent_access_no_corruption():
     )
     
     results = []
-    lock = threading.Lock()
+    results_lock = threading.Lock()
+    worker_errors = []
+    worker_errors_lock = threading.Lock()
     
-    def worker():
-        for _ in range(50):
-            res = manager.chat_completion(messages=[], model="test-model")
-            with lock:
-                results.append(res.choices[0].message.content)
+    def worker(idx):
+        try:
+            for _ in range(50):
+                res = manager.chat_completion(messages=[], model="test-model")
+                with results_lock:
+                    results.append(res.choices[0].message.content)
+        except BaseException as e:
+            with worker_errors_lock:
+                worker_errors.append(e)
             
-    threads = [threading.Thread(target=worker) for _ in range(10)]
+    threads = [threading.Thread(target=worker, args=(i,), name=f"groq-worker-{i}") for i in range(10)]
     for t in threads:
         t.start()
     for t in threads:
-        t.join()
-        
+        t.join(timeout=3.0)
+
+    alive = [t.name for t in threads if t.is_alive()]
+    assert not worker_errors, f"Worker errors: {worker_errors}"
+    assert not alive, f"Threads did not terminate: {alive}"
     assert len(results) == 500
     assert all(r == "ok" for r in results)
 
@@ -108,15 +117,25 @@ def test_concurrent_rate_limiting_cooldown(caplog):
         time_provider=lambda: fake_time
     )
     
+    worker_errors = []
+    worker_errors_lock = threading.Lock()
+    
     def mark():
-        manager._mark_key_rate_limited("key-one-11111111")
+        try:
+            manager._mark_key_rate_limited("key-one-11111111")
+        except BaseException as e:
+            with worker_errors_lock:
+                worker_errors.append(e)
         
-    threads = [threading.Thread(target=mark) for _ in range(5)]
+    threads = [threading.Thread(target=mark, name=f"rate-limit-worker-{i}") for i in range(5)]
     for t in threads:
         t.start()
     for t in threads:
-        t.join()
-        
+        t.join(timeout=3.0)
+
+    alive = [t.name for t in threads if t.is_alive()]
+    assert not worker_errors, f"Worker errors: {worker_errors}"
+    assert not alive, f"Threads did not terminate: {alive}"
     assert manager._cooldowns["key-one-11111111"] == 1010.0
     assert "event=groq_key_rate_limited" in caplog.text
     assert_sanitized(caplog.text)
@@ -128,15 +147,25 @@ def test_concurrent_deactivation(caplog):
         keys=["key-one-11111111"]
     )
     
+    worker_errors = []
+    worker_errors_lock = threading.Lock()
+    
     def deactivate():
-        manager._deactivate_key("key-one-11111111")
+        try:
+            manager._deactivate_key("key-one-11111111")
+        except BaseException as e:
+            with worker_errors_lock:
+                worker_errors.append(e)
         
-    threads = [threading.Thread(target=deactivate) for _ in range(5)]
+    threads = [threading.Thread(target=deactivate, name=f"deactivate-worker-{i}") for i in range(5)]
     for t in threads:
         t.start()
     for t in threads:
-        t.join()
-        
+        t.join(timeout=3.0)
+
+    alive = [t.name for t in threads if t.is_alive()]
+    assert not worker_errors, f"Worker errors: {worker_errors}"
+    assert not alive, f"Threads did not terminate: {alive}"
     assert "key-one-11111111" in manager._deactivated
     assert len(manager._deactivated) == 1
     assert "event=groq_key_disabled" in caplog.text
@@ -149,7 +178,10 @@ def test_slow_client_does_not_hold_lock():
     
     def slow_create(*args, **kwargs):
         slow_entered_event.set()
-        slow_done_event.wait(timeout=5.0)
+        try:
+            slow_done_event.wait(timeout=5.0)
+        except BaseException:
+            pass
         return MockCompletion("slow")
         
     def fast_create(*args, **kwargs):
@@ -166,17 +198,29 @@ def test_slow_client_does_not_hold_lock():
     )
     
     results = {}
+    worker_errors = []
+    worker_errors_lock = threading.Lock()
     
     def run_thread_1():
-        res = manager.chat_completion(messages=[], model="test")
-        results["t1"] = res.choices[0].message.content
+        try:
+            res = manager.chat_completion(messages=[], model="test")
+            results["t1"] = res.choices[0].message.content
+        except BaseException as e:
+            with worker_errors_lock:
+                worker_errors.append(e)
+        finally:
+            slow_done_event.set()
         
     def run_thread_2():
-        res = manager.chat_completion(messages=[], model="test")
-        results["t2"] = res.choices[0].message.content
+        try:
+            res = manager.chat_completion(messages=[], model="test")
+            results["t2"] = res.choices[0].message.content
+        except BaseException as e:
+            with worker_errors_lock:
+                worker_errors.append(e)
         
-    t1 = threading.Thread(target=run_thread_1)
-    t2 = threading.Thread(target=run_thread_2)
+    t1 = threading.Thread(target=run_thread_1, name="groq-slow-worker")
+    t2 = threading.Thread(target=run_thread_2, name="groq-fast-worker")
     
     t1.start()
     
@@ -187,12 +231,17 @@ def test_slow_client_does_not_hold_lock():
     
     # Thread 2 should finish quickly since it got key-two and is not blocked by the lock
     t2.join(timeout=2.0)
-    assert not t2.is_alive()
+    alive = [t.name for t in [t2] if t.is_alive()]
+    assert not worker_errors, f"Worker errors: {worker_errors}"
+    assert not alive, f"Threads did not terminate: {alive}"
     assert results["t2"] == "fast"
     
     # Resume slow call
     slow_done_event.set()
     t1.join(timeout=2.0)
+    alive = [t.name for t in [t1] if t.is_alive()]
+    assert not worker_errors, f"Worker errors: {worker_errors}"
+    assert not alive, f"Threads did not terminate: {alive}"
     assert results["t1"] == "slow"
 
 # 6. Cooldown expired makes key eligible again
@@ -348,11 +397,12 @@ def test_unexpected_error_sanitization(caplog):
         client_factory=make_client
     )
     
-    with pytest.raises(GroqRequestError) as excinfo:
+    # Generic Exception is now treated as transient; when all keys exhausted,
+    # GroqPoolExhaustedError is raised (not GroqRequestError).
+    with pytest.raises(GroqPoolExhaustedError) as excinfo:
         manager.chat_completion(messages=[{"role": "user", "content": "user-sensitive-message"}], model="test")
         
     # Assert public exception message is sanitized
-    assert "Falha ao executar requisição Groq" in str(excinfo.value)
     assert "very-secret-error-marker" not in str(excinfo.value)
     assert "key-one" not in str(excinfo.value)
     
@@ -465,3 +515,70 @@ def test_non_retryable_http_error_fails_immediately():
 
     assert len(calls) == 1
     assert calls == ["key-one-11111111"]
+
+
+# 18. Async 4xx (e.g. 400, 422) produces invalid_request through full chain
+@pytest.mark.anyio
+async def test_async_4xx_produces_invalid_request():
+    """Verify APIStatusError 4xx (terminal) in async path produces invalid_request.
+
+    Full chain: GroqClientManager → ConversationEngine → _map_turn_error → HTTP 503
+    """
+    import json
+    from unittest.mock import AsyncMock, MagicMock
+    from backend.engine import ConversationEngine
+    from backend.turn_execution import TurnExecutionConfig, TurnErrorCode, TurnExecutionError
+    from backend.emotional_domain import EmotionalStateV1
+    from backend.relationship import RelationshipStateV1
+    from backend.main import _map_turn_error
+
+    async def always_400(**kwargs):
+        mock_request = httpx.Request("POST", "https://api.groq.com")
+        response_400 = httpx.Response(400, request=mock_request)
+        raise APIStatusError("400 Bad Request", response=response_400, body=None)
+
+    config = TurnExecutionConfig(
+        total_deadline=30.0,
+        connect_timeout=2.0,
+        provider_attempt_timeout=10.0,
+        supabase_timeout=5.0,
+        commit_reserve=12.0,
+        max_attempts=1,
+    )
+    engine = ConversationEngine(
+        clock=lambda: 1700000000.0,
+        turn_config=config,
+    )
+    # Mock memory
+    engine.memory_manager.load_user_state = MagicMock(return_value={
+        "emotional_state": EmotionalStateV1.neutral(timestamp=1700000000.0).to_dict(),
+        "relationship_state": RelationshipStateV1.neutral(timestamp=1700000000.0).to_dict(),
+    })
+    engine.memory_manager.sync_state = MagicMock()
+    engine.memory_manager.save_turn = MagicMock()
+    engine.memory_manager.get_context = MagicMock(return_value="[mocked context]")
+    engine.memory_manager.load_recent_history = MagicMock(return_value=[])
+
+    mgr = GroqClientManager(
+        keys=["key-1-alpha", "key-2-beta"],
+        async_client_factory=lambda k: AsyncMock(**{"chat.completions.create": always_400}),
+        groq_params=config.to_groq_params(),
+    )
+    engine.groq_manager = mgr
+
+    # The 4xx terminal error is classified as invalid_request and raises
+    # GroqPoolExhaustedError (not TurnExecutionError) because the pool
+    # exhausts all keys with this failure code.
+    from backend.groq_manager import GroqPoolExhaustedError
+    with pytest.raises(GroqPoolExhaustedError) as exc_info:
+        await engine.process_turn("user", "Hello")
+    assert exc_info.value.failure_code is not None
+    from backend.groq_manager import ProviderFailure, provider_failure_to_turn_code
+    turn_code = provider_failure_to_turn_code(exc_info.value.failure_code)
+    assert turn_code == TurnErrorCode.provider_invalid_request
+
+    # Now verify HTTP mapping produces 503
+    http_exc = _map_turn_error(exc_info.value)
+    assert http_exc.status_code == 503
+    detail = http_exc.detail
+    assert detail["code"] == TurnErrorCode.provider_invalid_request.value

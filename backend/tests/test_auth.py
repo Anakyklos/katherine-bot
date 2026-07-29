@@ -283,6 +283,7 @@ def test_unexpected_error_503(client_app, mock_supabase, mock_engine_process, ca
     mock_engine_process.assert_not_called()
     mock_supabase.table.assert_not_called()
 
+
 def test_http_chat_load_failure_sanitization(client_app, mock_supabase, caplog):
     from backend.main import engine
     mock_supabase.auth.get_user.return_value = MockAuthResponse(user=MockUser("user123"))
@@ -290,12 +291,13 @@ def test_http_chat_load_failure_sanitization(client_app, mock_supabase, caplog):
     # Mock supabase select call to raise a sensitive exception
     mock_supabase.table.return_value.select.return_value.eq.return_value.execute.side_effect = Exception("SENSITIVE_DB_LOAD_ERROR")
 
-    # Mock LLM calls just in case
-    engine._perceive = MagicMock(return_value={"valence": 0, "arousal_shift": 0, "dominance_shift": 0})
-    m = MagicMock()
-    m.choices = [MagicMock()]
-    m.choices[0].message.content = "Response"
-    engine.groq_manager.chat_completion = MagicMock(return_value=m)
+    # Mock async LLM calls (appraisal and generation)
+    async def _mock_async(**kwargs):
+        mock_resp = MagicMock()
+        mock_resp.choices = [MagicMock()]
+        mock_resp.choices[0].message.content = '{"valence": 0, "arousal_shift": 0, "dominance_shift": 0}'
+        return mock_resp
+    engine.groq_manager.chat_completion_async = MagicMock(side_effect=_mock_async)
 
     with caplog.at_level(logging.ERROR):
         response = client_app.post(
@@ -304,12 +306,13 @@ def test_http_chat_load_failure_sanitization(client_app, mock_supabase, caplog):
             headers={"Authorization": "Bearer some_token"}
         )
 
-    assert response.status_code == 500
-    assert response.json()["detail"] == "Internal Server Error"
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "persistence_unavailable"
     assert "SENSITIVE_DB_LOAD_ERROR" not in response.text
     assert "SENSITIVE_DB_LOAD_ERROR" not in caplog.text
     assert "user123" not in response.text
     assert "user123" not in caplog.text
+
 
 def test_http_chat_persistence_failure_sanitization(client_app, mock_supabase, caplog):
     from backend.main import engine
@@ -326,12 +329,13 @@ def test_http_chat_persistence_failure_sanitization(client_app, mock_supabase, c
     # Mock sync_state (update) to raise a sensitive exception
     mock_supabase.table.return_value.update.return_value.eq.return_value.execute.side_effect = Exception("SENSITIVE_DB_SYNC_ERROR")
 
-    # Mock LLM calls
-    engine._perceive = MagicMock(return_value={"valence": 0, "arousal_shift": 0, "dominance_shift": 0})
-    m = MagicMock()
-    m.choices = [MagicMock()]
-    m.choices[0].message.content = "Response"
-    engine.groq_manager.chat_completion = MagicMock(return_value=m)
+    # Mock async LLM calls
+    async def _mock_async_persist(**kwargs):
+        mock_resp = MagicMock()
+        mock_resp.choices = [MagicMock()]
+        mock_resp.choices[0].message.content = '{"valence": 0, "arousal_shift": 0, "dominance_shift": 0}'
+        return mock_resp
+    engine.groq_manager.chat_completion_async = MagicMock(side_effect=_mock_async_persist)
 
     with caplog.at_level(logging.ERROR):
         response = client_app.post(
@@ -340,8 +344,8 @@ def test_http_chat_persistence_failure_sanitization(client_app, mock_supabase, c
             headers={"Authorization": "Bearer some_token"}
         )
 
-    assert response.status_code == 500
-    assert response.json()["detail"] == "Internal Server Error"
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "persistence_unavailable"
     assert "SENSITIVE_DB_SYNC_ERROR" not in response.text
     assert "SENSITIVE_DB_SYNC_ERROR" not in caplog.text
     assert "user123" not in response.text

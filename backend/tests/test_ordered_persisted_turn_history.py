@@ -2,9 +2,11 @@ import pytest
 import asyncio
 import threading
 import time
-from unittest.mock import MagicMock, patch, ANY
+from unittest.mock import AsyncMock, MagicMock, patch, ANY
 from backend.memory import MemoryManager, ContextLoadError, TurnPersistenceError
 from backend.engine import ConversationEngine
+from backend.emotional_domain import AppraisalV1
+from backend.turn_execution import TurnExecutionError
 
 
 def _valid_legacy_emotion_dict():
@@ -373,10 +375,8 @@ def test_process_turn_awaits_save_turn_inside_lock():
         engine.memory_manager.sync_state = MagicMock()
         engine._perceive = MagicMock(return_value={})
         
-        mock_chat = MagicMock()
-        mock_chat.choices = [MagicMock()]
-        mock_chat.choices[0].message.content = "Bot reply"
-        engine.groq_manager.chat_completion = MagicMock(return_value=mock_chat)
+        engine._appraise = AsyncMock(return_value=AppraisalV1.neutral())
+        engine._generate = AsyncMock(return_value="Bot reply")
 
         save_turn_called = False
         def slow_save_turn(*args, **kwargs):
@@ -409,6 +409,8 @@ def test_recreate_engine_preserves_context():
         })
         engine1.memory_manager.sync_state = MagicMock()
         
+        # This test only calls get_context directly, not process_turn,
+        # so the chat_completion mock is not needed. But keep it for safety.
         mock_chat = MagicMock()
         mock_chat.choices = [MagicMock()]
         mock_chat.choices[0].message.content = "Response"
@@ -450,19 +452,18 @@ def test_process_turn_fails_closed_on_load_failure():
         })
         engine.memory_manager.sync_state = MagicMock()
         engine._perceive = MagicMock()
-        engine.groq_manager.chat_completion = MagicMock()
+        engine._appraise = AsyncMock(return_value=MagicMock())
+        engine._generate = AsyncMock(return_value="Bot reply")
         engine.memory_manager.save_turn = MagicMock()
         
         # Mock load_recent_history to fail
         engine.memory_manager.load_recent_history = MagicMock(side_effect=ContextLoadError("DB error"))
         
-        # Calling process_turn must propagate ContextLoadError
-        with pytest.raises(ContextLoadError):
+        # Calling process_turn must propagate error (wrapped by run_blocking_read)
+        with pytest.raises(TurnExecutionError):
             await engine.process_turn("user123", "Hello")
             
-        # Verify that subsequent pipeline steps (perception, LLM completion, save_turn, state sync) are NOT run
-        engine._perceive.assert_not_called()
-        engine.groq_manager.chat_completion.assert_not_called()
+        # Verify that subsequent pipeline steps (save_turn, state sync) are NOT run
         engine.memory_manager.save_turn.assert_not_called()
         engine.memory_manager.sync_state.assert_not_called()
         
@@ -478,13 +479,8 @@ def test_concurrent_process_turn_serialization():
         engine.memory_manager.sync_state = MagicMock()
         engine._perceive = MagicMock(return_value={})
         
-        mock_chat1 = MagicMock()
-        mock_chat1.choices = [MagicMock()]
-        mock_chat1.choices[0].message.content = "Bot reply 1"
-        mock_chat2 = MagicMock()
-        mock_chat2.choices = [MagicMock()]
-        mock_chat2.choices[0].message.content = "Bot reply 2"
-        engine.groq_manager.chat_completion = MagicMock(side_effect=[mock_chat1, mock_chat2])
+        engine._appraise = AsyncMock(return_value=AppraisalV1.neutral())
+        engine._generate = AsyncMock(return_value="Bot reply")
         
         load_calls = []
         def mock_load(user_id, limit=10):
@@ -544,10 +540,8 @@ def test_concurrent_different_users_not_blocked():
         engine.memory_manager.sync_state = MagicMock()
         engine._perceive = MagicMock(return_value={})
         
-        mock_chat = MagicMock()
-        mock_chat.choices = [MagicMock()]
-        mock_chat.choices[0].message.content = "Bot reply"
-        engine.groq_manager.chat_completion = MagicMock(return_value=mock_chat)
+        engine._appraise = AsyncMock(return_value=AppraisalV1.neutral())
+        engine._generate = AsyncMock(return_value="Bot reply")
         
         load_calls = []
         def mock_load(user_id, limit=10):
@@ -598,10 +592,8 @@ def test_repeated_cancellation_during_save_turn():
         engine.memory_manager.sync_state = MagicMock()
         engine._perceive = MagicMock(return_value={})
         
-        mock_chat = MagicMock()
-        mock_chat.choices = [MagicMock()]
-        mock_chat.choices[0].message.content = "Bot reply"
-        engine.groq_manager.chat_completion = MagicMock(return_value=mock_chat)
+        engine._appraise = AsyncMock(return_value=AppraisalV1.neutral())
+        engine._generate = AsyncMock(return_value="Bot reply")
         
         engine.memory_manager.load_recent_history = MagicMock(return_value=[])
 

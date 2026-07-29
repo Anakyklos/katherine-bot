@@ -92,7 +92,7 @@ async def test_run_archival_extraction_llm_failure(backend, caplog):
     engine.memory_manager.load_persisted_user_message = MagicMock(return_value="Hello")
     
     # Mock Groq client failure
-    engine.groq_manager.chat_completion = MagicMock(side_effect=Exception("Groq error"))
+    engine.groq_manager.chat_completion_async = MagicMock(side_effect=Exception("Groq error"))
     
     ref = backend.PersistedTurnRef(user_id="user123", source_chat_log_id=1, assistant_chat_log_id=2)
     
@@ -114,12 +114,14 @@ async def test_run_archival_extraction_validation_failure(backend, caplog):
     engine.memory_manager.load_persisted_user_message = MagicMock(return_value="Hello")
     
     # Mock Groq client returning invalid fact payload (importance is bool)
-    m = MagicMock()
-    m.choices = [MagicMock()]
-    m.choices[0].message.content = json.dumps({
+    mock_resp = MagicMock()
+    mock_resp.choices = [MagicMock()]
+    mock_resp.choices[0].message.content = json.dumps({
         "facts": [{"content": "hello", "importance": True, "tags": []}]
     })
-    engine.groq_manager.chat_completion = MagicMock(return_value=m)
+    async def mock_async(*args, **kwargs):
+        return mock_resp
+    engine.groq_manager.chat_completion_async = MagicMock(side_effect=mock_async)
     
     ref = backend.PersistedTurnRef(user_id="user123", source_chat_log_id=1, assistant_chat_log_id=2)
     
@@ -144,7 +146,9 @@ async def test_run_archival_extraction_duplicate(backend, caplog):
         "schema_version": 1,
         "extractor_version": 1
     })
-    engine.groq_manager.chat_completion = MagicMock(return_value=m)
+    async def _async_return(*args, **kwargs):
+        return m
+    engine.groq_manager.chat_completion_async = MagicMock(side_effect=_async_return)
     
     # Simulate unique constraint failure treated as duplicate success
     engine.memory_manager.store_archival_extraction.side_effect = backend.ArchivalDuplicateError("Duplicate")
@@ -171,7 +175,9 @@ async def test_run_archival_extraction_store_failed(backend, caplog):
         "schema_version": 1,
         "extractor_version": 1
     })
-    engine.groq_manager.chat_completion = MagicMock(return_value=m)
+    async def _async_return(*args, **kwargs):
+        return m
+    engine.groq_manager.chat_completion_async = MagicMock(side_effect=_async_return)
     
     # Simulate general database failure
     engine.memory_manager.store_archival_extraction.side_effect = Exception("DB connection failed secret token")
@@ -230,11 +236,24 @@ async def test_process_turn_schedules_background_task(backend):
     engine.memory_manager.save_turn = MagicMock(side_effect=mock_save_turn)
     engine.memory_manager.sync_state = MagicMock(side_effect=mock_sync_state)
     
-    # Mock groq chat completion
-    m = MagicMock()
-    m.choices = [MagicMock()]
-    m.choices[0].message.content = "assistant reply"
-    engine.groq_manager.chat_completion = MagicMock(return_value=m)
+    from unittest.mock import AsyncMock
+    
+    # Responses: first for appraisal (JSON), then for generation (text)
+    responses = [
+        MagicMock(choices=[MagicMock(message=MagicMock(content=json.dumps({
+            "valence": 0.1, "arousal_shift": 0.0, "dominance_shift": 0.0,
+            "triggered_emotions": {"joy": 0.5},
+        })))]),
+        MagicMock(choices=[MagicMock(message=MagicMock(content="assistant reply"))]),
+    ]
+    
+    async def async_create(**kwargs):
+        return responses.pop(0)
+    
+    # Override the groq manager's async factory to return a mock client
+    engine.groq_manager._async_client_factory = lambda k: AsyncMock(**{
+        "chat.completions.create": async_create
+    })
     
     bg_tasks = MagicMock(spec=BackgroundTasks)
     
@@ -277,10 +296,23 @@ async def test_process_turn_does_not_schedule_when_extraction_disabled(backend):
     ))
     engine.memory_manager.sync_state = MagicMock()
     
-    m = MagicMock()
-    m.choices = [MagicMock()]
-    m.choices[0].message.content = "reply"
-    engine.groq_manager.chat_completion = MagicMock(return_value=m)
+    from unittest.mock import AsyncMock
+    
+    # Responses: first for appraisal (JSON), then for generation (text)
+    responses = [
+        MagicMock(choices=[MagicMock(message=MagicMock(content=json.dumps({
+            "valence": 0.1, "arousal_shift": 0.0, "dominance_shift": 0.0,
+            "triggered_emotions": {"joy": 0.5},
+        })))]),
+        MagicMock(choices=[MagicMock(message=MagicMock(content="reply"))]),
+    ]
+    
+    async def async_create(**kwargs):
+        return responses.pop(0)
+    
+    engine.groq_manager._async_client_factory = lambda k: AsyncMock(**{
+        "chat.completions.create": async_create
+    })
     
     bg_tasks = MagicMock(spec=BackgroundTasks)
     
@@ -418,6 +450,71 @@ def test_no_real_external_dependencies_proof():
     
     assert isinstance(sys.modules.get('sentence_transformers'), MagicMock)
     assert isinstance(sys.modules.get('supabase'), MagicMock)
+
+
+@pytest.mark.anyio
+async def test_run_archival_extraction_cancelled_during_store(backend, caplog):
+    """Cancel during archival store — write is not abandoned.
+
+    When the background archival extraction task is cancelled while
+    store_archival_extraction is running, the write helper must drain
+    the worker to completion before propagating the cancellation.
+    """
+    import threading
+    import asyncio
+
+    engine = backend.ConversationEngine(archival_extraction_enabled=True)
+    engine.memory_manager = MagicMock()
+    engine.memory_manager.load_persisted_user_message = MagicMock(return_value="Hello")
+
+    m = MagicMock()
+    m.choices = [MagicMock()]
+    m.choices[0].message.content = json.dumps({
+        "facts": [{"content": "likes coding", "importance": 0.9, "tags": []}],
+        "schema_version": 1,
+        "extractor_version": 1
+    })
+    async def _async_return(*args, **kwargs):
+        return m
+    engine.groq_manager.chat_completion_async = MagicMock(side_effect=_async_return)
+
+    # Block store_archival_extraction in a thread so we can verify drain
+    store_started = threading.Event()
+    store_can_proceed = threading.Event()
+    store_completed = threading.Event()
+
+    def blocking_store(user_id, source_chat_log_id, idempotency_key, envelope):
+        store_started.set()
+        store_can_proceed.wait(timeout=10.0)
+        store_completed.set()
+
+    engine.memory_manager.store_archival_extraction = blocking_store
+
+    ref = backend.PersistedTurnRef(
+        user_id="user123", source_chat_log_id=1, assistant_chat_log_id=2
+    )
+
+    task = asyncio.create_task(engine.run_archival_extraction(ref))
+
+    # Wait for store_archival_extraction to start in its thread
+    started_ok = await asyncio.to_thread(store_started.wait, 5.0)
+    assert started_ok, "store_archival_extraction did not start"
+
+    # Cancel the task while store is in progress
+    task.cancel()
+    await asyncio.sleep(0.05)
+
+    # Store should not have completed yet (blocked by event)
+    assert not store_completed.is_set(), "store should still be blocked"
+
+    # Release store to complete
+    store_can_proceed.set()
+
+    # Task should propagate CancelledError after draining
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert store_completed.is_set(), "store must have completed (drained)"
 
 
 def test_sql_guarantees_mock():
