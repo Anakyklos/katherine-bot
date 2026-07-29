@@ -13,7 +13,12 @@ import ipaddress
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
-from .admission_contracts import AdmissionError, RequestIdentity, estimate_text_units
+from .admission_contracts import (
+    AdmissionError,
+    NEW_MESSAGE_MAX_UNITS,
+    RequestIdentity,
+    estimate_text_units,
+)
 
 MESSAGE_HMAC_DOMAIN = b"message"
 NETWORK_HMAC_DOMAIN = b"network"
@@ -84,20 +89,31 @@ IPAddress = ipaddress.IPv4Address | ipaddress.IPv6Address
 IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
 
 
+def _validate_secret_bytes(value: object) -> bytes:
+    if not isinstance(value, bytes) or len(value) < 32:
+        raise AdmissionConfigurationError()
+    try:
+        decoded = value.decode("utf-8")
+    except UnicodeDecodeError:
+        raise AdmissionConfigurationError() from None
+    if not decoded.strip():
+        raise AdmissionConfigurationError()
+    return value
+
+
 @dataclass(frozen=True)
 class AdmissionRuntimeConfig:
     """Immutable process-wide admission configuration.
 
-    ``secret_bytes`` is excluded from repr and must contain at least 32 UTF-8
-    bytes. Trusted proxy CIDRs are parsed once during startup.
+    ``secret_bytes`` is excluded from repr and must contain at least 32 valid,
+    non-whitespace UTF-8 bytes. Trusted proxy CIDRs are parsed once at startup.
     """
 
     secret_bytes: bytes = field(repr=False)
     trusted_proxy_networks: tuple[IPNetwork, ...] = ()
 
     def __post_init__(self) -> None:
-        if not isinstance(self.secret_bytes, bytes) or len(self.secret_bytes) < 32:
-            raise AdmissionConfigurationError()
+        _validate_secret_bytes(self.secret_bytes)
         if not isinstance(self.trusted_proxy_networks, tuple):
             raise AdmissionConfigurationError()
         if any(
@@ -118,8 +134,7 @@ class AdmissionRuntimeConfig:
             secret_bytes = secret.encode("utf-8")
         except Exception:
             raise AdmissionConfigurationError() from None
-        if len(secret_bytes) < 32:
-            raise AdmissionConfigurationError()
+        _validate_secret_bytes(secret_bytes)
 
         if trusted_proxy_cidrs is None or trusted_proxy_cidrs == "":
             networks: tuple[IPNetwork, ...] = ()
@@ -166,7 +181,10 @@ def _parse_ip(value: object) -> IPAddress | None:
 
 
 def _is_trusted(address: IPAddress, networks: tuple[IPNetwork, ...]) -> bool:
-    return any(address.version == network.version and address in network for network in networks)
+    return any(
+        address.version == network.version and address in network
+        for network in networks
+    )
 
 
 def resolve_network_identity(
@@ -209,14 +227,13 @@ def resolve_network_identity(
 def compute_hmac_sha256(secret_bytes: bytes, domain: bytes, payload: str) -> str:
     """Compute an exact lowercase HMAC-SHA256 with domain separation."""
 
-    if not isinstance(secret_bytes, bytes) or len(secret_bytes) < 32:
-        raise AdmissionConfigurationError()
+    validated_secret = _validate_secret_bytes(secret_bytes)
     if domain not in (MESSAGE_HMAC_DOMAIN, NETWORK_HMAC_DOMAIN):
         raise ValueError("unsupported admission HMAC domain")
     if not isinstance(payload, str):
         raise TypeError("admission HMAC payload must be a str")
     return hmac.new(
-        secret_bytes,
+        validated_secret,
         domain + b"\x00" + payload.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
@@ -257,7 +274,7 @@ class AdmissionRequest:
         if (
             isinstance(self.estimated_units, bool)
             or not isinstance(self.estimated_units, int)
-            or not 1 <= self.estimated_units <= 6000
+            or not 1 <= self.estimated_units <= NEW_MESSAGE_MAX_UNITS
         ):
             raise AdmissionUnavailable()
         object.__setattr__(self, "request_id", canonical_request_id)
@@ -305,8 +322,16 @@ def build_admission_request(
         raise AdmissionUnavailable()
     if not isinstance(message, str) or not isinstance(network_identity, str):
         raise AdmissionUnavailable()
-    if not network_identity or not isinstance(config, AdmissionRuntimeConfig):
+    if not isinstance(config, AdmissionRuntimeConfig):
         raise AdmissionUnavailable()
+
+    if network_identity != UNKNOWN_NETWORK_IDENTITY:
+        parsed_network_identity = _parse_ip(network_identity)
+        if (
+            parsed_network_identity is None
+            or network_identity != str(parsed_network_identity)
+        ):
+            raise AdmissionUnavailable()
 
     return AdmissionRequest(
         user_id=user_id,
