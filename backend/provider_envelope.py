@@ -48,7 +48,7 @@ VALID_MESSAGE_KEYS: frozenset = frozenset({"role", "content"})
 """Set of valid keys in a message dict."""
 
 OMISSION_MARKER = "[...]"
-"""Constant marker inserted when optional context components are pruned."""
+"""Constant marker appended when an individual string value is truncated."""
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +254,7 @@ def fit_optional_context(
         A new messages list that fits within *max_units*.
 
     Raises:
-        ``ProviderEnvelopeError("mandatory_budget_exceeded")``
+        ``ProviderEnvelopeError("budget_exceeded")``
         if the mandatory messages alone exceed *max_units*.
 
     The selection of optional context follows this priority order

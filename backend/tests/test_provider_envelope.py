@@ -81,8 +81,9 @@ class TestCanonicalSerialisation:
         results = [estimate_provider_input_units(messages) for _ in range(10)]
         assert all(r == results[0] for r in results)
 
-    def test_messages_order_changes_result(self):
-        """PASS: message order changes the estimated units."""
+    def test_reordering_preserves_unit_count(self):
+        """PASS: swapping message order preserves the total byte count
+        because each message has the same content strings."""
         a = [{"role": "user", "content": "A"}, {"role": "assistant", "content": "B"}]
         b = [{"role": "assistant", "content": "B"}, {"role": "user", "content": "A"}]
         assert estimate_provider_input_units(a) == estimate_provider_input_units(b)

@@ -3,6 +3,7 @@ import threading
 import time
 import pytest
 import httpx
+from unittest.mock import AsyncMock
 from groq import RateLimitError, APIStatusError, AuthenticationError, APIConnectionError
 from backend.groq_manager import (
     GroqClientManager,
@@ -524,7 +525,105 @@ def test_non_retryable_http_error_fails_immediately():
     assert calls == ["key-one-11111111"]
 
 
-# 18. Async 4xx (e.g. 400, 422) produces invalid_request through full chain
+# 18. Sync invalid envelope rejected before key acquisition
+def test_sync_invalid_envelope_rejected():
+    """Invalid message structure is rejected before any key access."""
+    manager = GroqClientManager(
+        keys=["key-one-11111111"],
+        client_factory=lambda k: MockClient(lambda *args, **kwargs: MockCompletion("ok"))
+    )
+
+    with pytest.raises(GroqRequestError) as excinfo:
+        manager.chat_completion(messages=[], model="test")
+    assert "Falha ao executar requisição Groq" in str(excinfo.value)
+
+
+# 19. Sync oversized envelope rejected before key acquisition
+def test_sync_oversized_envelope_rejected(caplog):
+    """Oversized message is rejected before any key access."""
+    caplog.set_level(logging.ERROR)
+    manager = GroqClientManager(
+        keys=["key-one-11111111"],
+        client_factory=lambda k: MockClient(lambda *args, **kwargs: MockCompletion("ok"))
+    )
+
+    oversized = "x" * 20000
+    with pytest.raises(GroqRequestError) as excinfo:
+        manager.chat_completion(
+            messages=[{"role": "user", "content": oversized}],
+            model="test"
+        )
+    assert "Falha ao executar requisição Groq" in str(excinfo.value)
+    assert "event=provider_input_budget_exceeded" in caplog.text
+
+
+# 20. Async invalid envelope rejected before key acquisition
+@pytest.mark.anyio
+async def test_async_invalid_envelope_rejected():
+    """Invalid message structure is rejected before any key access (async)."""
+    from backend.turn_execution import TurnBudget, TurnExecutionConfig
+
+    config = TurnExecutionConfig(
+        total_deadline=30.0,
+        connect_timeout=2.0,
+        provider_attempt_timeout=10.0,
+        supabase_timeout=5.0,
+        commit_reserve=12.0,
+        max_attempts=1,
+    )
+    manager = GroqClientManager(
+        keys=["key-one-11111111"],
+        async_client_factory=lambda k: AsyncMock(**{"chat.completions.create": AsyncMock()}),
+        groq_params=config.to_groq_params(),
+    )
+
+    budget = TurnBudget(deadline=100.0, reserve=10.0, now_provider=lambda: 0.0)
+    with pytest.raises(GroqRequestError) as excinfo:
+        await manager.chat_completion_async(
+            messages=[],
+            model="test",
+            budget=budget,
+            stage="test",
+        )
+    assert "Falha ao executar requisição Groq" in str(excinfo.value)
+
+
+# 21. Async oversized envelope rejected before key acquisition
+@pytest.mark.anyio
+async def test_async_oversized_envelope_rejected(caplog):
+    """Oversized message is rejected before any key access (async)."""
+    caplog.set_level(logging.ERROR)
+    from backend.turn_execution import TurnBudget, TurnExecutionConfig
+
+    config = TurnExecutionConfig(
+        total_deadline=30.0,
+        connect_timeout=2.0,
+        provider_attempt_timeout=10.0,
+        supabase_timeout=5.0,
+        commit_reserve=12.0,
+        max_attempts=1,
+    )
+    manager = GroqClientManager(
+        keys=["key-one-11111111"],
+        async_client_factory=lambda k: AsyncMock(**{"chat.completions.create": AsyncMock()}),
+        groq_params=config.to_groq_params(),
+    )
+
+    oversized = "x" * 20000
+    budget = TurnBudget(deadline=100.0, reserve=10.0, now_provider=lambda: 0.0)
+    with pytest.raises(GroqRequestError) as excinfo:
+        await manager.chat_completion_async(
+            messages=[{"role": "user", "content": oversized}],
+            model="test",
+            budget=budget,
+            stage="test",
+        )
+    assert "Falha ao executar requisição Groq" in str(excinfo.value)
+    assert "event=provider_input_budget_exceeded" in caplog.text
+    assert "key-one" not in caplog.text
+
+
+# 22. Async 4xx (e.g. 400, 422) produces invalid_request through full chain
 @pytest.mark.anyio
 async def test_async_4xx_produces_invalid_request():
     """Verify APIStatusError 4xx (terminal) in async path produces invalid_request.
@@ -532,7 +631,7 @@ async def test_async_4xx_produces_invalid_request():
     Full chain: GroqClientManager → ConversationEngine → _map_turn_error → HTTP 503
     """
     import json
-    from unittest.mock import AsyncMock, MagicMock
+    from unittest.mock import MagicMock
     from backend.engine import ConversationEngine
     from backend.turn_execution import TurnExecutionConfig, TurnErrorCode, TurnExecutionError
     from backend.emotional_domain import EmotionalStateV1
