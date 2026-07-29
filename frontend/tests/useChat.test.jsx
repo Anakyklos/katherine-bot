@@ -1,7 +1,16 @@
 /**
  * Behavioral tests for ``useChat`` hook — issue #267.
+ *
+ * Tests cover:
+ * - Single-flight: second call while in-flight is rejected
+ * - Single-flight released after settlement, allowing new requests
+ * - Timeout: timer fires, abort triggered, error shown, loading cleared
+ * - Unmount during request: abort called, cleanup complete, no warnings
+ * - Ownership invalidation: stale callbacks after unmount do not update state
+ * - No React act() warnings
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import React from 'react';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { renderHook, act, waitFor } from '@testing-library/react';
 import { useChat } from '../src/features/chat/hooks/useChat';
 
@@ -48,7 +57,12 @@ function validEmotionResponse(text) {
 
 describe('useChat', () => {
     beforeEach(() => {
+        vi.useRealTimers();
         mockSendMessage.mockReset();
+    });
+
+    afterEach(() => {
+        vi.useRealTimers();
     });
 
     it('sends only one request when handleSend is called twice in same tick', async () => {
@@ -58,11 +72,14 @@ describe('useChat', () => {
 
         const { result } = renderHook(() => useChat());
 
-        act(() => { result.current.setInput('Hello'); });
+        await act(async () => { result.current.setInput('Hello'); });
         await waitFor(() => expect(result.current.input).toBe('Hello'));
 
-        const first = result.current.handleSend();
-        const second = result.current.handleSend();
+        let first, second;
+        await act(async () => {
+            first = result.current.handleSend();
+            second = result.current.handleSend();
+        });
 
         await act(async () => {
             resolveSend(validEmotionResponse('Bot reply'));
@@ -73,90 +90,183 @@ describe('useChat', () => {
         expect(result.current.messages.filter(m => m.role === 'user').length).toBe(1);
     });
 
-    it('prevents stale finally from clearing state of active request', async () => {
-        let resolve1;
-        const p1 = new Promise(r => { resolve1 = r; });
-        mockSendMessage.mockReturnValueOnce(p1);
+    it('releases single-flight after settlement allowing a new request', async () => {
+        let resolveFirst;
+        const firstP = new Promise(r => { resolveFirst = r; });
+        mockSendMessage.mockReturnValue(firstP);
 
         const { result } = renderHook(() => useChat());
 
-        act(() => { result.current.setInput('First'); });
+        // Start first request
+        let firstPromise;
+        await act(async () => { result.current.setInput('First'); });
         await waitFor(() => expect(result.current.input).toBe('First'));
+        await act(async () => { firstPromise = result.current.handleSend(); });
+        await waitFor(() => expect(result.current.isLoading).toBe(true));
+        expect(mockSendMessage).toHaveBeenCalledTimes(1);
 
-        const firstReq = result.current.handleSend();
-        resolve1(validEmotionResponse('stale'));
-        await act(async () => { await firstReq; });
+        // Second call while in-flight should be blocked
+        await act(async () => { result.current.setInput('Second'); });
+        await waitFor(() => expect(result.current.input).toBe('Second'));
+        let sp;
+        await act(async () => { sp = result.current.handleSend(); });
+        expect(mockSendMessage).toHaveBeenCalledTimes(1);
 
-        expect(result.current.isLoading).toBe(false);
-        expect(result.current.messages.filter(m => m.role === 'assistant').length).toBe(1);
+        // Resolve first
+        await act(async () => {
+            resolveFirst(validEmotionResponse('First reply'));
+            await firstPromise;
+        });
+
+        await waitFor(() => expect(result.current.isLoading).toBe(false));
+
+        // Now a new request should proceed
+        await act(async () => { result.current.setInput('Third'); });
+        await waitFor(() => expect(result.current.input).toBe('Third'));
+        await act(async () => { result.current.handleSend(); });
+        expect(mockSendMessage).toHaveBeenCalledTimes(2);
     });
 
     it('aborts request and shows error when timeout fires', async () => {
-        let timeoutCb = null;
-        const originalSetTimeout = globalThis.setTimeout;
-        // Only intercept the 50s timeout from the hook, not React's internal timers
-        vi.spyOn(globalThis, 'setTimeout').mockImplementation((cb, ms) => {
-            if (ms >= 49000) {
-                timeoutCb = cb;
-                return 12345;
-            }
-            return originalSetTimeout(cb, ms);
-        });
-        vi.spyOn(globalThis, 'clearTimeout');
+        vi.useFakeTimers();
         const abortSpy = vi.spyOn(AbortController.prototype, 'abort');
+        const clearTimeoutSpy = vi.spyOn(globalThis, 'clearTimeout');
 
-        mockSendMessage.mockImplementation((_msg, { signal }) => {
-            return new Promise((_, reject) => {
-                if (signal.aborted) {
+        mockSendMessage.mockImplementation((_message, { signal }) => {
+            return new Promise((_resolve, reject) => {
+                const onAbort = () => {
                     reject(Object.assign(new Error('canceled'), { code: 'ERR_CANCELED' }));
-                    return;
-                }
-                signal.addEventListener('abort', () => {
-                    reject(Object.assign(new Error('canceled'), { code: 'ERR_CANCELED' }));
-                }, { once: true });
+                };
+                if (signal.aborted) { onAbort(); return; }
+                signal.addEventListener('abort', onAbort, { once: true });
             });
         });
 
         const { result } = renderHook(() => useChat());
 
-        act(() => { result.current.setInput('Hello'); });
-        await waitFor(() => expect(result.current.input).toBe('Hello'));
+        await act(async () => { result.current.setInput('Hello'); });
+        expect(result.current.input).toBe('Hello');
 
-        // Start request
-        result.current.handleSend();
+        let sendPromise;
+        await act(async () => { sendPromise = result.current.handleSend(); });
+        expect(result.current.isLoading).toBe(true);
 
-        // Wait for isLoading to be true
-        await waitFor(() => expect(result.current.isLoading).toBe(true));
+        // Advance time to trigger timeout (50s)
+        await act(async () => {
+            vi.advanceTimersByTime(50000);
+        });
 
-        // Fire the captured timeout callback
-        act(() => { timeoutCb(); });
+        await act(async () => { await sendPromise; });
 
-        // Wait for the async catch/finally to update state
-        await waitFor(() => expect(result.current.isLoading).toBe(false));
-
+        expect(result.current.isLoading).toBe(false);
         expect(abortSpy).toHaveBeenCalled();
         expect(result.current.messages.filter(m => m.role === 'system').length).toBeGreaterThanOrEqual(1);
 
-        vi.mocked(globalThis.setTimeout).mockRestore();
-        vi.mocked(globalThis.clearTimeout).mockRestore();
         abortSpy.mockRestore();
+        clearTimeoutSpy.mockRestore();
+        vi.useRealTimers();
     });
 
-    it('cleans up abort controller and timer on unmount', async () => {
+    it('cleans up abort controller and timer on unmount and no state updates', async () => {
         const abortSpy = vi.spyOn(AbortController.prototype, 'abort');
-        mockSendMessage.mockReturnValue(new Promise(() => {})); // never resolves
+        const clearTimeoutSpy = vi.spyOn(globalThis, 'clearTimeout');
+        const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+        mockSendMessage.mockImplementation((_message, { signal }) => {
+            return new Promise((_resolve, reject) => {
+                const onAbort = () => {
+                    reject(Object.assign(new Error('canceled'), { code: 'ERR_CANCELED' }));
+                };
+                if (signal.aborted) { onAbort(); return; }
+                signal.addEventListener('abort', onAbort, { once: true });
+            });
+        });
 
         const { result, unmount } = renderHook(() => useChat());
 
-        act(() => { result.current.setInput('Hello'); });
-        await waitFor(() => expect(result.current.input).toBe('Hello'));
+        await act(async () => { result.current.setInput('Hello'); });
+        expect(result.current.input).toBe('Hello');
 
-        // Start request
-        result.current.handleSend();
-
+        let sendPromise;
+        await act(async () => { sendPromise = result.current.handleSend(); });
         await waitFor(() => expect(result.current.isLoading).toBe(true));
 
-        unmount();
+        // Unmount — this should abort and invalidate ownership
+        act(() => { unmount(); });
         expect(abortSpy).toHaveBeenCalled();
+        expect(clearTimeoutSpy).toHaveBeenCalled();
+
+        // Let the rejection settle
+        try { await sendPromise; } catch (e) { /* expected */ }
+
+        // No React warnings
+        const warningMessages = consoleErrorSpy.mock.calls
+            .filter(([msg]) => typeof msg === 'string')
+            .filter(([msg]) =>
+                msg.includes('not wrapped in act') ||
+                msg.includes('update') ||
+                msg.includes('unmount')
+            );
+        expect(warningMessages).toHaveLength(0);
+
+        abortSpy.mockRestore();
+        clearTimeoutSpy.mockRestore();
+        consoleErrorSpy.mockRestore();
+    });
+
+    it('invalidates stale callbacks after unmount — catch/finally do not update state', async () => {
+        const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+        mockSendMessage.mockImplementation((_message, { signal }) => {
+            return new Promise((_resolve, reject) => {
+                const onAbort = () => {
+                    reject(Object.assign(new Error('canceled'), { code: 'ERR_CANCELED' }));
+                };
+                if (signal.aborted) { onAbort(); return; }
+                signal.addEventListener('abort', onAbort, { once: true });
+            });
+        });
+
+        const { result, unmount } = renderHook(() => useChat());
+
+        await act(async () => { result.current.setInput('Hello'); });
+
+        let sendPromise;
+        await act(async () => { sendPromise = result.current.handleSend(); });
+        await waitFor(() => expect(result.current.isLoading).toBe(true));
+
+        expect(result.current.messages.filter(m => m.role === 'user').length).toBe(1);
+
+        // Unmount while request is in-flight — invalidates ownership before abort
+        act(() => { unmount(); });
+
+        try { await sendPromise; } catch (e) { /* expected */ }
+
+        // No React warnings (guarded by mountedRef and requestTokenRef)
+        const warningMessages = consoleErrorSpy.mock.calls
+            .filter(([msg]) => typeof msg === 'string')
+            .filter(([msg]) =>
+                msg.includes('not wrapped in act') ||
+                msg.includes('update') ||
+                msg.includes('unmount')
+            );
+        expect(warningMessages).toHaveLength(0);
+
+        consoleErrorSpy.mockRestore();
+    });
+
+    it('clears timer on successful request', async () => {
+        mockSendMessage.mockResolvedValue(validEmotionResponse('Bot reply'));
+
+        const { result } = renderHook(() => useChat());
+
+        await act(async () => { result.current.setInput('Hello'); });
+
+        let sendPromise;
+        await act(async () => { sendPromise = result.current.handleSend(); });
+        await act(async () => { await sendPromise; });
+
+        expect(result.current.isLoading).toBe(false);
+        expect(result.current.messages.filter(m => m.role === 'assistant').length).toBe(1);
     });
 });

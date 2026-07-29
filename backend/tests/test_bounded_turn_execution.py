@@ -55,9 +55,9 @@ from backend.groq_manager import (
 
 # Patch SentenceTransformer at module load time to prevent 3.5s model loading
 # on every engine creation (the model is not needed for these tests).
-from unittest.mock import MagicMock
-import backend.memory
-backend.memory.SentenceTransformer = MagicMock(return_value=MagicMock())
+from unittest.mock import MagicMock as _MagicMock
+import backend.memory as _memory
+_memory.SentenceTransformer = _MagicMock(return_value=_MagicMock())
 
 
 # ─── Fixed clock ─────────────────────────────────────────────────────────────
@@ -1481,3 +1481,411 @@ class TestPersistenceErrorHttp:
         with pytest.raises(TurnExecutionError) as exc_info:
             asyncio.run(engine.process_turn("user", "Hello"))
         assert exc_info.value.code == TurnErrorCode.persistence_unavailable
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Commit observability tests — issue #267 acceptance criteria
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestCommitObservability:
+    """Exact event classification for the commit section.
+
+    Each test verifies the outcome and code logged via _emit_stage_event
+    for different failure modes, both with and without cancellation.
+    """
+
+    def _capture_events(self, engine):
+        """Instrument the engine to capture stage events into a list."""
+        events = []
+
+        async def capture(event):
+            events.append(event)
+
+        engine._emit_stage_event = capture
+        return events
+
+    # ── No cancellation ───────────────────────────────────────────────
+
+    def test_save_turn_failure_classifies_as_persistence_unavailable(self):
+        """save_turn() fails without cancellation → commit/failed/persistence_unavailable."""
+        provider = FakeAsyncProvider()
+        provider.responses = [
+            FakeCompletion(json.dumps({"valence": 0.1, "arousal_shift": 0.0,
+                                       "dominance_shift": 0.0, "triggered_emotions": {}})),
+            FakeCompletion("Hi there!"),
+        ]
+        engine = _make_engine(fake_provider=provider)
+        events = self._capture_events(engine)
+
+        def failing_save(*args, **kwargs):
+            raise TurnExecutionError(TurnErrorCode.persistence_unavailable, "db down")
+
+        engine.memory_manager.save_turn = failing_save
+        engine.memory_manager.sync_state = MagicMock()
+
+        with pytest.raises(TurnExecutionError) as exc_info:
+            asyncio.run(engine.process_turn("user", "Hello"))
+
+        assert exc_info.value.code == TurnErrorCode.persistence_unavailable
+
+        commit_events = [e for e in events if e.stage.value == "commit"]
+        assert len(commit_events) == 1
+        assert commit_events[0].outcome.value == "failed"
+        assert commit_events[0].code == TurnErrorCode.persistence_unavailable
+
+        # No success event
+        assert not any(e.stage.value == "commit" and e.outcome.value == "success" for e in events)
+
+    def test_sync_state_failure_classifies_as_persistence_unavailable(self):
+        """sync_state() fails without cancellation → commit/failed/persistence_unavailable."""
+        provider = FakeAsyncProvider()
+        provider.responses = [
+            FakeCompletion(json.dumps({"valence": 0.1, "arousal_shift": 0.0,
+                                       "dominance_shift": 0.0, "triggered_emotions": {}})),
+            FakeCompletion("Hi there!"),
+        ]
+        engine = _make_engine(fake_provider=provider)
+        events = self._capture_events(engine)
+
+        engine.memory_manager.save_turn = MagicMock(return_value=MagicMock())
+
+        def failing_sync(*args, **kwargs):
+            raise TurnExecutionError(TurnErrorCode.persistence_unavailable, "db down")
+
+        engine.memory_manager.sync_state = failing_sync
+
+        with pytest.raises(TurnExecutionError) as exc_info:
+            asyncio.run(engine.process_turn("user", "Hello"))
+
+        assert exc_info.value.code == TurnErrorCode.persistence_unavailable
+
+        commit_events = [e for e in events if e.stage.value == "commit"]
+        assert len(commit_events) == 1
+        assert commit_events[0].outcome.value == "failed"
+        assert commit_events[0].code == TurnErrorCode.persistence_unavailable
+
+    def test_deadline_during_commit_classifies_as_timeout(self):
+        """Deadline between save_turn and sync_state without cancel → commit/timeout/turn_timeout."""
+        fake_now = [0.0]
+        def fake_monotonic():
+            return fake_now[0]
+
+        provider = FakeAsyncProvider()
+        provider.responses = [
+            FakeCompletion(json.dumps({"valence": 0.1, "arousal_shift": 0.0,
+                                       "dominance_shift": 0.0, "triggered_emotions": {}})),
+            FakeCompletion("Hi there!"),
+        ]
+
+        config = TurnExecutionConfig(
+            total_deadline=10.0,
+            connect_timeout=0.5,
+            provider_attempt_timeout=5.0,
+            commit_reserve=4.0,
+            supabase_timeout=0.5,
+        )
+        engine = _make_engine(turn_config=config, fake_provider=provider)
+        engine._monotonic = fake_monotonic
+        events = self._capture_events(engine)
+
+        def save_advancing_clock(*args, **kwargs):
+            # Advance clock past deadline before sync_state runs
+            fake_now[0] = 15.0
+            return MagicMock()
+
+        engine.memory_manager.save_turn = save_advancing_clock
+        engine.memory_manager.sync_state = MagicMock()
+
+        with pytest.raises(TurnExecutionError) as exc_info:
+            asyncio.run(engine.process_turn("user", "Hello"))
+
+        # sync_state's run_blocking_write sees budget.remaining <= 0
+        # and raises DeadlineExceeded, classified as timeout/turn_timeout
+        assert exc_info.value.code == TurnErrorCode.turn_timeout
+
+        commit_events = [e for e in events if e.stage.value == "commit"]
+        assert len(commit_events) == 1
+        assert commit_events[0].outcome.value == "timeout"
+        assert commit_events[0].code == TurnErrorCode.turn_timeout
+
+    # ── With cancellation ─────────────────────────────────────────────
+
+    async def _run_cancel_with_persistence_failure(self):
+        """Cancel during commit, worker ends with persistence failure.
+
+        Events: cancelled, then failed/persistence_unavailable.
+        CancelledError propagated.
+        """
+        provider = FakeAsyncProvider()
+        provider.responses = [
+            FakeCompletion(json.dumps({"valence": 0.1, "arousal_shift": 0.0,
+                                       "dominance_shift": 0.0, "triggered_emotions": {}})),
+            FakeCompletion("Hi there!"),
+        ]
+        engine = _make_engine(fake_provider=provider)
+        events = self._capture_events(engine)
+
+        import threading
+        save_started = threading.Event()
+        save_done = threading.Event()
+
+        def failing_save(*args, **kwargs):
+            save_started.set()
+            save_done.wait(timeout=10.0)
+            raise TurnExecutionError(TurnErrorCode.persistence_unavailable, "db failure")
+
+        engine.memory_manager.save_turn = failing_save
+        engine.memory_manager.sync_state = MagicMock()
+
+        task = asyncio.create_task(engine.process_turn("user_obs", "Hello"))
+
+        started_ok = await asyncio.to_thread(save_started.wait, 5.0)
+        assert started_ok, "save_turn did not start"
+
+        # Cancel during save
+        task.cancel()
+        await asyncio.sleep(0.05)
+
+        try:
+            # Always release the save so the worker can finish
+            save_done.set()
+            await task
+            pytest.fail("Expected CancelledError")
+        except asyncio.CancelledError:
+            pass
+
+        # Check events
+        commit_events = [e for e in events if e.stage.value == "commit"]
+        assert len(commit_events) >= 1
+
+        cancelled_events = [e for e in commit_events if e.outcome.value == "cancelled"]
+        assert len(cancelled_events) == 1
+
+        failed_events = [e for e in commit_events if e.outcome.value == "failed"]
+        assert len(failed_events) == 1
+        assert failed_events[0].code == TurnErrorCode.persistence_unavailable
+
+    def test_cancel_with_persistence_failure(self):
+        asyncio.run(self._run_cancel_with_persistence_failure())
+
+    async def _run_cancel_with_deadline(self):
+        """Cancel during commit, worker ends with deadline.
+
+        Events: cancelled, then timeout/turn_timeout.
+        CancelledError propagated.
+        No persistence_unavailable in the failed event.
+        """
+        provider = FakeAsyncProvider()
+        provider.responses = [
+            FakeCompletion(json.dumps({"valence": 0.1, "arousal_shift": 0.0,
+                                       "dominance_shift": 0.0, "triggered_emotions": {}})),
+            FakeCompletion("Hi there!"),
+        ]
+
+        fake_now = [0.0]
+        def fake_monotonic():
+            return fake_now[0]
+
+        config = TurnExecutionConfig(
+            total_deadline=10.0,
+            connect_timeout=0.5,
+            provider_attempt_timeout=5.0,
+            commit_reserve=4.0,
+            supabase_timeout=0.5,
+        )
+        engine = _make_engine(turn_config=config, fake_provider=provider)
+        engine._monotonic = fake_monotonic
+        events = self._capture_events(engine)
+
+        import threading
+        save_started = threading.Event()
+        save_done = threading.Event()
+
+        def blocking_save(*args, **kwargs):
+            save_started.set()
+            save_done.wait(timeout=10.0)
+            # Advance clock past deadline — the next run_blocking_write
+            # (sync_state) will see budget.remaining <= 0 and raise
+            # DeadlineExceeded.
+            fake_now[0] = 15.0
+            return MagicMock()
+
+        engine.memory_manager.save_turn = blocking_save
+        engine.memory_manager.sync_state = MagicMock()
+
+        task = asyncio.create_task(engine.process_turn("user_obs2", "Hello"))
+
+        started_ok = await asyncio.to_thread(save_started.wait, 5.0)
+        assert started_ok, "save_turn did not start"
+
+        # Cancel during save
+        task.cancel()
+        await asyncio.sleep(0.05)
+
+        # Release save — thread advances clock to 15.0, returns MagicMock.
+        # Then commit_section calls sync_state via run_blocking_write,
+        # which checks budget.remaining (10.0 - 15.0 = 0.0) → DeadlineExceeded.
+        # The drain loop catches it, recovers the exception via await,
+        # classifies as timeout/turn_timeout, emits the event.
+        save_done.set()
+
+        # Use wait_for to avoid flakiness from asyncio.sleep() timing.
+        # If the cancellation/drain takes longer than 5s this fails loudly.
+        try:
+            await asyncio.wait_for(task, timeout=5.0)
+            pytest.fail("Expected CancelledError")
+        except asyncio.CancelledError:
+            pass
+
+        commit_events = [e for e in events if e.stage.value == "commit"]
+        assert len(commit_events) >= 2, f"Expected at least 2 commit events, got {len(commit_events)}"
+
+        cancelled_events = [e for e in commit_events if e.outcome.value == "cancelled"]
+        assert len(cancelled_events) == 1
+
+        failed_events = [e for e in commit_events if e.outcome.value == "timeout"]
+        assert len(failed_events) == 1, f"Expected 1 timeout event, got {len(failed_events)}: {[e for e in commit_events if e.outcome.value != 'cancelled']}"
+        assert failed_events[0].code == TurnErrorCode.turn_timeout
+
+        # No persistence_unavailable
+        persistence_events = [e for e in commit_events if e.code == TurnErrorCode.persistence_unavailable]
+        assert len(persistence_events) == 0
+
+    def test_cancel_with_deadline(self):
+        asyncio.run(self._run_cancel_with_deadline())
+
+    # ── Typed error code preserved ────────────────────────────────────
+
+    def test_typed_turn_execution_error_preserves_code(self):
+        """TurnExecutionError with a non-default code preserves it in the event.
+
+        Propagation path: save_turn (thread) -> run_blocking_write
+        (isinstance(TurnExecutionError) -> re-raise) -> shield(commit_task)
+        -> except Exception -> _classify_commit_error preserves exc.code.
+        """
+        provider = FakeAsyncProvider()
+        provider.responses = [
+            FakeCompletion(json.dumps({"valence": 0.1, "arousal_shift": 0.0,
+                                       "dominance_shift": 0.0, "triggered_emotions": {}})),
+            FakeCompletion("Hi there!"),
+        ]
+        engine = _make_engine(fake_provider=provider)
+        events = self._capture_events(engine)
+
+        def failing_save(*args, **kwargs):
+            raise TurnExecutionError(TurnErrorCode.provider_invalid_request, "commit bad")
+
+        engine.memory_manager.save_turn = failing_save
+        engine.memory_manager.sync_state = MagicMock()
+
+        with pytest.raises(TurnExecutionError) as exc_info:
+            asyncio.run(engine.process_turn("user", "Hello"))
+
+        assert exc_info.value.code == TurnErrorCode.provider_invalid_request
+
+        commit_events = [e for e in events if e.stage.value == "commit"]
+        assert len(commit_events) == 1
+        assert commit_events[0].code == TurnErrorCode.provider_invalid_request
+
+        # No success event emitted
+        assert not any(
+            e.stage.value == "commit" and e.outcome.value == "success"
+            for e in events
+        )
+
+    # ── Typed error code preserved ────────────────────────────────────
+
+    def test_typed_turn_execution_error_preserves_code(self):
+        """TurnExecutionError with a non-default code preserves it in the event.
+
+        Propagation path: save_turn (thread) -> run_blocking_write
+        (isinstance(TurnExecutionError) -> re-raise) -> shield(commit_task)
+        -> except Exception -> _classify_commit_error preserves exc.code.
+        """
+        provider = FakeAsyncProvider()
+        provider.responses = [
+            FakeCompletion(json.dumps({"valence": 0.1, "arousal_shift": 0.0,
+                                       "dominance_shift": 0.0, "triggered_emotions": {}})),
+            FakeCompletion("Hi there!"),
+        ]
+        engine = _make_engine(fake_provider=provider)
+        events = self._capture_events(engine)
+
+        def failing_save(*args, **kwargs):
+            raise TurnExecutionError(TurnErrorCode.provider_invalid_request, "commit bad")
+
+        engine.memory_manager.save_turn = failing_save
+        engine.memory_manager.sync_state = MagicMock()
+
+        with pytest.raises(TurnExecutionError) as exc_info:
+            asyncio.run(engine.process_turn("user", "Hello"))
+
+        assert exc_info.value.code == TurnErrorCode.provider_invalid_request
+
+        commit_events = [e for e in events if e.stage.value == "commit"]
+        assert len(commit_events) == 1
+        assert commit_events[0].code == TurnErrorCode.provider_invalid_request
+
+        # No success event emitted
+        assert not any(
+            e.stage.value == "commit" and e.outcome.value == "success"
+            for e in events
+        )
+
+
+class TestClassifyCommitError:
+    """Unit tests for the _classify_commit_error helper."""
+
+    def test_deadline_exceeded(self):
+        outcome, code = ConversationEngine._classify_commit_error(DeadlineExceeded())
+        assert outcome.value == "timeout"
+        assert code == TurnErrorCode.turn_timeout
+
+    def test_turn_timeout_code(self):
+        outcome, code = ConversationEngine._classify_commit_error(
+            TurnExecutionError(TurnErrorCode.turn_timeout)
+        )
+        assert outcome.value == "timeout"
+        assert code == TurnErrorCode.turn_timeout
+
+    def test_persistence_unavailable(self):
+        outcome, code = ConversationEngine._classify_commit_error(
+            TurnExecutionError(TurnErrorCode.persistence_unavailable)
+        )
+        assert outcome.value == "failed"
+        assert code == TurnErrorCode.persistence_unavailable
+
+    def test_legacy_turn_persistence_error(self):
+        outcome, code = ConversationEngine._classify_commit_error(
+            TurnPersistenceError("legacy error")
+        )
+        assert outcome.value == "failed"
+        assert code == TurnErrorCode.persistence_unavailable
+
+    def test_legacy_state_persistence_error(self):
+        outcome, code = ConversationEngine._classify_commit_error(
+            StatePersistenceError("legacy error")
+        )
+        assert outcome.value == "failed"
+        assert code == TurnErrorCode.persistence_unavailable
+
+    def test_unexpected_exception(self):
+        outcome, code = ConversationEngine._classify_commit_error(
+            RuntimeError("unexpected")
+        )
+        assert outcome.value == "failed"
+        assert code == TurnErrorCode.internal_error
+
+    def test_typed_error_preserves_code(self):
+        outcome, code = ConversationEngine._classify_commit_error(
+            TurnExecutionError(TurnErrorCode.provider_invalid_request)
+        )
+        assert outcome.value == "failed"
+        assert code == TurnErrorCode.provider_invalid_request
+
+    def test_upstream_rate_limited_preserved(self):
+        outcome, code = ConversationEngine._classify_commit_error(
+            TurnExecutionError(TurnErrorCode.upstream_rate_limited)
+        )
+        assert outcome.value == "failed"
+        assert code == TurnErrorCode.upstream_rate_limited

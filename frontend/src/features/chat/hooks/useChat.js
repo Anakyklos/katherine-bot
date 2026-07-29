@@ -10,9 +10,18 @@ import { validateEmotionState } from '../../../shared/utils/formatters';
  * Each send creates a fresh AbortController. The timer is cleaned up on
  * success, error, cancellation, and unmount.
  *
- * A monotonically increasing request token prevents ownership races:
- * a stale `finally` block cannot clear the controller/timer of a newer
- * request or change `isLoading` of a request that already completed.
+ * Ownership model: single-flight — at most one active request per hook
+ * instance. A second handleSend() call while one is in-flight is silently
+ * rejected.
+ *
+ * A monotonically increasing request token invalidates ownership on
+ * unmount, ensuring stale callbacks never update state.
+ *
+ * Lifecycle:
+ * 1. mountedRef guards all state updates after await.
+ * 2. requestTokenRef guards ownership against stale requests on unmount.
+ * 3. inFlightRef synchronously blocks double submission before rerender.
+ * 4. focusTimerRef tracks the deferred focus timer for explicit cleanup.
  */
 export const useChat = () => {
     const [messages, setMessages] = useState([]);
@@ -24,6 +33,8 @@ export const useChat = () => {
     const abortControllerRef = useRef(null);
     const timerIdRef = useRef(null);
     const requestTokenRef = useRef(0);
+    const mountedRef = useRef(true);
+    const focusTimerRef = useRef(null);
     // Synchronous in-flight guard: prevents double submission before rerender.
     // isLoading depends on rerender, but the ref is synchronous, so a second
     // handleSend() call in the same microtask is rejected immediately.
@@ -40,12 +51,29 @@ export const useChat = () => {
         }
     }, []);
 
-    // Cleanup abort controller and timer on unmount
+    const cleanupFocusTimer = useCallback(() => {
+        if (focusTimerRef.current !== null) {
+            clearTimeout(focusTimerRef.current);
+            focusTimerRef.current = null;
+        }
+    }, []);
+
+    // Lifecycle effect: set mountedRef on mount, teardown on unmount
     useEffect(() => {
+        mountedRef.current = true;
+
         return () => {
+            mountedRef.current = false;
+
+            // Invalidate current request ownership before aborting, so the
+            // rejection caused by abort() is treated as stale continuation.
+            requestTokenRef.current += 1;
+            inFlightRef.current = false;
+
             cleanupRequest();
+            cleanupFocusTimer();
         };
-    }, [cleanupRequest]);
+    }, [cleanupRequest, cleanupFocusTimer]);
 
     // Auto-spin fetchHistory (EFH)
     useEffect(() => {
@@ -110,8 +138,8 @@ export const useChat = () => {
                 timeout: timeoutMs,
             });
 
-            // Guard: only the owning request may update state
-            if (token !== requestTokenRef.current) return;
+            // Guard: only mounted and owning request may update state
+            if (!mountedRef.current || token !== requestTokenRef.current) return;
 
             // Clear timer on success
             clearTimeout(timerId);
@@ -124,8 +152,8 @@ export const useChat = () => {
             const validated = validateEmotionState(data.emotion_state);
             setEmotionState(validated);
         } catch (error) {
-            // Guard: only the owning request may show error state
-            if (token !== requestTokenRef.current) return;
+            // Guard: only mounted and owning request may show error state
+            if (!mountedRef.current || token !== requestTokenRef.current) return;
 
             // Clear timer on error/cancel
             clearTimeout(timerId);
@@ -146,17 +174,18 @@ export const useChat = () => {
                 setMessages(prev => [...prev, errorMessage]);
             }
         } finally {
-            // Guard: only the owning request may clear refs, inFlight, and loading state
-            if (token === requestTokenRef.current) {
+            // Guard: only mounted and owning request may clear refs, inFlight, and loading state
+            if (mountedRef.current && token === requestTokenRef.current) {
                 setIsLoading(false);
                 inFlightRef.current = false;
                 abortControllerRef.current = null;
                 timerIdRef.current = null;
-                // Focus back on input
-                setTimeout(() => inputRef.current?.focus(), 100);
+                // Focus back on input — tracked by focusTimerRef for explicit cleanup
+                cleanupFocusTimer();
+                focusTimerRef.current = setTimeout(() => inputRef.current?.focus(), 100);
             }
         }
-    }, [input, isLoading, cleanupRequest]);
+    }, [input, isLoading, cleanupRequest, cleanupFocusTimer]);
 
     const clearHistory = useCallback(() => {
         setMessages([]);

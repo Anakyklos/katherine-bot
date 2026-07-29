@@ -157,6 +157,28 @@ class ConversationEngine:
     def _project_emotion_state(state: EmotionalStateV1, appraisal: AppraisalV1) -> EmotionStateResponse:
         return project_public_emotion(state, appraisal)
 
+    @staticmethod
+    def _classify_commit_error(
+        exc: BaseException,
+    ) -> tuple[StageOutcome, TurnErrorCode]:
+        """Classify a commit section exception into outcome and code.
+
+        Classification rules:
+        * DeadlineExceeded or TurnExecutionError(turn_timeout) → timeout/turn_timeout
+        * TurnExecutionError → failed / exc.code (preserves original code)
+        * TurnPersistenceError or StatePersistenceError → failed/persistence_unavailable
+        * Unexpected exception → failed/internal_error
+        """
+        if isinstance(exc, DeadlineExceeded):
+            return StageOutcome.timeout, TurnErrorCode.turn_timeout
+        if isinstance(exc, TurnExecutionError):
+            if exc.code == TurnErrorCode.turn_timeout:
+                return StageOutcome.timeout, TurnErrorCode.turn_timeout
+            return StageOutcome.failed, exc.code
+        if isinstance(exc, (TurnPersistenceError, StatePersistenceError)):
+            return StageOutcome.failed, TurnErrorCode.persistence_unavailable
+        return StageOutcome.failed, TurnErrorCode.internal_error
+
     async def _emit_stage_event(self, event: StageEvent) -> None:
         parts = ["event=turn_stage_completed", f"stage={event.stage.value}", f"outcome={event.outcome.value}"]
         if event.code is not None:
@@ -457,29 +479,27 @@ class ConversationEngine:
                 commit_error = exc
 
             if commit_error is not None:
-                # Emit sanitised observance of the commit failure, but
-                # do NOT replace the cancellation with a persistence error.
+                outcome, code = self._classify_commit_error(commit_error)
                 await self._emit_stage_event(StageEvent(
-                    stage=TurnStage.commit, outcome=StageOutcome.failed,
-                    code=TurnErrorCode.persistence_unavailable,
+                    stage=TurnStage.commit, outcome=outcome, code=code,
                 ))
 
             # Propagate the original cancellation after draining.
             # The lock is released by the finally block in _run_turn_locked.
             raise original_cancel
 
-        except (TurnPersistenceError, StatePersistenceError) as exc:
+        # Non-cancellation path: shield propagated the task's exception
+        # (TurnExecutionError, DeadlineExceeded, etc.). Classify, emit, re-raise.
+        except Exception as exc:
+            outcome, code = self._classify_commit_error(exc)
             await self._emit_stage_event(StageEvent(
-                stage=TurnStage.commit, outcome=StageOutcome.failed,
-                code=TurnErrorCode.persistence_unavailable,
+                stage=TurnStage.commit, outcome=outcome, code=code,
             ))
-            raise TurnExecutionError(
-                TurnErrorCode.persistence_unavailable,
-                "Turn persistence failed.",
-            ) from exc
+            if isinstance(exc, TurnExecutionError):
+                raise
+            raise TurnExecutionError(code, "Commit section failed.") from exc
 
-        # No cancellation — commit completed (possibly with failure that
-        # was already raised above)
+        # No cancellation — commit completed successfully
 
         if background_tasks and self.archival_extraction_enabled:
             background_tasks.add_task(self.run_archival_extraction, turn_ref)
