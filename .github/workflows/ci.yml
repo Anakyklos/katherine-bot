@@ -91,6 +91,23 @@ jobs:
           echo "SUPABASE_ANON_KEY=$anon_key" >> "$GITHUB_ENV"
           echo "SUPABASE_SERVICE_ROLE_KEY=$service_key" >> "$GITHUB_ENV"
 
+      - name: Reset database for admission ledger integration tests
+        run: |
+          set -euo pipefail
+          supabase db reset
+
+      - name: Run Admission Ledger Integration Tests
+        env:
+          SUPABASE_URL: "http://127.0.0.1:54321"
+          PYTHONPATH: "."
+        run: |
+          python -m pytest -q -ra backend/tests/test_admission_ledger_integration.py
+
+      - name: Reset database for legacy upgrade tests
+        run: |
+          set -euo pipefail
+          supabase db reset
+
       - name: Run Legacy Upgrade Test
         env:
           SUPABASE_URL: "http://127.0.0.1:54321"
@@ -155,6 +172,7 @@ jobs:
           timeout --signal=TERM --kill-after=30s 20m \
             python -m pytest backend/tests \
               --ignore=backend/tests/test_database_authorization_integration.py \
+              --ignore=backend/tests/test_admission_ledger_integration.py \
               --ignore=backend/tests/test_legacy_upgrade.py \
               -ra
 
