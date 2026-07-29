@@ -1,5 +1,7 @@
 import asyncio
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
 import logging
@@ -7,19 +9,40 @@ from supabase_auth.errors import AuthApiError, AuthRetryableError
 logger = logging.getLogger(__name__)
 
 
-from pydantic import BaseModel, ConfigDict, Field
-from typing import List, Optional
+from pydantic import BaseModel, ConfigDict, StrictStr, field_validator
+from pydantic_core import PydanticCustomError
+from typing import Optional
 import uvicorn
 import os
 from dotenv import load_dotenv
-from .engine import ConversationEngine
-from .memory import MAX_MESSAGE_LENGTH, StatePersistenceError
+from .admission import (
+    ADMITTED,
+    APPLICATION_RATE_LIMITED,
+    INVALID_ADMISSION_INPUT,
+    NETWORK_RATE_LIMITED,
+    REQUEST_ID_CONFLICT,
+    REQUEST_REPLAY_UNAVAILABLE,
+    USER_DAILY_REQUEST_QUOTA_EXCEEDED,
+    USER_DAILY_UNIT_QUOTA_EXCEEDED,
+    USER_RATE_LIMITED,
+    AdmissionResult,
+    AdmissionRuntimeConfig,
+    AdmissionUnavailable,
+    build_admission_request,
+    reserve_admission_sync,
+    resolve_network_identity,
+)
+from .admission_contracts import AdmissionError, RequestIdentity, validate_new_message
+from .chat_engine import ChatConversationEngine
+from .memory import StatePersistenceError
 from .emotion_presentation import EmotionStateResponse
 from .turn_execution import (
     TurnExecutionConfig,
     TurnExecutionError,
     TurnErrorCode,
     DeadlineExceeded,
+    create_budget,
+    run_blocking_write,
 )
 from .groq_manager import GroqPoolExhaustedError, GroqRequestError
 
@@ -51,11 +74,13 @@ _archival_extraction_enabled = parse_archival_extraction_flag(
     os.environ.get("ARCHIVAL_EXTRACTION_ENABLED")
 )
 
-# Parse turn execution config from environment
+# Parse turn execution and admission config from environment. Admission has no
+# fallback secret and fails closed during application initialisation.
 _turn_config = TurnExecutionConfig.from_env()
+_admission_config = AdmissionRuntimeConfig.from_env()
 
 # Initialize Engine with containment-aware configuration
-engine = ConversationEngine(
+engine = ChatConversationEngine(
     archival_extraction_enabled=_archival_extraction_enabled,
     turn_config=_turn_config,
 )
@@ -96,11 +121,58 @@ def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Depen
 
 class ChatInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    message: str = Field(max_length=MAX_MESSAGE_LENGTH)
+    request_id: StrictStr
+    message: StrictStr
+
+    @field_validator("request_id")
+    @classmethod
+    def _validate_request_id(cls, value: str) -> str:
+        try:
+            return RequestIdentity(value).request_id
+        except AdmissionError:
+            raise PydanticCustomError("invalid_request_id", "invalid_request_id")
+
+    @field_validator("message")
+    @classmethod
+    def _validate_message(cls, value: str) -> str:
+        try:
+            validate_new_message(value)
+        except AdmissionError as exc:
+            raise PydanticCustomError(exc.code, exc.code)
+        return value
 
 class ChatResponse(BaseModel):
     response: str
     emotion_state: EmotionStateResponse
+
+
+_VALIDATION_MESSAGES = {
+    "invalid_request_id": "Invalid request identifier.",
+    "message_too_long": "Message exceeds the character limit.",
+    "message_budget_exceeded": "Message exceeds the input budget.",
+    "invalid_request": "Invalid request body.",
+}
+
+
+@app.exception_handler(RequestValidationError)
+async def _sanitise_request_validation_error(
+    _request: Request,
+    exc: RequestValidationError,
+) -> JSONResponse:
+    error_types = {item.get("type") for item in exc.errors()}
+    code = "invalid_request"
+    for candidate in (
+        "invalid_request_id",
+        "message_too_long",
+        "message_budget_exceeded",
+    ):
+        if candidate in error_types:
+            code = candidate
+            break
+    return JSONResponse(
+        status_code=422,
+        content={"detail": {"code": code, "message": _VALIDATION_MESSAGES[code]}},
+    )
 
 
 # ─── Error mapping ───────────────────────────────────────────────────────────
@@ -192,21 +264,85 @@ def _map_turn_error(exc: Exception) -> HTTPException:
     )
 
 
+_ADMISSION_HTTP = {
+    REQUEST_REPLAY_UNAVAILABLE: (409, "Request was already received but its response is unavailable."),
+    REQUEST_ID_CONFLICT: (409, "Request identifier conflicts with a different message."),
+    USER_RATE_LIMITED: (429, "User request rate limit exceeded."),
+    NETWORK_RATE_LIMITED: (429, "Network request rate limit exceeded."),
+    APPLICATION_RATE_LIMITED: (429, "Application request rate limit exceeded."),
+    USER_DAILY_REQUEST_QUOTA_EXCEEDED: (429, "Daily request quota exceeded."),
+    USER_DAILY_UNIT_QUOTA_EXCEEDED: (429, "Daily input quota exceeded."),
+    INVALID_ADMISSION_INPUT: (422, "Invalid admission input."),
+}
+
+
+def _map_admission_rejection(result: AdmissionResult) -> HTTPException:
+    status_code, message = _ADMISSION_HTTP[result.decision]
+    headers = {"Retry-After": str(result.retry_after_seconds)} if status_code == 429 else None
+    return HTTPException(
+        status_code=status_code,
+        detail={"code": result.decision, "message": message},
+        headers=headers,
+    )
+
+
+def _admission_unavailable_error() -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail={"code": AdmissionUnavailable.code, "message": "Admission service unavailable."},
+    )
+
+
 @app.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(
     input_data: ChatInput,
+    request: Request,
     background_tasks: BackgroundTasks,
     current_user = Depends(get_current_user)
 ):
     try:
-        user_id = current_user.id
+        budget = create_budget(_turn_config)
+        user_id = getattr(current_user, "id", None)
+        identity = RequestIdentity(input_data.request_id)
+        peer_host = request.client.host if request.client is not None else None
+        network_identity = resolve_network_identity(
+            peer_host,
+            request.headers.get("x-forwarded-for"),
+            _admission_config.trusted_proxy_networks,
+        )
+        admission_request = build_admission_request(
+            user_id=user_id,
+            request_identity=identity,
+            message=input_data.message,
+            network_identity=network_identity,
+            config=_admission_config,
+        )
+        admission_result = await run_blocking_write(
+            "reserve_admission",
+            budget,
+            _turn_config.supabase_timeout,
+            reserve_admission_sync,
+            engine.memory_manager.supabase,
+            admission_request,
+            allowlist_exceptions=(AdmissionUnavailable,),
+        )
+        if admission_result.decision != ADMITTED:
+            logger.info("event=admission_rejected code=%s", admission_result.decision)
+            raise _map_admission_rejection(admission_result)
+
+        logger.info("event=admission_admitted")
         response_text, current_emotion = await engine.process_turn(
-            user_id, input_data.message, background_tasks
+            user_id, input_data.message, background_tasks, budget=budget
         )
         return ChatResponse(response=response_text, emotion_state=current_emotion)
     except asyncio.CancelledError:
         # CancelledError must NOT be converted to HTTP 500 — propagate
         raise
+    except HTTPException:
+        raise
+    except AdmissionUnavailable:
+        logger.error("event=admission_unavailable")
+        raise _admission_unavailable_error()
     except (DeadlineExceeded, TurnExecutionError, GroqPoolExhaustedError,
             GroqRequestError, StatePersistenceError) as exc:
         raise _map_turn_error(exc)

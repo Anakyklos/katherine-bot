@@ -13,6 +13,9 @@ from unittest.mock import patch, AsyncMock
 from fastapi import BackgroundTasks
 from fastapi.testclient import TestClient
 
+REQUEST_ID = "550e8400-e29b-41d4-a716-446655440000"
+
+
 @pytest.fixture(autouse=True, scope="module")
 def mock_external_dependencies():
     # Capture states at setup phase
@@ -28,6 +31,8 @@ def mock_external_dependencies():
     os.environ['GROQ_API_KEY'] = 'mock_key'
     os.environ['SUPABASE_URL'] = 'http://mock'
     os.environ['SUPABASE_SERVICE_ROLE_KEY'] = 'mock_key'
+    os.environ['ADMISSION_HMAC_SECRET'] = 'test-admission-secret-that-is-at-least-32-bytes'
+    os.environ['TRUSTED_PROXY_CIDRS'] = ''
 
     yield
 
@@ -72,6 +77,9 @@ def client_app(mock_external_dependencies):
 def mock_supabase():
     from backend.main import engine
     with patch.object(engine.memory_manager, 'supabase', MagicMock()) as mock_sb:
+        mock_sb.rpc.return_value.execute.return_value.data = [
+            {"decision": "admitted", "retry_after_seconds": 0}
+        ]
         yield mock_sb
 
 
@@ -342,7 +350,7 @@ async def test_run_archival_extraction_disabled_returns_early(backend):
     engine.groq_manager.chat_completion.assert_not_called()
 
 
-def test_chat_response_format(client_app, mock_supabase):
+def test_chat_response_format(client_app, mock_supabase, monkeypatch):
     from backend.main import engine
     from backend.relationship import RelationshipStateV1
     
@@ -357,7 +365,7 @@ def test_chat_response_format(client_app, mock_supabase):
     
     from backend.emotion_presentation import EmotionStateResponse, PublicPAD, PublicDominantEmotion
     
-    # Mock process_turn to return valid EmotionStateResponse
+    # Mock process_turn to return valid EmotionStateResponse and restore it after the test.
     mock_emotion = EmotionStateResponse(
         schema_version=1,
         mood_label="NEUTRA",
@@ -367,11 +375,15 @@ def test_chat_response_format(client_app, mock_supabase):
         ],
         timestamp=1700000000.0,
     )
-    engine.process_turn = AsyncMock(return_value=("My response text", mock_emotion))
+    monkeypatch.setattr(
+        engine,
+        "process_turn",
+        AsyncMock(return_value=("My response text", mock_emotion)),
+    )
     
     response = client_app.post(
         "/chat",
-        json={"message": "hello"},
+        json={"request_id": REQUEST_ID, "message": "hello"},
         headers={"Authorization": "Bearer valid_token"}
     )
     
