@@ -15,7 +15,7 @@ from typing import Any, Mapping
 
 from .admission_contracts import (
     AdmissionError,
-    NEW_MESSAGE_MAX_UNITS,
+    MESSAGE_MAX_ESTIMATED_UNITS,
     RequestIdentity,
     estimate_text_units,
 )
@@ -274,7 +274,7 @@ class AdmissionRequest:
         if (
             isinstance(self.estimated_units, bool)
             or not isinstance(self.estimated_units, int)
-            or not 1 <= self.estimated_units <= NEW_MESSAGE_MAX_UNITS
+            or not 1 <= self.estimated_units <= MESSAGE_MAX_ESTIMATED_UNITS
         ):
             raise AdmissionUnavailable()
         object.__setattr__(self, "request_id", canonical_request_id)
