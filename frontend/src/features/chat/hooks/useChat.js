@@ -40,6 +40,11 @@ export const useChat = () => {
     // handleSend() call in the same microtask is rejected immediately.
     const inFlightRef = useRef(false);
 
+    // Monotonically increasing version counter for local message mutations.
+    // Guards the deferred /history response from overwriting messages that
+    // were added or cleared after the history read started.
+    const localMessagesVersionRef = useRef(0);
+
     const cleanupRequest = useCallback(() => {
         if (timerIdRef.current !== null) {
             clearTimeout(timerIdRef.current);
@@ -75,24 +80,56 @@ export const useChat = () => {
         };
     }, [cleanupRequest, cleanupFocusTimer]);
 
-    // Auto-spin fetchHistory (EFH)
+    // Auto-spin fetchHistory (EFH) with guarded lifecycle.
+    // Uses a local active flag, an AbortController, and a version snapshot
+    // to prevent stale /history responses from updating state after:
+    //   - unmount (active flag + abort)
+    //   - a local mutation (version mismatch: send or clearHistory)
+    //   - the read was superseded by a newer fetch (the effect runs once)
     useEffect(() => {
+        let active = true;
+        const controller = new AbortController();
+        const versionAtStart = localMessagesVersionRef.current;
+
         const fetchHistory = async () => {
             try {
-                // api.get uses the interceptor to add the Bearer token automatically
-                const response = await api.get('/history');
+                const response = await api.get('/history', {
+                    signal: controller.signal,
+                });
+
+                if (
+                    !active ||
+                    !mountedRef.current ||
+                    versionAtStart !== localMessagesVersionRef.current
+                ) {
+                    return;
+                }
+
                 if (Array.isArray(response.data)) {
                     setMessages(response.data);
                 }
             } catch (error) {
+                // Silent return on expected lifecycle termination
+                if (!active || controller.signal.aborted) {
+                    return;
+                }
+
                 // History fetch failure is not critical — log sanitised
-                if (typeof import.meta !== 'undefined' && import.meta.env?.MODE !== 'test') {
+                if (
+                    typeof import.meta !== 'undefined' &&
+                    import.meta.env?.MODE !== 'test'
+                ) {
                     console.warn('Failed to fetch history');
                 }
             }
         };
 
         fetchHistory();
+
+        return () => {
+            active = false;
+            controller.abort();
+        };
     }, []);
 
     // Auto-scroll to bottom
@@ -109,6 +146,7 @@ export const useChat = () => {
 
         // Mark in-flight synchronously BEFORE any side effects.
         inFlightRef.current = true;
+        localMessagesVersionRef.current += 1;
 
         // Optimistic update
         setMessages(prev => [...prev, newUserMessage]);
@@ -188,6 +226,7 @@ export const useChat = () => {
     }, [input, isLoading, cleanupRequest, cleanupFocusTimer]);
 
     const clearHistory = useCallback(() => {
+        localMessagesVersionRef.current += 1;
         setMessages([]);
         setEmotionState(null);
     }, []);

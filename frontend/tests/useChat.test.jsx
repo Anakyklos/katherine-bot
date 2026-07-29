@@ -8,11 +8,19 @@
  * - Unmount during request: abort called, cleanup complete, no warnings
  * - Ownership invalidation: stale callbacks after unmount do not update state
  * - No React act() warnings
+ * - History lifecycle: deferred response after unmount does not update state
+ * - Late history does not overwrite sent messages
+ * - Late history does not undo clearHistory()
+ * - Normal history loading still works
+ * - Abort of history fetch on unmount is silent
  */
 import React from 'react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { renderHook, act, waitFor } from '@testing-library/react';
 import { useChat } from '../src/features/chat/hooks/useChat';
+
+// Export a configurable mock for api.get so tests can defer / control its resolution.
+const mockApiGet = vi.hoisted(() => vi.fn().mockResolvedValue({ data: [] }));
 
 const mockSendMessage = vi.fn();
 
@@ -29,7 +37,7 @@ vi.mock('../src/features/chat/services/chatService', () => ({
 
 vi.mock('../src/shared/services/apiClient', () => ({
     default: {
-        get: vi.fn().mockResolvedValue({ data: [] }),
+        get: (...args) => mockApiGet(...args),
         post: vi.fn(),
     },
 }));
@@ -59,6 +67,8 @@ describe('useChat', () => {
     beforeEach(() => {
         vi.useRealTimers();
         mockSendMessage.mockReset();
+        mockApiGet.mockReset();
+        mockApiGet.mockResolvedValue({ data: [] });
     });
 
     afterEach(() => {
@@ -268,5 +278,160 @@ describe('useChat', () => {
 
         expect(result.current.isLoading).toBe(false);
         expect(result.current.messages.filter(m => m.role === 'assistant').length).toBe(1);
+    });
+
+    // ─── History lifecycle tests ─────────────────────────────────────────
+
+    it('does not apply history response after unmount', async () => {
+        const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        let resolveHistory;
+        mockApiGet.mockReturnValue(new Promise(r => { resolveHistory = r; }));
+
+        const { unmount } = renderHook(() => useChat());
+
+        expect(mockApiGet).toHaveBeenCalled();
+
+        // Unmount before history resolves
+        act(() => { unmount(); });
+
+        // Resolve with non-empty history — mock deliberately ignores abort
+        await act(async () => {
+            resolveHistory({ data: [{ role: 'user', content: 'old message' }] });
+        });
+
+        // Flush pending microtasks
+        await act(async () => {});
+
+        // No React warnings (update-on-unmounted-component etc.)
+        const warningMessages = consoleErrorSpy.mock.calls
+            .filter(([msg]) => typeof msg === 'string')
+            .filter(([msg]) =>
+                msg.includes('not wrapped in act') ||
+                msg.includes('update') ||
+                msg.includes('unmount')
+            );
+        expect(warningMessages).toHaveLength(0);
+
+        // No console.warn from history failure (abort is expected, not an error)
+        expect(consoleWarnSpy).not.toHaveBeenCalled();
+
+        consoleErrorSpy.mockRestore();
+        consoleWarnSpy.mockRestore();
+    });
+
+    it('late history does not overwrite sent messages', async () => {
+        let resolveHistory;
+        mockApiGet.mockReturnValue(new Promise(r => { resolveHistory = r; }));
+
+        const { result } = renderHook(() => useChat());
+
+        // History is still pending — confirm it was called
+        await waitFor(() => expect(mockApiGet).toHaveBeenCalled());
+
+        // Send a message while history is pending
+        mockSendMessage.mockResolvedValue(validEmotionResponse('Bot reply'));
+
+        await act(async () => { result.current.setInput('Hello'); });
+        let sendPromise;
+        await act(async () => { sendPromise = result.current.handleSend(); });
+        await act(async () => { await sendPromise; });
+
+        // Verify the sent messages are in place
+        expect(result.current.messages).toHaveLength(2);
+        expect(result.current.messages[0].content).toBe('Hello');
+        expect(result.current.messages[1].content).toBe('Bot reply');
+
+        // Now resolve history with old/different data
+        await act(async () => {
+            resolveHistory({ data: [{ role: 'user', content: 'old message' }] });
+        });
+
+        await act(async () => {});
+
+        // The sent messages must still be present
+        expect(result.current.messages).toHaveLength(2);
+        expect(result.current.messages[0].content).toBe('Hello');
+        expect(result.current.messages[1].content).toBe('Bot reply');
+    });
+
+    it('late history does not undo clearHistory', async () => {
+        let resolveHistory;
+        mockApiGet.mockReturnValue(new Promise(r => { resolveHistory = r; }));
+
+        const { result } = renderHook(() => useChat());
+
+        expect(mockApiGet).toHaveBeenCalled();
+
+        // Clear history while /history is pending
+        await act(async () => {
+            result.current.clearHistory();
+        });
+
+        // Resolve history with old data
+        await act(async () => {
+            resolveHistory({ data: [{ role: 'user', content: 'old message' }] });
+        });
+
+        await act(async () => {});
+
+        // Messages must remain empty
+        expect(result.current.messages).toHaveLength(0);
+        expect(result.current.messages).toEqual([]);
+    });
+
+    it('loads history normally when no local mutations occur', async () => {
+        const historyData = [
+            { role: 'user', content: 'stored question' },
+            { role: 'assistant', content: 'stored answer' },
+        ];
+        mockApiGet.mockResolvedValue({ data: historyData });
+
+        const { result } = renderHook(() => useChat());
+
+        await waitFor(() => {
+            expect(result.current.messages).toEqual(historyData);
+        });
+    });
+
+    it('aborting history fetch on unmount does not produce warnings', async () => {
+        const consoleErrorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+        const consoleWarnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+        let resolveHistory;
+        mockApiGet.mockReturnValue(new Promise(r => { resolveHistory = r; }));
+
+        const { unmount } = renderHook(() => useChat());
+
+        expect(mockApiGet).toHaveBeenCalled();
+
+        // Unmount — triggers abort signal and sets active=false
+        await act(async () => {
+            unmount();
+        });
+
+        // Resolve the promise (the guards handle the rest)
+        await act(async () => {
+            resolveHistory({ data: [{ role: 'user', content: 'stale' }] });
+        });
+
+        await act(async () => {});
+
+        // No console.warn (abort is expected lifecycle, not a failure)
+        expect(consoleWarnSpy).not.toHaveBeenCalled();
+
+        // No React warnings
+        const warningMessages = consoleErrorSpy.mock.calls
+            .filter(([msg]) => typeof msg === 'string')
+            .filter(([msg]) =>
+                msg.includes('not wrapped in act') ||
+                msg.includes('update') ||
+                msg.includes('unmount')
+            );
+        expect(warningMessages).toHaveLength(0);
+
+        consoleErrorSpy.mockRestore();
+        consoleWarnSpy.mockRestore();
     });
 });
