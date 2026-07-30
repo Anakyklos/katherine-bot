@@ -27,7 +27,8 @@ Usage::
 
     validate_provider_input([{"role": "user", "content": "Hi"}])
     validate_provider_input(large_messages, max_units=16000)
-    pruned = fit_optional_context(mandatory, optional_components)
+    result = fit_optional_context(mandatory, optional_components)
+    assert isinstance(result, ContextFitResult)
 """
 
 from __future__ import annotations
@@ -305,7 +306,7 @@ def fit_optional_context(
     *,
     suffix: str = "",
     selection_priority: list[int] | None = None,
-) -> list:
+) -> ContextFitResult:
     """Build a messages list that fits within *max_units*.
 
     ``mandatory_messages``
@@ -418,13 +419,7 @@ def _fit_optional_context_impl(
             break
 
     if system_content_index is None:
-        if suffix:
-            logger.warning("Cannot append suffix: no system message in mandatory messages.")
-        return ContextFitResult(
-            messages=current_messages,
-            selected_indices=frozenset(),
-            pruned=False,
-        )
+        raise ProviderEnvelopeError("no_system_message")
 
     suffix_payload = "\n\n" + suffix if suffix else ""
 

@@ -28,6 +28,23 @@ class RetrievedMemory:
         if not isinstance(self.tags, tuple):
             raise ValueError(f"RetrievedMemory tags must be a tuple, got {type(self.tags)}")
 
+    def to_prompt_text(self) -> str:
+        """Format this memory entry for inclusion in a system prompt.
+
+        Preserves ``content`` and tags in a deterministic representation::
+
+            User likes cats.
+            Tags: pets, preference
+
+        Empty tags omit the ``Tags:`` line entirely.
+        """
+        parts = [self.content]
+        if self.tags and any(t.strip() for t in self.tags):
+            normalized_tags = sorted(set(t.strip() for t in self.tags if t.strip()))
+            if normalized_tags:
+                parts.append("Tags: " + ", ".join(normalized_tags))
+        return "\n".join(parts)
+
 logger = logging.getLogger(__name__)
 
 MAX_MESSAGE_LENGTH = 10000  # Limite máximo de caracteres por mensagem no histórico para evitar sobrecarga de contexto
@@ -344,13 +361,14 @@ class MemoryManager:
         # Build backward-compatible memory_str from structured entries
         if memory_entries:
             memory_str = "\n".join(
-                f"- {m.content} (Tags: {', '.join(m.tags)})" for m in memory_entries
+                m.to_prompt_text() for m in memory_entries
             )
         else:
             memory_str = "Nenhuma memória específica encontrada."
 
         # Build memory_entries as list of individual strings for engine consumption
-        memory_entry_strings = [m.content for m in memory_entries]
+        # Uses the same to_prompt_text() representation as memory_str.
+        memory_entry_strings = [m.to_prompt_text() for m in memory_entries]
 
         context_str = f"""
         === CORE MEMORY (QUEM VOCÊ É) ===

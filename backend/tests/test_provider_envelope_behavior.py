@@ -154,30 +154,60 @@ class TestAppraiseBehavioral:
         ]
 
     def test_largest_valid_message(self):
-        """Largest valid message that fits admission limit + envelope <= 16000."""
+        """Largest valid message at exactly MESSAGE_MAX_ESTIMATED_UNITS (6000 units).
+
+        Builds a deterministic string whose ``estimate_text_units`` is exactly
+        6000 (``"x" * 6000`` = 6000 ASCII bytes = 6000 units), calls
+        ``_appraise()``, and verifies:
+        - ``MESSAGE_MAX_ESTIMATED_UNITS == 6000``
+        - ``estimate_text_units(message) == 6000``
+        - Provider called exactly once
+        - The messages delivered to the provider validate
+        - ``estimate_provider_input_units(messages) <= 16000``
+        - Full message appears in the prompt
+        - ``AppraisalV1`` parsing succeeds
+        """
         async def run():
-            # Build a message up to MESSAGE_MAX_ESTIMATED_UNITS (6000 units)
+            from backend.admission_contracts import (
+                MESSAGE_MAX_ESTIMATED_UNITS, estimate_text_units,
+            )
+            from backend.emotional_domain import AppraisalV1
+
+            assert MESSAGE_MAX_ESTIMATED_UNITS == 6000
+
+            # Deterministic string: 6000 ASCII chars = 6000 UTF-8 bytes = 6000 units
+            message = "x" * 6000
+            assert estimate_text_units(message) == 6000
+
             engine = _make_engine()
             self._setup_success(engine)
             budget = _budget()
 
-            # The message is the content of the appraisal prompt, not a user message.
-            # Use content that hits approx 6000 units as the user message content
-            # which will then be wrapped in the appraisal prompt.
-            # The appraisal prompt adds overhead, so a 6000-unit user message
-            # will produce a >6000-unit appraisal envelope which is fine because
-            # the appraisal limit is 16000, not 6000. The 6000 limit is for
-            # admission of new user messages.
-            content = "x" * 5000
-            await engine._appraise(content, budget)
+            # Call _appraise with the message
+            appraisal = await engine._appraise(message, budget)
 
+            # Provider was called exactly once
             assert engine.groq_manager.chat_completion_async.call_count == 1
+
+            # Capture the messages delivered to chat_completion_async
             sent_messages = engine.groq_manager.chat_completion_async.call_args_list[0][1]["messages"]
-            # Validate the envelope sent to the provider
+
+            # Validate the same object with validate_provider_input
             validate_provider_input(sent_messages)
+
+            # Confirm estimate_provider_input_units(messages) <= 16000
             units = estimate_provider_input_units(sent_messages)
             assert units <= 16000, f"Appraisal envelope ({units}) exceeds 16000"
             assert units > 0
+
+            # Confirm the full message appears in the appraisal prompt
+            prompt = sent_messages[0]["content"]
+            assert message in prompt, (
+                f"Full message not found in appraisal prompt"
+            )
+
+            # Confirm valid AppraisalV1 parsing
+            assert isinstance(appraisal, AppraisalV1)
 
         asyncio.run(run())
 
