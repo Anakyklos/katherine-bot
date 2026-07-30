@@ -410,7 +410,10 @@ def _fit_optional_context_impl(
 
     if not optional_context_components:
         if suffix:
-            _append_to_system(current_messages, "\n\n" + suffix)
+            current_messages = _append_to_system(
+                current_messages,
+                "\n\n" + suffix,
+            )
             validate_provider_input(current_messages, max_units=max_units)
         return ContextFitResult(
             messages=current_messages,

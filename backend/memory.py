@@ -389,36 +389,57 @@ class MemoryManager:
     def _retrieve_relevant_entries(self, user_id: str, query: str) -> list[RetrievedMemory]:
         if not self.supabase or not self.embedding_model:
             return []
+
         try:
             query_embedding = self.embedding_model.encode(query).tolist()
-            params = {
-                "query_embedding": query_embedding,
-                "match_threshold": 0.5,
-                "match_count": 3,
-                "filter_user_id": user_id
-            }
-            response = self.supabase.rpc("match_memories", params).execute()
         except Exception:
             return []
-        if not response.data or not isinstance(response.data, list):
+
+        params = {
+            "query_embedding": query_embedding,
+            "match_threshold": 0.5,
+            "match_count": 3,
+            "filter_user_id": user_id,
+        }
+
+        # RPC call and response validation in a single protected block
+        try:
+            response = (
+                self.supabase
+                .rpc("match_memories", params)
+                .execute()
+            )
+
+            if (
+                response is None
+                or not hasattr(response, "data")
+                or not isinstance(response.data, list)
+            ):
+                return []
+
+            documents = response.data
+        except Exception:
             return []
+
         entries: list[RetrievedMemory] = []
-        for doc in response.data:
-            if not isinstance(doc, dict):
-                continue
-            content = doc.get("content", "")
-            if not isinstance(content, str) or not content.strip():
-                continue
-            metadata = doc.get("metadata", {})
-            raw_tags = metadata.get("tags", ()) if isinstance(metadata, dict) else ()
-            if isinstance(raw_tags, str):
-                tag_values = (raw_tags,)
-            elif isinstance(raw_tags, (list, tuple)):
-                tag_values = tuple(raw_tags)
-            else:
-                tag_values = ()
+        for doc in documents:
             try:
-                entries.append(RetrievedMemory(content=content, tags=tag_values))
-            except ValueError:
+                if not isinstance(doc, dict):
+                    continue
+                content = doc.get("content", "")
+                if not isinstance(content, str) or not content.strip():
+                    continue
+                metadata = doc.get("metadata", {})
+                raw_tags = metadata.get("tags", ()) if isinstance(metadata, dict) else ()
+                if isinstance(raw_tags, str):
+                    tag_values = (raw_tags,)
+                elif isinstance(raw_tags, (list, tuple)):
+                    tag_values = tuple(raw_tags)
+                else:
+                    tag_values = ()
+                entry = RetrievedMemory(content=content, tags=tag_values)
+                entries.append(entry)
+            except Exception:
                 continue
+
         return entries
