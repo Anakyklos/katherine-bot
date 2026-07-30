@@ -525,20 +525,70 @@ def test_non_retryable_http_error_fails_immediately():
     assert calls == ["key-one-11111111"]
 
 
-# 18. Sync invalid envelope rejected before key acquisition
-def test_sync_invalid_envelope_rejected():
-    """Invalid message structure is rejected before any key access."""
-    manager = GroqClientManager(
-        keys=["key-one-11111111"],
-        client_factory=lambda k: MockClient(lambda *args, **kwargs: MockCompletion("ok"))
-    )
+# 18–19. Sync invalid envelope rejected before key acquisition (parametrized)
 
-    with pytest.raises(GroqRequestError) as excinfo:
-        manager.chat_completion(messages=[], model="test")
-    assert "Falha ao executar requisição Groq" in str(excinfo.value)
+SENSITIVE_MARKER = "SENSITIVE_USER_MARKER_87342"
+
+INVALID_ENVELOPES = [
+    pytest.param([], id="empty_list"),
+    pytest.param("not-a-list", id="not_a_list"),
+    pytest.param(["not-a-dict"], id="not_a_dict_element"),
+    pytest.param([{"role": "user"}], id="missing_content"),
+    pytest.param(
+        [{"role": "invalid-role", "content": "hello"}],
+        id="invalid_role",
+    ),
+    pytest.param(
+        [{"role": "user", "content": "safe", SENSITIVE_MARKER: "classified"}],
+        id="unknown_key_with_sensitive_marker",
+    ),
+]
 
 
-# 19. Sync oversized envelope rejected before key acquisition
+class TestSyncInvalidEnvelope:
+    """Parametrized sync invalid envelope rejection.
+
+    Covers: empty list, not-a-list, not-a-dict element, missing content,
+    invalid role, and unknown key with sensitive marker. Each case must be
+    rejected before any key acquisition, factory call, or network operation.
+    """
+
+    def _make_manager(self):
+        factory_calls = []
+        def _factory(k):
+            factory_calls.append(k)
+            return MockClient(lambda *args, **kwargs: MockCompletion("ok"))
+        mgr = GroqClientManager(
+            keys=["key-one-11111111", "key-two-22222222"],
+            client_factory=_factory,
+        )
+        return mgr, factory_calls
+
+    @pytest.mark.parametrize("invalid_messages", INVALID_ENVELOPES)
+    def test_sync_invalid_envelope_rejected(self, invalid_messages, caplog):
+        caplog.set_level(logging.ERROR)
+        manager, factory_calls = self._make_manager()
+
+        initial_index = manager._index
+        initial_cooldowns = dict(manager._cooldowns)
+        initial_deactivated = set(manager._deactivated)
+
+        with pytest.raises(GroqRequestError) as exc_info:
+            manager.chat_completion(messages=invalid_messages, model="test")
+
+        assert "Falha ao executar requisição Groq" in str(exc_info.value)
+        assert "event=provider_input_invalid stage=generation" in caplog.text
+        assert factory_calls == []
+
+        assert manager._index == initial_index, "Cursor was modified by local error"
+        assert dict(manager._cooldowns) == initial_cooldowns, "Cooldowns were modified by local error"
+        assert set(manager._deactivated) == initial_deactivated, "Deactivated set was modified by local error"
+
+        assert SENSITIVE_MARKER not in caplog.text
+        assert SENSITIVE_MARKER not in str(exc_info.value)
+
+
+# 20. Sync oversized envelope rejected before key acquisition
 def test_sync_oversized_envelope_rejected(caplog):
     """Oversized message is rejected before any key access."""
     caplog.set_level(logging.ERROR)
@@ -557,35 +607,71 @@ def test_sync_oversized_envelope_rejected(caplog):
     assert "event=provider_input_budget_exceeded" in caplog.text
 
 
-# 20. Async invalid envelope rejected before key acquisition
-@pytest.mark.anyio
-async def test_async_invalid_envelope_rejected():
-    """Invalid message structure is rejected before any key access (async)."""
-    from backend.turn_execution import TurnBudget, TurnExecutionConfig
+# 22–23. Async invalid envelope rejected before key acquisition (parametrized)
 
-    config = TurnExecutionConfig(
-        total_deadline=30.0,
-        connect_timeout=2.0,
-        provider_attempt_timeout=10.0,
-        supabase_timeout=5.0,
-        commit_reserve=12.0,
-        max_attempts=1,
-    )
-    manager = GroqClientManager(
-        keys=["key-one-11111111"],
-        async_client_factory=lambda k: AsyncMock(**{"chat.completions.create": AsyncMock()}),
-        groq_params=config.to_groq_params(),
-    )
+class TestAsyncInvalidEnvelope:
+    """Parametrized async invalid envelope rejection.
 
-    budget = TurnBudget(deadline=100.0, reserve=10.0, now_provider=lambda: 0.0)
-    with pytest.raises(GroqRequestError) as excinfo:
-        await manager.chat_completion_async(
-            messages=[],
-            model="test",
-            budget=budget,
-            stage="test",
+    Covers same 6 cases as sync: empty list, not-a-list, not-a-dict element,
+    missing content, invalid role, and unknown key with sensitive marker.
+    Each case must be rejected before any key acquisition, factory call,
+    or network operation.
+    """
+
+    def _make_manager(self):
+        from backend.turn_execution import TurnExecutionConfig
+
+        factory_calls = []
+        def _async_factory(k):
+            factory_calls.append(k)
+            return AsyncMock(**{"chat.completions.create": AsyncMock()})
+        config = TurnExecutionConfig(
+            total_deadline=30.0,
+            connect_timeout=2.0,
+            provider_attempt_timeout=10.0,
+            supabase_timeout=5.0,
+            commit_reserve=12.0,
+            max_attempts=1,
         )
-    assert "Falha ao executar requisição Groq" in str(excinfo.value)
+        mgr = GroqClientManager(
+            keys=["key-one-11111111", "key-two-22222222"],
+            async_client_factory=_async_factory,
+            groq_params=config.to_groq_params(),
+        )
+        return mgr, factory_calls
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("invalid_messages", INVALID_ENVELOPES)
+    async def test_async_invalid_envelope_rejected(self, invalid_messages, caplog):
+        from backend.turn_execution import TurnBudget
+
+        caplog.set_level(logging.ERROR)
+        manager, factory_calls = self._make_manager()
+
+        budget = TurnBudget(deadline=100.0, reserve=10.0, now_provider=lambda: 0.0)
+
+        initial_index = manager._index
+        initial_cooldowns = dict(manager._cooldowns)
+        initial_deactivated = set(manager._deactivated)
+
+        with pytest.raises(GroqRequestError) as exc_info:
+            await manager.chat_completion_async(
+                messages=invalid_messages,
+                model="test",
+                budget=budget,
+                stage="test",
+            )
+
+        assert "Falha ao executar requisição Groq" in str(exc_info.value)
+        assert "event=provider_input_invalid stage=test" in caplog.text
+        assert factory_calls == []
+
+        assert manager._index == initial_index, "Cursor was modified by local error"
+        assert dict(manager._cooldowns) == initial_cooldowns, "Cooldowns were modified by local error"
+        assert set(manager._deactivated) == initial_deactivated, "Deactivated set was modified by local error"
+
+        assert SENSITIVE_MARKER not in caplog.text
+        assert SENSITIVE_MARKER not in str(exc_info.value)
 
 
 # 21. Async oversized envelope rejected before key acquisition
@@ -621,90 +707,6 @@ async def test_async_oversized_envelope_rejected(caplog):
     assert "Falha ao executar requisição Groq" in str(excinfo.value)
     assert "event=provider_input_budget_exceeded" in caplog.text
     assert "key-one" not in caplog.text
-
-
-# 23. Local envelope error does not touch factory, cursor, cooldown, keys
-@pytest.mark.anyio
-async def test_async_local_envelope_error_does_not_touch_factory():
-    """Local envelope validation error does not call factory, key acquisition, or cooldown."""
-    from backend.turn_execution import TurnBudget
-
-    factory_calls = []
-    def _factory(k):
-        factory_calls.append(k)
-        return AsyncMock(**{"chat.completions.create": AsyncMock()})
-
-    manager = GroqClientManager(
-        keys=["key-one-11111111", "key-two-22222222"],
-        client_factory=lambda k: MockClient(lambda *args, **kwargs: MockCompletion("ok")),
-        async_client_factory=_factory,
-        groq_params=type('obj', (object,), {
-            'max_attempts': 2, 'connect_timeout': 2.0,
-            'provider_attempt_timeout': 10.0, 'base_backoff': 0.25,
-            'max_backoff': 0.75, 'max_jitter': 0.10
-        })(),
-    )
-
-    budget = TurnBudget(deadline=100.0, reserve=10.0, now_provider=lambda: 0.0)
-
-    # Empty messages should fail locally before any factory call
-    with pytest.raises(GroqRequestError) as excinfo:
-        await manager.chat_completion_async(
-            messages=[],
-            model="test",
-            budget=budget,
-            stage="test",
-        )
-    assert "Falha ao executar requisição Groq" in str(excinfo.value)
-
-    # Assert factory was never called
-    assert len(factory_calls) == 0, f"Factory was called {len(factory_calls)} times despite local error"
-
-
-def test_sync_local_envelope_error_does_not_touch_keys():
-    """Sync local envelope error does not touch key state (index, cooldown, deactivated)."""
-    manager = GroqClientManager(
-        keys=["key-one-11111111", "key-two-22222222"],
-        client_factory=lambda k: MockClient(lambda *args, **kwargs: MockCompletion("ok")),
-    )
-
-    # Record initial state
-    initial_index = manager._index
-    initial_deactivated = dict(manager._deactivated)
-    initial_cooldowns = dict(manager._cooldowns)
-
-    # Empty messages should fail locally
-    with pytest.raises(GroqRequestError):
-        manager.chat_completion(messages=[], model="test")
-
-    # Assert internal state is untouched
-    assert manager._index == initial_index, "Cursor was modified by local error"
-    assert dict(manager._deactivated) == initial_deactivated, "Deactivated set was modified by local error"
-    assert dict(manager._cooldowns) == initial_cooldowns, "Cooldowns were modified by local error"
-
-
-def test_sync_local_envelope_error_does_not_rotate_or_attempt():
-    """Sync local envelope error does not attempt key rotation."""
-    call_count = [0]
-    def _create(*args, **kwargs):
-        call_count[0] += 1
-        return MockCompletion("ok")
-
-    manager = GroqClientManager(
-        keys=["key-one-11111111", "key-two-22222222"],
-        client_factory=lambda k: MockClient(_create),
-    )
-
-    # Oversized envelope (local failure)
-    oversized = "x" * 20000
-    with pytest.raises(GroqRequestError):
-        manager.chat_completion(
-            messages=[{"role": "user", "content": oversized}],
-            model="test",
-        )
-
-    # Assert no provider call was made
-    assert call_count[0] == 0, f"Provider was called {call_count[0]} times despite local envelope error"
 
 
 # 24. Async 4xx (e.g. 400, 422) produces invalid_request through full chain
