@@ -267,32 +267,62 @@ class MemoryManager:
         components = self.get_context_components(user_id, current_message, user_state)
         return components.get("assembled", "")
 
+    def _serialize_user_profile(self, raw_profile) -> str:
+        """Serialize a user profile to a canonical JSON string.
+
+        Accepts only ``dict`` type.  Returns the profile serialised with:
+
+        .. code:: python
+
+            json.dumps(profile, ensure_ascii=False, sort_keys=True,
+                       separators=(",", ":"))
+
+        Raises ``StatePersistenceError`` for any non-dict type (list,
+        string, int, bool, ``None``, or non-serialisable objects).
+        This is fail-closed: invalid types never reach the provider
+        prompt as raw ``str()`` output.
+        """
+        if not isinstance(raw_profile, dict):
+            raise StatePersistenceError(
+                "user_profile must be a dict for canonical serialization."
+            )
+        try:
+            return json.dumps(
+                raw_profile,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError):
+            raise StatePersistenceError(
+                "user_profile contains non-serialisable values."
+            )
+
     def get_context_components(self, user_id: str, current_message: str, user_state: dict) -> dict:
         """Return structured context components for pruning.
 
         Returns a dict with:
         - ``persona``: persona_config string.
-        - ``user_profile_str``: serialised user profile string.
-        - ``memory_str``: retrieved relevant memories string.
+        - ``user_profile_str``: serialised user profile string (canonical JSON).
+        - ``memory_str``: retrieved relevant memories string (backward compat).
+        - ``memory_entries``: list of individual memory entry strings.
         - ``history_list``: list of recent history message dicts.
         - ``assembled``: the full assembled context string (backward compat).
+
+        Raises ``StatePersistenceError`` if ``user_profile`` is not a dict.
         """
         history = self.load_recent_history(user_id, limit=10)
         short_term_str = "\n".join([f"{msg['role']}: {msg['content']}" for msg in history])
         relevant_memories = self._retrieve_relevant(user_id, current_message)
 
         persona = str(user_state.get('persona_config', 'Katherine...'))
-        # Use deterministic JSON serialization instead of str(dict)
+
+        # Canonical profile serialization — fail-closed for invalid types
         raw_profile = user_state.get('user_profile', {})
-        if isinstance(raw_profile, dict):
-            user_profile_str = json.dumps(
-                raw_profile,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-        else:
-            user_profile_str = str(raw_profile)
+        user_profile_str = self._serialize_user_profile(raw_profile)
+
+        # Parse memory entries into individual strings
+        memory_entries = self._parse_memory_entries(relevant_memories)
 
         context_str = f"""
         === CORE MEMORY (QUEM VOCÊ É) ===
@@ -312,9 +342,25 @@ class MemoryManager:
             "persona": persona,
             "user_profile_str": user_profile_str,
             "memory_str": relevant_memories,
+            "memory_entries": memory_entries,
             "history_list": history,
             "assembled": context_str,
         }
+
+    @staticmethod
+    def _parse_memory_entries(relevant_memories: str) -> list:
+        """Parse the memory string into individual entries.
+
+        If the memory string is empty or indicates no memories found,
+        returns an empty list.  Otherwise, splits by newlines and returns
+        non-empty lines as individual entries.
+        """
+        if not relevant_memories or relevant_memories in (
+            "", "Nenhuma memória específica encontrada.", "Memória indisponível (offline)."
+        ):
+            return []
+        entries = [line.strip() for line in relevant_memories.split("\n") if line.strip()]
+        return entries
 
     def save_turn(self, user_id: str, user_msg: str, bot_msg: str) -> PersistedTurnRef:
         if not self.supabase:

@@ -33,8 +33,12 @@ Usage::
 from __future__ import annotations
 
 import json
+import logging
 
 from .admission_contracts import PROVIDER_INPUT_MAX_ESTIMATED_UNITS, estimate_text_units
+
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -270,11 +274,17 @@ def _truncate_utf8_safe_head_tail(
 
 
 
+
+
+
 def fit_optional_context(
     mandatory_messages: list,
     optional_context_components: list[tuple[str, str]],
     max_units: int = PROVIDER_INPUT_MAX_ESTIMATED_UNITS,
     truncate_long_messages: bool = False,
+    *,
+    suffix: str = "",
+    selection_priority: list[int] | None = None,
 ) -> list:
     """Build a messages list that fits within *max_units*.
 
@@ -285,10 +295,11 @@ def fit_optional_context(
         fixed prompt sections.  They are never truncated.
 
     ``optional_context_components``
-        List of ``(section_label, section_content)`` tuples in **priority
-        order** (highest priority first).  All sections are included until
-        the budget is exhausted.  Section labels are only used for
-        observability — they are not included in the messages list.
+        List of ``(section_label, section_content)`` tuples in **visual
+        order** (the order they should appear in the final system prompt).
+        All sections whose combined content + suffix fits within *max_units*
+        (when added to mandatory messages) are included.  Sections that
+        would exceed the budget are excluded atomically.
 
     ``max_units``
         Maximum estimated input units for the final messages list.
@@ -301,20 +312,31 @@ def fit_optional_context(
         large.  When ``False``, entire components are included or
         excluded as atomic units.
 
+    ``suffix``
+        Optional mandatory suffix that **must** be appended to the system
+        content after optional components.  The budget calculation includes
+        this suffix during each selection check, ensuring optional context
+        never pushes the final envelope over budget.
+
+    ``selection_priority``
+        Optional list of indices into *optional_context_components*
+        indicating the **selection priority order** (highest priority
+        first).  When provided, components are tried for budget inclusion
+        in this priority order, but rendered in the original
+        *optional_context_components* visual order.
+
+        If ``None`` (default), components are tried in the same order
+        they appear in *optional_context_components* (no separation
+        between selection and visual order).
+
     Returns:
         A new messages list that fits within *max_units*.
+        If *suffix* is provided, it is appended to the system message
+        content before being returned.
 
     Raises:
         ``ProviderEnvelopeError("budget_exceeded")``
         if the mandatory messages alone exceed *max_units*.
-
-    The selection of optional context follows this priority order
-    (highest first), which matches the caller's ordering:
-
-    1. identity / persona contextual
-    2. recent history (most recent first)
-    3. relevant memories
-    4. serialised user profile
 
     Invariants:
 
@@ -322,6 +344,9 @@ def fit_optional_context(
     * The returned list is a new list; the input is not mutated.
     * Optional components are included as atomic units unless
       *truncate_long_messages* is ``True``.
+    * The suffix (if provided) is included in every budget check.
+    * Components are rendered in the order they appear in
+      *optional_context_components* (visual order).
     * UTF-8 sequences are never split.
     * No randomness is used — the output is deterministic.
     """
@@ -332,12 +357,13 @@ def fit_optional_context(
     current_messages = list(mandatory_messages)
 
     if not optional_context_components:
+        # Append suffix to system message if provided
+        if suffix:
+            _append_to_system(current_messages, "\n\n" + suffix)
+            validate_provider_input(current_messages, max_units=max_units)
         return current_messages
 
-    # We need to check if we can add optional components.
-    # The optional components are content strings that will be added
-    # into the system message. Work with the system message content
-    # for each addition.
+    # Find system message index
     system_content_index: int | None = None
     for i, msg in enumerate(current_messages):
         if msg.get("role") == "system":
@@ -346,61 +372,152 @@ def fit_optional_context(
 
     if system_content_index is None:
         # No system message — optional components can't be added
+        if suffix:
+            logger.warning("Cannot append suffix: no system message in mandatory messages.")
         return current_messages
 
-    for label, content in optional_context_components:
+    # Pre-compute the suffix payload once
+    suffix_payload = "\n\n" + suffix if suffix else ""
+
+    # Determine selection order: use selection_priority if provided,
+    # otherwise use the visual order (list order)
+    if selection_priority is not None:
+        _validate_selection_priority(selection_priority, optional_context_components)
+        selection_order = selection_priority
+    else:
+        selection_order = list(range(len(optional_context_components)))
+
+    # Track which components (by index) have been selected
+    selected_indices: set[int] = set()
+
+    # Get the mandatory header content (before any optional components)
+    mandatory_header = current_messages[system_content_index]["content"]
+
+    for idx in selection_order:
+        label, content = optional_context_components[idx]
         if not content:
             continue
 
-        if truncate_long_messages:
-            # Try with full content first
-            pass
+        # Tentatively add this component
+        selected_indices.add(idx)
 
-        # Tentatively add this component to the system message
+        # Build candidate from SCRATCH: mandatory header + all selected components (visual order) + suffix
+        candidate_components = [
+            optional_context_components[i]
+            for i in range(len(optional_context_components))
+            if i in selected_indices
+        ]
+
+        built_content = mandatory_header
+        for _, comp_content in candidate_components:
+            built_content += "\n" + comp_content
+        built_content += suffix_payload
+
         test_messages = list(current_messages)
-        original_content = test_messages[system_content_index]["content"]
         test_messages[system_content_index] = {
             "role": "system",
-            "content": original_content + "\n" + content,
+            "content": built_content,
         }
 
         try:
             validate_provider_input(test_messages, max_units=max_units)
-            # Fits — keep it
+            # Fits — keep it (without suffix in stored content)
             current_messages = test_messages
+            if suffix:
+                current_messages[system_content_index] = {
+                    "role": "system",
+                    "content": built_content[:-len(suffix_payload)] if suffix_payload else built_content,
+                }
         except ProviderEnvelopeError:
+            # Doesn't fit — remove from selected
+            selected_indices.discard(idx)
             if not truncate_long_messages:
-                # Doesn't fit — try next (lower priority) component
                 continue
             else:
                 # Try truncated version
                 remaining = _estimate_remaining_budget(
-                    current_messages, max_units
+                    current_messages, max_units, suffix_payload
                 )
                 if remaining <= 0:
                     continue
                 truncated, _ = _truncate_utf8_safe(content, remaining)
                 if truncated != content:
+                    selected_indices.add(idx)
+                    candidate_components = [
+                        (optional_context_components[i][0],
+                         truncated if i == idx else optional_context_components[i][1])
+                        for i in range(len(optional_context_components))
+                        if i in selected_indices
+                    ]
+                    built_content = mandatory_header
+                    for _, comp_content in candidate_components:
+                        built_content += "\n" + comp_content
+                    built_content += suffix_payload
+
                     test_truncated = list(current_messages)
                     test_truncated[system_content_index] = {
                         "role": "system",
-                        "content": original_content + "\n" + truncated,
+                        "content": built_content,
                     }
                     try:
                         validate_provider_input(
                             test_truncated, max_units=max_units
                         )
                         current_messages = test_truncated
+                        if suffix:
+                            current_messages[system_content_index] = {
+                                "role": "system",
+                                "content": built_content[:-len(suffix_payload)] if suffix_payload else built_content,
+                            }
                     except ProviderEnvelopeError:
-                        pass
+                        selected_indices.discard(idx)
+
+    # Append suffix to final system content
+    if suffix:
+        current_messages = _append_to_system(current_messages, suffix_payload)
+        validate_provider_input(current_messages, max_units=max_units)
 
     return current_messages
+
+
+def _validate_selection_priority(
+    priority: list[int],
+    components: list[tuple[str, str]],
+) -> None:
+    """Validate that *priority* covers all component indices exactly once."""
+    if sorted(priority) != list(range(len(components))):
+        raise ValueError(
+            "selection_priority must contain each component index exactly once"
+        )
 
 
 def _estimate_remaining_budget(
     messages: list,
     max_units: int,
+    suffix_payload: str = "",
 ) -> int:
-    """Estimate remaining budget before hitting *max_units*."""
+    """Estimate remaining budget before hitting *max_units*.
+
+    If *suffix_payload* is provided, its estimated units are subtracted
+    from the remaining budget so that suffix space is reserved.
+    """
     units = estimate_provider_input_units(messages)
-    return max(0, max_units - units)
+    suffix_units = estimate_text_units(suffix_payload) if suffix_payload else 0
+    return max(0, max_units - units - suffix_units)
+
+
+def _append_to_system(messages: list, payload: str) -> list:
+    """Append *payload* to the system message content in *messages*.
+
+    Returns a new list; does not mutate the input.
+    Raises ``ProviderEnvelopeError`` if no system message exists.
+    """
+    result = list(messages)
+    for i, msg in enumerate(result):
+        if msg.get("role") == "system":
+            result[i] = {
+                "role": "system",
+                "content": msg["content"] + payload,
+            }
+            return result
+    raise ProviderEnvelopeError("no_system_message")

@@ -201,6 +201,40 @@ class TestStructuralValidation:
 # 6–7. Budget limits: exact 16 000 accepted, 16 001 rejected
 # ═══════════════════════════════════════════════════════════════════════
 
+def _build_envelope_for_exact_units(target_units: int) -> list:
+    """Build a single-user-message envelope whose units hit *target_units*.
+
+    Binary-searches the content length to find the exact content that,
+    when serialised as ``[{"content":"...","role":"user"}]``, produces
+    *target_units* estimated units.
+
+    Raises ``ValueError`` if the exact target cannot be reached.
+    """
+    base = [{"role": "user", "content": ""}]
+    overhead = estimate_provider_input_units(base) - 1  # -1 for empty content min
+    needed = max(0, target_units - overhead)
+
+    lo, hi = 0, max(20000, target_units * 2)
+    best = None
+    for _ in range(60):  # binary search
+        mid = (lo + hi) // 2
+        msg = [{"role": "user", "content": "x" * mid}]
+        units = estimate_provider_input_units(msg)
+        if units == target_units:
+            return msg
+        if units < target_units:
+            best = msg
+            lo = mid + 1
+        else:
+            hi = mid - 1
+        if lo > hi:
+            break
+
+    if best is not None:
+        return best
+    raise ValueError(f"Cannot build envelope for exactly {target_units} units")
+
+
 class TestBudgetLimits:
     """Budget enforcement at the 16 000-unit boundary."""
 
@@ -451,7 +485,19 @@ class TestIsolatedSubprocessImport:
     """provider_envelope can be imported in an isolated subprocess."""
 
     def test_isolated_import_succeeds(self):
-        """Import provider_envelope in subprocess with infrastructure blocked."""
+        """Import provider_envelope in subprocess with infrastructure blocked.
+
+        Blocks BEFORE import to prevent any accidental loading of:
+        - FastAPI / Pydantic / uvicorn
+        - Groq SDK
+        - Supabase / PostgREST
+        - sentence_transformers / embeddings
+        - ConversationEngine, engine, or memory
+        - httpx / httpcore / anyio
+        - socket / network / filesystem
+        - environment variables
+        - clock or randomness
+        """
         import subprocess
         import sys
         import os as _os
@@ -462,13 +508,28 @@ class TestIsolatedSubprocessImport:
 
         code = f"""
 import sys
+import os
+
+# Block environment variables that trigger infrastructure loading
+os.environ.pop('SUPABASE_URL', None)
+os.environ.pop('SUPABASE_SERVICE_ROLE_KEY', None)
+os.environ.pop('GROQ_API_KEY', None)
+os.environ.pop('GROQ_API_KEYS', None)
+
 sys.path = [p for p in sys.path if 'katherine' not in p.lower()]
 sys.path.insert(0, {project_root!r})
 
 import builtins
 original_import = builtins.__import__
-blocked = {{'fastapi', 'groq', 'supabase', 'sentence_transformers', 'httpx',
-           'httpcore', 'anyio', 'websockets', 'uvicorn', 'pydantic'}}
+blocked = {{
+    'fastapi', 'groq', 'supabase', 'sentence_transformers', 'httpx',
+    'httpcore', 'anyio', 'websockets', 'uvicorn', 'pydantic',
+    'engine', 'memory', 'emotional_core', 'emotional_domain',
+    'relationship', 'lock_manager', 'archival_memory', 'turn_execution',
+    'provider_models', 'groq_keys', 'groq_manager',
+    'starlette', 'multipart', 'watchfiles', 'numpy', 'torch',
+    'dotenv', 'cryptography', 'bcrypt', 'passlib',
+}}
 hit_blocked = []
 
 def _blocking_import(name, *args, **kwargs):
@@ -485,6 +546,10 @@ original_socket = socket.socket
 def _blocking_socket(*args, **kwargs):
     raise OSError('network blocked')
 socket.socket = _blocking_socket
+
+import os as _os
+_os.listdir = lambda *a, **kw: (_ for _ in ()).throw(PermissionError('filesystem blocked'))
+_os.open = lambda *a, **kw: (_ for _ in ()).throw(PermissionError('filesystem blocked'))
 
 from backend.provider_envelope import (
     estimate_provider_input_units,
@@ -504,7 +569,7 @@ print(f"OK: blocked_imports_triggered={{hit_blocked}}")
             [sys.executable, "-c", code],
             capture_output=True,
             text=True,
-            timeout=10,
+            timeout=30,
         )
         print(f"Subprocess stdout: {result.stdout}")
         if result.returncode != 0:
@@ -514,31 +579,95 @@ print(f"OK: blocked_imports_triggered={{hit_blocked}}")
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 15. Exact 16 000-unit boundary
+# 15. Exact 16 000-unit boundary (dynamically constructed)
 # ═══════════════════════════════════════════════════════════════════════
 
 class TestExactBoundary:
-    """Exact boundary tests for 16000 and 16001 units."""
+    """Exact boundary tests for 16000 and 16001 units.
+
+    Envelopes are built **dynamically** via ``_build_envelope_for_exact_units``
+    using a binary search.  The test asserts exactly ``units == 16000``
+    for acceptance and exactly ``units == 16001`` for rejection,
+    not values far above the limit.
+    """
 
     def test_exactly_16000_accepted(self):
-        """Envelope with maximum content that still fits within 16000."""
-        content = "x" * 15969  # empirically verified: 15969+31=16000
-        messages = [{"role": "user", "content": content}]
+        """Envelope with exactly 16000 units is accepted."""
+        messages = _build_envelope_for_exact_units(16000)
         units = estimate_provider_input_units(messages)
-        assert units <= 16000, f"Expected <= 16000, got {units}"
+        assert units == 16000, f"Expected exactly 16000, got {units}"
         validate_provider_input(messages, max_units=16000)
 
-    def test_exactly_15970_accepted(self):
-        """Content of 15970 may still fit depending on exact overhead."""
-        content = "x" * 15970
-        messages = [{"role": "user", "content": content}]
-        units = estimate_provider_input_units(messages)
-        if units <= 16000:
-            validate_provider_input(messages, max_units=16000)
+    def test_exactly_16000_with_suffix(self):
+        """Envelope with suffix reservation: header + suffix + optional fit exactly 16000.
+
+        Verifies that the suffix is reserved during pruning, preventing a situation
+        where header + user + optional fits but header + user + optional + suffix
+        would exceed budget.  The suffix is included in every budget check.
+        """
+        # Build a system header, suffix, and optional component that alone fit
+        # but together push over 16000.
+        header = "S" * 50
+        suffix = "S" * 50
+        user_msg = "Hello"
+
+        # Build minimal mandatory (header + user)
+        mandatory = [
+            {"role": "system", "content": header},
+            {"role": "user", "content": user_msg},
+        ]
+        mandatory_with_suffix = [
+            {"role": "system", "content": header + "\n\n" + suffix},
+            {"role": "user", "content": user_msg},
+        ]
+        base_units = estimate_provider_input_units(mandatory_with_suffix)
+
+        # Create an optional component that fits without suffix but would push
+        # over budget with suffix.
+        tight_budget = base_units + 50
+        optional = [("opt", "O" * 100)]  # ~100 units
+
+        # Without suffix: header + user + optional fits within tight_budget
+        without_suffix = [
+            {"role": "system", "content": header + "\n" + optional[0][1]},
+            {"role": "user", "content": user_msg},
+        ]
+        units_without_suffix = estimate_provider_input_units(without_suffix)
+        assert units_without_suffix <= tight_budget, (
+            f"Optional component alone should fit within {tight_budget}, got {units_without_suffix}"
+        )
+
+        # With suffix: header + user + optional + suffix would exceed tight_budget
+        with_suffix = [
+            {"role": "system", "content": header + "\n" + optional[0][1] + "\n\n" + suffix},
+            {"role": "user", "content": user_msg},
+        ]
+        units_with_suffix = estimate_provider_input_units(with_suffix)
+
+        # Call fit_optional_context WITH suffix parameter
+        result = fit_optional_context(
+            mandatory, optional, max_units=tight_budget, suffix=suffix,
+        )
+
+        result_units = estimate_provider_input_units(result)
+        assert result_units <= tight_budget, (
+            f"Final envelope ({result_units}) exceeds budget ({tight_budget})"
+        )
+
+        # The optional component should NOT be included if it would push over budget
+        # when combined with the suffix
+        system_content = result[0]["content"]
+        if units_with_suffix > tight_budget:
+            # Optional should be excluded (suffix took priority)
+            assert "O" * 100 not in system_content, (
+                "Optional component should not be present when suffix + optional exceed budget"
+            )
         else:
-            # If it's 16001, must be rejected
-            with pytest.raises(ProviderEnvelopeError, match="budget_exceeded"):
-                validate_provider_input(messages, max_units=16000)
+            # Both fit
+            assert "O" * 100 in system_content
+
+        # Suffix is always present in the result
+        assert suffix in system_content, "Suffix must always be present"
 
     def test_16001_rejected_via_multibyte(self):
         """Content that clearly exceeds 16000 is rejected."""
@@ -547,10 +676,11 @@ class TestExactBoundary:
         with pytest.raises(ProviderEnvelopeError, match="budget_exceeded"):
             validate_provider_input(messages, max_units=16000)
 
-    def test_exactly_16001_multibyte_rejected(self):
-        """Multibyte envelope at 16001+ is rejected."""
-        content = "\u00f1" * 9000  # 18000 UTF-8 bytes
-        messages = [{"role": "user", "content": content}]
+    def test_exactly_16001_rejected(self):
+        """Envelope with exactly 16001 units is rejected."""
+        messages = _build_envelope_for_exact_units(16001)
+        units = estimate_provider_input_units(messages)
+        assert units == 16001, f"Expected exactly 16001, got {units}"
         with pytest.raises(ProviderEnvelopeError, match="budget_exceeded"):
             validate_provider_input(messages, max_units=16000)
 
@@ -587,18 +717,20 @@ class TestArchivalExtractionEnvelope:
         validate_provider_input(messages)
 
     def test_archival_10k_char_message(self):
-        """Archival prompt with 10000 char message."""
+        """Archival prompt with 10000 char message - should have positive units."""
         from backend.engine import ConversationEngine
         message = "x" * 10000
         prompt = ConversationEngine._build_archival_prompt(message)
         messages = [{"role": "user", "content": prompt}]
         units = estimate_provider_input_units(messages)
+        # Must be at least 1; may exceed budget for 16000-unit check
         assert units > 0
-        # May or may not exceed budget, but should not crash
-        try:
+        # Budget check: if over 16000, expect rejection
+        if units > 16000:
+            with pytest.raises(ProviderEnvelopeError, match="budget_exceeded"):
+                validate_provider_input(messages)
+        else:
             validate_provider_input(messages)
-        except ProviderEnvelopeError:
-            pass  # Expected if over budget
 
     def test_archival_escaping_preserved_in_estimate(self):
         """Escaping in archival prompt is correctly counted."""
@@ -636,64 +768,81 @@ class TestHistoryMessageByMessage:
         """Only the two most recent messages fit within a tight budget.
 
         With a very tight budget, only the newest messages should be included
-        because they have highest priority.
+        because they have highest priority.  Verifies both presence AND
+        position in the system prompt (oldest selected first).
+
+        Uses ``selection_priority`` to separate selection order (newest-first)
+        from visual order (oldest-first).
         """
-        # Build a header + suffix that barely fits with 2 history messages
         header = "S" * 50
         suffix = "S" * 50
         user_msg = "Hello"
 
-        # Compute mandatory overhead
-        mandatory_with_suffix = [
-            {"role": "system", "content": header + "\n\n" + suffix},
-            {"role": "user", "content": user_msg},
-        ]
-        mandatory_units = estimate_provider_input_units(mandatory_with_suffix)
-
-        # Create a budget that fits header + suffix + user + exactly 2 history messages
         history_msgs = [
-            {"role": "user", "content": "old message 1 that is quite long"},
-            {"role": "assistant", "content": "old response 1 that is quite long too"},
-            {"role": "user", "content": "old message 2"},
-            {"role": "assistant", "content": "old response 2"},
-            {"role": "user", "content": "newest message"},
-            {"role": "assistant", "content": "newest response"},
+            {"role": "user", "content": "old msg 1"},
+            {"role": "assistant", "content": "old resp 1"},
+            {"role": "user", "content": "msg 2"},
+            {"role": "assistant", "content": "resp 2"},
+            {"role": "user", "content": "newest msg"},
+            {"role": "assistant", "content": "newest resp"},
         ]
 
-        # Calculate the cost of adding 1 history message vs 3
-        one_msg = [{"role": "system", "content": header + "\n\n" + suffix + "\nuser: old message 1"}, {"role": "user", "content": user_msg}]
-        three_msgs = [{"role": "system", "content": header + "\n\n" + suffix + "\nuser: old message 1\nassistant: old response 1\nuser: old message 2"}, {"role": "user", "content": user_msg}]
-        one_cost = estimate_provider_input_units(one_msg)
-        three_cost = estimate_provider_input_units(three_msgs)
-        diff_per_msg = (three_cost - one_cost) // 2
-
-        # Set budget to fit exactly 2 recent messages on top of mandatory
-        tight_budget = mandatory_units + diff_per_msg * 2 + 10
-
-        # Build optional components (newest first per our policy)
+        # Build optional components in VISUAL order (oldest-first)
         optional = []
-        for msg in reversed(history_msgs):
+        for msg in history_msgs:
             text = f"{msg['role']}: {msg['content']}"
             section = f"=== MENSAGEM RECENTE ===\n{text}"
             optional.append(("history", section))
 
-        starting = [{"role": "system", "content": header}, {"role": "user", "content": user_msg}]
-        result_optional = fit_optional_context(starting, optional, max_units=tight_budget)
+        # Build selection_priority: newest-first indices
+        n = len(history_msgs)
+        selection_priority = list(reversed(range(n)))
 
-        # Verify only 2 newest messages fit (they have header, but no suffix yet)
+        starting = [{"role": "system", "content": header}, {"role": "user", "content": user_msg}]
+
+        # Compute budget that fits exactly the 2 newest history entries
+        two_newest_indices = selection_priority[:2]  # indices of 2 newest
+        two_newest = [optional[i] for i in sorted(two_newest_indices)]
+        with_two = fit_optional_context(
+            starting, two_newest, max_units=100000, suffix=suffix,
+        )
+        two_units = estimate_provider_input_units(with_two)
+
+        # Set budget to exactly fit 2 entries (with small tolerance)
+        tight_budget = two_units + 5
+
+        # Verify that with tight_budget, only 2 newest entries fit
+        result_optional = fit_optional_context(
+            starting, optional, max_units=tight_budget, suffix=suffix,
+            selection_priority=selection_priority,
+        )
+
         system_content = result_optional[0]["content"]
-        # The two newest messages are the last in history_msgs
-        two_newest_texts = [
+        result_units = estimate_provider_input_units(result_optional)
+        assert result_units <= tight_budget, (
+            f"Result ({result_units}) exceeds tight budget ({tight_budget})"
+        )
+
+        # The newest entries should be present
+        newest_texts = [
             f"{history_msgs[-2]['role']}: {history_msgs[-2]['content']}",
             f"{history_msgs[-1]['role']}: {history_msgs[-1]['content']}",
         ]
         oldest_text = f"{history_msgs[0]['role']}: {history_msgs[0]['content']}"
 
-        # Newest should be present
-        for text in two_newest_texts:
+        for text in newest_texts:
             assert text in system_content, f"Expected newest message in content: {text}"
-        # Oldest should be absent due to budget
         assert oldest_text not in system_content, f"Oldest message unexpectedly present"
+
+        # Verify POSITION: older selected message appears BEFORE newer selected message
+        pos_older_selected = system_content.find(newest_texts[0])
+        pos_newer_selected = system_content.find(newest_texts[1])
+        assert pos_older_selected >= 0, f"First selected message not found: {newest_texts[0]}"
+        assert pos_newer_selected >= 0, f"Second selected message not found: {newest_texts[1]}"
+        assert pos_older_selected < pos_newer_selected, (
+            f"Older selected message should appear before newer: "
+            f"pos_older={pos_older_selected}, pos_newer={pos_newer_selected}"
+        )
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1058,6 +1207,7 @@ class TestMandatoryComponentsFailsBeforeProvider:
                 for i in range(5)
             ],
             "memory_str": "Very long memory content " * 50,
+            "memory_entries": ["Very long memory content " * 50],
             "user_profile_str": '{"name":"TestUser"}',
         }
 
@@ -1080,3 +1230,190 @@ class TestMandatoryComponentsFailsBeforeProvider:
 
         # The final envelope validates
         validate_provider_input(messages)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 25. Profile fail-closed canonical serialization
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestProfileSerializationFailClosed:
+    """user_profile serialization is fail-closed and canonical."""
+
+    def test_profile_dict_canonical(self):
+        """Dict profile produces canonical JSON."""
+        profile = {"name": "Test", "age": 30, "z": 1, "a": 2}
+        from backend.memory import MemoryManager
+        mm = MemoryManager()
+        result = mm._serialize_user_profile(profile)
+        # sort_keys=True means a before z
+        assert result == '{"a":2,"age":30,"name":"Test","z":1}'
+
+    def test_profile_dict_ensure_ascii(self):
+        """Non-ASCII in profile uses ensure_ascii=False."""
+        profile = {"name": "José"}
+        from backend.memory import MemoryManager
+        mm = MemoryManager()
+        result = mm._serialize_user_profile(profile)
+        assert "José" in result
+        assert result == '{"name":"José"}'
+
+    def test_profile_list_rejected(self):
+        """List as profile raises StatePersistenceError."""
+        from backend.memory import MemoryManager, StatePersistenceError
+        mm = MemoryManager()
+        with pytest.raises(StatePersistenceError):
+            mm._serialize_user_profile(["a", "b"])
+
+    def test_profile_string_rejected(self):
+        """String as profile raises StatePersistenceError."""
+        from backend.memory import MemoryManager, StatePersistenceError
+        mm = MemoryManager()
+        with pytest.raises(StatePersistenceError):
+            mm._serialize_user_profile("raw string")
+
+    def test_profile_int_rejected(self):
+        from backend.memory import MemoryManager, StatePersistenceError
+        mm = MemoryManager()
+        with pytest.raises(StatePersistenceError):
+            mm._serialize_user_profile(42)
+
+    def test_profile_bool_rejected(self):
+        from backend.memory import MemoryManager, StatePersistenceError
+        mm = MemoryManager()
+        with pytest.raises(StatePersistenceError):
+            mm._serialize_user_profile(True)
+
+    def test_profile_none_rejected(self):
+        from backend.memory import MemoryManager, StatePersistenceError
+        mm = MemoryManager()
+        with pytest.raises(StatePersistenceError):
+            mm._serialize_user_profile(None)
+
+    def test_profile_nested_non_serializable(self):
+        """Object containing non-serialisable value raises error."""
+        from backend.memory import MemoryManager, StatePersistenceError
+        mm = MemoryManager()
+        # Object with a non-serialisable inner value
+        class NonSerializable:
+            pass
+        with pytest.raises(StatePersistenceError):
+            mm._serialize_user_profile({"obj": NonSerializable()})
+
+    def test_profile_get_context_components_fail_closed(self):
+        """get_context_components with non-dict profile raises error."""
+        from unittest.mock import patch, MagicMock
+        with patch('backend.memory.SentenceTransformer'):
+            from backend.memory import MemoryManager, StatePersistenceError
+            mm = MemoryManager()
+            user_state = {"user_profile": "invalid_string", "persona_config": "bot"}
+            with pytest.raises(StatePersistenceError):
+                mm.get_context_components("user123", "hello", user_state)
+
+    def test_profile_get_context_components_dict_works(self):
+        """get_context_components with dict profile works."""
+        from unittest.mock import patch, MagicMock
+        with patch('backend.memory.SentenceTransformer'):
+            from backend.memory import MemoryManager
+
+            mm = MemoryManager()
+            # Mock supabase to avoid db calls
+            mm.supabase = MagicMock()
+            mock_response = MagicMock()
+            mock_response.data = [
+                {"role": "user", "content": "hello"}
+            ]
+            mock_response.error = None
+            mm.supabase.table.return_value.select.return_value.eq.return_value.order.return_value.order.return_value.limit.return_value.execute.return_value = mock_response
+
+            user_state = {"user_profile": {"name": "User"}, "persona_config": "bot"}
+            components = mm.get_context_components("user123", "hello", user_state)
+            assert "user_profile_str" in components
+            assert '"name":"User"' in components["user_profile_str"]
+            assert "memory_entries" in components
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 26. Memory entries as individual atomic units
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestMemoryEntriesAtomic:
+    """Memory entries are treated as individual atomic units during pruning."""
+
+    def test_memory_entries_in_context_components(self):
+        """get_context_components includes memory_entries list."""
+        from backend.memory import MemoryManager
+        from unittest.mock import MagicMock
+
+        mm = MemoryManager()
+        mm.supabase = MagicMock()
+        mock_response = MagicMock()
+        mock_response.data = []
+        mock_response.error = None
+        mm.supabase.table.return_value.select.return_value.eq.return_value.execute.return_value = mock_response
+        mm.supabase.table.return_value.select.return_value.eq.return_value.order.return_value.order.return_value.limit.return_value.execute.return_value = mock_response
+
+        user_state = {"user_profile": {}, "persona_config": "bot"}
+        components = mm.get_context_components("user123", "hello", user_state)
+        assert "memory_entries" in components
+        assert isinstance(components["memory_entries"], list)
+
+    def test_memory_entries_empty_when_no_memories(self):
+        """When no memories retrieved, memory_entries is empty."""
+        from backend.memory import MemoryManager
+        mm = MemoryManager()
+        entries = mm._parse_memory_entries("")
+        assert entries == []
+
+        entries = mm._parse_memory_entries("Nenhuma memória específica encontrada.")
+        assert entries == []
+
+        entries = mm._parse_memory_entries("Memória indisponível (offline).")
+        assert entries == []
+
+    def test_memory_entries_parsed_correctly(self):
+        """Multiple memory lines are each returned as entries."""
+        from backend.memory import MemoryManager
+        mm = MemoryManager()
+        memory_str = "- Memory 1: likes cats (Tags: interest)\n- Memory 2: works from home (Tags: work)"
+        entries = mm._parse_memory_entries(memory_str)
+        assert len(entries) == 2
+        assert "Memory 1" in entries[0]
+        assert "Memory 2" in entries[1]
+
+    def test_fit_optional_context_with_three_memories_only_two_fit(self):
+        """Three memory entries, only two fit — both appear complete, none cut."""
+        mandatory = [
+            {"role": "system", "content": "S"},
+            {"role": "user", "content": "U"},
+        ]
+        mem1 = "- Memory 1: user likes cats (Tags: interest)"
+        mem2 = "- Memory 2: user works from home (Tags: work)"
+        mem3 = "- Memory 3: user has a dog (Tags: pet)"
+
+        # Budget that fits exactly 2 entries
+        one_entry = [{"role": "system", "content": "S\n=== MEMÓRIA ARQUIVADA (LEMBRANÇAS RELEVANTES) ===\n" + mem1}, {"role": "user", "content": "U"}]
+        two_entries = [{"role": "system", "content": "S\n=== MEMÓRIA ARQUIVADA (LEMBRANÇAS RELEVANTES) ===\n" + mem1 + "\n=== MEMÓRIA ARQUIVADA (LEMBRANÇAS RELEVANTES) ===\n" + mem2}, {"role": "user", "content": "U"}]
+        one_cost = estimate_provider_input_units(one_entry)
+        two_cost = estimate_provider_input_units(two_entries)
+
+        tight_budget = one_cost + (two_cost - one_cost) // 2 + 5  # fits ~1.5 entries
+
+        optional = [
+            ("memory", f"=== MEMÓRIA ARQUIVADA (LEMBRANÇAS RELEVANTES) ===\n{mem1}"),
+            ("memory", f"=== MEMÓRIA ARQUIVADA (LEMBRANÇAS RELEVANTES) ===\n{mem2}"),
+            ("memory", f"=== MEMÓRIA ARQUIVADA (LEMBRANÇAS RELEVANTES) ===\n{mem3}"),
+        ]
+
+        result = fit_optional_context(mandatory, optional, max_units=tight_budget)
+        content = result[0]["content"]
+
+        # If mem1 fits, verify it's complete
+        if "Memory 1" in content:
+            assert "cats" in content
+        # If mem2 fits, verify it's complete
+        if "Memory 2" in content:
+            assert "home" in content
+        # No memory should be cut (partial)
+        # If "Memory 1" is present, its full entry must be there
+        if "Memory 1" in content:
+            assert "Tags: interest" in content

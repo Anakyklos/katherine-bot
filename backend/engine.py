@@ -830,15 +830,20 @@ Regras adicionais de estilo:
 
         Steps:
         1. Build mandatory system prompt (without optional context)
-        2. Build optional context sections in priority order
-        3. Use ``fit_optional_context`` to prune context to fit budget
-        4. Return the validated messages list
+        2. Build optional context sections in visual order
+        3. Build selection priority (newest entries first for fairness)
+        4. Use ``fit_optional_context`` to prune context to fit budget
+        5. Return the validated messages list
 
-        The optional context priority order is:
-        1. Persona / identity
-        2. Recent history (most recent first)
-        3. Archived memories
-        4. User profile
+        Selection priority:
+        1. Persona / identity (highest)
+        2. Recent history — newest-first (for selection fairness)
+        3. Archived memories — newest-first
+        4. User profile (lowest)
+
+        Visual order within system prompt:
+        - History messages appear oldest-first (chronological)
+        - Memory entries appear in retrieval order
 
         Returns:
             A list of message dicts that fits within the provider budget.
@@ -850,40 +855,66 @@ Regras adicionais de estilo:
         suffix = self._build_prompt_suffix()
         user_message_content = user_message
 
-        # Build optional context sections in priority order.
-        # Each component is treated as an atomic unit.
+        # Build optional context components in VISUAL order (oldest-first for history).
         persona = context_components.get("persona", "").strip()
         history_list = context_components.get("history_list", [])
-        memory_str = context_components.get("memory_str", "").strip()
+        memory_entries = context_components.get("memory_entries", [])
         user_profile_str = context_components.get("user_profile_str", "").strip()
 
-        # Build optional components in priority order (highest priority first).
-        # History messages are added individually (newest first) so they can
-        # be pruned message-by-message rather than as a single blob.
         optional_components = []
 
-        # 1. Persona (highest priority)
+        # 1. Persona
         if persona:
             section = f"=== CORE MEMORY (QUEM VOCÊ É) ===\n{persona}"
             optional_components.append(("persona", section))
 
-        # 2. History messages, each as an atomic unit (newest first)
+        # 2. History — oldest-first for visual order
         if history_list:
-            # history_list is oldest-first (chronological) from load_recent_history
-            for msg in reversed(history_list):
+            for msg in history_list:  # oldest-first
                 text = f"{msg['role']}: {msg['content']}"
                 section = f"=== MENSAGEM RECENTE ===\n{text}"
                 optional_components.append(("history", section))
 
-        # 3. Archived memories
-        if memory_str and "Nenhuma memória" not in memory_str and memory_str.strip():
-            section = f"=== MEMÓRIA ARQUIVADA (LEMBRANÇAS RELEVANTES) ===\n{memory_str}"
-            optional_components.append(("memories", section))
+        # 3. Archived memories — in retrieval order
+        for entry in memory_entries:
+            if entry and "Nenhuma memória" not in entry:
+                section = f"=== MEMÓRIA ARQUIVADA (LEMBRANÇAS RELEVANTES) ===\n{entry}"
+                optional_components.append(("memory", section))
 
         # 4. User profile (lowest priority)
         if user_profile_str and user_profile_str not in ("{}", "", "None"):
             section = f"=== CORE MEMORY (QUEM É O USUÁRIO) ===\n{user_profile_str}"
             optional_components.append(("profile", section))
+
+        # Build SELECTION PRIORITY: indices into optional_components
+        # Priority order: persona first, then newest history, then newest memory, then profile.
+        selection_priority = []
+        history_indices_in_comp = [
+            i for i, (label, _) in enumerate(optional_components)
+            if label == "history"
+        ]
+        memory_indices_in_comp = [
+            i for i, (label, _) in enumerate(optional_components)
+            if label == "memory"
+        ]
+
+        # Persona first
+        for i, (label, _) in enumerate(optional_components):
+            if label == "persona":
+                selection_priority.append(i)
+
+        # History — newest first (reversed visual order)
+        for i in reversed(history_indices_in_comp):
+            selection_priority.append(i)
+
+        # Memory — newest first (reversed visual order)
+        for i in reversed(memory_indices_in_comp):
+            selection_priority.append(i)
+
+        # Profile last
+        for i, (label, _) in enumerate(optional_components):
+            if label == "profile":
+                selection_priority.append(i)
 
         # Start with only the header as mandatory system prompt content
         mandatory_messages = [
@@ -891,10 +922,7 @@ Regras adicionais de estilo:
             {"role": "user", "content": user_message_content},
         ]
 
-        # Track initial length for pruning detection
-        initial_prompt_len = len(header)
-
-        # First: validate that header + user_message + suffix fits (the bare minimum)
+        # Validate that header + user_message + suffix fits (the bare minimum)
         bare_with_suffix = [
             {"role": "system", "content": header + "\n\n" + suffix},
             {"role": "user", "content": user_message_content},
@@ -906,36 +934,18 @@ Regras adicionais de estilo:
             logger.error("event=provider_input_budget_exceeded stage=generation")
             raise ProviderEnvelopeError("budget_exceeded")
 
-        # Use fit_optional_context to add what fits
+        # Use fit_optional_context with suffix and selection_priority
         result = fit_optional_context(
             mandatory_messages,
             optional_components,
+            suffix=suffix,
+            selection_priority=selection_priority if len(selection_priority) == len(optional_components) else None,
         )
 
-        # Append the immutable safety suffix AFTER optional context
-        # so user-derived content never comes after safety rules.
-        system_content = result[0]["content"]
-        result[0]["content"] = system_content + "\n\n" + suffix
-
-        # Re-validate the final envelope (header + optional + suffix + user message)
-        try:
-            validate_provider_input(result)
-        except ProviderEnvelopeError:
-            # Safety net: if suffix pushes over budget, this means
-            # header+suffix alone was already validated above, so this
-            # should not happen.  But fail gracefully if it does.
-            logger.error("event=provider_input_budget_exceeded stage=generation")
-            raise ProviderEnvelopeError("budget_exceeded")
-
         # Log pruning event if context components were partially or fully omitted
+        initial_prompt_len = len(header)
         final_prompt_len = len(result[0]["content"]) - len(suffix) - 2  # -2 for \n\n
         if optional_components and final_prompt_len <= initial_prompt_len + 10:
-            # No context was added (or only minimal/marker)
-            logger.info("event=provider_input_pruned stage=generation")
-        elif optional_components and final_prompt_len < initial_prompt_len + sum(
-            len(c[1]) for c in optional_components
-        ):
-            # Some components were dropped
             logger.info("event=provider_input_pruned stage=generation")
 
         return result
