@@ -219,6 +219,57 @@ def _truncate_utf8_safe(text: str, max_bytes: int) -> tuple[str, bool]:
     return truncated + OMISSION_MARKER, True
 
 
+def _truncate_utf8_safe_head_tail(
+    text: str,
+    max_bytes: int,
+    head_ratio: float = 0.6,
+) -> tuple[str, bool]:
+    """Truncate *text* preserving both **beginning** and **end**.
+
+    If truncation is needed, the text is split into a head portion
+    (first *head_ratio* fraction of available bytes) and a tail portion
+    (the remainder), with ``OMISSION_MARKER`` inserted between them.
+
+    ``head_ratio`` controls the split between head and tail (default 0.6 = 60% head).
+    Both portions are decoded at full UTF-8 character boundaries.
+    If *max_bytes* is too small for both head and tail plus the marker,
+    falls back to head-only truncation (``_truncate_utf8_safe`` semantics).
+
+    Returns ``(truncated_text, was_truncated)``.
+    """
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text, False
+
+    marker_bytes = len(OMISSION_MARKER.encode("utf-8"))
+
+    # Need space for head + marker + tail
+    if max_bytes < marker_bytes + 4:
+        # Too small for meaningful head+tail — fall back to head-only
+        return _truncate_utf8_safe(text, max_bytes)
+
+    total_data = max_bytes - marker_bytes
+    head_bytes = max(1, int(total_data * head_ratio))
+    tail_bytes = max(1, total_data - head_bytes)
+
+    # Head: beginning of text, up to head_bytes
+    head = encoded[:head_bytes].decode("utf-8", errors="ignore")
+
+    # Tail: end of text, last tail_bytes
+    tail = encoded[-tail_bytes:].decode("utf-8", errors="ignore")
+
+    # If combined head + OMISSION_MARKER + tail still exceeds max_bytes,
+    # try reducing tail (tail is less important for structure)
+    result = head + OMISSION_MARKER + tail
+    while len(result.encode("utf-8")) > max_bytes and len(tail) > 0:
+        # Remove one character from tail at a time
+        tail = tail[:-1]
+        result = head + OMISSION_MARKER + tail
+
+    return result, True
+
+
+
 def fit_optional_context(
     mandatory_messages: list,
     optional_context_components: list[tuple[str, str]],

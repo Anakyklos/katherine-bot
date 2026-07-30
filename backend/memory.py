@@ -1,3 +1,4 @@
+import json
 import os
 import logging
 from datetime import datetime, UTC
@@ -281,7 +282,17 @@ class MemoryManager:
         relevant_memories = self._retrieve_relevant(user_id, current_message)
 
         persona = str(user_state.get('persona_config', 'Katherine...'))
-        user_profile_str = str(user_state.get('user_profile', {}))
+        # Use deterministic JSON serialization instead of str(dict)
+        raw_profile = user_state.get('user_profile', {})
+        if isinstance(raw_profile, dict):
+            user_profile_str = json.dumps(
+                raw_profile,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        else:
+            user_profile_str = str(raw_profile)
 
         context_str = f"""
         === CORE MEMORY (QUEM VOCÊ É) ===

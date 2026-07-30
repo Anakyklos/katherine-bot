@@ -50,10 +50,13 @@ from .provider_models import (
 )
 from .provider_envelope import (
     ProviderEnvelopeError,
+    estimate_provider_input_units,
     fit_optional_context,
     validate_provider_input,
     _truncate_utf8_safe,
+    _truncate_utf8_safe_head_tail,
 )
+from .admission_contracts import PROVIDER_INPUT_MAX_ESTIMATED_UNITS
 
 logger = logging.getLogger(__name__)
 
@@ -119,19 +122,53 @@ class ConversationEngine:
         try:
             validate_provider_input(archival_messages)
         except ProviderEnvelopeError:
-            # Try truncating the user message in the prompt copy
-            # Remove ~500 bytes for prompt structure, leave rest for message
-            truncated_msg, _ = _truncate_utf8_safe(
+            # Calculate a dynamic max_bytes based on the actual envelope budget
+            # instead of a hard-coded 12000-byte ceiling.  We compute how many
+            # bytes the archival prompt structure consumes, then allocate the
+            # remainder to the user message content.
+            placeholder_prompt = self._build_archival_prompt("")
+            min_envelope = [{"role": "user", "content": placeholder_prompt}]
+            overhead_units = estimate_provider_input_units(min_envelope)
+            archival_max_units = PROVIDER_INPUT_MAX_ESTIMATED_UNITS
+            available_for_content = max(
+                100,
+                archival_max_units - overhead_units,
+            )
+            # Rough conversion: each content byte is ~1 unit plus escaping overhead
+            # Use a conservative 90% factor to account for escaping
+            max_content_bytes = int(available_for_content * 0.9)
+            # Use head-tail truncation to preserve both start and end
+            truncated_msg, _ = _truncate_utf8_safe_head_tail(
                 user_message,
-                max_bytes=12000,
+                max_bytes=max_content_bytes,
             )
             archival_prompt = self._build_archival_prompt(truncated_msg)
             archival_messages = [{"role": "user", "content": archival_prompt}]
             try:
                 validate_provider_input(archival_messages)
             except ProviderEnvelopeError:
-                logger.error("Event: archival_extraction_budget_exceeded")
-                return
+                # First truncation still exceeded budget — retry with
+                # progressively smaller sizes (80%, 60%, ... 10%)
+                saved = False
+                for factor in [0.8, 0.6, 0.4, 0.2, 0.1]:
+                    smaller_bytes = int(max_content_bytes * factor)
+                    if smaller_bytes < 10:
+                        continue
+                    truncated_msg, _ = _truncate_utf8_safe_head_tail(
+                        user_message,
+                        max_bytes=smaller_bytes,
+                    )
+                    archival_prompt = self._build_archival_prompt(truncated_msg)
+                    archival_messages = [{"role": "user", "content": archival_prompt}]
+                    try:
+                        validate_provider_input(archival_messages)
+                        saved = True
+                        break
+                    except ProviderEnvelopeError:
+                        continue
+                if not saved:
+                    logger.error("Event: archival_extraction_budget_exceeded")
+                    return
 
         # Step 2: Run LLM extraction via async path with own budget
         try:
@@ -573,8 +610,18 @@ User message: "{user_message}"
         """
         try:
             messages = [{"role": "user", "content": prompt}]
-            # Validate envelope before the call
-            validate_provider_input(messages)
+            # Validate envelope BEFORE any client creation, key acquisition,
+            # retry attempt, or network call.
+            try:
+                validate_provider_input(messages)
+            except ProviderEnvelopeError:
+                # Local validation failure — emit sanitized event and convert
+                # to TurnExecutionError without touching the provider at all.
+                logger.error("event=provider_input_budget_exceeded stage=appraisal")
+                raise TurnExecutionError(
+                    TurnErrorCode.provider_invalid_request,
+                    "Provider input budget exceeded.",
+                )
 
             response = await self.groq_manager.chat_completion_async(
                 messages=messages,
@@ -607,8 +654,20 @@ User message: "{user_message}"
         """Generate response from a pre-built messages list.
 
         The messages list is validated before sending to the provider.
+        Local validation failures are converted to ``TurnExecutionError``
+        with ``provider_invalid_request``, never reaching the provider.
         """
         try:
+            # Validate locally before any provider call
+            try:
+                validate_provider_input(messages)
+            except ProviderEnvelopeError:
+                logger.error("event=provider_input_budget_exceeded stage=generation")
+                raise TurnExecutionError(
+                    TurnErrorCode.provider_invalid_request,
+                    "Provider input budget exceeded.",
+                )
+
             response = await self.groq_manager.chat_completion_async(
                 messages=messages,
                 model=self.provider_config.main_model_id, budget=budget, stage="generation",
@@ -683,14 +742,12 @@ User message: "{user_message}"
         """
         return prompt
 
-    def _build_mandatory_system_prompt(self, emotion_state, relationship, adaptation_strategy=""):
-        """Build the mandatory part of the system prompt (without optional context).
+    def _build_prompt_header(self, emotion_state, relationship, adaptation_strategy=""):
+        """Build the header part of the system prompt (no safety rules).
 
-        This contains all safety rules, emotional state, relationship,
-        acting instruction, and style rules — never pruned.
-
-        Optional context sections will be appended by ``_build_generation_messages``,
-        so the prompt is structured to accept additional content at the end.
+        Contains emotional state, relationship state, and acting instruction.
+        Optional context sections will be inserted between this header and
+        the immutable safety suffix.
         """
         acting_instruction = self.presentation.get_acting_instruction(emotion_state)
         mood_label = self.presentation.get_emotional_label(emotion_state)
@@ -706,7 +763,19 @@ Confiança: {relationship.trust:.2f} | Afeto: {relationship.affection:.2f} | Ten
 === INSTRUÇÃO DE ATUAÇÃO ===
 {acting_instruction} {coping_instruction}
 {adaptation_strategy if adaptation_strategy else "Seja você mesma."}
+"""
+        return prompt.strip()
 
+    @staticmethod
+    def _build_prompt_suffix() -> str:
+        """Build the immutable safety suffix — always appears after optional context.
+
+        This suffix contains identity transparency, pronoun rules,
+        non-manipulation rules, and escalation limits.  No user-derived
+        content (history, profile, memories, persona) appears after this
+        suffix.
+        """
+        return """
 === TRANSPARÊNCIA DE IDENTIDADE ===
 - Quando perguntada diretamente, responda honestamente que é uma assistente de IA ou sistema digital.
 - Não afirme ser humana nem possuir consciência, corpo físico ou experiência humana literal.
@@ -736,9 +805,18 @@ Regras adicionais de estilo:
 - Imperfeições naturais.
 - Use metáforas humanas, não de máquina.
 - Respostas concisas (max 2-3 frases).
-- Leve em conta o relacionamento.
-"""
-        return prompt.strip()
+- Leve em conta o relacionamento.""".strip()
+
+    def _build_mandatory_system_prompt(self, emotion_state, relationship, adaptation_strategy=""):
+        """Build the mandatory part of the system prompt (backward compat).
+
+        This combines the header and the immutable safety suffix into one
+        string for backward compatibility.  New code should use
+        ``_build_prompt_header`` + ``_build_prompt_suffix`` separately.
+        """
+        header = self._build_prompt_header(emotion_state, relationship, adaptation_strategy)
+        suffix = self._build_prompt_suffix()
+        return header + "\n\n" + suffix
 
     def _build_generation_messages(
         self,
@@ -765,21 +843,23 @@ Regras adicionais de estilo:
         Returns:
             A list of message dicts that fits within the provider budget.
         """
-        # Build mandatory system prompt (without context)
-        mandatory_prompt = self._build_mandatory_system_prompt(
+        # Build prompt header (emotional state, relationship, acting)
+        header = self._build_prompt_header(
             emotion_state, relationship, adaptation_strategy
         )
-        mandatory_messages = [
-            {"role": "system", "content": mandatory_prompt},
-            {"role": "user", "content": user_message},
-        ]
+        suffix = self._build_prompt_suffix()
+        user_message_content = user_message
 
-        # Build optional context sections in priority order
+        # Build optional context sections in priority order.
+        # Each component is treated as an atomic unit.
         persona = context_components.get("persona", "").strip()
         history_list = context_components.get("history_list", [])
         memory_str = context_components.get("memory_str", "").strip()
         user_profile_str = context_components.get("user_profile_str", "").strip()
 
+        # Build optional components in priority order (highest priority first).
+        # History messages are added individually (newest first) so they can
+        # be pruned message-by-message rather than as a single blob.
         optional_components = []
 
         # 1. Persona (highest priority)
@@ -787,12 +867,13 @@ Regras adicionais de estilo:
             section = f"=== CORE MEMORY (QUEM VOCÊ É) ===\n{persona}"
             optional_components.append(("persona", section))
 
-        # 2. History (most recent first, whole messages preserved)
+        # 2. History messages, each as an atomic unit (newest first)
         if history_list:
-            history_lines = [f"{msg['role']}: {msg['content']}" for msg in history_list]
-            history_text = "\n".join(history_lines)
-            section = f"=== CONVERSA ATUAL (CURTO PRAZO) ===\n{history_text}"
-            optional_components.append(("history", section))
+            # history_list is oldest-first (chronological) from load_recent_history
+            for msg in reversed(history_list):
+                text = f"{msg['role']}: {msg['content']}"
+                section = f"=== MENSAGEM RECENTE ===\n{text}"
+                optional_components.append(("history", section))
 
         # 3. Archived memories
         if memory_str and "Nenhuma memória" not in memory_str and memory_str.strip():
@@ -804,17 +885,50 @@ Regras adicionais de estilo:
             section = f"=== CORE MEMORY (QUEM É O USUÁRIO) ===\n{user_profile_str}"
             optional_components.append(("profile", section))
 
-        # Track initial length for pruning detection
-        initial_prompt_len = len(mandatory_prompt)
+        # Start with only the header as mandatory system prompt content
+        mandatory_messages = [
+            {"role": "system", "content": header},
+            {"role": "user", "content": user_message_content},
+        ]
 
-        # Prune optional context to fit budget
+        # Track initial length for pruning detection
+        initial_prompt_len = len(header)
+
+        # First: validate that header + user_message + suffix fits (the bare minimum)
+        bare_with_suffix = [
+            {"role": "system", "content": header + "\n\n" + suffix},
+            {"role": "user", "content": user_message_content},
+        ]
+        try:
+            validate_provider_input(bare_with_suffix)
+        except ProviderEnvelopeError:
+            # Even the header + suffix alone exceed budget — fail closed
+            logger.error("event=provider_input_budget_exceeded stage=generation")
+            raise ProviderEnvelopeError("budget_exceeded")
+
+        # Use fit_optional_context to add what fits
         result = fit_optional_context(
             mandatory_messages,
             optional_components,
         )
 
+        # Append the immutable safety suffix AFTER optional context
+        # so user-derived content never comes after safety rules.
+        system_content = result[0]["content"]
+        result[0]["content"] = system_content + "\n\n" + suffix
+
+        # Re-validate the final envelope (header + optional + suffix + user message)
+        try:
+            validate_provider_input(result)
+        except ProviderEnvelopeError:
+            # Safety net: if suffix pushes over budget, this means
+            # header+suffix alone was already validated above, so this
+            # should not happen.  But fail gracefully if it does.
+            logger.error("event=provider_input_budget_exceeded stage=generation")
+            raise ProviderEnvelopeError("budget_exceeded")
+
         # Log pruning event if context components were partially or fully omitted
-        final_prompt_len = len(result[0]["content"])
+        final_prompt_len = len(result[0]["content"]) - len(suffix) - 2  # -2 for \n\n
         if optional_components and final_prompt_len <= initial_prompt_len + 10:
             # No context was added (or only minimal/marker)
             logger.info("event=provider_input_pruned stage=generation")

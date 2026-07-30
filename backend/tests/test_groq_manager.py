@@ -623,7 +623,91 @@ async def test_async_oversized_envelope_rejected(caplog):
     assert "key-one" not in caplog.text
 
 
-# 22. Async 4xx (e.g. 400, 422) produces invalid_request through full chain
+# 23. Local envelope error does not touch factory, cursor, cooldown, keys
+@pytest.mark.anyio
+async def test_async_local_envelope_error_does_not_touch_factory():
+    """Local envelope validation error does not call factory, key acquisition, or cooldown."""
+    from backend.turn_execution import TurnBudget
+
+    factory_calls = []
+    def _factory(k):
+        factory_calls.append(k)
+        return AsyncMock(**{"chat.completions.create": AsyncMock()})
+
+    manager = GroqClientManager(
+        keys=["key-one-11111111", "key-two-22222222"],
+        client_factory=lambda k: MockClient(lambda *args, **kwargs: MockCompletion("ok")),
+        async_client_factory=_factory,
+        groq_params=type('obj', (object,), {
+            'max_attempts': 2, 'connect_timeout': 2.0,
+            'provider_attempt_timeout': 10.0, 'base_backoff': 0.25,
+            'max_backoff': 0.75, 'max_jitter': 0.10
+        })(),
+    )
+
+    budget = TurnBudget(deadline=100.0, reserve=10.0, now_provider=lambda: 0.0)
+
+    # Empty messages should fail locally before any factory call
+    with pytest.raises(GroqRequestError) as excinfo:
+        await manager.chat_completion_async(
+            messages=[],
+            model="test",
+            budget=budget,
+            stage="test",
+        )
+    assert "Falha ao executar requisição Groq" in str(excinfo.value)
+
+    # Assert factory was never called
+    assert len(factory_calls) == 0, f"Factory was called {len(factory_calls)} times despite local error"
+
+
+def test_sync_local_envelope_error_does_not_touch_keys():
+    """Sync local envelope error does not touch key state (index, cooldown, deactivated)."""
+    manager = GroqClientManager(
+        keys=["key-one-11111111", "key-two-22222222"],
+        client_factory=lambda k: MockClient(lambda *args, **kwargs: MockCompletion("ok")),
+    )
+
+    # Record initial state
+    initial_index = manager._index
+    initial_deactivated = dict(manager._deactivated)
+    initial_cooldowns = dict(manager._cooldowns)
+
+    # Empty messages should fail locally
+    with pytest.raises(GroqRequestError):
+        manager.chat_completion(messages=[], model="test")
+
+    # Assert internal state is untouched
+    assert manager._index == initial_index, "Cursor was modified by local error"
+    assert dict(manager._deactivated) == initial_deactivated, "Deactivated set was modified by local error"
+    assert dict(manager._cooldowns) == initial_cooldowns, "Cooldowns were modified by local error"
+
+
+def test_sync_local_envelope_error_does_not_rotate_or_attempt():
+    """Sync local envelope error does not attempt key rotation."""
+    call_count = [0]
+    def _create(*args, **kwargs):
+        call_count[0] += 1
+        return MockCompletion("ok")
+
+    manager = GroqClientManager(
+        keys=["key-one-11111111", "key-two-22222222"],
+        client_factory=lambda k: MockClient(_create),
+    )
+
+    # Oversized envelope (local failure)
+    oversized = "x" * 20000
+    with pytest.raises(GroqRequestError):
+        manager.chat_completion(
+            messages=[{"role": "user", "content": oversized}],
+            model="test",
+        )
+
+    # Assert no provider call was made
+    assert call_count[0] == 0, f"Provider was called {call_count[0]} times despite local envelope error"
+
+
+# 24. Async 4xx (e.g. 400, 422) produces invalid_request through full chain
 @pytest.mark.anyio
 async def test_async_4xx_produces_invalid_request():
     """Verify APIStatusError 4xx (terminal) in async path produces invalid_request.
