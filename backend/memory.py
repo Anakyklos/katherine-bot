@@ -17,7 +17,7 @@ class RetrievedMemory:
     """A single memory retrieved from archival storage.
 
     ``content`` is the non-empty text of the memory fact.
-    ``tags`` are zero or more category labels, normalised in first-seen order.
+    ``tags`` are zero or more category labels in canonical sorted order.
     """
     content: str
     tags: tuple[str, ...]
@@ -28,23 +28,18 @@ class RetrievedMemory:
         if not isinstance(self.tags, tuple):
             raise ValueError("RetrievedMemory tags must be a tuple")
 
-        normalized_tags: list[str] = []
-        seen: set[str] = set()
-        for raw_tag in self.tags:
-            if not isinstance(raw_tag, str):
-                continue
-            tag = raw_tag.strip()
-            if not tag or tag in seen:
-                continue
-            seen.add(tag)
-            normalized_tags.append(tag)
+        normalized_tags = sorted({
+            raw_tag.strip()
+            for raw_tag in self.tags
+            if isinstance(raw_tag, str) and raw_tag.strip()
+        })
         object.__setattr__(self, "tags", tuple(normalized_tags))
 
     def to_prompt_text(self) -> str:
         """Format this memory entry deterministically for a system prompt.
 
         ``content`` is preserved byte-for-byte, including internal newlines.
-        Valid tags are rendered once, in first-seen order. Empty tags omit the
+        Valid tags are rendered once in canonical order. Empty tags omit the
         ``Tags:`` line entirely.
         """
         if not self.tags:
@@ -93,10 +88,7 @@ def _default_supabase_factory(supabase_timeout: Optional[float] = None) -> Optio
     if not url or not key:
         return None
 
-    # Use the provided timeout (must come from validated TurnExecutionConfig).
-    # If None, default to 5.0 — no env-var re-parsing here.
     timeout = supabase_timeout if supabase_timeout is not None else 5.0
-
     try:
         from supabase.lib.client_options import ClientOptions
         options = ClientOptions(postgrest_client_timeout=timeout)
