@@ -105,7 +105,8 @@ class RetrievedMemory:
         """Convert this memory to a ``ContextItem`` for the trusted context bundle.
 
         The ``source_ref`` is an opaque local reference (e.g. ``"mem-1"``).
-        The real source_id (UUID) is kept only for internal tracking.
+        The real source_id (UUID) is transferred to ``internal_id`` so it
+        appears only in the lateral source map, never in provider messages.
         """
         return ContextItem(
             kind="memory",
@@ -114,6 +115,7 @@ class RetrievedMemory:
             confidence=self.confidence,
             epistemic_status=self.epistemic_status,
             source_id=source_ref,
+            internal_id=self.source_id,
         )
 
 
@@ -328,40 +330,34 @@ class MemoryManager:
         except (TypeError, ValueError):
             raise ContextLoadError("user_profile contains non-serialisable values.")
 
-    def build_context_bundle(
+    def load_context_data(
         self,
         user_id: str,
         current_message: str,
         user_state: dict,
-        emotional_state: EmotionalStateV1,
-        relationship: RelationshipStateV1,
-    ) -> ContextBundle:
-        """Build a ``ContextBundle`` from database state.
+    ) -> "LoadedContextData":
+        """Load context data exactly once, returning a ``LoadedContextData``.
 
-        This is the primary entry point for constructing trusted context.
-        It loads history, memories, and profile data and returns a structured
-        ``ContextBundle`` suitable for ``build_envelope()``.
+        This method performs ALL infrastructure I/O (Supabase, embeddings,
+        RPC) in a single call.  The result can be later converted to a
+        ``ContextBundle`` via the pure-domain ``build_context_bundle()``.
+
+        ``LoadedContextData`` is imported lazily to avoid circular imports.
         """
+        from .trusted_context import LoadedContextData
+
         # Load history with IDs for stable ordering
         history = self.load_recent_history(user_id, limit=10)
 
-        # Convert history to ChatMessage list
-        chat_messages: list[ChatMessage] = []
-        for i, msg in enumerate(history):
-            # Create opaque local reference
-            source_ref = f"msg-{i + 1}"
-            chat_messages.append(ChatMessage(
-                role=msg["role"],
-                content=msg["content"],
-                source_id=source_ref,
-                sort_key=(msg.get("id", 0), i),  # Stable ordering: id first, then index
-            ))
-
-        # Load memories with provenance
+        # Load memories via embedding RPC
         memories = self._retrieve_relevant_entries(user_id, current_message)
 
-        # Filter to approved memories with valid contract
-        memory_items: list[ContextItem] = []
+        # Extract profile and persona from user_state (no I/O needed)
+        profile_snapshot = user_state.get("user_profile", {})
+        persona_snapshot = user_state.get("persona_config", "")
+
+        # Filter: only approved, non-legacy memories survive
+        valid_memories: list = []
         for mem in memories:
             if not mem.approved:
                 logger.debug("event=context_memory_unapproved")
@@ -370,121 +366,14 @@ class MemoryManager:
                 # Legacy memory without metadata version — skip
                 logger.debug("event=context_item_rejected code=memory_legacy")
                 continue
-            source_ref = f"mem-{len(memory_items) + 1}"
-            memory_items.append(mem.to_context_item(source_ref))
+            valid_memories.append(mem)
 
-        # Profile as untrusted context item
-        profile_items: list[ContextItem] = []
-        raw_profile = user_state.get("user_profile", {})
-        if isinstance(raw_profile, dict) and raw_profile:
-            try:
-                profile_str = self._serialize_user_profile(raw_profile)
-                profile_items.append(ContextItem(
-                    kind="profile",
-                    content=profile_str,
-                    provenance=Provenance.LEGACY_PROFILE,
-                    confidence=0.3,  # Low confidence for legacy profile
-                    epistemic_status=EpistemicStatus.UNKNOWN,
-                    source_id="profile-1",
-                ))
-            except ContextLoadError:
-                logger.debug("event=context_item_rejected code=profile_invalid")
-
-        # Persona as untrusted context item (not interpolated into trusted policy)
-        persona_items: list[ContextItem] = []
-        persona_config = user_state.get("persona_config", "")
-        if persona_config and isinstance(persona_config, str) and persona_config.strip():
-            persona_items.append(ContextItem(
-                kind="persona",
-                content=persona_config.strip(),
-                provenance=Provenance.LEGACY_PERSONA,
-                confidence=0.3,
-                epistemic_status=EpistemicStatus.UNKNOWN,
-                source_id="persona-1",
-            ))
-
-        # Build trusted policy from application-controlled state
-        trusted_policy = self._build_trusted_policy(emotional_state, relationship)
-
-        return ContextBundle(
-            trusted_policy=trusted_policy,
-            history=tuple(chat_messages),
-            profile_items=tuple(profile_items),
-            memory_items=tuple(memory_items),
-            persona_items=tuple(persona_items),
+        return LoadedContextData(
+            history_rows=tuple(history),
+            retrieved_memories=tuple(valid_memories),
+            profile_snapshot=profile_snapshot,
+            persona_snapshot=persona_snapshot or "",
         )
-
-    @staticmethod
-    def _build_trusted_policy(
-        emotional_state: EmotionalStateV1,
-        relationship: RelationshipStateV1,
-    ) -> str:
-        """Build the trusted system policy from application-controlled state.
-
-        This is the only source of system prompt content.  It contains:
-        - Emotional state (typed, app-controlled)
-        - Relationship state (typed, app-controlled)
-        - Acting instructions (derived from code, not user data)
-        - Safety rules (hardcoded, immutable)
-
-        No user-derived content (history, profile, memories, persona)
-        appears here.
-        """
-        from .relationship import compute_bond_label
-
-        # Build mood label from emotional state
-        # (minimal projection for system prompt)
-        pleasure = emotional_state.pleasure
-        arousal = emotional_state.arousal
-        dominance = emotional_state.dominance
-        libido = emotional_state.libido
-        aggression = emotional_state.aggression
-        connection = emotional_state.connection
-
-        bond_label = compute_bond_label(relationship)
-
-        policy = f"""
-=== SEU ESTADO INTERNO ===
-HUMOR: {_compute_informal_mood(pleasure, arousal)}
-Prazer: {pleasure:.2f} | Arousal: {arousal:.2f} | Dominância: {dominance:.2f}
-Libido: {libido:.2f} | Agressão: {aggression:.2f} | Conexão: {connection:.2f}
-VÍNCULO: {bond_label}
-Confiança: {relationship.trust:.2f} | Afeto: {relationship.affection:.2f} | Tensão: {relationship.tension:.2f}
-=== INSTRUÇÃO DE ATUAÇÃO ===
-Seja você mesma.
-
-=== TRANSPARÊNCIA DE IDENTIDADE ===
-- Quando perguntada diretamente, responda honestamente que é uma assistente de IA ou sistema digital.
-- Não afirme ser humana nem possuir consciência, corpo físico ou experiência humana literal.
-- Mantenha um tom expressivo e feminino sem mentir sobre sua natureza.
-
-=== PRONOMES FEMININOS ===
-- Use pronomes e flexões femininas para se referir a si mesma.
-- Isso não deve ser usado para sugerir humanidade biológica.
-
-=== NÃO MANIPULAÇÃO E NÃO SEXUALIZAÇÃO ===
-- Não use coerção emocional, manipulação de vínculo, culpa, medo de abandono ou dependência.
-- Não use sexualização nem sexualize automaticamente as conversas.
-- Não aja de forma submissa, obediente ou servil por padrão.
-- Não recompense ordens coercivas.
-- Não use ameaças de afastamento ou sofrimento para controlar o usuário.
-
-=== LIMITES SEM ESCALADA ===
-- Diante de insultos ou agressividade, estabeleça limites de forma firme, breve e segura.
-- Não use sarcasmo hostil, retaliação, humilhação ou punição emocional.
-- Não escale insultos e não responda de forma passivo-agressiva.
-
-Regras adicionais de estilo:
-- Profundidade emocional genuína.
-- Use linguagem sensorial.
-- Show, don't tell.
-- Micro-comportamentos naturais.
-- Imperfeições naturais.
-- Use metáforas humanas, não de máquina.
-- Respostas concisas (max 2-3 frases).
-- Leve em conta o relacionamento.
-"""
-        return policy.strip()
 
     def get_context_components(self, user_id: str, current_message: str, user_state: dict) -> dict:
         """Get context components for backward compatibility.
@@ -678,8 +567,22 @@ Regras adicionais de estilo:
                 content = doc.get("content", "")
                 if not isinstance(content, str) or not content.strip():
                     continue
+
+                # Parse metadata according to the official contract
+                # Valid metadata must be a dict with schema_version >= 1
                 metadata = doc.get("metadata", {})
-                raw_tags = metadata.get("tags", ()) if isinstance(metadata, dict) else ()
+                if not isinstance(metadata, dict):
+                    continue
+
+                schema_version = metadata.get("schema_version", 0)
+                if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+                    continue
+                if schema_version < 1:
+                    # Legacy metadata — silently ignore
+                    continue
+
+                # Extract tags
+                raw_tags = metadata.get("tags", ())
                 if isinstance(raw_tags, str):
                     tag_values = (raw_tags,)
                 elif isinstance(raw_tags, (list, tuple)):
@@ -687,26 +590,54 @@ Regras adicionais de estilo:
                 else:
                     tag_values = ()
 
-                # Extract additional fields for provenance tracking
-                doc_id = doc.get("id", "")
-                if not isinstance(doc_id, str):
-                    doc_id = ""
-                doc_approved = doc.get("approved", False)
+                # Extract approved flag (exact bool, required)
+                doc_approved = metadata.get("approved", False)
                 if not isinstance(doc_approved, bool):
-                    doc_approved = False
-                metadata_version = metadata.get("version", 0) if isinstance(metadata, dict) else 0
-                if isinstance(metadata_version, bool) or not isinstance(metadata_version, int):
-                    metadata_version = 0
+                    continue
+                if not doc_approved:
+                    continue
+
+                # Extract provenance (must be in allowlist)
+                raw_provenance = metadata.get("provenance", "")
+                if not isinstance(raw_provenance, str):
+                    continue
+                if not Provenance.is_valid(raw_provenance):
+                    continue
+
+                # Extract epistemic_status (must be in allowlist)
+                raw_epistemic = metadata.get("epistemic_status", "")
+                if not isinstance(raw_epistemic, str):
+                    continue
+                if not EpistemicStatus.is_valid(raw_epistemic):
+                    continue
+
+                # Extract confidence (finite float in [0.0, 1.0])
+                raw_confidence = metadata.get("confidence", None)
+                if raw_confidence is None:
+                    continue
+                if isinstance(raw_confidence, bool):
+                    continue
+                if not isinstance(raw_confidence, (int, float)):
+                    continue
+                if math.isnan(raw_confidence) or math.isinf(raw_confidence):
+                    continue
+                if not (0.0 <= raw_confidence <= 1.0):
+                    continue
+
+                # Extract source UUID (must be non-empty valid string)
+                doc_id = doc.get("id", "")
+                if not isinstance(doc_id, str) or not doc_id:
+                    continue
 
                 entry = RetrievedMemory(
                     content=content,
                     tags=tag_values,
                     source_id=doc_id,
-                    confidence=0.5,  # Default confidence for retrieval
-                    provenance=Provenance.LEGACY_MEMORY,
-                    epistemic_status=EpistemicStatus.UNKNOWN,
+                    confidence=raw_confidence,
+                    provenance=raw_provenance,
+                    epistemic_status=raw_epistemic,
                     approved=doc_approved,
-                    metadata_version=metadata_version,
+                    metadata_version=schema_version,
                 )
                 entries.append(entry)
             except Exception:
@@ -715,17 +646,4 @@ Regras adicionais de estilo:
         return entries
 
 
-def _compute_informal_mood(pleasure: float, arousal: float) -> str:
-    """Compute an informal mood label from pleasure and arousal values."""
-    if pleasure > 0.3:
-        if arousal > 0.3:
-            return "Animada"
-        return "Calma"
-    elif pleasure < -0.3:
-        if arousal > 0.3:
-            return "Irritada"
-        return "Triste"
-    else:
-        if arousal > 0.3:
-            return "Tensa"
-        return "Neutra"
+

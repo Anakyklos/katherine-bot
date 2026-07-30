@@ -60,6 +60,8 @@ from .provider_envelope import (
 from .admission_contracts import PROVIDER_INPUT_MAX_ESTIMATED_UNITS
 from .trusted_context import (
     ContextBundle,
+    LoadedContextData,
+    build_context_bundle,
     build_envelope,
     TrustedContextError,
 )
@@ -343,9 +345,9 @@ class ConversationEngine:
 
         t0 = self._monotonic()
         try:
-            context_components = await run_blocking_read(
-                "get_context", budget, supabase_timeout,
-                self.memory_manager.get_context_components, user_id, user_message, user_state
+            loaded_context_data = await run_blocking_read(
+                "load_context", budget, supabase_timeout,
+                self.memory_manager.load_context_data, user_id, user_message, user_state
             )
         except DeadlineExceeded:
             await self._emit_stage_event(StageEvent(
@@ -433,14 +435,19 @@ class ConversationEngine:
 
         adaptation_strategy = ""
 
-        # Build the trusted context bundle and envelope
-        # Uses the new trusted context boundary — history gets original roles,
-        # profile and memory enter as untrusted data, never in system prompt.
+        # Build the trusted policy using the engine's own emotional presentation
+        trusted_policy = self._build_trusted_policy(
+            new_state, relationship, adaptation_strategy
+        )
+
+        # Convert loaded context into bundle using PURE domain function (no I/O)
+        context_bundle = build_context_bundle(
+            trusted_policy=trusted_policy,
+            loaded_data=loaded_context_data,
+        )
+
+        # Build envelope with budget-aware selection
         try:
-            context_bundle = self.memory_manager.build_context_bundle(
-                user_id, user_message, user_state,
-                new_state, relationship,
-            )
             envelope_result = build_envelope(
                 context_bundle,
                 user_message,
@@ -822,6 +829,73 @@ Regras adicionais de estilo:
 - Use metáforas humanas, não de máquina.
 - Respostas concisas (max 2-3 frases).
 - Leve em conta o relacionamento.""".strip()
+
+    def _build_trusted_policy(
+        self,
+        emotional_state: EmotionalStateV1,
+        relationship: RelationshipStateV1,
+        adaptation_strategy: str = "",
+    ) -> str:
+        """Build the trusted system policy from application-controlled state.
+
+        This is the only source of system prompt content.  It contains:
+        - Emotional state (typed, app-controlled)
+        - Relationship state (typed, app-controlled)
+        - Acting instructions (derived from code, not user data)
+        - Safety rules (hardcoded, immutable)
+
+        Uses the engine's own ``presentation`` for emotional label and
+        acting instruction — same as ``_build_prompt_header``.
+
+        No user-derived content (history, profile, memories, persona)
+        appears here.
+        """
+        acting_instruction = self.presentation.get_acting_instruction(emotional_state)
+        mood_label = self.presentation.get_emotional_label(emotional_state)
+
+        policy = f"""
+=== SEU ESTADO INTERNO ===
+HUMOR: {mood_label}
+Prazer: {emotional_state.pleasure:.2f} | Arousal: {emotional_state.arousal:.2f} | Dominância: {emotional_state.dominance:.2f}
+Libido: {emotional_state.libido:.2f} | Agressão: {emotional_state.aggression:.2f} | Conexão: {emotional_state.connection:.2f}
+VÍNCULO: {compute_bond_label(relationship)}
+Confiança: {relationship.trust:.2f} | Afeto: {relationship.affection:.2f} | Tensão: {relationship.tension:.2f}
+=== INSTRUÇÃO DE ATUAÇÃO ===
+{acting_instruction}
+{adaptation_strategy if adaptation_strategy else "Seja você mesma."}
+
+=== TRANSPARÊNCIA DE IDENTIDADE ===
+- Quando perguntada diretamente, responda honestamente que é uma assistente de IA ou sistema digital.
+- Não afirme ser humana nem possuir consciência, corpo físico ou experiência humana literal.
+- Mantenha um tom expressivo e feminino sem mentir sobre sua natureza.
+
+=== PRONOMES FEMININOS ===
+- Use pronomes e flexões femininas para se referir a si mesma.
+- Isso não deve ser usado para sugerir humanidade biológica.
+
+=== NÃO MANIPULAÇÃO E NÃO SEXUALIZAÇÃO ===
+- Não use coerção emocional, manipulação de vínculo, culpa, medo de abandono ou dependência.
+- Não use sexualização nem sexualize automaticamente as conversas.
+- Não aja de forma submissa, obediente ou servil por padrão.
+- Não recompense ordens coercivas.
+- Não use ameaças de afastamento ou sofrimento para controlar o usuário.
+
+=== LIMITES SEM ESCALADA ===
+- Diante de insultos ou agressividade, estabeleça limites de forma firme, breve e segura.
+- Não use sarcasmo hostil, retaliação, humilhação ou punição emocional.
+- Não escale insultos e não responda de forma passivo-agressiva.
+
+Regras adicionais de estilo:
+- Profundidade emocional genuína.
+- Use linguagem sensorial.
+- Show, don't tell.
+- Micro-comportamentos naturais.
+- Imperfeições naturais.
+- Use metáforas humanas, não de máquina.
+- Respostas concisas (max 2-3 frases).
+- Leve em conta o relacionamento.
+"""
+        return policy.strip()
 
     def _build_mandatory_system_prompt(self, emotion_state, relationship, adaptation_strategy=""):
         """Build the mandatory part of the system prompt (backward compat).

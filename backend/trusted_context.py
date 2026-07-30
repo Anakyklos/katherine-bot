@@ -197,11 +197,15 @@ class ChatMessage:
         if self.role not in VALID_HISTORY_ROLES:
             raise TrustedContextError("invalid_history_role")
 
-        # Validate content
+        # Validate content — non-empty after strip
         if not isinstance(self.content, str):
             raise TrustedContextError("invalid_history_content_type")
+        if not self.content.strip():
+            raise TrustedContextError("invalid_history_content")
 
-        # Validate source_id
+        # Validate source_id — must be unique non-empty string
+        if isinstance(self.source_id, bool):
+            raise TrustedContextError("invalid_source_id_bool")
         if not isinstance(self.source_id, str) or not self.source_id:
             raise TrustedContextError("invalid_source_id")
 
@@ -211,6 +215,12 @@ class ChatMessage:
         if len(self.sort_key) < 2:
             # Must have at least (timestamp, id) for stable ordering
             raise TrustedContextError("invalid_sort_key")
+        # Validate all components are comparable (no non-sortable types)
+        for comp in self.sort_key:
+            if isinstance(comp, bool):
+                raise TrustedContextError("invalid_sort_key_component_bool")
+            if isinstance(comp, (list, dict)):
+                raise TrustedContextError("invalid_sort_key_component_container")
 
 
 @dataclass(frozen=True)
@@ -256,9 +266,11 @@ class ContextItem:
         if self.kind not in ("profile", "memory", "persona"):
             raise TrustedContextError("invalid_kind")
 
-        # Validate content
+        # Validate content — non-empty after strip
         if not isinstance(self.content, str) or not self.content:
             raise TrustedContextError("invalid_item_content")
+        if not self.content.strip():
+            raise TrustedContextError("invalid_item_content_whitespace")
 
         # Validate provenance
         if not Provenance.is_valid(self.provenance):
@@ -280,9 +292,15 @@ class ContextItem:
         if not (0.0 <= self.confidence <= 1.0):
             raise TrustedContextError("invalid_confidence_range")
 
-        # Validate source_id
+        # Validate source_id — must be non-empty string, not bool
+        if isinstance(self.source_id, bool):
+            raise TrustedContextError("invalid_source_id_bool")
         if not isinstance(self.source_id, str) or not self.source_id:
             raise TrustedContextError("invalid_source_id")
+
+        # Validate internal_id if present
+        if self.internal_id and not isinstance(self.internal_id, str):
+            raise TrustedContextError("invalid_internal_id_type")
 
     def to_json_dict(self) -> dict:
         """Return a JSON‑safe dict for the untrusted context payload.
@@ -318,6 +336,9 @@ class TruncationReport:
     ``omitted_profile_count``
         Number of profile items omitted.
 
+    ``omitted_persona_count``
+        Number of persona items omitted.
+
     ``selected_history_count``
         Number of history messages included.
 
@@ -326,15 +347,48 @@ class TruncationReport:
 
     ``selected_profile_count``
         Number of profile items included.
+
+    ``selected_persona_count``
+        Number of persona items included.
     """
 
     codes: tuple[str, ...] = ()
     omitted_history_count: int = 0
     omitted_memory_count: int = 0
     omitted_profile_count: int = 0
+    omitted_persona_count: int = 0
     selected_history_count: int = 0
     selected_memory_count: int = 0
     selected_profile_count: int = 0
+    selected_persona_count: int = 0
+
+
+@dataclass(frozen=True)
+class LoadedContextData:
+    """Raw loaded data from infrastructure before envelope construction.
+
+    This is the single payload produced during the ``load_context`` stage.
+    It holds the raw rows and snapshots that will later be converted into
+    a ``ContextBundle`` via pure domain logic (no I/O).
+
+    ``history_rows``
+        List of raw history dicts with ``role``, ``content``, and ``id`` keys.
+
+    ``retrieved_memories``
+        List of ``RetrievedMemory`` objects from the RPC call.
+        Imported lazily to keep this module infrastructure-free.
+
+    ``profile_snapshot``
+        Raw user profile dict (may be empty).
+
+    ``persona_snapshot``
+        Raw persona config string (may be empty).
+    """
+
+    history_rows: tuple = ()
+    retrieved_memories: tuple = ()
+    profile_snapshot: dict = field(default_factory=dict)
+    persona_snapshot: str = ""
 
 
 @dataclass(frozen=True)
@@ -446,6 +500,86 @@ def _estimate_messages_units(messages: list) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Bundle builder — pure conversion from loaded data
+# ---------------------------------------------------------------------------
+
+
+def build_context_bundle(
+    trusted_policy: str,
+    loaded_data: LoadedContextData,
+) -> ContextBundle:
+    """Convert ``LoadedContextData`` into a ``ContextBundle``.
+
+    This is a pure-domain function that performs NO I/O — it only converts
+    already-loaded raw data into typed ``ChatMessage`` and ``ContextItem``
+    instances.
+
+    ``trusted_policy``
+        The trusted system prompt content (built by the engine after
+        emotional transition).
+
+    ``loaded_data``
+        The ``LoadedContextData`` produced during ``load_context``.
+    """
+    # Convert history rows to ChatMessages
+    chat_messages: list[ChatMessage] = []
+    for i, msg in enumerate(loaded_data.history_rows):
+        source_ref = f"msg-{i + 1}"
+        chat_messages.append(ChatMessage(
+            role=msg["role"],
+            content=msg["content"],
+            source_id=source_ref,
+            sort_key=(msg.get("id", 0), i),
+        ))
+
+    # Convert retrieved memories to ContextItems
+    memory_items: list[ContextItem] = []
+    for j, mem in enumerate(loaded_data.retrieved_memories):
+        source_ref = f"mem-{j + 1}"
+        memory_items.append(mem.to_context_item(source_ref))
+
+    # Profile as ContextItem
+    profile_items: list[ContextItem] = []
+    raw_profile = loaded_data.profile_snapshot
+    if raw_profile and isinstance(raw_profile, dict):
+        try:
+            profile_str = json.dumps(
+                raw_profile, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+            profile_items.append(ContextItem(
+                kind="profile",
+                content=profile_str,
+                provenance=Provenance.LEGACY_PROFILE,
+                confidence=0.3,
+                epistemic_status=EpistemicStatus.UNKNOWN,
+                source_id="profile-1",
+            ))
+        except (TypeError, ValueError):
+            pass
+
+    # Persona as ContextItem
+    persona_items: list[ContextItem] = []
+    raw_persona = loaded_data.persona_snapshot
+    if raw_persona and isinstance(raw_persona, str) and raw_persona.strip():
+        persona_items.append(ContextItem(
+            kind="persona",
+            content=raw_persona.strip(),
+            provenance=Provenance.LEGACY_PERSONA,
+            confidence=0.3,
+            epistemic_status=EpistemicStatus.UNKNOWN,
+            source_id="persona-1",
+        ))
+
+    return ContextBundle(
+        trusted_policy=trusted_policy,
+        history=tuple(chat_messages),
+        memory_items=tuple(memory_items),
+        profile_items=tuple(profile_items),
+        persona_items=tuple(persona_items),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Envelope builder — main entry point
 # ---------------------------------------------------------------------------
 
@@ -479,27 +613,30 @@ def build_envelope(
     1. **System message** — ``trusted_policy`` + ``BOUNDARY_RULE``.
        Only application‑controlled material.  Never truncated.
 
-    2. **Untrusted context message** (optional) — if any profile,
-       memory, or persona items exist, a single ``user`` message with
-       canonical JSON containing all untrusted items.
-
-    3. **History messages** — each ``ChatMessage`` as a separate
+    2. **History messages** — each ``ChatMessage`` as a separate
        ``user`` / ``assistant`` message, in chronological order.
-       Selected by recency priority within budget.
+       Selected by recency priority (newest first), then rendered
+       oldest-first.  Each message is selected atomically.
+
+    3. **Untrusted context message** (optional) — if any memory,
+       profile, or persona items remain after budget selection,
+       they are serialized as a single ``user`` message with
+       canonical JSON.  Selection priority: memories first (by
+       relevance), then profile, then persona.
 
     4. **Current user message** — always last, byte‑identical to input.
+       NEVER deduplicated — each history entry has its own identity.
+
+    **Selection priority** (all items atomically, never truncated):
+    1. History messages — newest first (closest to current)
+    2. Memory ``ContextItem`` entries — in retrieval order
+    3. Profile ``ContextItem`` entries
+    4. Persona ``ContextItem`` entries
 
     **Budget allocation**:
 
     - System message and current user message are **mandatory** and
       never truncated.  They are always included in the final envelope.
-
-    - Untrusted context data (profile + memory + persona) is included
-      only if it fits within budget after accounting for mandatory items.
-
-    - History messages are selected newest‑first, then rendered
-      oldest‑first, until the budget is exhausted.  Each message is
-      selected atomically — no message is cut in the middle.
 
     - If the mandatory items alone exceed the budget, raises
       ``TrustedContextError("mandatory_budget_exceeded")``.
@@ -512,6 +649,8 @@ def build_envelope(
         ``TrustedContextError`` on validation failure.
     """
     # 1. Validate inputs ---------------------------------------------------
+    _validate_max_units(max_units)
+
     if not isinstance(bundle, ContextBundle):
         raise TrustedContextError("invalid_bundle_type")
     if not isinstance(user_message, str):
@@ -531,64 +670,30 @@ def build_envelope(
         if not isinstance(item, ContextItem):
             raise TrustedContextError("invalid_context_item")
 
+    # Validate unique source references
+    _validate_unique_refs(bundle)
+
     # 2. Build system message ----------------------------------------------
     system_content = bundle.trusted_policy + BOUNDARY_RULE
     final_messages: list = [{"role": "system", "content": system_content}]
 
-    # 3. Build untrusted context payload -----------------------------------
-    all_items = (
-        *bundle.profile_items,
-        *bundle.memory_items,
-        *bundle.persona_items,
-    )
-    untrusted_payload = _serialize_untrusted_items(all_items)
-
-    # Build source map (opaque local ref → actual internal ID)
-    source_map: dict[str, str] = {}
-    for item in all_items:
-        source_map[item.source_id] = item.internal_id or item.source_id
-
-    # 4. Build initial mandatory envelope (system + current user) ----------
     current_user_message = user_message
 
-    # Template for budget calculation — system + current user
+    # 3. Check mandatory budget --------------------------------------------
     mandatory_min = [
         {"role": "system", "content": system_content},
         {"role": "user", "content": current_user_message},
     ]
-
     mandatory_units = _estimate_messages_units(mandatory_min)
     if mandatory_units > max_units:
         raise TrustedContextError("mandatory_budget_exceeded")
 
-    # 5. Try to include untrusted context ----------------------------------
-    # Build a candidate with untrusted context and check budget
-    has_untrusted_items = bool(all_items)
-
-    if has_untrusted_items:
-        untrusted_candidate = [
-            {"role": "system", "content": system_content},
-            {"role": "user", "content": untrusted_payload},
-            {"role": "user", "content": current_user_message},
-        ]
-        untrusted_units = _estimate_messages_units(untrusted_candidate)
-
-        if untrusted_units <= max_units:
-            final_messages.append({"role": "user", "content": untrusted_payload})
-        else:
-            # Untrusted context doesn't fit — omit it entirely
-            logger_debug("event=context_pruned category=untrusted_context")
-    else:
-        # No untrusted items to include
-        pass
-
-    # 6. Select history messages by recency within budget ------------------
+    # 4. Select history messages by recency (newest first) -----------------
     selected_history: list[ChatMessage] = []
     omitted_history_count = 0
 
     if bundle.history:
         # Build a candidate with all history to check budget
-        # If all history fits, include it all
         all_history_candidate = list(final_messages)
         for msg in bundle.history:
             all_history_candidate.append(
@@ -597,105 +702,131 @@ def build_envelope(
         all_history_candidate.append(
             {"role": "user", "content": current_user_message},
         )
-
         all_history_units = _estimate_messages_units(all_history_candidate)
+
         if all_history_units <= max_units:
-            # All history fits
-            for msg in bundle.history:
-                final_messages.append({"role": msg.role, "content": msg.content})
+            # All history fits — keep it all
             selected_history = list(bundle.history)
         else:
             # Select newest history messages atomically until budget is full
-            # Reverse order for selection (newest first)
             history_newest_first = list(reversed(bundle.history))
 
-            # Ensure current user message is always last
-            base_messages = list(final_messages)
-
             for msg in history_newest_first:
-                candidate = list(base_messages)
-                # Add this message (and all previously selected newer ones)
-                # We build from base + selected in chronological order
-                test_selected = list(selected_history)  # already sorted newest→oldest
+                # Build a test envelope with all currently selected history
+                test_selected = list(selected_history)
                 test_selected.append(msg)
 
-                # Reconstruct in chronological order
-                test_messages = list(base_messages)
-                # selected_history is newest-first, reverse to chronological
-                for sm in reversed(test_selected):
-                    test_messages.append({"role": sm.role, "content": sm.content})
-                test_messages.append({"role": "user", "content": current_user_message})
+                # Render selected history in chronological order
+                test_msgs = list(final_messages)
+                sorted_selected = sorted(test_selected, key=lambda m: m.sort_key)
+                for sm in sorted_selected:
+                    test_msgs.append({"role": sm.role, "content": sm.content})
+                test_msgs.append({"role": "user", "content": current_user_message})
 
-                test_units = _estimate_messages_units(test_messages)
+                test_units = _estimate_messages_units(test_msgs)
                 if test_units <= max_units:
-                    selected_history.append(msg)
+                    selected_history = test_selected
                 else:
                     omitted_history_count += 1
 
-            # Apply final selection in chronological order
-            if selected_history:
-                final_msgs = list(base_messages)
-                # Sort selected history chronologically
-                selected_history.sort(key=lambda m: m.sort_key)
-                for sm in selected_history:
-                    final_msgs.append({"role": sm.role, "content": sm.content})
-                final_msgs.append({"role": "user", "content": current_user_message})
-                final_messages = final_msgs
+    # 5. Select context items atomically (memories first, then profile, then persona) ---
+    # Selection priority for budget: history (newest first), then memories, then
+    # profile, then persona.  BUT visual (rendering) order in the final envelope
+    # is: untrusted context BEFORE history (per the original contract).
+    selected_items: list[ContextItem] = []
+    omitted_memory_count = 0
+    omitted_profile_count = 0
+    omitted_persona_count = 0
 
-    # 7. Ensure current user message is last --------------------------------
-    # Remove any trailing user message if present and re-add
-    if final_messages and final_messages[-1].get("role") == "user" and \
-            final_messages[-1].get("content") == current_user_message:
-        pass  # Already last
-    else:
-        # Remove any existing current user message and re-add at end
-        final_messages = [
-            m for m in final_messages
-            if not (m.get("role") == "user" and m.get("content") == current_user_message)
-        ]
-        final_messages.append({"role": "user", "content": current_user_message})
+    # Build all candidate context items in priority order
+    all_context_candidates: list[tuple[str, ContextItem]] = []
+    for item in bundle.memory_items:
+        all_context_candidates.append(("memory", item))
+    for item in bundle.profile_items:
+        all_context_candidates.append(("profile", item))
+    for item in bundle.persona_items:
+        all_context_candidates.append(("persona", item))
+
+    for category, item in all_context_candidates:
+        # Build test envelope with all selected items so far + rendered history
+        test_item_dicts = [i.to_json_dict() for i in selected_items]
+        test_item_dicts.append(item.to_json_dict())
+        test_payload = _serialize_canonical_json(test_item_dicts)
+
+        # Build full test messages: system + untrusted + history + current
+        test_msgs = list(final_messages)
+        test_msgs.append({"role": "user", "content": test_payload})
+        # Add selected history (chronological)
+        if selected_history:
+            sorted_hist = sorted(selected_history, key=lambda m: m.sort_key)
+            for sm in sorted_hist:
+                test_msgs.append({"role": sm.role, "content": sm.content})
+        test_msgs.append({"role": "user", "content": current_user_message})
+
+        test_units = _estimate_messages_units(test_msgs)
+        if test_units <= max_units:
+            selected_items.append(item)
+        else:
+            if category == "memory":
+                omitted_memory_count += 1
+            elif category == "profile":
+                omitted_profile_count += 1
+            elif category == "persona":
+                omitted_persona_count += 1
+
+    # 6. Build final message order: system + untrusted context + history + current ----
+    # Build a fresh list so order is deterministic
+    final_msgs: list = [{"role": "system", "content": system_content}]
+
+    # Add selected untrusted context (if any)
+    if selected_items:
+        untrusted_payload = _serialize_untrusted_items(tuple(selected_items))
+        final_msgs.append({"role": "user", "content": untrusted_payload})
+
+    # Add selected history in chronological order
+    if selected_history:
+        sorted_hist = sorted(selected_history, key=lambda m: m.sort_key)
+        for sm in sorted_hist:
+            final_msgs.append({"role": sm.role, "content": sm.content})
+
+    # Add current user message (always last, never deduplicated)
+    final_msgs.append({"role": "user", "content": current_user_message})
+    final_messages = final_msgs
+
+    # 7. Build source map (only selected items) ---------------------------
+    source_map: dict[str, str] = {}
+    for item in selected_items:
+        ref = item.source_id
+        if ref in source_map:
+            raise TrustedContextError("duplicate_source_ref")
+        source_map[ref] = item.internal_id or ref
 
     # 8. Final validation --------------------------------------------------
     total_units = _estimate_messages_units(final_messages)
     if total_units > max_units:
-        # As a last resort, try once more by removing untrusted context
-        # but this should not happen if the selection logic is correct
         raise TrustedContextError("budget_exceeded_after_selection")
 
     # 9. Build truncation report -------------------------------------------
     truncation_codes: list[str] = []
-
     if omitted_history_count > 0:
         truncation_codes.append("history_partial")
-
-    # Determine if untrusted context was excluded
-    untrusted_was_omitted = (
-        has_untrusted_items
-        and bool(untrusted_payload)
-        and untrusted_payload not in [m.get("content") for m in final_messages]
-    )
-    if untrusted_was_omitted:
-        truncation_codes.append("untrusted_context_omitted")
-
-    if untrusted_was_omitted:
-        selected_memory_count = 0
-        selected_profile_count = 0
-        omitted_memory_count = len(bundle.memory_items)
-        omitted_profile_count = len(bundle.profile_items)
-    else:
-        selected_memory_count = len(bundle.memory_items)
-        selected_profile_count = len(bundle.profile_items)
-        omitted_memory_count = 0
-        omitted_profile_count = 0
+    if omitted_memory_count > 0:
+        truncation_codes.append("memory_omitted")
+    if omitted_profile_count > 0:
+        truncation_codes.append("profile_omitted")
+    if omitted_persona_count > 0:
+        truncation_codes.append("persona_omitted")
 
     report = TruncationReport(
         codes=tuple(truncation_codes),
         omitted_history_count=omitted_history_count,
         omitted_memory_count=omitted_memory_count,
         omitted_profile_count=omitted_profile_count,
+        omitted_persona_count=omitted_persona_count,
         selected_history_count=len(selected_history),
-        selected_memory_count=selected_memory_count,
-        selected_profile_count=selected_profile_count,
+        selected_memory_count=sum(1 for i in selected_items if i.kind == 'memory'),
+        selected_profile_count=sum(1 for i in selected_items if i.kind == 'profile'),
+        selected_persona_count=sum(1 for i in selected_items if i.kind == 'persona'),
     )
 
     return ContextBuildResult(
@@ -704,6 +835,40 @@ def build_envelope(
         truncation_report=report,
         unit_count=total_units,
     )
+
+
+# ---------------------------------------------------------------------------
+# Validation helpers
+# ---------------------------------------------------------------------------
+
+
+def _validate_max_units(value: object) -> None:
+    """Validate that ``max_units`` is a positive integer (not bool)."""
+    if isinstance(value, bool):
+        raise TrustedContextError("invalid_max_units_bool")
+    if not isinstance(value, int):
+        raise TrustedContextError("invalid_max_units_type")
+    if value <= 0:
+        raise TrustedContextError("invalid_max_units_non_positive")
+
+
+def _validate_unique_refs(bundle: ContextBundle) -> None:
+    """Validate that all source references in the bundle are unique.
+
+    History messages, memory items, profile items, and persona items
+    must all have distinct ``source_id`` values.
+    """
+    seen: set[str] = set()
+    for msg in bundle.history:
+        ref = msg.source_id
+        if ref in seen:
+            raise TrustedContextError("duplicate_source_ref")
+        seen.add(ref)
+    for item in (*bundle.memory_items, *bundle.profile_items, *bundle.persona_items):
+        ref = item.source_id
+        if ref in seen:
+            raise TrustedContextError("duplicate_source_ref")
+        seen.add(ref)
 
 
 # ---------------------------------------------------------------------------

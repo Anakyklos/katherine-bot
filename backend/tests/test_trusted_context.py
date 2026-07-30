@@ -565,18 +565,24 @@ class TestEnvelopeConstruction:
         the "reference" field — that is intentional (it is an opaque local
         ref, not a real UUID).  Real UUIDs must never appear.
         """
-        item = ContextItem(
+        item_mem = ContextItem(
             kind="memory", content="Fact",
             provenance=Provenance.LEGACY_MEMORY,
             confidence=0.5, epistemic_status=EpistemicStatus.UNKNOWN,
             source_id="mem-1",
         )
+        item_prof = ContextItem(
+            kind="profile", content='{"name":"User"}',
+            provenance=Provenance.LEGACY_PROFILE,
+            confidence=0.3, epistemic_status=EpistemicStatus.UNKNOWN,
+            source_id="prof-1",
+        )
         msg = ChatMessage(role="user", content="Test", source_id="msg-1", sort_key=(1, 1))
         bundle = ContextBundle(
             trusted_policy="Policy.",
             history=(msg,),
-            memory_items=(item,),
-            profile_items=(item,),
+            memory_items=(item_mem,),
+            profile_items=(item_prof,),
         )
         result = build_envelope(bundle, "Hi")
         serialized = json.dumps(result.messages)
@@ -1157,8 +1163,7 @@ class TestBuildContextBundle:
     def test_build_context_bundle_filters_unapproved_legacy(self, monkeypatch):
         """Only approved, non-legacy memories appear in ContextBundle.memory_items."""
         from backend.memory import MemoryManager, RetrievedMemory
-        from backend.emotional_domain import EmotionalStateV1
-        from backend.relationship import RelationshipStateV1
+        from backend.trusted_context import build_context_bundle, LoadedContextData
 
         approved_current = RetrievedMemory(
             content="Approved current memory",
@@ -1192,15 +1197,15 @@ class TestBuildContextBundle:
         mm = MemoryManager()
         monkeypatch.setattr(mm, "load_recent_history", lambda *a, **kw: [])
 
-        state = EmotionalStateV1.neutral(timestamp=1000.0)
-        rel = RelationshipStateV1.neutral(timestamp=1000.0)
-
-        bundle = mm.build_context_bundle(
+        loaded = mm.load_context_data(
             user_id="user-x",
             current_message="Hi",
             user_state={},
-            emotional_state=state,
-            relationship=rel,
+        )
+
+        bundle = build_context_bundle(
+            trusted_policy="Test policy.",
+            loaded_data=loaded,
         )
 
         contents = [item.content for item in bundle.memory_items]
@@ -1211,8 +1216,7 @@ class TestBuildContextBundle:
     def test_build_context_bundle_profile_persona_metadata(self, monkeypatch):
         """Profile and persona in user_state produce ContextItems with expected metadata."""
         from backend.memory import MemoryManager
-        from backend.emotional_domain import EmotionalStateV1
-        from backend.relationship import RelationshipStateV1
+        from backend.trusted_context import build_context_bundle
 
         def fake_retrieve(*args, **kwargs):
             return []
@@ -1228,15 +1232,16 @@ class TestBuildContextBundle:
             "user_profile": {"name": "Test User"},
             "persona_config": "Helpful assistant persona",
         }
-        state = EmotionalStateV1.neutral(timestamp=1000.0)
-        rel = RelationshipStateV1.neutral(timestamp=1000.0)
 
-        bundle = mm.build_context_bundle(
+        loaded = mm.load_context_data(
             user_id="user-x",
             current_message="Hi",
             user_state=user_state,
-            emotional_state=state,
-            relationship=rel,
+        )
+
+        bundle = build_context_bundle(
+            trusted_policy="Test policy.",
+            loaded_data=loaded,
         )
 
         # Profile items are in bundle.profile_items, not memory_items
@@ -1258,8 +1263,7 @@ class TestBuildContextBundle:
     def test_build_context_bundle_history_conversion(self, monkeypatch):
         """History from load_recent_history becomes ChatMessages with stable sort_key."""
         from backend.memory import MemoryManager
-        from backend.emotional_domain import EmotionalStateV1
-        from backend.relationship import RelationshipStateV1
+        from backend.trusted_context import build_context_bundle
 
         def fake_retrieve(*args, **kwargs):
             return []
@@ -1276,15 +1280,15 @@ class TestBuildContextBundle:
         mm = MemoryManager()
         monkeypatch.setattr(mm, "load_recent_history", lambda *a, **kw: fake_history)
 
-        state = EmotionalStateV1.neutral(timestamp=1000.0)
-        rel = RelationshipStateV1.neutral(timestamp=1000.0)
-
-        bundle = mm.build_context_bundle(
+        loaded = mm.load_context_data(
             user_id="user-x",
             current_message="Hi",
             user_state={},
-            emotional_state=state,
-            relationship=rel,
+        )
+
+        bundle = build_context_bundle(
+            trusted_policy="Test policy.",
+            loaded_data=loaded,
         )
 
         assert len(bundle.history) == 2
@@ -1302,28 +1306,195 @@ class TestBuildContextBundle:
 class TestEngineGenerationPath:
     """Engine generation path uses trusted context."""
 
-    def test_generate_with_messages_called_directly(self):
-        """Verify the generation path uses _generate_with_messages, not _generate."""
+    @pytest.mark.anyio
+    async def test_generate_uses_envelope_with_history_roles(self, monkeypatch):
+        """The provider receives the full envelope with original history roles."""
+        import json
         from backend.engine import ConversationEngine
-        engine = ConversationEngine()
-        # The _run_under_lock method should call _generate_with_messages
-        # We verify by checking the code references
-        import inspect
-        source = inspect.getsource(engine._run_under_lock)
-        assert "_generate_with_messages" in source
-        # The old flattening should NOT be present
-        assert "pruned_system_prompt" not in source
+        from backend.trusted_context import ChatMessage, ContextItem, EpistemicStatus, Provenance
 
-    def test_build_envelope_not_reduced_to_two_messages(self):
-        """_run_under_lock does not flatten the envelope to system + user."""
+        recorded = {}
+
+        async def mock_chat_completion(messages, **kwargs):
+            recorded["messages"] = messages
+            # Return valid appraisal JSON so both appraisal and generation work
+            resp_json = json.dumps({
+                "valence": 0.0, "arousal_shift": 0.0, "dominance_shift": 0.0,
+                "triggered_emotions": {
+                    "joy": 0, "sadness": 0, "anger": 0, "fear": 0,
+                    "disgust": 0, "surprise": 0, "tenderness": 0,
+                    "guilt": 0, "pride": 0, "jealousy": 0, "gratitude": 0,
+                },
+            })
+            return type("Resp", (), {
+                "choices": [type("C", (), {
+                    "message": type("M", (), {"content": resp_json}),
+                })()],
+            })()
+
+        def mock_load_state(uid, default_timestamp=None):
+            return {
+                "persona_config": "Katherine...",
+                "user_profile": {},
+                "relationship_state": {
+                    "trust": 0.5, "affection": 0.3, "tension": 0.0,
+                    "triggers": [], "last_interaction": 1000.0,
+                },
+                "emotional_state": {
+                    "schema_version": 1,
+                    "pleasure": 0.0, "arousal": 0.0, "dominance": 0.0,
+                    "libido": 0.0, "aggression": 0.0, "connection": 0.5,
+                    "energy": 0.8, "tension": 0.0, "coping_mode": "HEALTHY",
+                    "timestamp": 1000.0,
+                },
+            }
+
+        def mock_load_context(uid, msg, state):
+            from backend.trusted_context import LoadedContextData
+            return LoadedContextData(
+                history_rows=(
+                    {"role": "user", "content": "Hello", "id": 1},
+                    {"role": "assistant", "content": "Hi there", "id": 2},
+                ),
+                retrieved_memories=(),
+                profile_snapshot={},
+                persona_snapshot="",
+            )
+
+        engine = ConversationEngine()
+        monkeypatch.setattr(
+            engine.groq_manager, "chat_completion_async", mock_chat_completion
+        )
+        monkeypatch.setattr(
+            engine.memory_manager, "load_user_state", mock_load_state
+        )
+        monkeypatch.setattr(
+            engine.memory_manager, "load_context_data", mock_load_context
+        )
+        monkeypatch.setattr(
+            engine.memory_manager, "save_turn",
+            lambda *a, **kw: type("Ref", (), {
+                "user_id": "u1", "source_chat_log_id": 1,
+                "assistant_chat_log_id": 2,
+            })()
+        )
+        monkeypatch.setattr(
+            engine.memory_manager, "sync_state", lambda *a, **kw: None
+        )
+
+        from backend.turn_execution import create_budget, TurnExecutionConfig
+        budget = create_budget(TurnExecutionConfig.defaults(), now_provider=engine._monotonic)
+
+        # Process turn with the mocked dependencies
+        result = await engine.process_turn(
+            user_id="u1",
+            user_message="World",
+        )
+
+        assert result is not None
+        messages = recorded.get("messages")
+        assert messages is not None, "Provider was never called"
+
+        # Verify the envelope structure:
+        # 1. System message with trusted policy
+        assert messages[0]["role"] == "system"
+        assert len(messages[0]["content"]) > 0
+
+        # 2. History messages with original roles (user/assistant)
+        history_msgs = [m for m in messages[1:-1] if m["role"] in ("user", "assistant")]
+        assert len(history_msgs) >= 2, f"Expected history messages, got {len(history_msgs)}"
+        assert history_msgs[0]["role"] == "user"
+        assert "Hello" in history_msgs[0]["content"]
+        assert history_msgs[1]["role"] == "assistant"
+        assert "Hi there" in history_msgs[1]["content"]
+
+        # 3. Current message is last
+        assert messages[-1]["role"] == "user"
+        assert messages[-1]["content"] == "World"
+
+        # 4. No raw user content in system message
+        assert "World" not in messages[0]["content"]
+        assert "Hello" not in messages[0]["content"]
+
+    @pytest.mark.anyio
+    async def test_engine_loads_context_once(self, monkeypatch):
+        """Context is loaded exactly once during a turn."""
         from backend.engine import ConversationEngine
-        import inspect
-        source = inspect.getsource(ConversationEngine._run_under_lock)
-        # Should call _generate_with_messages with the full messages list
-        assert "await self._generate_with_messages(generation_messages, budget)" in source
-        # Should NOT call _generate(message[0], message[1])
-        assert "pruned_system_prompt" not in source
-        assert "pruned_user_message" not in source
+
+        load_count = 0
+
+        async def mock_chat_completion(messages, **kwargs):
+            import json as _json
+            resp_json = _json.dumps({
+                "valence": 0.0, "arousal_shift": 0.0, "dominance_shift": 0.0,
+                "triggered_emotions": {
+                    "joy": 0, "sadness": 0, "anger": 0, "fear": 0,
+                    "disgust": 0, "surprise": 0, "tenderness": 0,
+                    "guilt": 0, "pride": 0, "jealousy": 0, "gratitude": 0,
+                },
+            })
+            return type("Resp", (), {
+                "choices": [type("C", (), {
+                    "message": type("M", (), {"content": resp_json}),
+                })()],
+            })()
+
+        def mock_load_state(uid, default_timestamp=None):
+            return {
+                "persona_config": "K...",
+                "user_profile": {},
+                "relationship_state": {
+                    "trust": 0.5, "affection": 0.3, "tension": 0.0,
+                    "triggers": [], "last_interaction": 1000.0,
+                },
+                "emotional_state": {
+                    "schema_version": 1,
+                    "pleasure": 0.0, "arousal": 0.0, "dominance": 0.0,
+                    "libido": 0.0, "aggression": 0.0, "connection": 0.5,
+                    "energy": 0.8, "tension": 0.0, "coping_mode": "HEALTHY",
+                    "timestamp": 1000.0,
+                },
+            }
+
+        def mock_load_context(uid, msg, state):
+            nonlocal load_count
+            load_count += 1
+            from backend.trusted_context import LoadedContextData
+            return LoadedContextData(
+                history_rows=({"role": "user", "content": "Hi", "id": 1},),
+                retrieved_memories=(),
+                profile_snapshot={},
+                persona_snapshot="",
+            )
+
+        engine = ConversationEngine()
+        monkeypatch.setattr(
+            engine.groq_manager, "chat_completion_async", mock_chat_completion
+        )
+        monkeypatch.setattr(
+            engine.memory_manager, "load_user_state", mock_load_state
+        )
+        monkeypatch.setattr(
+            engine.memory_manager, "load_context_data", mock_load_context
+        )
+        monkeypatch.setattr(
+            engine.memory_manager, "save_turn",
+            lambda *a, **kw: type("Ref", (), {
+                "user_id": "u1", "source_chat_log_id": 1,
+                "assistant_chat_log_id": 2,
+            })()
+        )
+        monkeypatch.setattr(
+            engine.memory_manager, "sync_state", lambda *a, **kw: None
+        )
+
+        await engine.process_turn(
+            user_id="u1",
+            user_message="World",
+        )
+
+        # Context must be loaded exactly once
+        assert load_count == 1, f"Expected 1 context load, got {load_count}"
 
 
 # ═══════════════════════════════════════════════════════════════════════
