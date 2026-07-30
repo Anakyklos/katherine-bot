@@ -58,6 +58,11 @@ from .provider_envelope import (
     _truncate_utf8_safe_head_tail,
 )
 from .admission_contracts import PROVIDER_INPUT_MAX_ESTIMATED_UNITS
+from .trusted_context import (
+    ContextBundle,
+    build_envelope,
+    TrustedContextError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -428,12 +433,20 @@ class ConversationEngine:
 
         adaptation_strategy = ""
 
-        # Build the generation messages with optional context pruning
+        # Build the trusted context bundle and envelope
+        # Uses the new trusted context boundary — history gets original roles,
+        # profile and memory enter as untrusted data, never in system prompt.
         try:
-            generation_messages = self._build_generation_messages(
-                new_state, context_components, relationship, user_message, adaptation_strategy
+            context_bundle = self.memory_manager.build_context_bundle(
+                user_id, user_message, user_state,
+                new_state, relationship,
             )
-        except ProviderEnvelopeError:
+            envelope_result = build_envelope(
+                context_bundle,
+                user_message,
+            )
+            generation_messages = envelope_result.messages
+        except TrustedContextError:
             # Mandatory messages alone already exceed the provider budget.
             # Fail closed before any client creation or network call.
             logger.error("event=provider_input_budget_exceeded stage=generation")
@@ -442,14 +455,12 @@ class ConversationEngine:
                 "Provider input budget exceeded.",
             )
 
-        # Extract system prompt and user message from pruned messages for backward
-        # compatibility with tests that mock ``_generate``.
-        pruned_system_prompt = generation_messages[0]["content"]
-        pruned_user_message = generation_messages[1]["content"]
-
         t0 = self._monotonic()
         try:
-            response_text = await self._generate(pruned_system_prompt, pruned_user_message, budget)
+            # Use _generate_with_messages directly — no flattening to
+            # system_prompt + user_message.  The full validated envelope
+            # is sent to the provider.
+            response_text = await self._generate_with_messages(generation_messages, budget)
         except TurnExecutionError as exc:
             duration_ms = (self._monotonic() - t0) * 1000
             await self._emit_stage_event(StageEvent(
@@ -599,18 +610,22 @@ User message: "{user_message}"
 """
 
     async def _appraise(self, message: str, budget: TurnBudget) -> AppraisalV1:
-        prompt = f"""
-        Analyze the emotional impact of this message on the listener (Katherine).
-        Return JSON ONLY:
-        {{"valence": -1.0 to 1.0, "arousal_shift": -1.0 to 1.0,
-          "dominance_shift": -1.0 to 1.0,
-          "triggered_emotions": {{"joy": 0-1, "sadness": 0-1, "anger": 0-1,
-             "fear": 0-1, "disgust": 0-1, "surprise": 0-1, "tenderness": 0-1,
-             "guilt": 0-1, "pride": 0-1, "jealousy": 0-1, "gratitude": 0-1}}}}
-        Message: "{message}"
-        """
+        # Appraisal uses separate system instruction and user message.
+        # The instruction is not interpolated with the message content.
+        appraisal_policy = (
+            'Analyze the emotional impact of this message on the listener (Katherine).\n'
+            'Return JSON ONLY:\n'
+            '{"valence": -1.0 to 1.0, "arousal_shift": -1.0 to 1.0, '
+            '"dominance_shift": -1.0 to 1.0, '
+            '"triggered_emotions": {"joy": 0-1, "sadness": 0-1, "anger": 0-1, '
+            '"fear": 0-1, "disgust": 0-1, "surprise": 0-1, "tenderness": 0-1, '
+            '"guilt": 0-1, "pride": 0-1, "jealousy": 0-1, "gratitude": 0-1}}'
+        )
         try:
-            messages = [{"role": "user", "content": prompt}]
+            messages = [
+                {"role": "system", "content": appraisal_policy},
+                {"role": "user", "content": message},
+            ]
             # Validate envelope BEFORE any client creation, key acquisition,
             # retry attempt, or network call.
             try:

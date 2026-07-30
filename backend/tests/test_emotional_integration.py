@@ -109,6 +109,11 @@ def _make_engine(clock=FIXED_CLOCK, archival_extraction_enabled=False):
     engine.memory_manager.save_turn = MagicMock()
     engine.memory_manager.get_context = MagicMock(return_value="[mocked context]")
     engine.memory_manager.load_recent_history = MagicMock(return_value=[])
+    engine.memory_manager._retrieve_relevant_entries = MagicMock(return_value=[])
+    from backend.trusted_context import ContextBundle
+    engine.memory_manager.build_context_bundle = MagicMock(return_value=ContextBundle(
+        trusted_policy="You are a helpful assistant.",
+    ))
     
     # Mock sync completion for archival extraction
     sync_m = MagicMock()
@@ -828,6 +833,11 @@ class TestNewProfileFirstTurn:
                 "history_list": [],
                 "assembled": "[ctx]",
             })
+            # Mock build_context_bundle for the new trusted context flow
+            from backend.trusted_context import ContextBundle, ChatMessage, ContextItem
+            engine.memory_manager.build_context_bundle = MagicMock(return_value=ContextBundle(
+                trusted_policy="You are a helpful assistant.",
+            ))
             engine.memory_manager.sync_state = MagicMock()
             engine.memory_manager.save_turn = MagicMock()
             
@@ -946,9 +956,14 @@ class TestSanitisedLogging:
                 "persona": "Katherine...",
                 "user_profile_str": "{}",
                 "memory_str": "",
+                "memory_entries": [],
                 "history_list": [],
                 "assembled": "[mocked context]",
             })
+            from backend.trusted_context import ContextBundle
+            engine.memory_manager.build_context_bundle = MagicMock(return_value=ContextBundle(
+                trusted_policy="You are a helpful assistant.",
+            ))
             async def _mock_bad_appraisal(**kwargs):
                 mock_resp = MagicMock()
                 mock_resp.choices = [MagicMock()]

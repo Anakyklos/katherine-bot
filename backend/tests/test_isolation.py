@@ -50,6 +50,18 @@ def _make_mock_generate_response(text="Hi"):
     return text
 
 
+def _add_trusted_context_mocks(engine):
+    """Add mocks for the trusted context flow to the engine for testing.
+
+    Must be called after engine.memory_manager.save_turn and sync_state are set.
+    """
+    from backend.trusted_context import ContextBundle
+    engine.memory_manager.build_context_bundle = MagicMock(return_value=ContextBundle(
+        trusted_policy="You are a test assistant.",
+    ))
+    engine._generate_with_messages = AsyncMock(return_value="Hi")
+
+
 def test_deterministic_transition():
     engine = AffectiveEngine()
     state = EmotionalState(pleasure=0.1, arousal=0.2, dominance=0.3)
@@ -84,6 +96,7 @@ def test_user_isolation():
         }
         engine.memory_manager.load_user_state = MagicMock(side_effect=lambda uid, **kwargs: states.get(uid, {}))
         engine._perceive = MagicMock(return_value={})
+        _add_trusted_context_mocks(engine)
         _, state_a = await engine.process_turn("A", "Msg A")
         _, state_b = await engine.process_turn("B", "Msg B")
         assert state_a.pad.pleasure > 0
@@ -106,6 +119,7 @@ def test_identity_binding():
         sync_mock = MagicMock()
         engine.memory_manager.sync_state = sync_mock
         engine._perceive = MagicMock(return_value={})
+        _add_trusted_context_mocks(engine)
         await engine.process_turn(auth_id, "Hello")
         args, _ = sync_mock.call_args
         assert args[0] == auth_id
@@ -139,6 +153,7 @@ def test_persistence_failure_zero_rows():
         engine._generate = AsyncMock(return_value=_make_mock_generate_response())
         engine.memory_manager.save_turn = MagicMock()
         engine._perceive = MagicMock(return_value={})
+        _add_trusted_context_mocks(engine)
         with pytest.raises(TurnExecutionError) as exc:
             await engine.process_turn("user", "Msg")
         assert exc.value.code == TurnErrorCode.persistence_unavailable
@@ -178,6 +193,7 @@ def test_concurrent_requests_serialization():
             )
         engine._appraise = AsyncMock(side_effect=async_appraise_mock)
         engine._generate = AsyncMock(return_value=_make_mock_generate_response())
+        _add_trusted_context_mocks(engine)
 
         t1 = asyncio.create_task(engine.process_turn(user_id, "T1"))
         await req1_in.wait()
@@ -200,6 +216,7 @@ def test_no_global_lock():
         engine.memory_manager.sync_state = MagicMock()
         engine.memory_manager.save_turn = MagicMock()
         engine._perceive = MagicMock(return_value={})
+        _add_trusted_context_mocks(engine)
         await asyncio.gather(engine.process_turn("A", "M"), engine.process_turn("B", "M"))
     asyncio.run(run_test())
 
@@ -214,6 +231,7 @@ def test_lock_cleanup():
         engine.memory_manager.sync_state = MagicMock()
         engine.memory_manager.save_turn = MagicMock()
         engine._perceive = MagicMock(return_value={})
+        _add_trusted_context_mocks(engine)
 
         await engine.process_turn(user_id, "Msg")
         async with engine.lock_manager._dict_lock:
@@ -254,6 +272,7 @@ def test_lock_cleanup_on_cancellation_during_thread_work():
         engine.memory_manager.sync_state = MagicMock()
         engine.memory_manager.save_turn = MagicMock()
         engine._perceive = MagicMock(return_value={"valence": 0.0})
+        _add_trusted_context_mocks(engine)
 
         # 1. Start process_turn
         task1 = asyncio.create_task(engine.process_turn(user_id, "Msg 1"))
@@ -331,6 +350,7 @@ def test_lock_cleanup_on_cancellation_during_sync_state():
         engine.memory_manager.sync_state = MagicMock(side_effect=mock_sync)
         engine.memory_manager.save_turn = MagicMock()
         engine._perceive = MagicMock(return_value={"valence": 0.0})
+        _add_trusted_context_mocks(engine)
 
         # 1. Start process_turn
         task1 = asyncio.create_task(engine.process_turn(user_id, "Msg 1"))
@@ -384,6 +404,7 @@ def test_lock_cleanup_on_cancellation_during_waiting():
         engine.memory_manager.sync_state = MagicMock()
         engine.memory_manager.save_turn = MagicMock()
         engine._perceive = MagicMock(return_value={})
+        _add_trusted_context_mocks(engine)
 
         # Task 1 holds the lock and blocks on load
         task1 = asyncio.create_task(engine.process_turn(user_id, "Msg 1"))
@@ -455,6 +476,7 @@ def test_lock_cleanup_on_repeated_cancellation_during_thread_work():
         engine.memory_manager.sync_state = MagicMock()
         engine.memory_manager.save_turn = MagicMock()
         engine._perceive = MagicMock(return_value={"valence": 0.0})
+        _add_trusted_context_mocks(engine)
 
         # 1. Start request 1 (task1)
         task1 = asyncio.create_task(engine.process_turn(user_id, "Msg 1"))

@@ -116,6 +116,12 @@ def _make_engine(archival_extraction_enabled=False, clock=FIXED_CLOCK):
     })
     engine.memory_manager.load_recent_history = MagicMock(return_value=[])
 
+    # Mock the trusted context bundle so process_turn paths work
+    from backend.trusted_context import ContextBundle
+    engine.memory_manager.build_context_bundle = MagicMock(return_value=ContextBundle(
+        trusted_policy="You are a test assistant.",
+    ))
+
     # ---- Groq manager mocks ----
     sync_m = MagicMock()
     sync_m.choices = [MagicMock()]

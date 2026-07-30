@@ -244,6 +244,12 @@ async def test_process_turn_schedules_background_task(backend):
     engine.memory_manager.save_turn = MagicMock(side_effect=mock_save_turn)
     engine.memory_manager.sync_state = MagicMock(side_effect=mock_sync_state)
     
+    # Mock build_context_bundle for the trusted context flow
+    from backend.trusted_context import ContextBundle
+    engine.memory_manager.build_context_bundle = MagicMock(return_value=ContextBundle(
+        trusted_policy="You are a helpful assistant.",
+    ))
+    
     from unittest.mock import AsyncMock
     
     # Responses: first for appraisal (JSON), then for generation (text)
@@ -303,6 +309,12 @@ async def test_process_turn_does_not_schedule_when_extraction_disabled(backend):
         user_id="user123", source_chat_log_id=1, assistant_chat_log_id=2
     ))
     engine.memory_manager.sync_state = MagicMock()
+    
+    # Mock build_context_bundle for the trusted context flow
+    from backend.trusted_context import ContextBundle
+    engine.memory_manager.build_context_bundle = MagicMock(return_value=ContextBundle(
+        trusted_policy="You are a helpful assistant.",
+    ))
     
     from unittest.mock import AsyncMock
     

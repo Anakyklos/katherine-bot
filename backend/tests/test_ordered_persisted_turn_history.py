@@ -7,6 +7,7 @@ from backend.memory import MemoryManager, ContextLoadError, TurnPersistenceError
 from backend.engine import ConversationEngine
 from backend.emotional_domain import AppraisalV1
 from backend.turn_execution import TurnExecutionError
+from backend.trusted_context import ContextBundle
 
 
 def _valid_legacy_emotion_dict():
@@ -149,7 +150,12 @@ def test_load_recent_history_validation_failures():
     mock_resp_valid_extra.error = None
     mm.supabase.table.return_value.select.return_value.eq.return_value.order.return_value.order.return_value.limit.return_value.execute.return_value = mock_resp_valid_extra
     history = mm.load_recent_history("user123")
-    assert history == [{"role": "user", "content": "hello"}]
+    # load_recent_history now includes "id" field for stable ordering
+    assert len(history) == 1
+    assert history[0]["role"] == "user"
+    assert history[0]["content"] == "hello"
+    assert history[0]["id"] == 1
+    assert "extra_key" not in history[0]
 
 
 def test_save_turn_zero_inserted_rows():
@@ -293,16 +299,17 @@ def test_user_history_isolation():
     mock_limit = mock_order2.return_value.limit
     
     mock_resp = MagicMock()
-    mock_resp.data = [{"role": "user", "content": "hello"}]
+    mock_resp.data = [{"role": "user", "content": "hello", "id": 1}]
     mock_resp.error = None
     mock_limit.return_value.execute.return_value = mock_resp
     
     history = mm.load_recent_history("userA")
     
     # Assert query filters strictly by userA
-    mock_select.assert_called_with("role, content")
+    mock_select.assert_called_with("id, role, content")
     mock_eq.assert_called_with("user_id", "userA")
     assert len(history) == 1
+    assert history[0]["id"] == 1
 
 def test_deterministic_ordering_calls():
     mm = MemoryManager()
@@ -316,10 +323,10 @@ def test_deterministic_ordering_calls():
     
     mock_resp = MagicMock()
     mock_resp.data = [
-        {"role": "assistant", "content": "reply2"},
-        {"role": "user", "content": "msg2"},
-        {"role": "assistant", "content": "reply1"},
-        {"role": "user", "content": "msg1"}
+        {"role": "assistant", "content": "reply2", "id": 4},
+        {"role": "user", "content": "msg2", "id": 3},
+        {"role": "assistant", "content": "reply1", "id": 2},
+        {"role": "user", "content": "msg1", "id": 1},
     ]
     mock_resp.error = None
     mock_limit.return_value.execute.return_value = mock_resp
@@ -330,13 +337,14 @@ def test_deterministic_ordering_calls():
     mock_order1.assert_called_with("created_at", desc=True)
     mock_order2.assert_called_with("id", desc=True)
     
-    # Assert returned history is reversed to chronological ascending order
-    assert history == [
-        {"role": "user", "content": "msg1"},
-        {"role": "assistant", "content": "reply1"},
-        {"role": "user", "content": "msg2"},
-        {"role": "assistant", "content": "reply2"}
-    ]
+    # Assert returned history is reversed to chronological ascending order, with ids
+    assert len(history) == 4
+    assert history[0]["role"] == "user"
+    assert history[0]["content"] == "msg1"
+    assert history[0]["id"] == 1
+    assert history[3]["role"] == "assistant"
+    assert history[3]["content"] == "reply2"
+    assert history[3]["id"] == 4
 
 def test_tied_timestamps_ordering():
     mm = MemoryManager()
@@ -364,6 +372,8 @@ def test_tied_timestamps_ordering():
     
     # Inversion in Python memory yields correct chronological insertion order: user -> assistant -> user -> assistant
     assert [h["content"] for h in history] == ["msg1", "reply1", "msg2", "reply2"]
+    # id fields are preserved in the result
+    assert [h["id"] for h in history] == [1, 2, 3, 4]
 
 def test_process_turn_awaits_save_turn_inside_lock():
     async def run_test():
@@ -386,6 +396,8 @@ def test_process_turn_awaits_save_turn_inside_lock():
 
         # Mock load_recent_history to return empty list
         engine.memory_manager.load_recent_history = MagicMock(return_value=[])
+        engine.memory_manager.build_context_bundle = MagicMock(return_value=ContextBundle(trusted_policy="test"))
+        engine._generate_with_messages = AsyncMock(return_value="Bot reply")
 
         with patch.object(engine.memory_manager, 'save_turn', side_effect=slow_save_turn):
             t = asyncio.create_task(engine.process_turn("user123", "Hello"))
@@ -458,6 +470,8 @@ def test_process_turn_fails_closed_on_load_failure():
         
         # Mock load_recent_history to fail
         engine.memory_manager.load_recent_history = MagicMock(side_effect=ContextLoadError("DB error"))
+        engine.memory_manager.build_context_bundle = MagicMock(return_value=ContextBundle(trusted_policy="test"))
+        engine._generate_with_messages = AsyncMock(return_value="Bot reply")
         
         # Calling process_turn must propagate error (wrapped by run_blocking_read)
         with pytest.raises(TurnExecutionError):
@@ -487,6 +501,8 @@ def test_concurrent_process_turn_serialization():
             load_calls.append((user_id, time.time()))
             return []
         engine.memory_manager.load_recent_history = mock_load
+        engine.memory_manager.build_context_bundle = MagicMock(return_value=ContextBundle(trusted_policy="test"))
+        engine._generate_with_messages = AsyncMock(return_value="Bot reply")
 
         save_started = threading.Event()
         save_proceed = threading.Event()
@@ -548,6 +564,8 @@ def test_concurrent_different_users_not_blocked():
             load_calls.append(user_id)
             return []
         engine.memory_manager.load_recent_history = mock_load
+        engine.memory_manager.build_context_bundle = MagicMock(return_value=ContextBundle(trusted_policy="test"))
+        engine._generate_with_messages = AsyncMock(return_value="Bot reply")
 
         save1_started = threading.Event()
         save1_proceed = threading.Event()
@@ -596,6 +614,8 @@ def test_repeated_cancellation_during_save_turn():
         engine._generate = AsyncMock(return_value="Bot reply")
         
         engine.memory_manager.load_recent_history = MagicMock(return_value=[])
+        engine.memory_manager.build_context_bundle = MagicMock(return_value=ContextBundle(trusted_policy="test"))
+        engine._generate_with_messages = AsyncMock(return_value="Bot reply")
 
         save_started = threading.Event()
         save_proceed = threading.Event()
