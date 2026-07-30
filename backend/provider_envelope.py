@@ -160,27 +160,41 @@ def validate_provider_input(
 
     Raises ``ProviderEnvelopeError`` on failure; returns ``None`` on success.
     """
+    # Collection checks
     if not isinstance(messages, list):
         raise ProviderEnvelopeError("invalid_envelope_type")
     if len(messages) == 0:
         raise ProviderEnvelopeError("empty_messages")
 
-    for msg in messages:
+    for i, msg in enumerate(messages):
+        # Item must be a dict
         if not isinstance(msg, dict):
-            raise ProviderEnvelopeError("invalid_message_structure")
+            raise ProviderEnvelopeError(
+                "invalid_message_structure",
+            )
 
+        # No unknown keys
         unknown_keys = set(msg.keys()) - VALID_MESSAGE_KEYS
         if unknown_keys:
-            raise ProviderEnvelopeError("invalid_message_keys")
+            raise ProviderEnvelopeError(
+                "invalid_message_keys",
+            )
 
+        # Role must be valid
         role = msg.get("role")
         if role not in VALID_ROLES:
-            raise ProviderEnvelopeError("invalid_role")
+            raise ProviderEnvelopeError(
+                "invalid_role",
+            )
 
+        # Content must be a string
         content = msg.get("content")
         if not isinstance(content, str):
-            raise ProviderEnvelopeError("invalid_content")
+            raise ProviderEnvelopeError(
+                "invalid_content",
+            )
 
+    # Budget check
     units = estimate_provider_input_units(messages)
     if units > max_units:
         raise ProviderEnvelopeError(
@@ -226,8 +240,11 @@ def _truncate_utf8_safe(text: str, max_bytes: int) -> tuple[str, bool]:
     if len(encoded) <= max_bytes:
         return text, False
 
+    # Account for omission marker space
     marker_bytes = len(OMISSION_MARKER.encode("utf-8"))
     available = max(max_bytes - marker_bytes, 1)
+
+    # Decode up to *available* bytes, handling partial characters
     truncated = encoded[:available].decode("utf-8", errors="ignore")
     return truncated + OMISSION_MARKER, True
 
@@ -255,21 +272,35 @@ def _truncate_utf8_safe_head_tail(
         return text, False
 
     marker_bytes = len(OMISSION_MARKER.encode("utf-8"))
+
+    # Need space for head + marker + tail
     if max_bytes < marker_bytes + 4:
+        # Too small for meaningful head+tail — fall back to head-only
         return _truncate_utf8_safe(text, max_bytes)
 
     total_data = max_bytes - marker_bytes
     head_bytes = max(1, int(total_data * head_ratio))
     tail_bytes = max(1, total_data - head_bytes)
+
+    # Head: beginning of text, up to head_bytes
     head = encoded[:head_bytes].decode("utf-8", errors="ignore")
+
+    # Tail: end of text, last tail_bytes
     tail = encoded[-tail_bytes:].decode("utf-8", errors="ignore")
 
+    # If combined head + OMISSION_MARKER + tail still exceeds max_bytes,
+    # try reducing tail (tail is less important for structure)
     result = head + OMISSION_MARKER + tail
     while len(result.encode("utf-8")) > max_bytes and len(tail) > 0:
+        # Remove one character from tail at a time
         tail = tail[:-1]
         result = head + OMISSION_MARKER + tail
 
     return result, True
+
+
+
+
 
 
 def fit_optional_context(
@@ -351,6 +382,7 @@ def fit_optional_context(
     * UTF-8 sequences are never split.
     * No randomness is used — the output is deterministic.
     """
+    # Validate mandatory messages first
     validate_provider_input(mandatory_messages, max_units=max_units)
 
     return _fit_optional_context_impl(
@@ -372,11 +404,13 @@ def _fit_optional_context_impl(
     suffix: str = "",
     selection_priority: list[int] | None = None,
 ) -> ContextFitResult:
+    # Already validated by caller (fit_optional_context)
+
     current_messages = list(mandatory_messages)
 
     if not optional_context_components:
         if suffix:
-            current_messages = _append_to_system(current_messages, "\n\n" + suffix)
+            _append_to_system(current_messages, "\n\n" + suffix)
             validate_provider_input(current_messages, max_units=max_units)
         return ContextFitResult(
             messages=current_messages,
@@ -384,6 +418,7 @@ def _fit_optional_context_impl(
             pruned=False,
         )
 
+    # Find system message index
     system_content_index: int | None = None
     for i, msg in enumerate(current_messages):
         if msg.get("role") == "system":
@@ -405,11 +440,12 @@ def _fit_optional_context_impl(
     mandatory_header = current_messages[system_content_index]["content"]
 
     for idx in selection_order:
-        _, content = optional_context_components[idx]
+        label, content = optional_context_components[idx]
         if not content:
             continue
 
         selected_indices.add(idx)
+
         candidate_components = [
             optional_context_components[i]
             for i in range(len(optional_context_components))
@@ -439,45 +475,43 @@ def _fit_optional_context_impl(
             selected_indices.discard(idx)
             if not truncate_long_messages:
                 continue
-
-            remaining = _estimate_remaining_budget(
-                current_messages, max_units, suffix_payload
-            )
-            if remaining <= 0:
-                continue
-            truncated, _ = _truncate_utf8_safe(content, remaining)
-            if truncated == content:
-                continue
-
-            selected_indices.add(idx)
-            candidate_components = [
-                (
-                    optional_context_components[i][0],
-                    truncated if i == idx else optional_context_components[i][1],
+            else:
+                remaining = _estimate_remaining_budget(
+                    current_messages, max_units, suffix_payload
                 )
-                for i in range(len(optional_context_components))
-                if i in selected_indices
-            ]
-            built_content = mandatory_header
-            for _, comp_content in candidate_components:
-                built_content += "\n" + comp_content
-            built_content += suffix_payload
+                if remaining <= 0:
+                    continue
+                truncated, _ = _truncate_utf8_safe(content, remaining)
+                if truncated != content:
+                    selected_indices.add(idx)
+                    candidate_components = [
+                        (optional_context_components[i][0],
+                         truncated if i == idx else optional_context_components[i][1])
+                        for i in range(len(optional_context_components))
+                        if i in selected_indices
+                    ]
+                    built_content = mandatory_header
+                    for _, comp_content in candidate_components:
+                        built_content += "\n" + comp_content
+                    built_content += suffix_payload
 
-            test_truncated = list(current_messages)
-            test_truncated[system_content_index] = {
-                "role": "system",
-                "content": built_content,
-            }
-            try:
-                validate_provider_input(test_truncated, max_units=max_units)
-                current_messages = test_truncated
-                if suffix:
-                    current_messages[system_content_index] = {
+                    test_truncated = list(current_messages)
+                    test_truncated[system_content_index] = {
                         "role": "system",
-                        "content": built_content[:-len(suffix_payload)] if suffix_payload else built_content,
+                        "content": built_content,
                     }
-            except ProviderEnvelopeError:
-                selected_indices.discard(idx)
+                    try:
+                        validate_provider_input(
+                            test_truncated, max_units=max_units
+                        )
+                        current_messages = test_truncated
+                        if suffix:
+                            current_messages[system_content_index] = {
+                                "role": "system",
+                                "content": built_content[:-len(suffix_payload)] if suffix_payload else built_content,
+                            }
+                    except ProviderEnvelopeError:
+                        selected_indices.discard(idx)
 
     if suffix:
         current_messages = _append_to_system(current_messages, suffix_payload)
