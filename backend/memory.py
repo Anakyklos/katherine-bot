@@ -1,5 +1,7 @@
+import json
 import os
 import logging
+from dataclasses import dataclass
 from datetime import datetime, UTC
 from supabase import create_client, Client
 from sentence_transformers import SentenceTransformer
@@ -8,6 +10,41 @@ from typing import Optional, Callable
 from .relationship import RelationshipStateV1
 from .emotional_domain import EmotionalStateV1
 from .archival_memory import PersistedTurnRef, ArchivalExtractionEnvelope, ArchivalDuplicateError
+
+
+@dataclass(frozen=True)
+class RetrievedMemory:
+    """A single memory retrieved from archival storage.
+
+    ``content`` is the non-empty text of the memory fact.
+    ``tags`` are zero or more category labels in canonical sorted order.
+    """
+    content: str
+    tags: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.content, str) or not self.content.strip():
+            raise ValueError("RetrievedMemory content must be a non-empty string")
+        if not isinstance(self.tags, tuple):
+            raise ValueError("RetrievedMemory tags must be a tuple")
+
+        normalized_tags = sorted({
+            raw_tag.strip()
+            for raw_tag in self.tags
+            if isinstance(raw_tag, str) and raw_tag.strip()
+        })
+        object.__setattr__(self, "tags", tuple(normalized_tags))
+
+    def to_prompt_text(self) -> str:
+        """Format this memory entry deterministically for a system prompt.
+
+        ``content`` is preserved byte-for-byte, including internal newlines.
+        Valid tags are rendered once in canonical order. Empty tags omit the
+        ``Tags:`` line entirely.
+        """
+        if not self.tags:
+            return self.content
+        return f"{self.content}\nTags: {', '.join(self.tags)}"
 
 logger = logging.getLogger(__name__)
 
@@ -51,10 +88,7 @@ def _default_supabase_factory(supabase_timeout: Optional[float] = None) -> Optio
     if not url or not key:
         return None
 
-    # Use the provided timeout (must come from validated TurnExecutionConfig).
-    # If None, default to 5.0 — no env-var re-parsing here.
     timeout = supabase_timeout if supabase_timeout is not None else 5.0
-
     try:
         from supabase.lib.client_options import ClientOptions
         options = ClientOptions(postgrest_client_timeout=timeout)
@@ -70,55 +104,33 @@ class MemoryManager:
         supabase_factory: Optional[Callable[[], Optional[Client]]] = None,
         supabase_timeout: Optional[float] = None,
     ):
-        # 1. Initialize Supabase with timeout config
-        # The timeout comes from validated TurnExecutionConfig; if not provided,
-        # the factory will parse from env (with fallback to 5.0s default).
         if supabase_factory is not None:
             self.supabase: Optional[Client] = supabase_factory()
         else:
-            # Use the config's supabase_timeout, or None (let factory handle it)
             if supabase_timeout is not None:
                 factory = lambda: _default_supabase_factory(supabase_timeout)
             else:
                 factory = lambda: _default_supabase_factory()
             self.supabase: Optional[Client] = factory()
 
-        # 2. Initialize Embeddings Model (Local)
         try:
             self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
         except Exception:
             self.embedding_model = None
-
-        # 3. Clock for deterministic testing
         self._clock = clock
 
-
-
     def load_user_state(self, user_id: str, default_timestamp: float | None = None) -> dict:
-        """
-        Loads the full user state from Supabase 'profiles' table.
-        If not found, creates a default profile using the given ``default_timestamp``
-        (or ``self._clock()`` if not provided).
-        Raises StateLoadError on transient database failures.
-        """
         if not self.supabase:
             raise StateLoadError("Serviço de persistência indisponível.")
-
         try:
             response = self.supabase.table("profiles").select("*").eq("user_id", user_id).execute()
-
             if response is None:
                 raise StateLoadError("Sem resposta do banco de dados na leitura.")
-
-            # Check for error in response if client supports it
             if hasattr(response, 'error') and response.error:
                 raise StateLoadError("Erro retornado pelo banco de dados na leitura.")
-
             if not hasattr(response, 'data') or response.data is None:
                 raise StateLoadError("Resposta inválida do banco de dados na leitura.")
-
             if len(response.data) == 0:
-                # Create default profile with the provided timestamp or clock
                 default_state = self._get_default_state(user_id, timestamp=default_timestamp)
                 try:
                     insert_response = self.supabase.table("profiles").insert({
@@ -128,7 +140,6 @@ class MemoryManager:
                         "relationship_state": default_state["relationship_state"],
                         "emotional_state": default_state["emotional_state"]
                     }).execute()
-
                     if insert_response is None:
                         raise StateLoadError("Sem resposta do banco de dados na criação do perfil.")
                     if hasattr(insert_response, 'error') and insert_response.error:
@@ -140,7 +151,6 @@ class MemoryManager:
                 except Exception as e:
                     raise StateLoadError("Falha na criação do perfil inicial.") from e
                 return default_state
-
             data = response.data[0]
             return {
                 "persona_config": data.get("persona_config"),
@@ -154,9 +164,7 @@ class MemoryManager:
             raise StateLoadError("Falha ao carregar estado do usuário.") from e
 
     def _get_default_state(self, user_id: str, timestamp: float | None = None):
-        effective_timestamp = (
-            timestamp if timestamp is not None else self._clock()
-        )
+        effective_timestamp = timestamp if timestamp is not None else self._clock()
         v1_state = EmotionalStateV1.neutral(timestamp=effective_timestamp)
         return {
             "persona_config": "Katherine...",
@@ -166,47 +174,23 @@ class MemoryManager:
         }
 
     def sync_state(self, user_id: str, emotional_state: EmotionalStateV1, relationship: RelationshipStateV1, user_profile: dict = None):
-        """
-        Persists the current state to Supabase.
-        Accepts only ``EmotionalStateV1`` and ``RelationshipStateV1`` (serialized via
-        ``.to_dict()`` for JSONB). Raises ``StatePersistenceError`` on invalid type
-        or database failure.
-        """
         if not isinstance(emotional_state, EmotionalStateV1):
-            raise StatePersistenceError(
-                "emotional_state must be an EmotionalStateV1 instance."
-            )
-
+            raise StatePersistenceError("emotional_state must be an EmotionalStateV1 instance.")
         if not isinstance(relationship, RelationshipStateV1):
-            raise StatePersistenceError(
-                "relationship must be a RelationshipStateV1 instance."
-            )
-
+            raise StatePersistenceError("relationship must be a RelationshipStateV1 instance.")
         if not self.supabase:
             raise StatePersistenceError("Serviço de persistência não configurado.")
-
         update_data = {
             "emotional_state": emotional_state.to_dict(),
             "relationship_state": relationship.to_dict(),
             "updated_at": datetime.now(UTC).isoformat()
         }
-
         if user_profile:
             update_data["user_profile"] = user_profile
-
         try:
             response = self.supabase.table("profiles").update(update_data).eq("user_id", user_id).execute()
-
-            if response is None:
+            if response is None or (hasattr(response, 'error') and response.error) or not response.data:
                 raise StatePersistenceError()
-
-            if hasattr(response, 'error') and response.error:
-                raise StatePersistenceError()
-
-            # Check for zero updated rows (response.data is empty list)
-            if not response.data:
-                raise StatePersistenceError()
-
         except StatePersistenceError:
             raise
         except Exception:
@@ -216,13 +200,7 @@ class MemoryManager:
         if not self.supabase:
             raise ContextLoadError("Serviço de persistência indisponível.")
         try:
-            response = self.supabase.table("chat_logs")\
-                .select("role, content")\
-                .eq("user_id", user_id)\
-                .order("created_at", desc=True)\
-                .order("id", desc=True)\
-                .limit(limit)\
-                .execute()
+            response = self.supabase.table("chat_logs").select("role, content").eq("user_id", user_id).order("created_at", desc=True).order("id", desc=True).limit(limit).execute()
             if response is None:
                 raise ContextLoadError("Sem resposta do banco de dados na leitura do histórico.")
             if hasattr(response, 'error') and response.error:
@@ -231,7 +209,6 @@ class MemoryManager:
                 raise ContextLoadError("Resposta inválida do banco de dados na leitura do histórico.")
             if not isinstance(response.data, list):
                 raise ContextLoadError("Resposta do banco de dados não é uma lista.")
-
             normalized = []
             for item in response.data:
                 if not isinstance(item, dict):
@@ -246,13 +223,7 @@ class MemoryManager:
                     raise ContextLoadError("Conteúdo da mensagem não é uma string.")
                 if len(content) > MAX_MESSAGE_LENGTH:
                     raise ContextLoadError("Mensagem no histórico excede o limite máximo de caracteres permitido.")
-                
-                # Normalize: keep only role and content
-                normalized.append({
-                    "role": role,
-                    "content": content
-                })
-
+                normalized.append({"role": role, "content": content})
             return normalized[::-1]
         except ContextLoadError as e:
             logger.error(f"Erro ao carregar histórico: {type(e).__name__}")
@@ -262,23 +233,48 @@ class MemoryManager:
             raise ContextLoadError("Falha ao carregar histórico de conversação.") from None
 
     def get_context(self, user_id: str, current_message: str, user_state: dict):
+        components = self.get_context_components(user_id, current_message, user_state)
+        return components.get("assembled", "")
+
+    @staticmethod
+    def _serialize_user_profile(raw_profile) -> str:
+        if not isinstance(raw_profile, dict):
+            raise ContextLoadError("user_profile must be a dict for canonical serialization.")
+        try:
+            return json.dumps(raw_profile, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError):
+            raise ContextLoadError("user_profile contains non-serialisable values.")
+
+    def get_context_components(self, user_id: str, current_message: str, user_state: dict) -> dict:
         history = self.load_recent_history(user_id, limit=10)
         short_term_str = "\n".join([f"{msg['role']}: {msg['content']}" for msg in history])
-        relevant_memories = self._retrieve_relevant(user_id, current_message)
+        memory_entries = self._retrieve_relevant_entries(user_id, current_message)
+        persona = str(user_state.get('persona_config', 'Katherine...'))
+        raw_profile = user_state.get('user_profile', {})
+        user_profile_str = self._serialize_user_profile(raw_profile)
+        memory_entry_strings = [m.to_prompt_text() for m in memory_entries]
+        memory_str = "\n\n".join(memory_entry_strings) if memory_entry_strings else "Nenhuma memória específica encontrada."
         context_str = f"""
         === CORE MEMORY (QUEM VOCÊ É) ===
-        {user_state.get('persona_config', 'Katherine...')}
+        {persona}
 
         === CORE MEMORY (QUEM É O USUÁRIO) ===
-        {user_state.get('user_profile', {})}
+        {user_profile_str}
 
         === MEMÓRIA ARQUIVADA (LEMBRANÇAS RELEVANTES) ===
-        {relevant_memories}
+        {memory_str}
 
         === CONVERSA ATUAL (CURTO PRAZO) ===
         {short_term_str}
         """
-        return context_str
+        return {
+            "persona": persona,
+            "user_profile_str": user_profile_str,
+            "memory_str": memory_str,
+            "memory_entries": memory_entry_strings,
+            "history_list": history,
+            "assembled": context_str,
+        }
 
     def save_turn(self, user_id: str, user_msg: str, bot_msg: str) -> PersistedTurnRef:
         if not self.supabase:
@@ -296,11 +292,9 @@ class MemoryManager:
                 raise TurnPersistenceError("Erro retornado pelo banco de dados ao salvar turno.")
             if not hasattr(response, 'data') or response.data is None:
                 raise TurnPersistenceError("Falha na gravação do turno: registros inseridos incompletos.")
-            
             records = response.data
             if not isinstance(records, list) or len(records) != 2:
                 raise TurnPersistenceError("Falha na gravação do turno: registros inseridos incompletos.")
-            
             user_rec = None
             assistant_rec = None
             for rec in records:
@@ -308,13 +302,11 @@ class MemoryManager:
                     raise TurnPersistenceError("Registro retornado inválido.")
                 if "id" not in rec or "role" not in rec or "user_id" not in rec or "content" not in rec:
                     raise TurnPersistenceError("Campos estruturais ausentes nas linhas persistidas.")
-                
                 rec_id = rec["id"]
                 if type(rec_id) is not int or rec_id <= 0:
                     raise TurnPersistenceError("ID do registro inválido.")
                 if rec["user_id"] != user_id:
                     raise TurnPersistenceError("Divergência de usuário no turno persistido.")
-                
                 if rec["role"] == "user":
                     if user_rec is not None:
                         raise TurnPersistenceError("Mais de uma linha de usuário retornada.")
@@ -325,21 +317,13 @@ class MemoryManager:
                     assistant_rec = rec
                 else:
                     raise TurnPersistenceError("Role desconhecida no turno persistido.")
-            
             if not user_rec or not assistant_rec:
                 raise TurnPersistenceError("Roles user e assistant não encontradas.")
-            
             if user_rec["id"] == assistant_rec["id"]:
                 raise TurnPersistenceError("IDs de usuário e assistente devem ser distintos.")
-                
             if user_rec["content"] != user_msg or assistant_rec["content"] != bot_msg:
                 raise TurnPersistenceError("Conteúdo do turno persistido divergente.")
-            
-            return PersistedTurnRef(
-                user_id=user_id,
-                source_chat_log_id=user_rec["id"],
-                assistant_chat_log_id=assistant_rec["id"]
-            )
+            return PersistedTurnRef(user_id=user_id, source_chat_log_id=user_rec["id"], assistant_chat_log_id=assistant_rec["id"])
         except TurnPersistenceError as e:
             logger.error(f"Erro ao persistir turno: {type(e).__name__}")
             raise
@@ -351,16 +335,11 @@ class MemoryManager:
         if not self.supabase:
             raise RuntimeError("Serviço de persistência indisponível.")
         try:
-            response = self.supabase.table("chat_logs")\
-                .select("id, user_id, role, content")\
-                .eq("id", source_chat_log_id)\
-                .eq("user_id", user_id)\
-                .execute()
+            response = self.supabase.table("chat_logs").select("id, user_id, role, content").eq("id", source_chat_log_id).eq("user_id", user_id).execute()
             if not response or not hasattr(response, 'data') or not isinstance(response.data, list):
                 raise KeyError("Mensagem persistida não encontrada ou resposta inválida.")
             if len(response.data) != 1:
                 raise KeyError("Mensagem persistida não encontrada ou registros múltiplos retornados.")
-            
             record = response.data[0]
             if not isinstance(record, dict):
                 raise KeyError("Registro retornado inválido.")
@@ -374,7 +353,6 @@ class MemoryManager:
                 raise KeyError("A mensagem encontrada não é do usuário.")
             if type(record["content"]) is not str:
                 raise KeyError("Conteúdo retornado não é uma string.")
-            
             return record["content"]
         except Exception as e:
             if isinstance(e, KeyError):
@@ -384,16 +362,7 @@ class MemoryManager:
     def store_archival_extraction(self, user_id: str, source_chat_log_id: int, idempotency_key: str, envelope: ArchivalExtractionEnvelope):
         if not self.supabase:
             raise RuntimeError("Serviço de persistência indisponível.")
-        
-        facts_data = [
-            {
-                "content": fact.content,
-                "importance": fact.importance,
-                "tags": fact.tags
-            }
-            for fact in envelope.facts
-        ]
-
+        facts_data = [{"content": fact.content, "importance": fact.importance, "tags": fact.tags} for fact in envelope.facts]
         payload = {
             "user_id": user_id,
             "source_chat_log_id": source_chat_log_id,
@@ -402,7 +371,6 @@ class MemoryManager:
             "idempotency_key": idempotency_key,
             "facts": facts_data
         }
-
         response = None
         try:
             response = self.supabase.table("archival_extractions").insert(payload).execute()
@@ -411,7 +379,6 @@ class MemoryManager:
             if err_code is not None and str(err_code) == "23505":
                 raise ArchivalDuplicateError("Extração arquivística duplicada.")
             raise RuntimeError("Falha ao gravar extração arquivística.") from None
-
         if response is None:
             raise RuntimeError("Sem resposta do banco de dados na gravação.")
         if hasattr(response, 'error') and response.error:
@@ -419,32 +386,60 @@ class MemoryManager:
         if not hasattr(response, 'data') or response.data is None:
             raise RuntimeError("Resposta estruturalmente inválida do banco de dados.")
 
-
-    def _retrieve_relevant(self, user_id: str, query: str):
+    def _retrieve_relevant_entries(self, user_id: str, query: str) -> list[RetrievedMemory]:
         if not self.supabase or not self.embedding_model:
-            return "Memória indisponível (offline)."
+            return []
 
         try:
-            # Generate embedding
             query_embedding = self.embedding_model.encode(query).tolist()
-
-            # Call RPC function
-            params = {
-                "query_embedding": query_embedding,
-                "match_threshold": 0.5,
-                "match_count": 3,
-                "filter_user_id": user_id
-            }
-            response = self.supabase.rpc("match_memories", params).execute()
-
-            if not response.data:
-                return "Nenhuma memória específica encontrada."
-
-            formatted = []
-            for doc in response.data:
-                meta = doc.get('metadata', {})
-                formatted.append(f"- {doc['content']} (Tags: {meta.get('tags', '')})")
-
-            return "\n".join(formatted)
         except Exception:
-            return ""
+            return []
+
+        params = {
+            "query_embedding": query_embedding,
+            "match_threshold": 0.5,
+            "match_count": 3,
+            "filter_user_id": user_id,
+        }
+
+        # RPC call and response validation in a single protected block
+        try:
+            response = (
+                self.supabase
+                .rpc("match_memories", params)
+                .execute()
+            )
+
+            if (
+                response is None
+                or not hasattr(response, "data")
+                or not isinstance(response.data, list)
+            ):
+                return []
+
+            documents = response.data
+        except Exception:
+            return []
+
+        entries: list[RetrievedMemory] = []
+        for doc in documents:
+            try:
+                if not isinstance(doc, dict):
+                    continue
+                content = doc.get("content", "")
+                if not isinstance(content, str) or not content.strip():
+                    continue
+                metadata = doc.get("metadata", {})
+                raw_tags = metadata.get("tags", ()) if isinstance(metadata, dict) else ()
+                if isinstance(raw_tags, str):
+                    tag_values = (raw_tags,)
+                elif isinstance(raw_tags, (list, tuple)):
+                    tag_values = tuple(raw_tags)
+                else:
+                    tag_values = ()
+                entry = RetrievedMemory(content=content, tags=tag_values)
+                entries.append(entry)
+            except Exception:
+                continue
+
+        return entries

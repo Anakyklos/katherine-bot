@@ -3,6 +3,7 @@ import threading
 import time
 import pytest
 import httpx
+from unittest.mock import AsyncMock
 from groq import RateLimitError, APIStatusError, AuthenticationError, APIConnectionError
 from backend.groq_manager import (
     GroqClientManager,
@@ -89,7 +90,7 @@ def test_concurrent_access_no_corruption():
     def worker(idx):
         try:
             for _ in range(50):
-                res = manager.chat_completion(messages=[], model="test-model")
+                res = manager.chat_completion(messages=[{"role": "user", "content": "hello"}], model="test-model")
                 with results_lock:
                     results.append(res.choices[0].message.content)
         except BaseException as e:
@@ -201,9 +202,10 @@ def test_slow_client_does_not_hold_lock():
     worker_errors = []
     worker_errors_lock = threading.Lock()
     
+    VALID_MSG = [{"role": "user", "content": "hello"}]
     def run_thread_1():
         try:
-            res = manager.chat_completion(messages=[], model="test")
+            res = manager.chat_completion(messages=VALID_MSG, model="test")
             results["t1"] = res.choices[0].message.content
         except BaseException as e:
             with worker_errors_lock:
@@ -213,7 +215,7 @@ def test_slow_client_does_not_hold_lock():
         
     def run_thread_2():
         try:
-            res = manager.chat_completion(messages=[], model="test")
+            res = manager.chat_completion(messages=VALID_MSG, model="test")
             results["t2"] = res.choices[0].message.content
         except BaseException as e:
             with worker_errors_lock:
@@ -257,17 +259,18 @@ def test_clock_progression_cooldown():
     )
     
     manager._mark_key_rate_limited("key-one-11111111")
+    VALID_MSG = [{"role": "user", "content": "hello"}]
     
     # Cooled down
     with pytest.raises(GroqPoolExhaustedError):
-        manager.chat_completion(messages=[], model="test")
+        manager.chat_completion(messages=VALID_MSG, model="test")
         
     fake_time = 1009.0
     with pytest.raises(GroqPoolExhaustedError):
-        manager.chat_completion(messages=[], model="test")
+        manager.chat_completion(messages=VALID_MSG, model="test")
         
     fake_time = 1010.0
-    res = manager.chat_completion(messages=[], model="test")
+    res = manager.chat_completion(messages=VALID_MSG, model="test")
     assert res.choices[0].message.content == "ok"
 
 # 7. Bounded attempts per call
@@ -286,8 +289,9 @@ def test_bounded_attempts():
         client_factory=make_client
     )
     
+    VALID_MSG = [{"role": "user", "content": "hello"}]
     with pytest.raises(GroqPoolExhaustedError):
-        manager.chat_completion(messages=[], model="test")
+        manager.chat_completion(messages=VALID_MSG, model="test")
         
     assert len(calls) == 2
     assert "key-one-11111111" in calls
@@ -310,8 +314,8 @@ def test_rate_limit_rotation():
         keys=["key-one-11111111", "key-two-22222222"],
         client_factory=make_client
     )
-    
-    res = manager.chat_completion(messages=[], model="test")
+    VALID_MSG = [{"role": "user", "content": "hello"}]
+    res = manager.chat_completion(messages=VALID_MSG, model="test")
     assert res.choices[0].message.content == "success"
     assert len(calls) == 2
     assert calls == ["key-one-11111111", "key-two-22222222"]
@@ -328,8 +332,9 @@ def test_all_keys_unavailable(caplog):
     manager._deactivate_key("key-one-11111111")
     manager._deactivate_key("key-two-22222222")
     
+    VALID_MSG = [{"role": "user", "content": "hello"}]
     with pytest.raises(GroqPoolExhaustedError) as excinfo:
-        manager.chat_completion(messages=[], model="test")
+        manager.chat_completion(messages=VALID_MSG, model="test")
         
     assert "deactivated" in str(excinfo.value)
     assert "key-one" not in str(excinfo.value)
@@ -353,8 +358,8 @@ def test_structured_401_authentication_error():
         keys=["key-one-11111111", "key-two-22222222"],
         client_factory=make_client
     )
-    
-    res = manager.chat_completion(messages=[], model="test")
+    VALID_MSG = [{"role": "user", "content": "hello"}]
+    res = manager.chat_completion(messages=VALID_MSG, model="test")
     assert res.choices[0].message.content == "success"
     assert "key-one-11111111" in manager._deactivated
     assert "key-two-22222222" not in manager._deactivated
@@ -376,8 +381,8 @@ def test_structured_401_api_status_error():
         keys=["key-one-11111111", "key-two-22222222"],
         client_factory=make_client
     )
-    
-    res = manager.chat_completion(messages=[], model="test")
+    VALID_MSG = [{"role": "user", "content": "hello"}]
+    res = manager.chat_completion(messages=VALID_MSG, model="test")
     assert res.choices[0].message.content == "success"
     assert "key-one-11111111" in manager._deactivated
     assert "key-two-22222222" not in manager._deactivated
@@ -427,7 +432,8 @@ def test_transient_connection_error_rotation():
         client_factory=make_client
     )
 
-    res = manager.chat_completion(messages=[], model="test")
+    VALID_MSG = [{"role": "user", "content": "hello"}]
+    res = manager.chat_completion(messages=VALID_MSG, model="test")
     assert res.choices[0].message.content == "success"
     assert calls == ["key-one-11111111", "key-two-22222222"]
 
@@ -449,7 +455,8 @@ def test_transient_5xx_status_error_rotation():
         client_factory=make_client
     )
 
-    res = manager.chat_completion(messages=[], model="test")
+    VALID_MSG = [{"role": "user", "content": "hello"}]
+    res = manager.chat_completion(messages=VALID_MSG, model="test")
     assert res.choices[0].message.content == "success"
     assert calls == ["key-one-11111111", "key-two-22222222"]
 
@@ -469,8 +476,9 @@ def test_all_keys_failing_transient():
         client_factory=make_client
     )
 
+    VALID_MSG = [{"role": "user", "content": "hello"}]
     with pytest.raises(GroqPoolExhaustedError) as excinfo:
-        manager.chat_completion(messages=[], model="test")
+        manager.chat_completion(messages=VALID_MSG, model="test")
 
     assert len(calls) == 2
     assert "key-one" not in str(excinfo.value)
@@ -487,7 +495,7 @@ def test_client_factory_leak_sanitization(caplog):
     )
 
     with pytest.raises(GroqRequestError) as excinfo:
-        manager.chat_completion(messages=[], model="test")
+        manager.chat_completion(messages=[{"role": "user", "content": "hello"}], model="test")
 
     assert "Falha ao executar requisição Groq" in str(excinfo.value)
     assert "very-secret-error-marker" not in str(excinfo.value)
@@ -511,13 +519,197 @@ def test_non_retryable_http_error_fails_immediately():
     )
 
     with pytest.raises(GroqRequestError):
-        manager.chat_completion(messages=[], model="test")
+        manager.chat_completion(messages=[{"role": "user", "content": "hello"}], model="test")
 
     assert len(calls) == 1
     assert calls == ["key-one-11111111"]
 
 
-# 18. Async 4xx (e.g. 400, 422) produces invalid_request through full chain
+# 18–19. Sync invalid envelope rejected before key acquisition (parametrized)
+
+SENSITIVE_MARKER = "SENSITIVE_USER_MARKER_87342"
+
+INVALID_ENVELOPES = [
+    pytest.param([], id="empty_list"),
+    pytest.param("not-a-list", id="not_a_list"),
+    pytest.param(["not-a-dict"], id="not_a_dict_element"),
+    pytest.param([{"role": "user"}], id="missing_content"),
+    pytest.param(
+        [{"role": "invalid-role", "content": "hello"}],
+        id="invalid_role",
+    ),
+    pytest.param(
+        [{"role": "user", "content": "safe", SENSITIVE_MARKER: "classified"}],
+        id="unknown_key_with_sensitive_marker",
+    ),
+]
+
+
+class TestSyncInvalidEnvelope:
+    """Parametrized sync invalid envelope rejection.
+
+    Covers: empty list, not-a-list, not-a-dict element, missing content,
+    invalid role, and unknown key with sensitive marker. Each case must be
+    rejected before any key acquisition, factory call, or network operation.
+    """
+
+    def _make_manager(self):
+        factory_calls = []
+        def _factory(k):
+            factory_calls.append(k)
+            return MockClient(lambda *args, **kwargs: MockCompletion("ok"))
+        mgr = GroqClientManager(
+            keys=["key-one-11111111", "key-two-22222222"],
+            client_factory=_factory,
+        )
+        return mgr, factory_calls
+
+    @pytest.mark.parametrize("invalid_messages", INVALID_ENVELOPES)
+    def test_sync_invalid_envelope_rejected(self, invalid_messages, caplog):
+        caplog.set_level(logging.ERROR)
+        manager, factory_calls = self._make_manager()
+
+        initial_index = manager._index
+        initial_cooldowns = dict(manager._cooldowns)
+        initial_deactivated = set(manager._deactivated)
+
+        with pytest.raises(GroqRequestError) as exc_info:
+            manager.chat_completion(messages=invalid_messages, model="test")
+
+        assert "Falha ao executar requisição Groq" in str(exc_info.value)
+        assert "event=provider_input_invalid stage=generation" in caplog.text
+        assert factory_calls == []
+
+        assert manager._index == initial_index, "Cursor was modified by local error"
+        assert dict(manager._cooldowns) == initial_cooldowns, "Cooldowns were modified by local error"
+        assert set(manager._deactivated) == initial_deactivated, "Deactivated set was modified by local error"
+
+        assert SENSITIVE_MARKER not in caplog.text
+        assert SENSITIVE_MARKER not in str(exc_info.value)
+
+
+# 20. Sync oversized envelope rejected before key acquisition
+def test_sync_oversized_envelope_rejected(caplog):
+    """Oversized message is rejected before any key access."""
+    caplog.set_level(logging.ERROR)
+    manager = GroqClientManager(
+        keys=["key-one-11111111"],
+        client_factory=lambda k: MockClient(lambda *args, **kwargs: MockCompletion("ok"))
+    )
+
+    oversized = "x" * 20000
+    with pytest.raises(GroqRequestError) as excinfo:
+        manager.chat_completion(
+            messages=[{"role": "user", "content": oversized}],
+            model="test"
+        )
+    assert "Falha ao executar requisição Groq" in str(excinfo.value)
+    assert "event=provider_input_budget_exceeded" in caplog.text
+
+
+# 22–23. Async invalid envelope rejected before key acquisition (parametrized)
+
+class TestAsyncInvalidEnvelope:
+    """Parametrized async invalid envelope rejection.
+
+    Covers same 6 cases as sync: empty list, not-a-list, not-a-dict element,
+    missing content, invalid role, and unknown key with sensitive marker.
+    Each case must be rejected before any key acquisition, factory call,
+    or network operation.
+    """
+
+    def _make_manager(self):
+        from backend.turn_execution import TurnExecutionConfig
+
+        factory_calls = []
+        def _async_factory(k):
+            factory_calls.append(k)
+            return AsyncMock(**{"chat.completions.create": AsyncMock()})
+        config = TurnExecutionConfig(
+            total_deadline=30.0,
+            connect_timeout=2.0,
+            provider_attempt_timeout=10.0,
+            supabase_timeout=5.0,
+            commit_reserve=12.0,
+            max_attempts=1,
+        )
+        mgr = GroqClientManager(
+            keys=["key-one-11111111", "key-two-22222222"],
+            async_client_factory=_async_factory,
+            groq_params=config.to_groq_params(),
+        )
+        return mgr, factory_calls
+
+    @pytest.mark.anyio
+    @pytest.mark.parametrize("invalid_messages", INVALID_ENVELOPES)
+    async def test_async_invalid_envelope_rejected(self, invalid_messages, caplog):
+        from backend.turn_execution import TurnBudget
+
+        caplog.set_level(logging.ERROR)
+        manager, factory_calls = self._make_manager()
+
+        budget = TurnBudget(deadline=100.0, reserve=10.0, now_provider=lambda: 0.0)
+
+        initial_index = manager._index
+        initial_cooldowns = dict(manager._cooldowns)
+        initial_deactivated = set(manager._deactivated)
+
+        with pytest.raises(GroqRequestError) as exc_info:
+            await manager.chat_completion_async(
+                messages=invalid_messages,
+                model="test",
+                budget=budget,
+                stage="test",
+            )
+
+        assert "Falha ao executar requisição Groq" in str(exc_info.value)
+        assert "event=provider_input_invalid stage=test" in caplog.text
+        assert factory_calls == []
+
+        assert manager._index == initial_index, "Cursor was modified by local error"
+        assert dict(manager._cooldowns) == initial_cooldowns, "Cooldowns were modified by local error"
+        assert set(manager._deactivated) == initial_deactivated, "Deactivated set was modified by local error"
+
+        assert SENSITIVE_MARKER not in caplog.text
+        assert SENSITIVE_MARKER not in str(exc_info.value)
+
+
+# 21. Async oversized envelope rejected before key acquisition
+@pytest.mark.anyio
+async def test_async_oversized_envelope_rejected(caplog):
+    """Oversized message is rejected before any key access (async)."""
+    caplog.set_level(logging.ERROR)
+    from backend.turn_execution import TurnBudget, TurnExecutionConfig
+
+    config = TurnExecutionConfig(
+        total_deadline=30.0,
+        connect_timeout=2.0,
+        provider_attempt_timeout=10.0,
+        supabase_timeout=5.0,
+        commit_reserve=12.0,
+        max_attempts=1,
+    )
+    manager = GroqClientManager(
+        keys=["key-one-11111111"],
+        async_client_factory=lambda k: AsyncMock(**{"chat.completions.create": AsyncMock()}),
+        groq_params=config.to_groq_params(),
+    )
+
+    oversized = "x" * 20000
+    budget = TurnBudget(deadline=100.0, reserve=10.0, now_provider=lambda: 0.0)
+    with pytest.raises(GroqRequestError) as excinfo:
+        await manager.chat_completion_async(
+            messages=[{"role": "user", "content": oversized}],
+            model="test",
+            budget=budget,
+            stage="test",
+        )
+    assert "Falha ao executar requisição Groq" in str(excinfo.value)
+    assert "event=provider_input_budget_exceeded" in caplog.text
+    assert "key-one" not in caplog.text
+
+
+# 24. Async 4xx (e.g. 400, 422) produces invalid_request through full chain
 @pytest.mark.anyio
 async def test_async_4xx_produces_invalid_request():
     """Verify APIStatusError 4xx (terminal) in async path produces invalid_request.
@@ -525,7 +717,7 @@ async def test_async_4xx_produces_invalid_request():
     Full chain: GroqClientManager → ConversationEngine → _map_turn_error → HTTP 503
     """
     import json
-    from unittest.mock import AsyncMock, MagicMock
+    from unittest.mock import MagicMock
     from backend.engine import ConversationEngine
     from backend.turn_execution import TurnExecutionConfig, TurnErrorCode, TurnExecutionError
     from backend.emotional_domain import EmotionalStateV1
@@ -557,6 +749,13 @@ async def test_async_4xx_produces_invalid_request():
     engine.memory_manager.sync_state = MagicMock()
     engine.memory_manager.save_turn = MagicMock()
     engine.memory_manager.get_context = MagicMock(return_value="[mocked context]")
+    engine.memory_manager.get_context_components = MagicMock(return_value={
+        "persona": "Katherine...",
+        "user_profile_str": "{}",
+        "memory_str": "",
+        "history_list": [],
+        "assembled": "[mocked context]",
+    })
     engine.memory_manager.load_recent_history = MagicMock(return_value=[])
 
     mgr = GroqClientManager(

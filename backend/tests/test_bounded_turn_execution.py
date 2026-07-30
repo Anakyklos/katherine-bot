@@ -142,6 +142,13 @@ def _make_engine(
     engine.memory_manager.sync_state = MagicMock()
     engine.memory_manager.save_turn = MagicMock()
     engine.memory_manager.get_context = MagicMock(return_value="[mocked context]")
+    engine.memory_manager.get_context_components = MagicMock(return_value={
+        "persona": "Katherine...",
+        "user_profile_str": "{}",
+        "memory_str": "",
+        "history_list": [],
+        "assembled": "[mocked context]",
+    })
     engine.memory_manager.load_recent_history = MagicMock(return_value=[])
 
     groq_params = engine._turn_config.to_groq_params()
@@ -1382,6 +1389,7 @@ class TestDeadlineDuringStages:
             )
             engine = _make_engine(turn_config=config, fake_provider=provider)
             engine.memory_manager.get_context = blocking_context
+            engine.memory_manager.get_context_components = blocking_context
 
             try:
                 with pytest.raises((DeadlineExceeded, TurnExecutionError)):
@@ -1464,6 +1472,7 @@ class TestPersistenceErrorHttp:
             raise ContextLoadError("context load failed")
 
         engine.memory_manager.get_context = failing_context
+        engine.memory_manager.get_context_components = failing_context
 
         with pytest.raises(TurnExecutionError) as exc_info:
             asyncio.run(engine.process_turn("user", "Hello"))

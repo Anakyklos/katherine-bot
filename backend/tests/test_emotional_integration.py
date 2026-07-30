@@ -821,6 +821,13 @@ class TestNewProfileFirstTurn:
 
             # ── Mock other engine dependencies                             ──
             engine.memory_manager.get_context = MagicMock(return_value="[ctx]")
+            engine.memory_manager.get_context_components = MagicMock(return_value={
+                "persona": "Katherine...",
+                "user_profile_str": "{}",
+                "memory_str": "",
+                "history_list": [],
+                "assembled": "[ctx]",
+            })
             engine.memory_manager.sync_state = MagicMock()
             engine.memory_manager.save_turn = MagicMock()
             
@@ -935,6 +942,13 @@ class TestSanitisedLogging:
             engine.memory_manager.sync_state = MagicMock()
             engine.memory_manager.save_turn = MagicMock()
             engine.memory_manager.get_context = MagicMock(return_value="[mocked context]")
+            engine.memory_manager.get_context_components = MagicMock(return_value={
+                "persona": "Katherine...",
+                "user_profile_str": "{}",
+                "memory_str": "",
+                "history_list": [],
+                "assembled": "[mocked context]",
+            })
             async def _mock_bad_appraisal(**kwargs):
                 mock_resp = MagicMock()
                 mock_resp.choices = [MagicMock()]

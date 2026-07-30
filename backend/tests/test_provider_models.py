@@ -107,6 +107,13 @@ def _make_engine(archival_extraction_enabled=False, clock=FIXED_CLOCK):
     engine.memory_manager.sync_state = MagicMock()
     engine.memory_manager.save_turn = MagicMock()
     engine.memory_manager.get_context = MagicMock(return_value="[mocked context]")
+    engine.memory_manager.get_context_components = MagicMock(return_value={
+        "persona": "Katherine...",
+        "user_profile_str": "{}",
+        "memory_str": "",
+        "history_list": [],
+        "assembled": "[mocked context]",
+    })
     engine.memory_manager.load_recent_history = MagicMock(return_value=[])
 
     # ---- Groq manager mocks ----
