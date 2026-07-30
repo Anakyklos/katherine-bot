@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import logging
 from typing import get_type_hints
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -368,7 +368,11 @@ class TestRpcResponseValidation:
         assert result[2].content == "Third valid memory."
 
     def test_invalid_metadata_isolated_to_document(self, manager):
-        """Non-dict metadata (string, None, int) isolated without crashing batch."""
+        """Non-dict metadata (string, None, int) does not crash the batch.
+
+        Documents with invalid metadata are still included; the tag policy
+        handles non-dict metadata gracefully by falling back to empty tags.
+        """
         rpc_mock = MagicMock()
         response = MagicMock()
         response.data = [
@@ -382,10 +386,24 @@ class TestRpcResponseValidation:
         rpc_mock.execute.return_value = response
         manager.supabase.rpc.return_value = rpc_mock
         result = manager._retrieve_relevant_entries("user-id", "query")
-        assert len(result) == 3
-        assert result[0].content == "First valid memory."
-        assert result[1].content == "Second valid memory."
-        assert result[2].content == "Third valid memory."
+
+        # All 6 documents returned; invalid metadata entries get empty tags
+        assert [entry.content for entry in result] == [
+            "First valid memory.",
+            "Memory with bad metadata.",
+            "Memory with None metadata.",
+            "Second valid memory.",
+            "Memory with int metadata.",
+            "Third valid memory.",
+        ]
+        assert [entry.tags for entry in result] == [
+            ("tag1",),
+            (),
+            (),
+            ("tag2",),
+            (),
+            ("tag3",),
+        ]
 
 
 # ═══════════════════════════════════════════════════════════════════════
