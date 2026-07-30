@@ -236,6 +236,11 @@ class ContextItem:
     ``source_id``
         Internal opaque local reference (e.g. ``"ctx-1"``).  Never
         a real database UUID.
+
+    ``internal_id``
+        Optional real database UUID for internal tracking only.  Empty
+        string means the real ID is unknown or not yet wired.
+        Never logged or sent to the provider.
     """
 
     kind: str
@@ -244,6 +249,7 @@ class ContextItem:
     confidence: float
     epistemic_status: str
     source_id: str
+    internal_id: str = ""
 
     def __post_init__(self) -> None:
         # Validate kind
@@ -537,12 +543,10 @@ def build_envelope(
     )
     untrusted_payload = _serialize_untrusted_items(all_items)
 
-    # Build source map (opaque local ref → actual source_id)
+    # Build source map (opaque local ref → actual internal ID)
     source_map: dict[str, str] = {}
     for item in all_items:
-        source_map[item.source_id] = item.source_id
-        # In a real system, the source_id is an opaque local ref like "ctx-1"
-        # and the actual database UUID is stored in a separate map not exposed.
+        source_map[item.source_id] = item.internal_id or item.source_id
 
     # 4. Build initial mandatory envelope (system + current user) ----------
     current_user_message = user_message

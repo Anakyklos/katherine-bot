@@ -557,7 +557,14 @@ class TestEnvelopeConstruction:
         assert result_a.messages[0]["content"] == result_b.messages[0]["content"]
 
     def test_no_real_ids_in_messages(self):
-        """No UUID or real source ID is sent to the provider."""
+        """No opaque local ref from ChatMessage appears in provider messages.
+
+        ChatMessage.source_id ("msg-1") is an internal opaque reference
+        that must NOT leak into the serialized messages sent to the provider.
+        ContextItem.source_id appears in the untrusted JSON payload as
+        the "reference" field — that is intentional (it is an opaque local
+        ref, not a real UUID).  Real UUIDs must never appear.
+        """
         item = ContextItem(
             kind="memory", content="Fact",
             provenance=Provenance.LEGACY_MEMORY,
@@ -573,8 +580,8 @@ class TestEnvelopeConstruction:
         )
         result = build_envelope(bundle, "Hi")
         serialized = json.dumps(result.messages)
-        # Check that real IDs are not exposed
-        assert "msg-1" not in serialized or "msg-1" in result.source_map
+        # ChatMessage source_ids must never appear in provider messages
+        assert "msg-1" not in serialized, "ChatMessage source_id leaked into provider messages"
         # No UUID format in messages
         import re
         uuid_pattern = r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
@@ -823,22 +830,109 @@ class TestEpistemicContracts:
 class TestAppraisalBoundary:
     """Appraisal uses separated system instruction and user message."""
 
-    def test_appraisal_system_and_user_separate(self):
+    @pytest.mark.anyio
+    async def test_appraisal_system_and_user_separate(self, monkeypatch):
         """Appraisal system instruction is in a system message, user message separate."""
+        import json
         from backend.engine import ConversationEngine
-        engine = ConversationEngine()
-        # The method _appraise is async, so we just verify the contract
-        # by checking what the appraisal_policy looks like
-        assert hasattr(engine, "_appraise")
-        # _appraise builds messages with system role for the policy
-        # We verify this by checking the config
+        from backend.turn_execution import create_budget, TurnExecutionConfig
 
-    def test_appraisal_policy_has_no_user_message_interpolated(self):
+        recorded = {}
+
+        async def mock_chat_completion_async(messages, **kwargs):
+            recorded["messages"] = messages
+            # Return a valid appraisal JSON response using simple dict-style objects
+            response_text = json.dumps({
+                "valence": 0.0, "arousal_shift": 0.0, "dominance_shift": 0.0,
+                "triggered_emotions": {
+                    "joy": 0, "sadness": 0, "anger": 0, "fear": 0,
+                    "disgust": 0, "surprise": 0, "tenderness": 0,
+                    "guilt": 0, "pride": 0, "jealousy": 0, "gratitude": 0,
+                },
+            })
+            # Build nested object matching groq response structure
+            class FakeContent:
+                content = response_text
+            class FakeMessage:
+                message = FakeContent()
+            class FakeResponse:
+                choices = [FakeMessage()]
+            return FakeResponse()
+
+        engine = ConversationEngine()
+        monkeypatch.setattr(
+            engine.groq_manager, "chat_completion_async", mock_chat_completion_async
+        )
+
+        budget = create_budget(TurnExecutionConfig.defaults(), now_provider=engine._monotonic)
+        user_text = "I love cats"
+
+        await engine._appraise(user_text, budget)
+
+        messages = recorded.get("messages")
+        assert messages is not None and len(messages) >= 2
+
+        # First message must be a system policy message
+        system_msg = messages[0]
+        assert system_msg.get("role") == "system"
+        assert "emotional impact" in system_msg.get("content", "")
+
+        # Second message must be the raw user message
+        user_msg = messages[1]
+        assert user_msg.get("role") == "user"
+        assert user_msg.get("content") == user_text
+
+    @pytest.mark.anyio
+    async def test_appraisal_policy_has_no_user_message_interpolated(self, monkeypatch):
         """The appraisal policy does not contain the user message."""
+        import json
         from backend.engine import ConversationEngine
-        # Just verify the method signature exists and structure is correct
-        # The internal implementation uses system + user message format
-        pass
+        from backend.turn_execution import create_budget, TurnExecutionConfig
+
+        recorded = {}
+
+        async def mock_chat_completion_async(messages, **kwargs):
+            recorded["messages"] = messages
+            response_text = json.dumps({
+                "valence": 0.0, "arousal_shift": 0.0, "dominance_shift": 0.0,
+                "triggered_emotions": {
+                    "joy": 0, "sadness": 0, "anger": 0, "fear": 0,
+                    "disgust": 0, "surprise": 0, "tenderness": 0,
+                    "guilt": 0, "pride": 0, "jealousy": 0, "gratitude": 0,
+                },
+            })
+            class _Msg:
+                content = response_text
+            class _Choice:
+                message = _Msg()
+            class _Resp:
+                choices = [_Choice()]
+            return _Resp()
+
+        engine = ConversationEngine()
+        monkeypatch.setattr(
+            engine.groq_manager, "chat_completion_async", mock_chat_completion_async
+        )
+
+        budget = create_budget(TurnExecutionConfig.defaults(), now_provider=engine._monotonic)
+        user_text = "My bank account number is 1234-5678."
+
+        await engine._appraise(user_text, budget)
+
+        messages = recorded.get("messages")
+        assert messages is not None and len(messages) >= 2
+
+        system_msg = messages[0]
+        user_msg = messages[1]
+
+        # System message must not contain the user content
+        assert system_msg.get("role") == "system"
+        system_content = system_msg.get("content", "")
+        assert user_text not in system_content, "User content leaked into appraisal policy"
+
+        # User message must contain the raw user content
+        assert user_msg.get("role") == "user"
+        assert user_msg.get("content") == user_text
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1054,7 +1148,155 @@ class TestRetrievedMemoryIntegration:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 17. Engine integration — generation path
+# 17. MemoryManager.build_context_bundle integration
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestBuildContextBundle:
+    """MemoryManager.build_context_bundle integration tests."""
+
+    def test_build_context_bundle_filters_unapproved_legacy(self, monkeypatch):
+        """Only approved, non-legacy memories appear in ContextBundle.memory_items."""
+        from backend.memory import MemoryManager, RetrievedMemory
+        from backend.emotional_domain import EmotionalStateV1
+        from backend.relationship import RelationshipStateV1
+
+        approved_current = RetrievedMemory(
+            content="Approved current memory",
+            tags=("keep",),
+            source_id="uuid-abc",
+            confidence=0.9,
+            provenance=Provenance.USER_CONFIRMED,
+            epistemic_status=EpistemicStatus.APPROVED,
+            approved=True,
+            metadata_version=2,
+        )
+        unapproved = RetrievedMemory(
+            content="Unapproved memory",
+            tags=(), source_id="uuid-def",
+            approved=False, metadata_version=2,
+        )
+        legacy = RetrievedMemory(
+            content="Legacy memory",
+            tags=(), source_id="uuid-ghi",
+            approved=True, metadata_version=0,
+        )
+        retrieved = [approved_current, unapproved, legacy]
+
+        def fake_retrieve(*args, **kwargs):
+            return retrieved
+
+        monkeypatch.setattr(
+            MemoryManager, "_retrieve_relevant_entries", fake_retrieve
+        )
+
+        mm = MemoryManager()
+        monkeypatch.setattr(mm, "load_recent_history", lambda *a, **kw: [])
+
+        state = EmotionalStateV1.neutral(timestamp=1000.0)
+        rel = RelationshipStateV1.neutral(timestamp=1000.0)
+
+        bundle = mm.build_context_bundle(
+            user_id="user-x",
+            current_message="Hi",
+            user_state={},
+            emotional_state=state,
+            relationship=rel,
+        )
+
+        contents = [item.content for item in bundle.memory_items]
+        assert "Approved current memory" in contents
+        assert "Unapproved memory" not in contents
+        assert "Legacy memory" not in contents
+
+    def test_build_context_bundle_profile_persona_metadata(self, monkeypatch):
+        """Profile and persona in user_state produce ContextItems with expected metadata."""
+        from backend.memory import MemoryManager
+        from backend.emotional_domain import EmotionalStateV1
+        from backend.relationship import RelationshipStateV1
+
+        def fake_retrieve(*args, **kwargs):
+            return []
+
+        monkeypatch.setattr(
+            MemoryManager, "_retrieve_relevant_entries", fake_retrieve
+        )
+
+        mm = MemoryManager()
+        monkeypatch.setattr(mm, "load_recent_history", lambda *a, **kw: [])
+
+        user_state = {
+            "user_profile": {"name": "Test User"},
+            "persona_config": "Helpful assistant persona",
+        }
+        state = EmotionalStateV1.neutral(timestamp=1000.0)
+        rel = RelationshipStateV1.neutral(timestamp=1000.0)
+
+        bundle = mm.build_context_bundle(
+            user_id="user-x",
+            current_message="Hi",
+            user_state=user_state,
+            emotional_state=state,
+            relationship=rel,
+        )
+
+        # Profile items are in bundle.profile_items, not memory_items
+        assert len(bundle.profile_items) == 1
+        pi = bundle.profile_items[0]
+        assert pi.kind == "profile"
+        assert pi.provenance == Provenance.LEGACY_PROFILE
+        assert pi.epistemic_status == EpistemicStatus.UNKNOWN
+        assert 0.0 <= pi.confidence <= 1.0
+
+        # Persona items are in bundle.persona_items, not memory_items
+        assert len(bundle.persona_items) == 1
+        pi2 = bundle.persona_items[0]
+        assert pi2.kind == "persona"
+        assert pi2.provenance == Provenance.LEGACY_PERSONA
+        assert pi2.epistemic_status == EpistemicStatus.UNKNOWN
+        assert "persona" in pi2.content
+
+    def test_build_context_bundle_history_conversion(self, monkeypatch):
+        """History from load_recent_history becomes ChatMessages with stable sort_key."""
+        from backend.memory import MemoryManager
+        from backend.emotional_domain import EmotionalStateV1
+        from backend.relationship import RelationshipStateV1
+
+        def fake_retrieve(*args, **kwargs):
+            return []
+
+        monkeypatch.setattr(
+            MemoryManager, "_retrieve_relevant_entries", fake_retrieve
+        )
+
+        fake_history = [
+            {"role": "user", "content": "Hi there", "id": 1},
+            {"role": "assistant", "content": "Hello!", "id": 2},
+        ]
+
+        mm = MemoryManager()
+        monkeypatch.setattr(mm, "load_recent_history", lambda *a, **kw: fake_history)
+
+        state = EmotionalStateV1.neutral(timestamp=1000.0)
+        rel = RelationshipStateV1.neutral(timestamp=1000.0)
+
+        bundle = mm.build_context_bundle(
+            user_id="user-x",
+            current_message="Hi",
+            user_state={},
+            emotional_state=state,
+            relationship=rel,
+        )
+
+        assert len(bundle.history) == 2
+        for i, hmsg in enumerate(bundle.history):
+            assert hmsg.role in ("user", "assistant")
+            assert hmsg.content == fake_history[i]["content"]
+            assert isinstance(hmsg.sort_key, tuple)
+            assert len(hmsg.sort_key) >= 2
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 18. Engine integration — generation path
 # ═══════════════════════════════════════════════════════════════════════
 
 class TestEngineGenerationPath:
@@ -1085,7 +1327,7 @@ class TestEngineGenerationPath:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 18. ContextBuildResult validation
+# 19. ContextBuildResult validation
 # ═══════════════════════════════════════════════════════════════════════
 
 class TestContextBuildResult:
@@ -1105,7 +1347,7 @@ class TestContextBuildResult:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 19. Existing public DTO unchanged
+# 20. Existing public DTO unchanged
 # ═══════════════════════════════════════════════════════════════════════
 
 class TestPublicDTO:
