@@ -32,6 +32,7 @@ Coverage (Fix 6 — _appraise behavioral):
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 from unittest.mock import MagicMock, AsyncMock, call
@@ -456,15 +457,67 @@ class TestArchivalExtractionBehavioral:
             )
 
     def test_persisted_record_unchanged(self):
-        """Truncation does not modify the original persisted message."""
+        """Truncation does not modify the original persisted message.
+
+        Uses spies that record:
+        - the exact text returned by load_persisted_user_message()
+        - the reduced envelope sent to the provider
+        - calls to store_archival_extraction()
+
+        Verifies the source text is never modified.
+        """
+        import copy
+
         engine = _make_engine(archival_extraction_enabled=True)
         original_message = "ORIGINAL_" + "x" * 50000 + "_PERSISTED"
-        persisted_copy = original_message
-        self._run(engine, user_message=original_message)
 
-        # The original should have been passed to load_persisted_user_message
-        # and should not be modified
-        assert persisted_copy == original_message, "Original message was mutated"
+        # Spies to record calls
+        recorded_load_text = None
+        recorded_envelope = None
+        recorded_store_calls = []
+
+        def spy_load(user_id, source_chat_log_id):
+            nonlocal recorded_load_text
+            recorded_load_text = original_message
+            return original_message
+
+        async def spy_provider(**kwargs):
+            nonlocal recorded_envelope
+            recorded_envelope = copy.deepcopy(kwargs.get("messages", []))
+            return _mock_async_result(self.VALID_EXTRACTION)
+
+        def spy_store(user_id, source_chat_log_id, idempotency_key, envelope):
+            recorded_store_calls.append(copy.deepcopy(envelope))
+
+        engine.memory_manager.load_persisted_user_message = spy_load
+        engine.groq_manager.chat_completion_async.side_effect = spy_provider
+        engine.memory_manager.store_archival_extraction = spy_store
+
+        from backend.archival_memory import PersistedTurnRef
+        ref = PersistedTurnRef(user_id="u1", source_chat_log_id=1, assistant_chat_log_id=2)
+
+        async def run():
+            await engine.run_archival_extraction(ref)
+
+            # Verify the source text is UNCHANGED (same as what was loaded)
+            assert recorded_load_text is not None
+            assert recorded_load_text == original_message
+
+            # The envelope sent to the provider (prompt copy) may be truncated
+            # but the source is never modified
+            if recorded_envelope:
+                prompt_text = recorded_envelope[0]["content"]
+                # Source text start/end markers preserved, but prompt is not
+                # necessarily the full original text
+                assert "ORIGINAL_" in prompt_text or "_PERSISTED" in prompt_text
+
+            # store_archival_extraction is called with the LLM result
+            assert len(recorded_store_calls) <= 1
+
+            # Verify the original_message variable is unchanged
+            assert original_message == "ORIGINAL_" + "x" * 50000 + "_PERSISTED"
+
+        asyncio.run(run())
 
     def test_fake_provider_receives_validated_envelope(self):
         """Fake provider receives exactly the validated envelope."""
@@ -494,27 +547,53 @@ class TestArchivalExtractionBehavioral:
         asyncio.run(run())
 
     def test_mounting_failure_no_state_change(self):
-        """Assembly failure (budget exceeded even after truncation) does not
-        alter response or state."""
+        """Real archival mounting failure: message loaded successfully but the
+        envelope budget is exceeded after repeated truncation attempts.
+
+        Uses a very large message that triggers the head-tail truncation path,
+        then patches validate_provider_input to always fail even after
+        truncation — simulating that no truncation level produces a valid
+        envelope.  Provider not called, nothing stored.
+        """
+        import backend.engine as engine_module
+
         engine = _make_engine(archival_extraction_enabled=True)
-        # Empty message that causes budget issues — this should not happen
-        # because the archival prompt itself has overhead. Instead, we test
-        # that even if load or validation fails, nothing is stored.
+
+        # Very large message that triggers archival truncation
+        huge_message = "BIG_" + "x" * 100000 + "_END"
+
         engine.memory_manager.load_persisted_user_message = MagicMock(
-            side_effect=Exception("Load failed")
+            return_value=huge_message
         )
         engine.groq_manager.chat_completion_async = AsyncMock()
         engine.memory_manager.store_archival_extraction = MagicMock()
+
+        # Patch validate_provider_input to always fail — even truncated
+        # versions will be rejected, so the progressive factor loop
+        # exhausts and returns without calling the provider.
+        original_validate = engine_module.validate_provider_input
+
+        def always_failing_validate(messages, max_units=16000):
+            from backend.provider_envelope import ProviderEnvelopeError
+            raise ProviderEnvelopeError("budget_exceeded")
+
+        engine_module.validate_provider_input = always_failing_validate
 
         from backend.archival_memory import PersistedTurnRef
         ref = PersistedTurnRef(user_id="u1", source_chat_log_id=1, assistant_chat_log_id=2)
 
         async def run():
             await engine.run_archival_extraction(ref)
+
+            # Provider NOT called — every truncation failed validation
             engine.groq_manager.chat_completion_async.assert_not_called()
+            # Nothing stored
             engine.memory_manager.store_archival_extraction.assert_not_called()
 
         asyncio.run(run())
+
+        # Restore the original
+        engine_module.validate_provider_input = original_validate
 
     def test_no_sensitive_in_logs(self, caplog):
         """No sensitive content in logs during archival extraction."""

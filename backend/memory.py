@@ -1,6 +1,7 @@
 import json
 import os
 import logging
+from dataclasses import dataclass
 from datetime import datetime, UTC
 from supabase import create_client, Client
 from sentence_transformers import SentenceTransformer
@@ -9,6 +10,23 @@ from typing import Optional, Callable
 from .relationship import RelationshipStateV1
 from .emotional_domain import EmotionalStateV1
 from .archival_memory import PersistedTurnRef, ArchivalExtractionEnvelope, ArchivalDuplicateError
+
+
+@dataclass(frozen=True)
+class RetrievedMemory:
+    """A single memory retrieved from archival storage.
+
+    ``content`` is the non-empty text of the memory fact.
+    ``tags`` are zero or more category labels (normalized, sorted).
+    """
+    content: str
+    tags: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.content, str) or not self.content.strip():
+            raise ValueError(f"RetrievedMemory content must be non-empty string, got {type(self.content)}")
+        if not isinstance(self.tags, tuple):
+            raise ValueError(f"RetrievedMemory tags must be a tuple, got {type(self.tags)}")
 
 logger = logging.getLogger(__name__)
 
@@ -267,7 +285,8 @@ class MemoryManager:
         components = self.get_context_components(user_id, current_message, user_state)
         return components.get("assembled", "")
 
-    def _serialize_user_profile(self, raw_profile) -> str:
+    @staticmethod
+    def _serialize_user_profile(raw_profile) -> str:
         """Serialize a user profile to a canonical JSON string.
 
         Accepts only ``dict`` type.  Returns the profile serialised with:
@@ -277,13 +296,14 @@ class MemoryManager:
             json.dumps(profile, ensure_ascii=False, sort_keys=True,
                        separators=(",", ":"))
 
-        Raises ``StatePersistenceError`` for any non-dict type (list,
+        Raises ``ContextLoadError`` for any non-dict type (list,
         string, int, bool, ``None``, or non-serialisable objects).
         This is fail-closed: invalid types never reach the provider
-        prompt as raw ``str()`` output.
+        prompt as raw ``str()`` output.  The typing is read/context
+        domain, not persistence domain.
         """
         if not isinstance(raw_profile, dict):
-            raise StatePersistenceError(
+            raise ContextLoadError(
                 "user_profile must be a dict for canonical serialization."
             )
         try:
@@ -294,7 +314,7 @@ class MemoryManager:
                 separators=(",", ":"),
             )
         except (TypeError, ValueError):
-            raise StatePersistenceError(
+            raise ContextLoadError(
                 "user_profile contains non-serialisable values."
             )
 
@@ -309,11 +329,11 @@ class MemoryManager:
         - ``history_list``: list of recent history message dicts.
         - ``assembled``: the full assembled context string (backward compat).
 
-        Raises ``StatePersistenceError`` if ``user_profile`` is not a dict.
+        Raises ``ContextLoadError`` if ``user_profile`` is not a dict.
         """
         history = self.load_recent_history(user_id, limit=10)
         short_term_str = "\n".join([f"{msg['role']}: {msg['content']}" for msg in history])
-        relevant_memories = self._retrieve_relevant(user_id, current_message)
+        memory_entries = self._retrieve_relevant_entries(user_id, current_message)
 
         persona = str(user_state.get('persona_config', 'Katherine...'))
 
@@ -321,8 +341,16 @@ class MemoryManager:
         raw_profile = user_state.get('user_profile', {})
         user_profile_str = self._serialize_user_profile(raw_profile)
 
-        # Parse memory entries into individual strings
-        memory_entries = self._parse_memory_entries(relevant_memories)
+        # Build backward-compatible memory_str from structured entries
+        if memory_entries:
+            memory_str = "\n".join(
+                f"- {m.content} (Tags: {', '.join(m.tags)})" for m in memory_entries
+            )
+        else:
+            memory_str = "Nenhuma memória específica encontrada."
+
+        # Build memory_entries as list of individual strings for engine consumption
+        memory_entry_strings = [m.content for m in memory_entries]
 
         context_str = f"""
         === CORE MEMORY (QUEM VOCÊ É) ===
@@ -332,7 +360,7 @@ class MemoryManager:
         {user_profile_str}
 
         === MEMÓRIA ARQUIVADA (LEMBRANÇAS RELEVANTES) ===
-        {relevant_memories}
+        {memory_str}
 
         === CONVERSA ATUAL (CURTO PRAZO) ===
         {short_term_str}
@@ -341,26 +369,13 @@ class MemoryManager:
         return {
             "persona": persona,
             "user_profile_str": user_profile_str,
-            "memory_str": relevant_memories,
-            "memory_entries": memory_entries,
+            "memory_str": memory_str,
+            "memory_entries": memory_entry_strings,
             "history_list": history,
             "assembled": context_str,
         }
 
-    @staticmethod
-    def _parse_memory_entries(relevant_memories: str) -> list:
-        """Parse the memory string into individual entries.
 
-        If the memory string is empty or indicates no memories found,
-        returns an empty list.  Otherwise, splits by newlines and returns
-        non-empty lines as individual entries.
-        """
-        if not relevant_memories or relevant_memories in (
-            "", "Nenhuma memória específica encontrada.", "Memória indisponível (offline)."
-        ):
-            return []
-        entries = [line.strip() for line in relevant_memories.split("\n") if line.strip()]
-        return entries
 
     def save_turn(self, user_id: str, user_msg: str, bot_msg: str) -> PersistedTurnRef:
         if not self.supabase:
@@ -502,9 +517,20 @@ class MemoryManager:
             raise RuntimeError("Resposta estruturalmente inválida do banco de dados.")
 
 
-    def _retrieve_relevant(self, user_id: str, query: str):
+    def _retrieve_relevant_entries(self, user_id: str, query: str) -> list[RetrievedMemory]:
+        """Retrieve relevant memories as structured ``RetrievedMemory`` entries.
+
+        Returns a list preserving the order returned by the RPC (relevance
+        order).  Each entry is an atomic unit with validated ``content`` and
+        normalised ``tags``.
+
+        Returns an empty list when:
+        - Supabase or embedding model is unavailable
+        - No relevant memories are found
+        - The RPC returns invalid data
+        """
         if not self.supabase or not self.embedding_model:
-            return "Memória indisponível (offline)."
+            return []
 
         try:
             # Generate embedding
@@ -519,14 +545,26 @@ class MemoryManager:
             }
             response = self.supabase.rpc("match_memories", params).execute()
 
-            if not response.data:
-                return "Nenhuma memória específica encontrada."
+            if not response.data or not isinstance(response.data, list):
+                return []
 
-            formatted = []
+            entries: list[RetrievedMemory] = []
             for doc in response.data:
-                meta = doc.get('metadata', {})
-                formatted.append(f"- {doc['content']} (Tags: {meta.get('tags', '')})")
+                if not isinstance(doc, dict):
+                    continue
+                content = doc.get("content", "")
+                if not isinstance(content, str) or not content.strip():
+                    continue
+                raw_tags = doc.get("metadata", {}).get("tags", [])
+                if not isinstance(raw_tags, (list, tuple)):
+                    raw_tags = [str(raw_tags)] if raw_tags else []
+                tags = tuple(str(t) for t in raw_tags)
+                try:
+                    entry = RetrievedMemory(content=content, tags=tags)
+                    entries.append(entry)
+                except ValueError:
+                    continue
 
-            return "\n".join(formatted)
+            return entries
         except Exception:
-            return ""
+            return []

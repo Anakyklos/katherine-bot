@@ -49,6 +49,7 @@ from .provider_models import (
     ProviderConfig,
 )
 from .provider_envelope import (
+    ContextFitResult,
     ProviderEnvelopeError,
     estimate_provider_input_units,
     fit_optional_context,
@@ -907,8 +908,8 @@ Regras adicionais de estilo:
         for i in reversed(history_indices_in_comp):
             selection_priority.append(i)
 
-        # Memory — newest first (reversed visual order)
-        for i in reversed(memory_indices_in_comp):
+        # Memory — retrieval order (relevance order, not reversed)
+        for i in memory_indices_in_comp:
             selection_priority.append(i)
 
         # Profile last
@@ -935,7 +936,7 @@ Regras adicionais de estilo:
             raise ProviderEnvelopeError("budget_exceeded")
 
         # Use fit_optional_context with suffix and selection_priority
-        result = fit_optional_context(
+        fit_result = fit_optional_context(
             mandatory_messages,
             optional_components,
             suffix=suffix,
@@ -943,9 +944,7 @@ Regras adicionais de estilo:
         )
 
         # Log pruning event if context components were partially or fully omitted
-        initial_prompt_len = len(header)
-        final_prompt_len = len(result[0]["content"]) - len(suffix) - 2  # -2 for \n\n
-        if optional_components and final_prompt_len <= initial_prompt_len + 10:
+        if fit_result.pruned:
             logger.info("event=provider_input_pruned stage=generation")
 
-        return result
+        return fit_result.messages

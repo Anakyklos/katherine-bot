@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 
 from .admission_contracts import PROVIDER_INPUT_MAX_ESTIMATED_UNITS, estimate_text_units
 
@@ -202,6 +203,25 @@ def validate_provider_input(
 # Context pruning
 # ---------------------------------------------------------------------------
 
+
+@dataclass(frozen=True)
+class ContextFitResult:
+    """Result of context pruning via ``fit_optional_context()``.
+
+    ``messages``
+        Final messages list that fits within budget.
+
+    ``selected_indices``
+        Indices (into the original optional_context_components) that
+        were included in the final result.
+
+    ``pruned``
+        ``True`` when at least one optional component was excluded.
+    """
+    messages: list
+    selected_indices: frozenset[int]
+    pruned: bool
+
 def _truncate_utf8_safe(text: str, max_bytes: int) -> tuple[str, bool]:
     """Truncate *text* to fit within *max_bytes* UTF-8 bytes.
 
@@ -330,7 +350,11 @@ def fit_optional_context(
         between selection and visual order).
 
     Returns:
-        A new messages list that fits within *max_units*.
+        ``ContextFitResult`` with:
+        - ``messages``: final messages list that fits within *max_units*.
+        - ``selected_indices``: indices of included optional components.
+        - ``pruned``: ``True`` when at least one optional component was excluded.
+
         If *suffix* is provided, it is appended to the system message
         content before being returned.
 
@@ -353,15 +377,38 @@ def fit_optional_context(
     # Validate mandatory messages first
     validate_provider_input(mandatory_messages, max_units=max_units)
 
-    # Start with mandatory messages
+    return _fit_optional_context_impl(
+        mandatory_messages,
+        optional_context_components,
+        max_units=max_units,
+        truncate_long_messages=truncate_long_messages,
+        suffix=suffix,
+        selection_priority=selection_priority,
+    )
+
+
+def _fit_optional_context_impl(
+    mandatory_messages: list,
+    optional_context_components: list[tuple[str, str]],
+    max_units: int = PROVIDER_INPUT_MAX_ESTIMATED_UNITS,
+    truncate_long_messages: bool = False,
+    *,
+    suffix: str = "",
+    selection_priority: list[int] | None = None,
+) -> ContextFitResult:
+    # Already validated by caller (fit_optional_context)
+
     current_messages = list(mandatory_messages)
 
     if not optional_context_components:
-        # Append suffix to system message if provided
         if suffix:
             _append_to_system(current_messages, "\n\n" + suffix)
             validate_provider_input(current_messages, max_units=max_units)
-        return current_messages
+        return ContextFitResult(
+            messages=current_messages,
+            selected_indices=frozenset(),
+            pruned=False,
+        )
 
     # Find system message index
     system_content_index: int | None = None
@@ -371,26 +418,23 @@ def fit_optional_context(
             break
 
     if system_content_index is None:
-        # No system message — optional components can't be added
         if suffix:
             logger.warning("Cannot append suffix: no system message in mandatory messages.")
-        return current_messages
+        return ContextFitResult(
+            messages=current_messages,
+            selected_indices=frozenset(),
+            pruned=False,
+        )
 
-    # Pre-compute the suffix payload once
     suffix_payload = "\n\n" + suffix if suffix else ""
 
-    # Determine selection order: use selection_priority if provided,
-    # otherwise use the visual order (list order)
     if selection_priority is not None:
         _validate_selection_priority(selection_priority, optional_context_components)
         selection_order = selection_priority
     else:
         selection_order = list(range(len(optional_context_components)))
 
-    # Track which components (by index) have been selected
     selected_indices: set[int] = set()
-
-    # Get the mandatory header content (before any optional components)
     mandatory_header = current_messages[system_content_index]["content"]
 
     for idx in selection_order:
@@ -398,10 +442,8 @@ def fit_optional_context(
         if not content:
             continue
 
-        # Tentatively add this component
         selected_indices.add(idx)
 
-        # Build candidate from SCRATCH: mandatory header + all selected components (visual order) + suffix
         candidate_components = [
             optional_context_components[i]
             for i in range(len(optional_context_components))
@@ -421,7 +463,6 @@ def fit_optional_context(
 
         try:
             validate_provider_input(test_messages, max_units=max_units)
-            # Fits — keep it (without suffix in stored content)
             current_messages = test_messages
             if suffix:
                 current_messages[system_content_index] = {
@@ -429,12 +470,10 @@ def fit_optional_context(
                     "content": built_content[:-len(suffix_payload)] if suffix_payload else built_content,
                 }
         except ProviderEnvelopeError:
-            # Doesn't fit — remove from selected
             selected_indices.discard(idx)
             if not truncate_long_messages:
                 continue
             else:
-                # Try truncated version
                 remaining = _estimate_remaining_budget(
                     current_messages, max_units, suffix_payload
                 )
@@ -472,12 +511,18 @@ def fit_optional_context(
                     except ProviderEnvelopeError:
                         selected_indices.discard(idx)
 
-    # Append suffix to final system content
     if suffix:
         current_messages = _append_to_system(current_messages, suffix_payload)
         validate_provider_input(current_messages, max_units=max_units)
 
-    return current_messages
+    total_optional = len(optional_context_components)
+    pruned = len(selected_indices) < total_optional
+
+    return ContextFitResult(
+        messages=current_messages,
+        selected_indices=frozenset(selected_indices),
+        pruned=pruned,
+    )
 
 
 def _validate_selection_priority(

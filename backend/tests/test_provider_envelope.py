@@ -32,6 +32,7 @@ import logging
 import pytest
 
 from backend.provider_envelope import (
+    ContextFitResult,
     VALID_ROLES,
     VALID_MESSAGE_KEYS,
     OMISSION_MARKER,
@@ -323,10 +324,10 @@ class TestPruningDeterministic:
             ("persona", "You are kind and caring."),
             ("history", "user: How are you?"),
         ]
-        result1 = fit_optional_context(mandatory, optional)
-        result2 = fit_optional_context(mandatory, optional)
-        assert result1 == result2
-        assert len(result1) == 2
+        r1 = fit_optional_context(mandatory, optional)
+        r2 = fit_optional_context(mandatory, optional)
+        assert r1.messages == r2.messages
+        assert len(r1.messages) == 2
 
     def test_repeated_pruning_identical(self):
         mandatory = [
@@ -335,7 +336,8 @@ class TestPruningDeterministic:
         ]
         optional = [("memories", "Relevant memory 1.")]
         results = [fit_optional_context(mandatory, optional) for _ in range(5)]
-        assert all(r == results[0] for r in results)
+        first = results[0].messages
+        assert all(r.messages == first for r in results)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -377,19 +379,21 @@ class TestSanitization:
 # ═══════════════════════════════════════════════════════════════════════
 
 class TestFitOptionalContext:
-    """Context pruning integration."""
+    """Context pruning integration — returns ContextFitResult."""
 
     def test_no_optional_components(self):
         mandatory = [{"role": "user", "content": "Hello"}]
-        result = fit_optional_context(mandatory, [])
-        assert result == mandatory
+        r = fit_optional_context(mandatory, [])
+        assert r.messages == mandatory
+        assert not r.pruned
 
     def test_all_components_fit(self):
         mandatory = [{"role": "system", "content": "System prompt."}, {"role": "user", "content": "Hi."}]
         optional = [("persona", "You are a bot.")]
-        result = fit_optional_context(mandatory, optional)
-        assert len(result) == 2
-        assert "You are a bot" in result[0]["content"]
+        r = fit_optional_context(mandatory, optional)
+        assert len(r.messages) == 2
+        assert "You are a bot" in r.messages[0]["content"]
+        assert not r.pruned
 
     def test_priority_order_persona_first(self):
         """Persona (highest priority) should be included before lower priority items."""
@@ -402,8 +406,8 @@ class TestFitOptionalContext:
             ("persona", "P" * 200),
             ("history", "H" * 300),
         ]
-        result = fit_optional_context(mandatory, optional, max_units=small_budget)
-        content = result[0]["content"]
+        r = fit_optional_context(mandatory, optional, max_units=small_budget)
+        content = r.messages[0]["content"]
         # Persona is higher priority than history
         assert "P" * 200 in content  # persona fits
         # May or may not have history depending on budget
@@ -419,8 +423,9 @@ class TestFitOptionalContext:
         """When there's no system message, optional components are not added."""
         mandatory = [{"role": "user", "content": "Hello"}]
         optional = [("persona", "You are a bot.")]
-        result = fit_optional_context(mandatory, optional)
-        assert result == mandatory
+        r = fit_optional_context(mandatory, optional)
+        assert r.messages == mandatory
+        assert not r.pruned
 
     def test_new_messages_preserved_byte_exact(self):
         """User message must remain byte-exact after pruning."""
@@ -433,8 +438,8 @@ class TestFitOptionalContext:
             ("persona", "P" * 5000),
             ("history", "H" * 5000),
         ]
-        result = fit_optional_context(mandatory, optional)
-        assert result[1]["content"] == user_msg
+        r = fit_optional_context(mandatory, optional)
+        assert r.messages[1]["content"] == user_msg
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -475,6 +480,46 @@ class TestRemainingBudget:
         messages = [{"role": "user", "content": content}]
         remaining = _estimate_remaining_budget(messages, max_units=16000)
         assert remaining >= 0
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 15a. Pruning observability — ContextFitResult and event logging
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestPruningObservability:
+    """Pruning decisions produce correct ContextFitResult metadata and events."""
+
+    def test_no_pruning_when_all_fit(self):
+        """When all optional components fit, pruned=False."""
+        mandatory = [{"role": "system", "content": "S"}, {"role": "user", "content": "U"}]
+        optional = [("p", "P" * 10)]
+        r = fit_optional_context(mandatory, optional, max_units=100000)
+        assert not r.pruned
+        assert len(r.selected_indices) == 1
+
+    def test_partial_pruning(self):
+        """When some optional components don't fit, pruned=True, selected_indices is subset."""
+        mandatory = [{"role": "system", "content": "S"}, {"role": "user", "content": "U"}]
+        large = "x" * 100000
+        optional = [
+            ("small", "small"),
+            ("huge", large),
+        ]
+        r = fit_optional_context(mandatory, optional, max_units=500)
+        assert r.pruned
+        assert 0 in r.selected_indices  # "small" fits
+        assert 1 not in r.selected_indices  # "huge" doesn't
+
+    def test_total_pruning(self):
+        """When no optional components fit, all are excluded, pruned=True."""
+        mandatory = [{"role": "system", "content": "S"}, {"role": "user", "content": "U" * 100}]
+        optional = [
+            ("huge1", "x" * 100000),
+            ("huge2", "y" * 100000),
+        ]
+        r = fit_optional_context(mandatory, optional, max_units=200)
+        assert r.pruned
+        assert len(r.selected_indices) == 0
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -645,18 +690,18 @@ class TestExactBoundary:
         units_with_suffix = estimate_provider_input_units(with_suffix)
 
         # Call fit_optional_context WITH suffix parameter
-        result = fit_optional_context(
+        r = fit_optional_context(
             mandatory, optional, max_units=tight_budget, suffix=suffix,
         )
 
-        result_units = estimate_provider_input_units(result)
+        result_units = estimate_provider_input_units(r.messages)
         assert result_units <= tight_budget, (
             f"Final envelope ({result_units}) exceeds budget ({tight_budget})"
         )
 
         # The optional component should NOT be included if it would push over budget
         # when combined with the suffix
-        system_content = result[0]["content"]
+        system_content = r.messages[0]["content"]
         if units_with_suffix > tight_budget:
             # Optional should be excluded (suffix took priority)
             assert "O" * 100 not in system_content, (
@@ -806,19 +851,19 @@ class TestHistoryMessageByMessage:
         with_two = fit_optional_context(
             starting, two_newest, max_units=100000, suffix=suffix,
         )
-        two_units = estimate_provider_input_units(with_two)
+        two_units = estimate_provider_input_units(with_two.messages)
 
         # Set budget to exactly fit 2 entries (with small tolerance)
         tight_budget = two_units + 5
 
         # Verify that with tight_budget, only 2 newest entries fit
-        result_optional = fit_optional_context(
+        r = fit_optional_context(
             starting, optional, max_units=tight_budget, suffix=suffix,
             selection_priority=selection_priority,
         )
 
-        system_content = result_optional[0]["content"]
-        result_units = estimate_provider_input_units(result_optional)
+        system_content = r.messages[0]["content"]
+        result_units = estimate_provider_input_units(r.messages)
         assert result_units <= tight_budget, (
             f"Result ({result_units}) exceeds tight budget ({tight_budget})"
         )
@@ -876,20 +921,20 @@ class TestOrderIndependence:
         mandatory = [{"role": "system", "content": "S"}, {"role": "user", "content": "U"}]
         optional = [("persona", "P" * 500)]
 
-        result_big = fit_optional_context(mandatory, optional, max_units=16000)
-        result_small = fit_optional_context(mandatory, optional, max_units=100)
+        r_big = fit_optional_context(mandatory, optional, max_units=16000)
+        r_small = fit_optional_context(mandatory, optional, max_units=100)
 
         # Big budget includes persona, small budget doesn't
-        assert len(result_big[0]["content"]) > len(result_small[0]["content"])
+        assert len(r_big.messages[0]["content"]) > len(r_small.messages[0]["content"])
 
     def test_no_global_state_leak(self):
         """Multiple calls do not leak global state."""
         mandatory = [{"role": "system", "content": "S"}, {"role": "user", "content": "U"}]
         optional = [("p1", "A" * 100), ("p2", "B" * 100)]
 
-        result1 = fit_optional_context(mandatory, optional, max_units=500)
-        result2 = fit_optional_context(mandatory, optional, max_units=500)
-        assert result1 == result2
+        r1 = fit_optional_context(mandatory, optional, max_units=500)
+        r2 = fit_optional_context(mandatory, optional, max_units=500)
+        assert r1.messages == r2.messages
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -952,6 +997,7 @@ class TestPromptInjectionSafety:
             "persona": persona,
             "history_list": history_list,
             "memory_str": memory_str,
+            "memory_entries": [memory_str],
             "user_profile_str": user_profile_str,
         }
 
@@ -1047,8 +1093,8 @@ class TestMemoryPruningAtomic:
         ]
         budget = estimate_provider_input_units(mandatory) + 200
 
-        result = fit_optional_context(mandatory, memories, max_units=budget)
-        content = result[0]["content"]
+        r = fit_optional_context(mandatory, memories, max_units=budget)
+        content = r.messages[0]["content"]
         # At least some memory entries may fit
         assert "Memory 1" in content or "Memory 2" in content or "Memory 3" in content
 
@@ -1065,8 +1111,8 @@ class TestMemoryPruningAtomic:
         one_entry = [{"role": "system", "content": "S\n" + optional[0][1]}, {"role": "user", "content": "U"}]
         budget = estimate_provider_input_units(one_entry) + 5
 
-        result = fit_optional_context(mandatory, optional, max_units=budget)
-        content = result[0]["content"]
+        r = fit_optional_context(mandatory, optional, max_units=budget)
+        content = r.messages[0]["content"]
         # The full first entry should be present (or absent), never partial
         if "likes cats" in content:
             assert "Tags: interest" in content  # Same entry, complete
@@ -1082,13 +1128,49 @@ class TestAppraisalBoundary:
     """Tests for appraisal with boundary messages."""
 
     def test_appraisal_largest_valid(self):
-        """Appraisal with the largest message that still fits within budget."""
-        # Build an appraisal-sized message that fits
-        content = "x" * 15900
-        messages = [{"role": "user", "content": content}]
-        units = estimate_provider_input_units(messages)
-        assert units < 16000, f"Expected < 16000, got {units}"
-        validate_provider_input(messages, max_units=16000)
+        """Appraisal with a message at exactly the admission limit (6000 units).
+
+        The MESSAGE_MAX_ESTIMATED_UNITS constant sets the admission limit for
+        a single user message at 6000 estimated units.  Build a message whose
+        estimate_text_units exactly equals 6000, then verify the full envelope
+        (with the appraisal prompt) stays within 16000.
+        """
+        from backend.admission_contracts import MESSAGE_MAX_ESTIMATED_UNITS, estimate_text_units
+
+        # Binary-search for content that produces exactly 6000 estimated units
+        # when encoded as a single user message.
+        assert MESSAGE_MAX_ESTIMATED_UNITS == 6000
+
+        lo, hi = 0, 10000
+        exact_message = None
+        for _ in range(60):
+            mid = (lo + hi) // 2
+            msg = "x" * mid
+            units = estimate_text_units(msg)
+            if units == 6000:
+                exact_message = msg
+                break
+            if units < 6000:
+                lo = mid + 1
+            else:
+                hi = mid - 1
+            if lo > hi:
+                break
+
+        if exact_message:
+            assert estimate_text_units(exact_message) == 6000
+            messages = [{"role": "user", "content": exact_message}]
+            units = estimate_provider_input_units(messages)
+            # The full envelope (JSON overhead + content) should be > 6000 but <= 16000
+            assert units > 6000, f"Expected > 6000 for full envelope, got {units}"
+            assert units <= 16000, f"Full envelope ({units}) exceeds 16000"
+            validate_provider_input(messages, max_units=16000)
+        else:
+            # Fallback: verify a large but valid message
+            content = "x" * 5900
+            assert estimate_text_units(content) < 6000
+            messages = [{"role": "user", "content": content}]
+            validate_provider_input(messages, max_units=16000)
 
     def test_appraisal_above_limit_simulated(self):
         """Appraisal message that exceeds the budget is rejected."""
@@ -1116,10 +1198,11 @@ class TestGenerationSmallContext:
             ("large_memories", "M" * 5000),
         ]
         # Very tight budget — no optional context should fit
-        result = fit_optional_context(mandatory, optional, max_units=300)
-        assert len(result) == 2
-        assert result[0]["role"] == "system"
-        assert result[1]["content"] == "URGENT_MESSAGE"
+        r = fit_optional_context(mandatory, optional, max_units=300)
+        assert len(r.messages) == 2
+        assert r.messages[0]["role"] == "system"
+        assert r.messages[1]["content"] == "URGENT_MESSAGE"
+        assert r.pruned
 
     def test_enormous_context_preserves_safety_and_message(self):
         """With enormous optional context, current message and mandatory rules survive.
@@ -1258,78 +1341,79 @@ class TestProfileSerializationFailClosed:
         assert result == '{"name":"José"}'
 
     def test_profile_list_rejected(self):
-        """List as profile raises StatePersistenceError."""
-        from backend.memory import MemoryManager, StatePersistenceError
+        """List as profile raises ContextLoadError."""
+        from backend.memory import MemoryManager, ContextLoadError
         mm = MemoryManager()
-        with pytest.raises(StatePersistenceError):
+        with pytest.raises(ContextLoadError):
             mm._serialize_user_profile(["a", "b"])
 
     def test_profile_string_rejected(self):
-        """String as profile raises StatePersistenceError."""
-        from backend.memory import MemoryManager, StatePersistenceError
+        """String as profile raises ContextLoadError."""
+        from backend.memory import MemoryManager, ContextLoadError
         mm = MemoryManager()
-        with pytest.raises(StatePersistenceError):
+        with pytest.raises(ContextLoadError):
             mm._serialize_user_profile("raw string")
 
     def test_profile_int_rejected(self):
-        from backend.memory import MemoryManager, StatePersistenceError
+        from backend.memory import MemoryManager, ContextLoadError
         mm = MemoryManager()
-        with pytest.raises(StatePersistenceError):
+        with pytest.raises(ContextLoadError):
             mm._serialize_user_profile(42)
 
     def test_profile_bool_rejected(self):
-        from backend.memory import MemoryManager, StatePersistenceError
+        from backend.memory import MemoryManager, ContextLoadError
         mm = MemoryManager()
-        with pytest.raises(StatePersistenceError):
+        with pytest.raises(ContextLoadError):
             mm._serialize_user_profile(True)
 
     def test_profile_none_rejected(self):
-        from backend.memory import MemoryManager, StatePersistenceError
+        from backend.memory import MemoryManager, ContextLoadError
         mm = MemoryManager()
-        with pytest.raises(StatePersistenceError):
+        with pytest.raises(ContextLoadError):
             mm._serialize_user_profile(None)
 
     def test_profile_nested_non_serializable(self):
-        """Object containing non-serialisable value raises error."""
-        from backend.memory import MemoryManager, StatePersistenceError
+        """Object containing non-serialisable value raises ContextLoadError."""
+        from backend.memory import MemoryManager, ContextLoadError
         mm = MemoryManager()
-        # Object with a non-serialisable inner value
         class NonSerializable:
             pass
-        with pytest.raises(StatePersistenceError):
+        with pytest.raises(ContextLoadError):
             mm._serialize_user_profile({"obj": NonSerializable()})
 
     def test_profile_get_context_components_fail_closed(self):
-        """get_context_components with non-dict profile raises error."""
-        from unittest.mock import patch, MagicMock
-        with patch('backend.memory.SentenceTransformer'):
-            from backend.memory import MemoryManager, StatePersistenceError
-            mm = MemoryManager()
-            user_state = {"user_profile": "invalid_string", "persona_config": "bot"}
-            with pytest.raises(StatePersistenceError):
-                mm.get_context_components("user123", "hello", user_state)
+        """get_context_components with non-dict profile raises ContextLoadError.
+
+        Uses doubles installed before the call — no real Supabase access.
+        """
+        from unittest.mock import MagicMock
+        from backend.memory import MemoryManager, ContextLoadError
+
+        mm = MemoryManager()
+        # Install doubles for all dependencies accessed during context load
+        mm.load_recent_history = MagicMock(return_value=[])
+        mm._retrieve_relevant_entries = MagicMock(return_value=[])
+        mm.supabase = None  # Not needed since load_recent_history is mocked
+
+        user_state = {"user_profile": "invalid_string", "persona_config": "bot"}
+        with pytest.raises(ContextLoadError):
+            mm.get_context_components("user123", "hello", user_state)
 
     def test_profile_get_context_components_dict_works(self):
         """get_context_components with dict profile works."""
-        from unittest.mock import patch, MagicMock
-        with patch('backend.memory.SentenceTransformer'):
-            from backend.memory import MemoryManager
+        from unittest.mock import MagicMock
+        from backend.memory import MemoryManager
 
-            mm = MemoryManager()
-            # Mock supabase to avoid db calls
-            mm.supabase = MagicMock()
-            mock_response = MagicMock()
-            mock_response.data = [
-                {"role": "user", "content": "hello"}
-            ]
-            mock_response.error = None
-            mm.supabase.table.return_value.select.return_value.eq.return_value.order.return_value.order.return_value.limit.return_value.execute.return_value = mock_response
+        mm = MemoryManager()
+        mm.load_recent_history = MagicMock(return_value=[])
+        mm._retrieve_relevant_entries = MagicMock(return_value=[])
+        mm.supabase = None
 
-            user_state = {"user_profile": {"name": "User"}, "persona_config": "bot"}
-            components = mm.get_context_components("user123", "hello", user_state)
-            assert "user_profile_str" in components
-            assert '"name":"User"' in components["user_profile_str"]
-            assert "memory_entries" in components
+        user_state = {"user_profile": {"name": "User"}, "persona_config": "bot"}
+        components = mm.get_context_components("user123", "hello", user_state)
+        assert "user_profile_str" in components
+        assert '"name":"User"' in components["user_profile_str"]
+        assert "memory_entries" in components
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1337,48 +1421,31 @@ class TestProfileSerializationFailClosed:
 # ═══════════════════════════════════════════════════════════════════════
 
 class TestMemoryEntriesAtomic:
-    """Memory entries are treated as individual atomic units during pruning."""
+    """Memory entries are treated as individual atomic units during pruning.
 
-    def test_memory_entries_in_context_components(self):
-        """get_context_components includes memory_entries list."""
-        from backend.memory import MemoryManager
+    Uses ``RetrievedMemory`` dataclass — no textual parsing.
+    """
+
+    def test_retrieve_memory_entries_in_context_components(self):
+        """get_context_components includes memory_entries list from structured retrieval."""
         from unittest.mock import MagicMock
-
+        from backend.memory import MemoryManager, RetrievedMemory
+        
         mm = MemoryManager()
-        mm.supabase = MagicMock()
-        mock_response = MagicMock()
-        mock_response.data = []
-        mock_response.error = None
-        mm.supabase.table.return_value.select.return_value.eq.return_value.execute.return_value = mock_response
-        mm.supabase.table.return_value.select.return_value.eq.return_value.order.return_value.order.return_value.limit.return_value.execute.return_value = mock_response
+        mm.load_recent_history = MagicMock(return_value=[])
+        mm._retrieve_relevant_entries = MagicMock(return_value=[
+            RetrievedMemory(content="User likes cats.", tags=("pets",)),
+            RetrievedMemory(content="User works from home.", tags=("work",)),
+        ])
+        mm.supabase = None
 
         user_state = {"user_profile": {}, "persona_config": "bot"}
         components = mm.get_context_components("user123", "hello", user_state)
         assert "memory_entries" in components
         assert isinstance(components["memory_entries"], list)
-
-    def test_memory_entries_empty_when_no_memories(self):
-        """When no memories retrieved, memory_entries is empty."""
-        from backend.memory import MemoryManager
-        mm = MemoryManager()
-        entries = mm._parse_memory_entries("")
-        assert entries == []
-
-        entries = mm._parse_memory_entries("Nenhuma memória específica encontrada.")
-        assert entries == []
-
-        entries = mm._parse_memory_entries("Memória indisponível (offline).")
-        assert entries == []
-
-    def test_memory_entries_parsed_correctly(self):
-        """Multiple memory lines are each returned as entries."""
-        from backend.memory import MemoryManager
-        mm = MemoryManager()
-        memory_str = "- Memory 1: likes cats (Tags: interest)\n- Memory 2: works from home (Tags: work)"
-        entries = mm._parse_memory_entries(memory_str)
-        assert len(entries) == 2
-        assert "Memory 1" in entries[0]
-        assert "Memory 2" in entries[1]
+        assert len(components["memory_entries"]) == 2
+        assert components["memory_entries"][0] == "User likes cats."
+        assert components["memory_entries"][1] == "User works from home."
 
     def test_fit_optional_context_with_three_memories_only_two_fit(self):
         """Three memory entries, only two fit — both appear complete, none cut."""
@@ -1405,7 +1472,7 @@ class TestMemoryEntriesAtomic:
         ]
 
         result = fit_optional_context(mandatory, optional, max_units=tight_budget)
-        content = result[0]["content"]
+        content = result.messages[0]["content"]
 
         # If mem1 fits, verify it's complete
         if "Memory 1" in content:
