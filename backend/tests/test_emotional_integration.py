@@ -107,10 +107,9 @@ def _make_engine(clock=FIXED_CLOCK, archival_extraction_enabled=False):
     })
     engine.memory_manager.sync_state = MagicMock()
     engine.memory_manager.save_turn = MagicMock()
-    engine.memory_manager.get_context = MagicMock(return_value="[mocked context]")
     engine.memory_manager.load_recent_history = MagicMock(return_value=[])
     engine.memory_manager._retrieve_relevant_entries = MagicMock(return_value=[])
-    from backend.trusted_context import ContextBundle, LoadedContextData
+    from backend.trusted_context import LoadedContextData
     engine.memory_manager.load_context_data = MagicMock(return_value=LoadedContextData(
         history_rows=(),
         retrieved_memories=(),
