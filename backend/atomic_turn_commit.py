@@ -31,6 +31,8 @@ Security notes:
 
 from __future__ import annotations
 
+import re
+
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Mapping, Optional
@@ -104,7 +106,7 @@ class CommittedTurn:
             "user_message_id": self.user_message_id,
             "assistant_message_id": self.assistant_message_id,
             "replay_payload": _deep_unfreeze(self.replay_payload),
-            "outbox_events": [_deep_unfreeze(e) for e in self.outbox_events],
+            "outbox_events": [e.to_db_row() for e in self.outbox_events],
             "created_at": self.created_at,
             "completed_at": self.completed_at,
         }
@@ -165,13 +167,44 @@ TURN_REQUEST_STATUS_EXPIRED = "expired"
 # Valid status values for outbox_events (mirrors database CHECK).
 OUTBOX_STATUS_PENDING = "pending"
 
+# UUID regex pattern (same as database: [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})
+_UUID_PATTERN = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
+
+
+def _validate_uuid(value: str, field_name: str) -> None:
+    """Validate that a string is a valid lowercase hex UUID."""
+    if not isinstance(value, str):
+        raise ValidationError(f"invalid_{field_name}", f"must be a string")
+    if not _UUID_PATTERN.match(value):
+        raise ValidationError(f"invalid_{field_name}", "must be a valid lowercase UUID")
+
 
 def _validate_snapshot_payload(payload: Optional[Mapping[str, Any]], field_name: str) -> None:
-    """Validate snapshot payloads (emotional_state, relationship_state) against forbidden keys."""
+    """Validate snapshot payloads (emotional_state, relationship_state) against forbidden keys and schema."""
     if payload is None:
         return
     if not isinstance(payload, Mapping):
         raise ValidationError(f"invalid_{field_name}", f"must be a mapping or None")
+    
+    # Require schema_version field
+    if "schema_version" not in payload:
+        raise ValidationError(
+            f"invalid_{field_name}",
+            "must contain schema_version field",
+        )
+    
+    # schema_version must be integer 1
+    schema_version = payload["schema_version"]
+    if not isinstance(schema_version, int) or isinstance(schema_version, bool):
+        raise ValidationError(
+            f"invalid_{field_name}",
+            "schema_version must be an integer",
+        )
+    if schema_version != 1:
+        raise ValidationError(
+            f"invalid_{field_name}",
+            "schema_version must be 1",
+        )
     
     # Check for forbidden keys recursively
     def _has_forbidden(obj: Any) -> bool:
@@ -259,6 +292,67 @@ def _validate_error_code(code: Optional[str]) -> None:
         )
 
 
+def _validate_outbox_event_payload(payload: Mapping[str, Any], event_index: int) -> None:
+    """Validate outbox event payload against allowlist and forbidden keys."""
+    # Allowed keys for outbox event payload (same as database validation)
+    _OUTBOX_PAYLOAD_ALLOWED_KEYS = {
+        'ref', 'request_id', 'turn_id', 'message_id', 'entity_id', 'kind', 'version'
+    }
+    
+    # Check for allowed keys
+    for key in payload.keys():
+        if key not in _OUTBOX_PAYLOAD_ALLOWED_KEYS:
+            raise ValidationError(
+                "invalid_outbox_events",
+                f"event {event_index}: payload contains disallowed key '{key}'",
+            )
+    
+    # Check for forbidden keys recursively
+    def _has_forbidden(obj: Any) -> bool:
+        if isinstance(obj, Mapping):
+            for k, v in obj.items():
+                if k in _SNAPSHOT_FORBIDDEN_KEYS or _has_forbidden(v):
+                    return True
+        elif isinstance(obj, (list, tuple)):
+            for v in obj:
+                if _has_forbidden(v):
+                    return True
+        return False
+    
+    if _has_forbidden(payload):
+        raise ValidationError(
+            "invalid_outbox_events",
+            f"event {event_index}: payload contains forbidden keys",
+        )
+    
+    # Validate value contract for each field
+    for key, value in payload.items():
+        if key in ('ref', 'request_id', 'turn_id', 'message_id', 'entity_id', 'kind'):
+            # Must be scalar string, max 128 chars
+            if not isinstance(value, str) or not value:
+                raise ValidationError(
+                    "invalid_outbox_events",
+                    f"event {event_index}: payload.{key} must be a non-empty string",
+                )
+            if len(value) > 128:
+                raise ValidationError(
+                    "invalid_outbox_events",
+                    f"event {event_index}: payload.{key} must be <= 128 characters",
+                )
+        elif key == 'version':
+            # Must be integer in range [1, 1000]
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise ValidationError(
+                    "invalid_outbox_events",
+                    f"event {event_index}: payload.version must be an integer",
+                )
+            if value < 1 or value > 1000:
+                raise ValidationError(
+                    "invalid_outbox_events",
+                    f"event {event_index}: payload.version must be in range 1-1000",
+                )
+
+
 def _validate_replay_payload(payload: Mapping[str, Any]) -> None:
     """Validate replay payload keys against the database allowlist."""
     if not isinstance(payload, Mapping):
@@ -342,8 +436,8 @@ def validate_atomic_commit_input(
     if not isinstance(authenticated_user_id, str) or not authenticated_user_id:
         raise ValidationError("invalid_user_id", "must be a non-empty string")
 
-    if not isinstance(request_id, str) or not request_id:
-        raise ValidationError("invalid_request_id", "must be a non-empty string")
+    # Validate request_id is a valid UUID
+    _validate_uuid(request_id, "request_id")
 
     # expected_revision must be an integer, not bool (bool is subclass of int in Python)
     if not isinstance(expected_revision, int) or isinstance(expected_revision, bool):
@@ -371,15 +465,33 @@ def validate_atomic_commit_input(
     if not isinstance(outbox_events, list):
         raise ValidationError("invalid_outbox_events", "must be a list")
 
+    # Event type regex pattern (same as database: ^[a-z0-9_]{1,64}$)
+    _EVENT_TYPE_PATTERN = re.compile(r'^[a-z0-9_]{1,64}$')
+    
+    # Outbox payload forbidden keys (same as database validation)
+    _OUTBOX_FORBIDDEN_KEYS = FORBIDDEN_PAYLOAD_KEYS
+    
     for i, (event_type, payload, idempotency_key) in enumerate(outbox_events):
+        # Validate event_type
         if not isinstance(event_type, str) or not event_type:
             raise ValidationError(
                 "invalid_outbox_events", f"event {i}: event_type must be a non-empty string"
             )
+        if not _EVENT_TYPE_PATTERN.match(event_type):
+            raise ValidationError(
+                "invalid_outbox_events",
+                f"event {i}: event_type must match ^[a-z0-9_]{{1,64}}$",
+            )
+        
+        # Validate payload
         if not isinstance(payload, Mapping):
             raise ValidationError(
                 "invalid_outbox_events", f"event {i}: payload must be a mapping"
             )
+        
+        # Validate payload keys (allowlist and forbidden)
+        _validate_outbox_event_payload(payload, i)
+        
         _validate_idempotency_key(idempotency_key)
 
     _validate_replay_payload(replay_payload)
@@ -501,19 +613,21 @@ def parse_commit_turn_result(result: Mapping[str, Any]) -> CommittedTurn:
             expected = error_info.get("expected_revision")
             actual = error_info.get("actual_revision")
             request = error_info.get("request_id")
-            raise ConflictError(
-                code=code,
-                message=message,
-                expected_revision=expected if isinstance(expected, int) else None,
-                actual_revision=actual if isinstance(actual, int) else None,
-                request_id=request if isinstance(request, str) else None,
-            )
+            # Only raise ConflictError for known conflict codes
+            # database_error should raise a different exception
+            if code in ("revision_mismatch", "request_payload_conflict"):
+                raise ConflictError(
+                    code=code,
+                    message=message,
+                    expected_revision=expected if isinstance(expected, int) else None,
+                    actual_revision=actual if isinstance(actual, int) else None,
+                    request_id=request if isinstance(request, str) else None,
+                )
+            else:
+                # For database_error and other unknown errors, raise ValidationError
+                raise ValidationError(code, message)
         else:
-            raise ConflictError(
-                code="unknown_error",
-                message=str(error_info),
-                expected_revision=0,
-            )
+            raise ValidationError("invalid_error_format", "error field must be a mapping")
 
     try:
         user_id = result["user_id"]
@@ -530,12 +644,37 @@ def parse_commit_turn_result(result: Mapping[str, Any]) -> CommittedTurn:
     except KeyError as e:
         raise ValidationError("invalid_rpc_result", f"missing field: {e}")
 
+    # Validate field types - fail on type mismatch, don't silently convert
+    if not isinstance(user_id, str):
+        raise ValidationError("invalid_user_id", "user_id must be a string")
+    if not isinstance(request_id, str):
+        raise ValidationError("invalid_request_id", "request_id must be a string")
+    if not isinstance(committed_revision, int):
+        raise ValidationError("invalid_committed_revision", "committed_revision must be an integer")
+    if not isinstance(user_message_chat_log_id, int):
+        raise ValidationError("invalid_user_message_chat_log_id", "user_message_chat_log_id must be an integer")
+    if not isinstance(assistant_message_chat_log_id, int):
+        raise ValidationError("invalid_assistant_message_chat_log_id", "assistant_message_chat_log_id must be an integer")
+    if not isinstance(user_message_id, str):
+        raise ValidationError("invalid_user_message_id", "user_message_id must be a string")
+    if not isinstance(assistant_message_id, str):
+        raise ValidationError("invalid_assistant_message_id", "assistant_message_id must be a string")
+    if not isinstance(replay_payload, Mapping):
+        raise ValidationError("invalid_replay_payload", "replay_payload must be a mapping")
+    if not isinstance(outbox_events_raw, list):
+        raise ValidationError("invalid_outbox_events", "outbox_events must be a list")
+    if not isinstance(created_at, str):
+        raise ValidationError("invalid_created_at", "created_at must be a string")
+    if not isinstance(completed_at, str):
+        raise ValidationError("invalid_completed_at", "completed_at must be a string")
+
     # Parse outbox events
     outbox_events: list[OutboxEventRecord] = []
-    if isinstance(outbox_events_raw, list):
-        for evt in outbox_events_raw:
-            if isinstance(evt, Mapping):
-                outbox_events.append(OutboxEventRecord.from_db_row(evt))
+    for evt in outbox_events_raw:
+        if isinstance(evt, Mapping):
+            outbox_events.append(OutboxEventRecord.from_db_row(evt))
+        else:
+            raise ValidationError("invalid_outbox_event", "each outbox event must be a mapping")
 
     return CommittedTurn(
         user_id=user_id,
@@ -545,7 +684,7 @@ def parse_commit_turn_result(result: Mapping[str, Any]) -> CommittedTurn:
         assistant_message_chat_log_id=assistant_message_chat_log_id,
         user_message_id=user_message_id,
         assistant_message_id=assistant_message_id,
-        replay_payload=replay_payload if isinstance(replay_payload, Mapping) else {},
+        replay_payload=dict(replay_payload),  # Ensure it's a mutable dict for deep-freeze
         outbox_events=outbox_events,
         created_at=created_at,
         completed_at=completed_at,

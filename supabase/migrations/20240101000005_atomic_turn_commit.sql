@@ -250,15 +250,39 @@ BEGIN
         END IF;
     END IF;
 
-    -- Validate emotional_state snapshot (no forbidden keys)
-    IF p_emotional_state IS NOT NULL AND jsonb_typeof(p_emotional_state) = 'object' THEN
+    -- Validate emotional_state snapshot (must be object or null, has schema_version, no forbidden keys)
+    IF p_emotional_state IS NOT NULL THEN
+        IF jsonb_typeof(p_emotional_state) <> 'object' THEN
+            RAISE EXCEPTION 'emotional_state must be a JSON object or null' USING ERRCODE = 'P0001';
+        END IF;
+        -- Require schema_version field
+        IF (p_emotional_state->>'schema_version') IS NULL THEN
+            RAISE EXCEPTION 'emotional_state must have schema_version' USING ERRCODE = 'P0001';
+        END IF;
+        -- schema_version must be integer 1
+        IF (p_emotional_state->>'schema_version')::text <> '1' THEN
+            RAISE EXCEPTION 'emotional_state schema_version must be 1' USING ERRCODE = 'P0001';
+        END IF;
+        -- Check for forbidden keys
         IF public.jsonb_has_forbidden_key(p_emotional_state, v_snapshot_forbidden_keys) THEN
             RAISE EXCEPTION 'emotional_state contains forbidden keys' USING ERRCODE = 'P0001';
         END IF;
     END IF;
 
-    -- Validate relationship_state snapshot (no forbidden keys)
-    IF p_relationship_state IS NOT NULL AND jsonb_typeof(p_relationship_state) = 'object' THEN
+    -- Validate relationship_state snapshot (must be object or null, has schema_version, no forbidden keys)
+    IF p_relationship_state IS NOT NULL THEN
+        IF jsonb_typeof(p_relationship_state) <> 'object' THEN
+            RAISE EXCEPTION 'relationship_state must be a JSON object or null' USING ERRCODE = 'P0001';
+        END IF;
+        -- Require schema_version field
+        IF (p_relationship_state->>'schema_version') IS NULL THEN
+            RAISE EXCEPTION 'relationship_state must have schema_version' USING ERRCODE = 'P0001';
+        END IF;
+        -- schema_version must be integer 1
+        IF (p_relationship_state->>'schema_version')::text <> '1' THEN
+            RAISE EXCEPTION 'relationship_state schema_version must be 1' USING ERRCODE = 'P0001';
+        END IF;
+        -- Check for forbidden keys
         IF public.jsonb_has_forbidden_key(p_relationship_state, v_snapshot_forbidden_keys) THEN
             RAISE EXCEPTION 'relationship_state contains forbidden keys' USING ERRCODE = 'P0001';
         END IF;
@@ -337,7 +361,8 @@ BEGIN
                 v_outbox_results := '[]'::jsonb;
             END IF;
             
-            -- Return the stored assistant_message_id from chat_logs for reproducibility
+            -- Return the stored assistant_message_id for reproducibility
+            -- Use the chat_log_id directly as string (durable, doesn't depend on chat_logs existence)
             v_result := jsonb_build_object(
                 'user_id', p_authenticated_user_id,
                 'request_id', p_request_id::text,
@@ -345,11 +370,7 @@ BEGIN
                 'user_message_chat_log_id', v_existing_user_message_chat_log_id,
                 'assistant_message_chat_log_id', v_existing_assistant_message_chat_log_id,
                 'user_message_id', p_request_id::text,
-                'assistant_message_id', (
-                    SELECT id::text FROM public.chat_logs
-                    WHERE user_id = p_authenticated_user_id 
-                      AND id = v_existing_assistant_message_chat_log_id
-                ),
+                'assistant_message_id', v_existing_assistant_message_chat_log_id::text,
                 'replay_payload', COALESCE(v_existing_replay_payload, '{}'::jsonb),
                 'outbox_events', v_outbox_results,
                 'created_at', v_existing_created_at::text,

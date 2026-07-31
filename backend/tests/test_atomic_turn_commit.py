@@ -54,7 +54,7 @@ from backend.transactional_schema import (
 _PURITY_SCRIPT = '''
 import sys
 import os as _os
-import socket as _socket
+import socket
 
 class _FailEnv:
     def __getitem__(self, key):
@@ -82,8 +82,13 @@ def _raise_getenv(key, default=None):
     raise RuntimeError(f"os.getenv read: {key!r}")
 _os.getenv = _raise_getenv
 
+# Patch socket.socket directly (not _os.socket)
+_original_socket = socket.socket
 def _raise_socket(*args, **kwargs):
     raise OSError("socket.socket blocked")
+socket.socket = _raise_socket
+
+# Also patch _os.socket for backward compatibility
 _os.socket = _raise_socket
 
 _BLOCKED = frozenset({
@@ -92,9 +97,13 @@ _BLOCKED = frozenset({
     "backend.engine", "backend.memory", "backend.trusted_context",
 })
 
+# Allow backend.transactional_schema but block others
+_BLOCKED_PREFIXES = ("backend.engine", "backend.memory", "backend.trusted_context",
+                    "tests.", "backend.tests.")
+
 class _BlockImport:
     def find_module(self, name, path=None):
-        if name in _BLOCKED or name.startswith(("backend.", "tests.")):
+        if name in _BLOCKED or name.startswith(_BLOCKED_PREFIXES):
             raise ImportError(f"blocked: {name}")
         return None
 
@@ -225,12 +234,12 @@ class TestValidateAtomicCommitInput:
     def valid_inputs(self):
         return {
             "authenticated_user_id": "user_123",
-            "request_id": "req_456",
+            "request_id": "12345678-1234-1234-1234-123456789abc",
             "expected_revision": 0,
             "user_message": "Hello",
             "assistant_message": "Hi there!",
-            "emotional_state": {"mood": "happy"},
-            "relationship_state": {"trust": 0.8},
+            "emotional_state": {"schema_version": 1, "mood": "happy"},
+            "relationship_state": {"schema_version": 1, "trust": 0.8},
             "public_response": "Hi there!",
             "outbox_events": [("turn_completed", {"ref": "turn_1"}, "turn_1_priv")],
             "replay_payload": {"response": "Hi there!", "duration_ms": 100},
@@ -250,6 +259,13 @@ class TestValidateAtomicCommitInput:
         with pytest.raises(ValidationError) as exc:
             validate_atomic_commit_input(**valid_inputs)
         assert "invalid_request_id" in str(exc.value)
+
+    def test_invalid_uuid_request_id(self, valid_inputs):
+        valid_inputs["request_id"] = "not-a-valid-uuid"
+        with pytest.raises(ValidationError) as exc:
+            validate_atomic_commit_input(**valid_inputs)
+        assert "invalid_request_id" in str(exc.value)
+        assert "UUID" in str(exc.value)
 
     def test_negative_revision(self, valid_inputs):
         valid_inputs["expected_revision"] = -1
@@ -320,6 +336,34 @@ class TestValidateAtomicCommitInput:
     def test_none_relationship_state(self, valid_inputs):
         valid_inputs["relationship_state"] = None
         validate_atomic_commit_input(**valid_inputs)
+
+    def test_emotional_state_missing_schema_version(self, valid_inputs):
+        valid_inputs["emotional_state"] = {"mood": "happy"}
+        with pytest.raises(ValidationError) as exc:
+            validate_atomic_commit_input(**valid_inputs)
+        assert "invalid_emotional_state" in str(exc.value)
+        assert "schema_version" in str(exc.value)
+
+    def test_emotional_state_invalid_schema_version(self, valid_inputs):
+        valid_inputs["emotional_state"] = {"schema_version": 2, "mood": "happy"}
+        with pytest.raises(ValidationError) as exc:
+            validate_atomic_commit_input(**valid_inputs)
+        assert "invalid_emotional_state" in str(exc.value)
+        assert "schema_version must be 1" in str(exc.value)
+
+    def test_relationship_state_missing_schema_version(self, valid_inputs):
+        valid_inputs["relationship_state"] = {"trust": 0.8}
+        with pytest.raises(ValidationError) as exc:
+            validate_atomic_commit_input(**valid_inputs)
+        assert "invalid_relationship_state" in str(exc.value)
+        assert "schema_version" in str(exc.value)
+
+    def test_relationship_state_invalid_schema_version(self, valid_inputs):
+        valid_inputs["relationship_state"] = {"schema_version": 0, "trust": 0.8}
+        with pytest.raises(ValidationError) as exc:
+            validate_atomic_commit_input(**valid_inputs)
+        assert "invalid_relationship_state" in str(exc.value)
+        assert "schema_version must be 1" in str(exc.value)
 
     def test_empty_outbox_events(self, valid_inputs):
         valid_inputs["outbox_events"] = []
@@ -469,7 +513,7 @@ class TestParseCommitTurnResult:
             "error": {
                 "code": "request_payload_conflict",
                 "message": "Request ID already exists with different payload",
-                "request_id": "req_123",
+                "request_id": "12345678-1234-1234-1234-123456789abc",
             }
         }
         with pytest.raises(ConflictError) as exc:
@@ -477,7 +521,7 @@ class TestParseCommitTurnResult:
 
         error = exc.value
         assert error.code == "request_payload_conflict"
-        assert error.request_id == "req_123"
+        assert error.request_id == "12345678-1234-1234-1234-123456789abc"
 
     def test_parse_invalid_result_not_mapping(self):
         with pytest.raises(ValidationError) as exc:
@@ -507,7 +551,7 @@ class TestCommittedTurn:
     def committed_turn(self):
         return CommittedTurn(
             user_id="user_123",
-            request_id="req_456",
+            request_id="87654321-4321-4321-4321-cba987654321",
             committed_revision=1,
             user_message_chat_log_id=100,
             assistant_message_chat_log_id=101,
@@ -522,7 +566,7 @@ class TestCommittedTurn:
     def test_to_db_row(self, committed_turn):
         row = committed_turn.to_db_row()
         assert row["user_id"] == "user_123"
-        assert row["request_id"] == "req_456"
+        assert row["request_id"] == "87654321-4321-4321-4321-cba987654321"
         assert row["committed_revision"] == 1
         assert isinstance(row["replay_payload"], dict)
         assert isinstance(row["outbox_events"], list)
@@ -539,14 +583,14 @@ class TestConflictError:
             message="Revision mismatch",
             expected_revision=5,
             actual_revision=6,
-            request_id="req_123",
+            request_id="12345678-1234-1234-1234-123456789abc",
         )
         error_str = str(error)
         assert "revision_mismatch" in error_str
         assert "Revision mismatch" in error_str
         assert "expected_revision=5" in error_str
         assert "actual_revision=6" in error_str
-        assert "request_id=req_123" in error_str
+        assert "request_id=12345678-1234-1234-1234-123456789abc" in error_str
 
     def test_is_exception(self):
         """Test that ConflictError is an Exception subclass."""
@@ -620,7 +664,7 @@ class TestNoSharedMutableState:
         # Call validation multiple times with different inputs
         validate_atomic_commit_input(
             authenticated_user_id="user_1",
-            request_id="req_1",
+            request_id="11111111-1111-1111-1111-111111111111",
             expected_revision=0,
             user_message="Hello",
             assistant_message="Hi",
@@ -632,7 +676,7 @@ class TestNoSharedMutableState:
         )
         validate_atomic_commit_input(
             authenticated_user_id="user_2",
-            request_id="req_2",
+            request_id="22222222-2222-2222-2222-222222222222",
             expected_revision=1,
             user_message="Goodbye",
             assistant_message="Bye",
@@ -647,7 +691,7 @@ class TestNoSharedMutableState:
         """Payload building doesn't retain state between calls."""
         result1 = build_commit_turn_rpc_payload(
             authenticated_user_id="user_1",
-            request_id="req_1",
+            request_id="11111111-1111-1111-1111-111111111111",
             expected_revision=0,
             user_message="Hello",
             assistant_message="Hi",
@@ -661,7 +705,7 @@ class TestNoSharedMutableState:
         )
         result2 = build_commit_turn_rpc_payload(
             authenticated_user_id="user_2",
-            request_id="req_2",
+            request_id="22222222-2222-2222-2222-222222222222",
             expected_revision=0,
             user_message="Hello",
             assistant_message="Hi",
@@ -723,7 +767,7 @@ class TestEdgeCases:
             "response": "test",
             "emotion_state": {},
             "message_id": "msg_1",
-            "request_id": "req_1",
+            "request_id": "11111111-1111-1111-1111-111111111111",
             "duration_ms": 100,
         }
         _validate_replay_payload(payload)
@@ -731,7 +775,7 @@ class TestEdgeCases:
     def test_validation_with_large_revision(self):
         validate_atomic_commit_input(
             authenticated_user_id="user_1",
-            request_id="req_1",
+            request_id="11111111-1111-1111-1111-111111111111",
             expected_revision=2**60,  # Large but valid
             user_message="Hello",
             assistant_message="Hi",
@@ -745,7 +789,7 @@ class TestEdgeCases:
     def test_validation_with_zero_revision(self):
         validate_atomic_commit_input(
             authenticated_user_id="user_1",
-            request_id="req_1",
+            request_id="11111111-1111-1111-1111-111111111111",
             expected_revision=0,
             user_message="Hello",
             assistant_message="Hi",
