@@ -136,29 +136,51 @@ and confidence is independent of retrieval score.
 ## Budget / Pruning
 
 - Hard cap: **16,000 estimated units** (from `PROVIDER_INPUT_MAX_ESTIMATED_UNITS`).
-- Mandatory: system message + current user message.
+- Mandatory: system message + current user message — never truncated.
 - Selection priority: history (most recent) → approved memories (by relevance)
   → profile (legacy) → persona (legacy).
 - Each message or item is selected **atomically** — never cut in the middle.
-- Selected history is rendered in **chronological order**.
+- Selected history is rendered in **chronological order** based on
+  `sort_key = (created_at, id)`.  When `created_at` ties, `id` is used as
+  tiebreaker.
 - The unit count is estimated on the **canonical JSON** of the final messages
   list.
+- The `TruncationReport` from bundle construction is **aggregated** with
+  envelope pruning decisions — codes deduplicated, counts summed.
+- A large profile (or memory/persona) cannot expel more‑recent history messages;
+  recency priority is enforced.
 
 ## Memory Validation
 
 A memory entry enters the context bundle **only** when:
 
 1. The row belongs to the authenticated user (enforced by DB query).
-2. The UUID returned is valid (non‑empty string).
+2. The UUID returned is structurally valid — parsable by `uuid.UUID()`, never empty.
 3. Content is valid (non‑empty string).
-4. Metadata has a recognised version (`metadata_version >= 1`).
+4. Metadata has the exact supported version (`SUPPORTED_MEMORY_METADATA_SCHEMA_VERSION == 1`).
+   Rejected: absent, bool, zero, negative, future (>1), string, float.
 5. `approved is True` with exact boolean type.
 6. Provenance belongs to the allowlist.
 7. Confidence is finite and in range.
 8. Epistemic status belongs to the allowlist.
 
+The `metadata` contract for schema version 1:
+
+```json
+{
+  "schema_version": 1,
+  "approved": true,
+  "provenance": "user_confirmed",
+  "confidence": 0.9,
+  "epistemic_status": "approved",
+  "tags": ["..."]
+}
+```
+
 Legacy memories that do not satisfy this contract are **silently ignored**
-with a debug log event (`context_memory_unapproved`).
+with a debug log event (`context_item_rejected code=unsupported_metadata_version`).
+Incomplete metadata (non‑dict, missing keys, wrong types) causes the document
+to be **individually skipped**, without discarding adjacent valid documents.
 
 ## Fail‑Closed Behaviour
 
@@ -175,8 +197,11 @@ All log events are low‑cardinality and contain no user content, prompts,
 UUIDs, or sensitive data:
 
 - `event=context_memory_unapproved` — Memory skipped due to `approved != True`
-- `event=context_item_rejected` — Item rejected (with code)
+- `event=context_item_rejected code=memory_legacy` — Legacy memory without contract
+- `event=context_item_rejected code=unsupported_metadata_version` — Unsupported schema
 - `event=context_pruned` — Context omitted due to budget
+- `event=provider_input_invalid stage=generation` — Envelope construction failure
+  (converted to `TurnExecutionError(provider_invalid_request)` before provider call)
 
 ## Appraisal
 
@@ -232,9 +257,26 @@ docs/
 4. **No real IDs to provider.**  UUIDs, user IDs, and internal keys are
    never sent.  Only opaque local references appear in untrusted JSON.
 5. **Memory approval required.**  Only memories with `approved=True`,
-   valid metadata, and valid confidence enter the context.
+   valid metadata (`schema_version == 1`), and valid confidence enter
+   the context.
 6. **Similarity ≠ confidence.**  Retrieval score is separate from
    factual confidence.
 7. **Fail closed before provider.**  Budget validation and structural
    checks happen before any network call.
-8. **Low‑cardinality logs.**  No content, UUIDs, or sensitive data in logs.
+8. **UUID validation.**  Source IDs from RPC must be structurally valid
+   UUIDs (parsable by `uuid.UUID()`).  Real UUIDs appear only in
+   `source_map` — never in messages or logs.
+9. **Sort key stability.**  History is ordered by `(created_at, id)`.
+   Identical timestamps are tie‑broken by ascending `id`.
+10. **TruncationReport aggregation.**  Pre‑existing truncation codes
+    from bundle construction are aggregated with envelope pruning
+    decisions; duplicate codes are removed.
+11. **ContextBundle validation.**  `trusted_policy` is non‑empty string.
+    `history`, `profile_items`, `memory_items`, `persona_items` are
+    tuples of the correct typed objects (`ChatMessage`, `ContextItem`).
+    `truncation_report` is a `TruncationReport`.
+12. **Builder failure conversion.**  `TrustedContextError` raised during
+    `build_context_bundle()` or `build_envelope()` is converted to
+    `TurnExecutionError(provider_invalid_request)` with sanitized
+    logging (`event=provider_input_invalid stage=generation`).
+13. **Low‑cardinality logs.**  No content, UUIDs, or sensitive data in logs.
