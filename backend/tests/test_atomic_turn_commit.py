@@ -33,6 +33,7 @@ from backend.atomic_turn_commit import (
     validate_atomic_commit_input,
     build_commit_turn_rpc_payload,
     parse_commit_turn_result,
+    commit_turn,
     _validate_idempotency_key,
     _validate_lease_owner,
     _validate_error_code,
@@ -848,3 +849,104 @@ class TestEdgeCases:
             outbox_events=[],
             replay_payload={},
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 10. Async commit_turn path
+# ═══════════════════════════════════════════════════════════════════════
+
+
+class TestAsyncCommitTurn:
+    """Test the async commit_turn function directly."""
+
+    @pytest.fixture
+    def valid_inputs(self):
+        return {
+            "authenticated_user_id": "user_123",
+            "request_id": "12345678-1234-1234-1234-123456789abc",
+            "expected_revision": 0,
+            "user_message": "Hello",
+            "assistant_message": "Hi there!",
+            "emotional_state": {"schema_version": 1, "mood": "happy"},
+            "relationship_state": {"schema_version": 1, "trust": 0.8},
+            "public_response": "Hi there!",
+            "outbox_events": [("turn_completed", {"ref": "turn_1"}, "turn_1_key")],
+            "replay_payload": {"response": "Hi there!", "duration_ms": 100},
+        }
+
+    @pytest.fixture
+    def mock_rpc_client(self):
+        """Create a mock RPC client that returns a successful result."""
+        async def _mock_rpc(name: str, params: dict) -> Mapping[str, Any]:
+            return {
+                "user_id": "user_123",
+                "request_id": "12345678-1234-1234-1234-123456789abc",
+                "committed_revision": 1,
+                "user_message_chat_log_id": 100,
+                "assistant_message_chat_log_id": 101,
+                "user_message_id": "12345678-1234-1234-1234-123456789abc",
+                "assistant_message_id": "87654321-4321-4321-4321-cba987654321",
+                "replay_payload": {"response": "Hi there!", "duration_ms": 100},
+                "outbox_events": [
+                    {
+                        "id": "evt_1",
+                        "event_type": "turn_completed",
+                        "user_id": "user_123",
+                        "payload": {"ref": "turn_1"},
+                        "status": "pending",
+                        "idempotency_key": "turn_1_key",
+                        "turn_request_id": "12345678-1234-1234-1234-123456789abc",
+                        "contract_version": 1,
+                        "attempts": 0,
+                        "next_attempt_at": "2024-01-01T00:00:01Z",
+                        "created_at": "2024-01-01T00:00:00Z",
+                        "updated_at": "2024-01-01T00:00:00Z",
+                    }
+                ],
+                "created_at": "2024-01-01T00:00:00Z",
+                "completed_at": "2024-01-01T00:00:00Z",
+            }
+        return _mock_rpc
+
+    @pytest.mark.asyncio
+    async def test_commit_turn_success(self, valid_inputs, mock_rpc_client):
+        """Test that commit_turn successfully validates, builds payload, calls RPC, and parses result."""
+        result = await commit_turn(
+            rpc_client=mock_rpc_client,
+            **valid_inputs,
+        )
+
+        assert isinstance(result, CommittedTurn)
+        assert result.user_id == "user_123"
+        assert result.request_id == "12345678-1234-1234-1234-123456789abc"
+        assert result.committed_revision == 1
+
+    @pytest.mark.asyncio
+    async def test_commit_turn_validation_error(self, mock_rpc_client):
+        """Test that commit_turn raises ValidationError for invalid input."""
+        with pytest.raises(ValidationError) as exc:
+            await commit_turn(
+                rpc_client=mock_rpc_client,
+                authenticated_user_id="",  # Invalid: empty
+                request_id="12345678-1234-1234-1234-123456789abc",
+                expected_revision=0,
+                user_message="Hello",
+                assistant_message="Hi",
+                emotional_state=None,
+                relationship_state=None,
+                public_response="Hi",
+                outbox_events=[],
+                replay_payload={},
+            )
+        assert "invalid_user_id" in str(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_commit_turn_with_lease_owner(self, valid_inputs, mock_rpc_client):
+        """Test that commit_turn accepts lease_owner parameter."""
+        result = await commit_turn(
+            rpc_client=mock_rpc_client,
+            lease_owner="worker-1",
+            **valid_inputs,
+        )
+
+        assert isinstance(result, CommittedTurn)
