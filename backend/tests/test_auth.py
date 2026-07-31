@@ -25,30 +25,33 @@ def mock_external_dependencies():
     }
     os.environ.update(mock_env)
 
-    # Mock modules before importing
-    sys.modules['sentence_transformers'] = MagicMock()
-    sys.modules['supabase'] = MagicMock()
+    # Mock modules before importing — save originals for exact restore
+    _mocked_keys: set[str] = set()
+    for _key in ('sentence_transformers', 'supabase'):
+        _original_modules.setdefault(_key, sys.modules.get(_key))
+        sys.modules[_key] = MagicMock()
+        _mocked_keys.add(_key)
 
     yield
 
-    # Restore modules directionally:
-    # - If the module existed before the fixture, restore the ORIGINAL object
-    # - If the module was added by the fixture, remove it
+    # Restore only the modules that this fixture explicitly touched.
+    # NEVER iterate over all backend.* modules — that destroys class
+    # identity for modules imported by other test files during the
+    # same session (e.g. backend.trusted_context, backend.memory).
     def _restore_module(name):
-        if name in _original_modules:
+        if name in _original_modules and _original_modules[name] is not None:
             sys.modules[name] = _original_modules[name]
         elif name in sys.modules:
             del sys.modules[name]
 
-    _restore_module('backend.main')
-    _restore_module('sentence_transformers')
-    _restore_module('supabase')
+    for _key in _mocked_keys:
+        _restore_module(_key)
 
-    # Restore backend modules that were added during this test module
-    # (not present in the pre-fixture snapshot)
-    for k in list(sys.modules.keys()):
-        if k.startswith('backend.') and k not in _original_modules:
-            del sys.modules[k]
+    # Explicitly restore only backend.main if it existed before
+    if 'backend.main' in _original_modules:
+        sys.modules['backend.main'] = _original_modules['backend.main']
+    elif 'backend.main' in sys.modules:
+        del sys.modules['backend.main']
 
     os.environ.clear()
     os.environ.update(_original_env)
@@ -429,6 +432,11 @@ def test_fixture_teardown_preserves_existing_modules():
     Este teste executa diretamente a lógica de setup/teardown do
     fixture ``mock_external_dependencies`` sem depender do decorador
     autouse scope=module.
+
+    A nova implementação do fixture:
+    1. Registra as chaves explicitamente mockadas em _mocked_keys.
+    2. No teardown, restaura somente as chaves em _mocked_keys.
+    3. NÃO percorre todos os módulos backend.* para removê-los.
     """
     sentinel_main = object()
     sentinel_sb = object()
@@ -446,21 +454,30 @@ def test_fixture_teardown_preserves_existing_modules():
         sys.modules["supabase"] = sentinel_sb
         sys.modules["sentence_transformers"] = sentinel_st
 
-        # 2. Simulate fixture setup: snapshot + replace with mocks
+        # 2. Simulate fixture setup: snapshot + replace specific keys with mocks
         _original_modules = dict(sys.modules)
-        sys.modules["sentence_transformers"] = MagicMock()
-        sys.modules["supabase"] = MagicMock()
+        _mocked_keys: set[str] = set()
+        for _key in ('sentence_transformers', 'supabase'):
+            _original_modules.setdefault(_key, sys.modules.get(_key))
+            sys.modules[_key] = MagicMock()
+            _mocked_keys.add(_key)
 
-        # 3. Simulate fixture teardown with directional restore
+        # 3. Simulate fixture teardown (NEW implementation):
+        #    Restore only the explicitly mocked keys, never backend.*
         def _restore_module(name):
-            if name in _original_modules:
+            if name in _original_modules and _original_modules[name] is not None:
                 sys.modules[name] = _original_modules[name]
             elif name in sys.modules:
                 del sys.modules[name]
 
-        _restore_module("backend.main")
-        _restore_module("sentence_transformers")
-        _restore_module("supabase")
+        for _key in _mocked_keys:
+            _restore_module(_key)
+
+        # Explicitly restore backend.main if it existed before
+        if 'backend.main' in _original_modules:
+            sys.modules['backend.main'] = _original_modules['backend.main']
+        elif 'backend.main' in sys.modules:
+            del sys.modules['backend.main']
 
         # 4. Assert identity is preserved (original objects restored)
         assert sys.modules.get("backend.main") is sentinel_main, \
@@ -469,6 +486,11 @@ def test_fixture_teardown_preserves_existing_modules():
             "supabase should be restored to original sentinel"
         assert sys.modules.get("sentence_transformers") is sentinel_st, \
             "sentence_transformers should be restored to original sentinel"
+
+        # 5. Assert that NO backend.* modules were removed (key fix of the new impl)
+        for k in list(sys.modules.keys()):
+            if k.startswith('backend.') and k not in _original_modules:
+                assert k in sys.modules, f"{k} should NOT have been removed"
     finally:
         # Restore actual modules
         for name in ("backend.main", "supabase", "sentence_transformers"):

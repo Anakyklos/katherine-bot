@@ -21,18 +21,17 @@ def test_imports():
 
         assert backend.main.app is not None
     finally:
-        # Restore environment and modules directionally
-        if 'backend.main' in sys.modules:
-            del sys.modules['backend.main']
-        if 'sentence_transformers' in sys.modules:
-            del sys.modules['sentence_transformers']
-        if 'supabase' in sys.modules:
-            del sys.modules['supabase']
-
-        # Restore what was actually added during the test
-        for k in list(sys.modules.keys()):
-            if k.startswith('backend.'):
-                del sys.modules[k]
+        # Restore ONLY the keys this test explicitly touched.
+        # Never remove all backend.* modules generically: that destroys
+        # class identity for modules imported naturally by other test
+        # files during the same session (e.g. backend.trusted_context,
+        # backend.memory, backend.engine).
+        for _key in ('backend.main', 'sentence_transformers', 'supabase'):
+            _original = _original_modules.get(_key)
+            if _original is not None:
+                sys.modules[_key] = _original
+            elif _key in sys.modules:
+                del sys.modules[_key]
 
         os.environ.clear()
         os.environ.update(_original_env)

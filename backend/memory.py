@@ -1,6 +1,7 @@
 import json
 import os
 import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime, UTC
 from supabase import create_client, Client
@@ -10,6 +11,14 @@ from typing import Optional, Callable
 from .relationship import RelationshipStateV1
 from .emotional_domain import EmotionalStateV1
 from .archival_memory import PersistedTurnRef, ArchivalExtractionEnvelope, ArchivalDuplicateError
+from .trusted_context import (
+    ChatMessage,
+    ContextItem,
+    ContextBundle,
+    TruncationReport,
+    EpistemicStatus,
+    Provenance,
+)
 
 
 @dataclass(frozen=True)
@@ -18,9 +27,22 @@ class RetrievedMemory:
 
     ``content`` is the non-empty text of the memory fact.
     ``tags`` are zero or more category labels in canonical sorted order.
+    ``source_id`` is the opaque local reference for tracking (not a real UUID).
+    ``confidence`` is a float in [0.0, 1.0], rejecting bool/None/NaN/inf.
+    ``provenance`` must be a member of Provenance allowlist.
+    ``epistemic_status`` must be a member of EpistemicStatus allowlist.
+    ``approved`` must be a bool (exact type).
+    ``metadata_version`` indicates the schema version of the metadata structure.
     """
     content: str
     tags: tuple[str, ...]
+    source_id: str = ""
+    confidence: float = 0.0
+    provenance: str = Provenance.LEGACY_MEMORY
+    epistemic_status: str = EpistemicStatus.UNKNOWN
+    approved: bool = False
+    metadata_version: int = 0
+    retrieval_similarity: float | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.content, str) or not self.content.strip():
@@ -35,6 +57,51 @@ class RetrievedMemory:
         })
         object.__setattr__(self, "tags", tuple(normalized_tags))
 
+        # Validate source_id
+        if not isinstance(self.source_id, str):
+            raise ValueError("RetrievedMemory source_id must be a string")
+
+        # Validate confidence
+        if isinstance(self.confidence, bool):
+            raise ValueError("RetrievedMemory confidence must not be bool")
+        if self.confidence is None:
+            raise ValueError("RetrievedMemory confidence must not be None")
+        if not isinstance(self.confidence, (int, float)):
+            raise ValueError("RetrievedMemory confidence must be numeric")
+        if math.isnan(self.confidence) or math.isinf(self.confidence):
+            raise ValueError("RetrievedMemory confidence must be finite")
+        if not (0.0 <= self.confidence <= 1.0):
+            raise ValueError("RetrievedMemory confidence must be in [0.0, 1.0]")
+
+        # Validate provenance
+        if not Provenance.is_valid(self.provenance):
+            raise ValueError(f"RetrievedMemory invalid provenance: {self.provenance}")
+
+        # Validate epistemic_status
+        if not EpistemicStatus.is_valid(self.epistemic_status):
+            raise ValueError(f"RetrievedMemory invalid epistemic_status: {self.epistemic_status}")
+
+        # Validate approved is exact bool
+        if not isinstance(self.approved, bool):
+            raise ValueError("RetrievedMemory approved must be a bool")
+
+        # Validate metadata_version
+        if isinstance(self.metadata_version, bool) or not isinstance(self.metadata_version, int):
+            raise ValueError("RetrievedMemory metadata_version must be an int")
+        if self.metadata_version < 0:
+            raise ValueError("RetrievedMemory metadata_version must be >= 0")
+
+        # Validate retrieval_similarity (not confused with confidence)
+        if self.retrieval_similarity is not None:
+            if isinstance(self.retrieval_similarity, bool):
+                raise ValueError("RetrievedMemory retrieval_similarity must not be bool")
+            if not isinstance(self.retrieval_similarity, (int, float)):
+                raise ValueError("RetrievedMemory retrieval_similarity must be numeric")
+            if math.isnan(self.retrieval_similarity) or math.isinf(self.retrieval_similarity):
+                raise ValueError("RetrievedMemory retrieval_similarity must be finite")
+            if not (-1.0 <= self.retrieval_similarity <= 1.0):
+                raise ValueError("RetrievedMemory retrieval_similarity must be in [-1.0, 1.0]")
+
     def to_prompt_text(self) -> str:
         """Format this memory entry deterministically for a system prompt.
 
@@ -46,9 +113,39 @@ class RetrievedMemory:
             return self.content
         return f"{self.content}\nTags: {', '.join(self.tags)}"
 
+    def to_context_item(self, source_ref: str) -> ContextItem:
+        """Convert this memory to a ``ContextItem`` for the trusted context bundle.
+
+        The ``source_ref`` is an opaque local reference (e.g. ``"mem-1"``).
+        The real source_id (UUID) is transferred to ``internal_id`` so it
+        appears only in the lateral source map, never in provider messages.
+        """
+        return ContextItem(
+            kind="memory",
+            content=self.content,
+            provenance=self.provenance,
+            confidence=self.confidence,
+            epistemic_status=self.epistemic_status,
+            source_id=source_ref,
+            internal_id=self.source_id,
+        )
+
+
 logger = logging.getLogger(__name__)
 
 MAX_MESSAGE_LENGTH = 10000  # Limite máximo de caracteres por mensagem no histórico para evitar sobrecarga de contexto
+
+SUPPORTED_MEMORY_METADATA_SCHEMA_VERSION = 1
+"""The only metadata schema version accepted for memory documents.
+
+Rejected values:
+- absent key
+- bool
+- zero or negative
+- future version
+- numeric string
+- float
+"""
 
 class StatePersistenceError(Exception):
     """Exception raised when user state cannot be persisted safely."""
@@ -197,10 +294,17 @@ class MemoryManager:
             raise StatePersistenceError() from None
 
     def load_recent_history(self, user_id: str, limit: int = 10) -> list:
+        """Load recent history including structural fields for stable ordering.
+
+        Returns a list of dicts with ``role``, ``content``, and ``id`` keys,
+        ordered by ``created_at`` then ``id`` (oldest first).
+
+        The ``id`` field is used for stable sort key construction.
+        """
         if not self.supabase:
             raise ContextLoadError("Serviço de persistência indisponível.")
         try:
-            response = self.supabase.table("chat_logs").select("role, content").eq("user_id", user_id).order("created_at", desc=True).order("id", desc=True).limit(limit).execute()
+            response = self.supabase.table("chat_logs").select("id, role, content, created_at").eq("user_id", user_id).order("created_at", desc=True).order("id", desc=True).limit(limit).execute()
             if response is None:
                 raise ContextLoadError("Sem resposta do banco de dados na leitura do histórico.")
             if hasattr(response, 'error') and response.error:
@@ -215,15 +319,23 @@ class MemoryManager:
                     raise ContextLoadError("Item do histórico não é um dicionário.")
                 if "role" not in item or "content" not in item:
                     raise ContextLoadError("Item do histórico não possui as chaves obrigatórias 'role' e 'content'.")
+                if "id" not in item:
+                    raise ContextLoadError("Item do histórico não possui a chave 'id'.")
                 role = item["role"]
                 content = item["content"]
+                msg_id = item["id"]
+                created_at = item.get("created_at")
                 if role not in ("user", "assistant"):
                     raise ContextLoadError("Role inválida no histórico recente.")
                 if not isinstance(content, str):
                     raise ContextLoadError("Conteúdo da mensagem não é uma string.")
                 if len(content) > MAX_MESSAGE_LENGTH:
                     raise ContextLoadError("Mensagem no histórico excede o limite máximo de caracteres permitido.")
-                normalized.append({"role": role, "content": content})
+                if isinstance(msg_id, bool) or not isinstance(msg_id, int) or msg_id <= 0:
+                    raise ContextLoadError("ID do histórico inválido.")
+                if created_at is None or not isinstance(created_at, str):
+                    raise ContextLoadError("created_at ausente ou inválido no histórico.")
+                normalized.append({"role": role, "content": content, "id": msg_id, "created_at": created_at})
             return normalized[::-1]
         except ContextLoadError as e:
             logger.error(f"Erro ao carregar histórico: {type(e).__name__}")
@@ -245,7 +357,57 @@ class MemoryManager:
         except (TypeError, ValueError):
             raise ContextLoadError("user_profile contains non-serialisable values.")
 
+    def load_context_data(
+        self,
+        user_id: str,
+        current_message: str,
+        user_state: dict,
+    ) -> "LoadedContextData":
+        """Load context data exactly once, returning a ``LoadedContextData``.
+
+        This method performs ALL infrastructure I/O (Supabase, embeddings,
+        RPC) in a single call.  The result can be later converted to a
+        ``ContextBundle`` via the pure-domain ``build_context_bundle()``.
+
+        ``LoadedContextData`` is imported lazily to avoid circular imports.
+        """
+        from .trusted_context import LoadedContextData
+
+        # Load history with IDs for stable ordering
+        history = self.load_recent_history(user_id, limit=10)
+
+        # Load memories via embedding RPC
+        memories = self._retrieve_relevant_entries(user_id, current_message)
+
+        # Extract profile and persona from user_state (no I/O needed)
+        profile_snapshot = user_state.get("user_profile", {})
+        persona_snapshot = user_state.get("persona_config", "")
+
+        # Filter: only approved, non-legacy memories survive
+        valid_memories: list = []
+        for mem in memories:
+            if not mem.approved:
+                logger.debug("event=context_memory_unapproved")
+                continue
+            if mem.metadata_version != SUPPORTED_MEMORY_METADATA_SCHEMA_VERSION:
+                # Unsupported metadata version — reject
+                logger.debug("event=context_item_rejected code=unsupported_metadata_version")
+                continue
+            valid_memories.append(mem)
+
+        return LoadedContextData(
+            history_rows=tuple(history),
+            retrieved_memories=tuple(valid_memories),
+            profile_snapshot=profile_snapshot,
+            persona_snapshot=persona_snapshot or "",
+        )
+
     def get_context_components(self, user_id: str, current_message: str, user_state: dict) -> dict:
+        """Get context components for backward compatibility.
+
+        This method retains the old format for compatibility with existing tests.
+        Use ``build_context_bundle()`` for new code.
+        """
         history = self.load_recent_history(user_id, limit=10)
         short_term_str = "\n".join([f"{msg['role']}: {msg['content']}" for msg in history])
         memory_entries = self._retrieve_relevant_entries(user_id, current_message)
@@ -387,7 +549,10 @@ class MemoryManager:
             raise RuntimeError("Resposta estruturalmente inválida do banco de dados.")
 
     def _retrieve_relevant_entries(self, user_id: str, query: str) -> list[RetrievedMemory]:
-        if not self.supabase or not self.embedding_model:
+        # Use getattr for resilience when MemoryManager is mocked in tests
+        supabase = getattr(self, 'supabase', None)
+        embedding_model = getattr(self, 'embedding_model', None)
+        if not supabase or not embedding_model:
             return []
 
         try:
@@ -429,17 +594,102 @@ class MemoryManager:
                 content = doc.get("content", "")
                 if not isinstance(content, str) or not content.strip():
                     continue
+
+                # Parse metadata according to the official contract
+                # Valid metadata must be a dict with SUPPORTED_MEMORY_METADATA_SCHEMA_VERSION
+                import uuid
+
                 metadata = doc.get("metadata", {})
-                raw_tags = metadata.get("tags", ()) if isinstance(metadata, dict) else ()
+                if not isinstance(metadata, dict):
+                    continue
+
+                schema_version = metadata.get("schema_version", 0)
+                # Reject: absent (defaulted to 0), bool, zero, negative, future, string, float
+                if isinstance(schema_version, bool) or not isinstance(schema_version, int):
+                    continue
+                if schema_version != SUPPORTED_MEMORY_METADATA_SCHEMA_VERSION:
+                    continue
+
+                # Extract tags
+                raw_tags = metadata.get("tags", ())
                 if isinstance(raw_tags, str):
                     tag_values = (raw_tags,)
                 elif isinstance(raw_tags, (list, tuple)):
                     tag_values = tuple(raw_tags)
                 else:
                     tag_values = ()
-                entry = RetrievedMemory(content=content, tags=tag_values)
+
+                # Extract approved flag (exact bool, required)
+                doc_approved = metadata.get("approved", False)
+                if not isinstance(doc_approved, bool):
+                    continue
+                if not doc_approved:
+                    continue
+
+                # Extract provenance (must be in allowlist)
+                raw_provenance = metadata.get("provenance", "")
+                if not isinstance(raw_provenance, str):
+                    continue
+                if not Provenance.is_valid(raw_provenance):
+                    continue
+
+                # Extract epistemic_status (must be in allowlist)
+                raw_epistemic = metadata.get("epistemic_status", "")
+                if not isinstance(raw_epistemic, str):
+                    continue
+                if not EpistemicStatus.is_valid(raw_epistemic):
+                    continue
+
+                # Extract confidence (finite float in [0.0, 1.0])
+                raw_confidence = metadata.get("confidence", None)
+                if raw_confidence is None:
+                    continue
+                if isinstance(raw_confidence, bool):
+                    continue
+                if not isinstance(raw_confidence, (int, float)):
+                    continue
+                if math.isnan(raw_confidence) or math.isinf(raw_confidence):
+                    continue
+                if not (0.0 <= raw_confidence <= 1.0):
+                    continue
+
+                # Extract source UUID (must be non-empty valid UUID string)
+                doc_id = doc.get("id", "")
+                if not isinstance(doc_id, str) or not doc_id:
+                    continue
+                try:
+                    uuid.UUID(doc_id)
+                except (ValueError, AttributeError):
+                    continue
+
+                # Extract retrieval_similarity (never used as confidence)
+                raw_similarity = doc.get("similarity", None)
+                if raw_similarity is not None:
+                    if isinstance(raw_similarity, bool):
+                        raw_similarity = None
+                    elif not isinstance(raw_similarity, (int, float)):
+                        raw_similarity = None
+                    elif math.isnan(raw_similarity) or math.isinf(raw_similarity):
+                        raw_similarity = None
+                    elif not (-1.0 <= raw_similarity <= 1.0):
+                        raw_similarity = None
+
+                entry = RetrievedMemory(
+                    content=content,
+                    tags=tag_values,
+                    source_id=doc_id,
+                    confidence=raw_confidence,
+                    provenance=raw_provenance,
+                    epistemic_status=raw_epistemic,
+                    approved=doc_approved,
+                    metadata_version=schema_version,
+                    retrieval_similarity=raw_similarity,
+                )
                 entries.append(entry)
             except Exception:
                 continue
 
         return entries
+
+
+

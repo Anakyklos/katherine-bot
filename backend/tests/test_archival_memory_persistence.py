@@ -37,11 +37,17 @@ def mock_external_dependencies():
         if not k.startswith("PYTEST_"):
             os.environ[k] = v
 
-    # Restore sys.modules exactly
-    for key in list(sys.modules.keys()):
-        if key not in _original_sys_modules:
-            del sys.modules[key]
-    sys.modules.update(_original_sys_modules)
+    # Restore ONLY the modules this fixture explicitly mocked.
+    # Never iterate over all sys.modules keys or all backend.* modules:
+    # doing so destroys class identity for modules imported naturally by
+    # other test files during the same session (e.g. backend.trusted_context,
+    # backend.memory, backend.engine).
+    for _key in ('sentence_transformers', 'supabase'):
+        _original = _original_sys_modules.get(_key)
+        if _original is not None:
+            sys.modules[_key] = _original
+        elif _key in sys.modules:
+            del sys.modules[_key]
 
 
 @pytest.fixture(scope="module")

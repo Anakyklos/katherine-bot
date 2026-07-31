@@ -1471,8 +1471,7 @@ class TestPersistenceErrorHttp:
         def failing_context(*args, **kwargs):
             raise ContextLoadError("context load failed")
 
-        engine.memory_manager.get_context = failing_context
-        engine.memory_manager.get_context_components = failing_context
+        engine.memory_manager.load_context_data = failing_context
 
         with pytest.raises(TurnExecutionError) as exc_info:
             asyncio.run(engine.process_turn("user", "Hello"))

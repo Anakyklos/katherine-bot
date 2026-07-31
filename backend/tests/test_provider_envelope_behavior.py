@@ -200,11 +200,16 @@ class TestAppraiseBehavioral:
             assert units <= 16000, f"Appraisal envelope ({units}) exceeds 16000"
             assert units > 0
 
-            # Confirm the full message appears in the appraisal prompt
-            prompt = sent_messages[0]["content"]
-            assert message in prompt, (
-                f"Full message not found in appraisal prompt"
+            # Confirm the full message is in the user message (separate from system)
+            # Appraisal now uses system + user message format
+            user_content = sent_messages[1]["content"]
+            assert user_content == message, (
+                f"User message not found in second message"
             )
+            assert sent_messages[0]["role"] == "system", \
+                "First message should be system instruction"
+            assert sent_messages[1]["role"] == "user", \
+                "Second message should be user message"
 
             # Confirm valid AppraisalV1 parsing
             assert isinstance(appraisal, AppraisalV1)
@@ -233,8 +238,11 @@ class TestAppraiseBehavioral:
             sent = captured[0]
             # Validate the same envelope
             validate_provider_input(sent)
-            # The sent messages contain the appraisal prompt
-            assert sent[0]["role"] == "user"
+            # The sent messages contain the appraisal prompt (system + user)
+            assert sent[0]["role"] == "system", \
+                "First message should be system instruction"
+            assert sent[1]["role"] == "user", \
+                "Second message should be the user message"
             assert "analyze the emotional impact" in sent[0]["content"].lower()
 
         asyncio.run(run())
