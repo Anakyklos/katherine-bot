@@ -370,21 +370,32 @@ BEGIN
             -- Same hash: check status for replay vs lease semantics
             IF v_existing_status = 'completed' THEN
                 -- Idempotent replay: return the EXACT stored result
-                -- Reconstruct the outbox events for this request with ORDER BY for determinism
-                SELECT jsonb_agg(to_jsonb(outbox_events.*) ORDER BY outbox_events.id)
+                -- Use only immutable fields from stored turn_requests row
+                -- Do NOT query chat_logs (durable references only)
+                -- Use stable projection: only immutable outbox fields that were part of the original commit
+                SELECT jsonb_agg(
+                    jsonb_build_object(
+                        'id', outbox_events.id,
+                        'event_type', outbox_events.event_type,
+                        'user_id', outbox_events.user_id,
+                        'turn_request_id', outbox_events.turn_request_id,
+                        'payload', outbox_events.payload,
+                        'status', outbox_events.status,
+                        'idempotency_key', outbox_events.idempotency_key,
+                        'contract_version', outbox_events.contract_version,
+                        'created_at', outbox_events.created_at::text
+                    ) ORDER BY outbox_events.id
+                )
                 INTO v_outbox_results
                 FROM public.outbox_events
-                WHERE turn_request_id = (
-                    SELECT id FROM public.turn_requests
-                    WHERE user_id = p_authenticated_user_id AND request_id = p_request_id
-                );
+                WHERE turn_request_id = v_existing_turn_request_id;
                 
                 IF v_outbox_results IS NULL THEN
                     v_outbox_results := '[]'::jsonb;
                 END IF;
                 
-                -- Return the stored assistant_message_id for reproducibility
-                -- Use the chat_log_id directly as string (durable, doesn't depend on chat_logs existence)
+                -- Return the stored result for reproducibility
+                -- assistant_message_id uses the stored chat_log_id (durable, doesn't depend on chat_logs existence)
                 v_result := jsonb_build_object(
                     'user_id', p_authenticated_user_id,
                     'request_id', p_request_id::text,
