@@ -114,12 +114,13 @@ jobs:
           PYTHONPATH: "."
         run: |
           set -euo pipefail
-          # Hide every migration AFTER the hardening target (02) — now 03 and
-          # 04 — so the legacy upgrade scenario starts from a true
+          # Hide every migration AFTER the hardening target (02) — now 03, 04,
+          # and 05 — so the legacy upgrade scenario starts from a true
           # baseline-only database. Restored in a trap, including on failure.
           migrations=(
             "supabase/migrations/20240101000003_admission_ledger.sql"
             "supabase/migrations/20240101000004_transactional_turn_schema.sql"
+            "supabase/migrations/20240101000005_atomic_turn_commit.sql"
           )
           hidden=()
           restore_migrations() {
