@@ -49,6 +49,7 @@ from backend.trusted_context import (
     Provenance,
     TrustedContextError,
     build_context_bundle,
+    build_envelope,
     LoadedContextData,
     _normalize_timestamp,
     _parse_timestamp,
@@ -162,6 +163,64 @@ class TestInternalIdValidation:
                 source_id="mem-1",
                 internal_id="123",
             )
+
+    def test_approved_memory_empty_internal_id_rejected(self):
+        """Approved memory with empty internal_id is rejected.
+
+        Regression for the ID contract: an approved memory must always
+        carry a persisted canonical UUID.  An empty string must never
+        reach the source map, which would otherwise fall back to the
+        local reference (``mem-1 -> mem-1``).
+        """
+        with pytest.raises(
+            TrustedContextError,
+            match="missing_approved_memory_internal_id",
+        ):
+            ContextItem(
+                kind="memory",
+                content="Approved fact",
+                provenance=Provenance.USER_CONFIRMED,
+                confidence=0.9,
+                epistemic_status=EpistemicStatus.APPROVED,
+                source_id="mem-1",
+                internal_id="",
+            )
+
+    @pytest.mark.parametrize("non_canonical", [
+        "550E8400-E29B-41D4-A716-446655440000",
+        "{550e8400-e29b-41d4-a716-446655440000}",
+        "550e8400e29b41d4a716446655440000",
+    ])
+    def test_approved_memory_rejects_non_canonical_uuid(self, non_canonical):
+        """Approved memory rejects non-canonical UUID representations.
+
+        Accepted representation is lowercase, hyphenated, without braces
+        or prefix — exactly ``str(uuid.UUID(value))``.  The value is
+        never silently normalized.
+        """
+        with pytest.raises(TrustedContextError, match="invalid_internal_id_not_uuid"):
+            ContextItem(
+                kind="memory",
+                content="Approved fact",
+                provenance=Provenance.USER_CONFIRMED,
+                confidence=0.9,
+                epistemic_status=EpistemicStatus.APPROVED,
+                source_id="mem-1",
+                internal_id=non_canonical,
+            )
+
+    def test_approved_memory_accepts_canonical_uuid(self):
+        """Canonical lowercase hyphenated UUID is accepted and preserved verbatim."""
+        item = ContextItem(
+            kind="memory",
+            content="Approved fact",
+            provenance=Provenance.USER_CONFIRMED,
+            confidence=0.9,
+            epistemic_status=EpistemicStatus.APPROVED,
+            source_id="mem-1",
+            internal_id="550e8400-e29b-41d4-a716-446655440000",
+        )
+        assert item.internal_id == "550e8400-e29b-41d4-a716-446655440000"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -342,6 +401,44 @@ class TestLoadedContextDataValidation:
         """retrieved_memories that are not a tuple raises."""
         with pytest.raises(TrustedContextError, match="invalid_loaded_data_memories_type"):
             LoadedContextData(retrieved_memories=[])
+
+    @pytest.mark.parametrize("bad_source_id", [
+        "550E8400-E29B-41D4-A716-446655440000",
+        "{550e8400-e29b-41d4-a716-446655440000}",
+        "550e8400e29b41d4a716446655440000",
+        "urn:uuid:550e8400-e29b-41d4-a716-446655440000",
+    ])
+    def test_non_canonical_source_id_rejected(self, bad_source_id):
+        """LoadedContextData rejects non-canonical memory source_id."""
+        from backend.memory import RetrievedMemory
+        mem = RetrievedMemory(
+            content="Test", tags=(),
+            source_id=bad_source_id,
+            confidence=0.9,
+            provenance=Provenance.USER_CONFIRMED,
+            epistemic_status=EpistemicStatus.APPROVED,
+            approved=True,
+            metadata_version=1,
+        )
+        with pytest.raises(TrustedContextError, match="invalid_loaded_memory_source_id"):
+            LoadedContextData(
+                retrieved_memories=(mem,),
+            )
+
+    def test_canonical_source_id_accepted(self):
+        """Canonical lowercase hyphenated source_id is accepted."""
+        from backend.memory import RetrievedMemory
+        mem = RetrievedMemory(
+            content="Test", tags=(),
+            source_id="550e8400-e29b-41d4-a716-446655440000",
+            confidence=0.9,
+            provenance=Provenance.USER_CONFIRMED,
+            epistemic_status=EpistemicStatus.APPROVED,
+            approved=True,
+            metadata_version=1,
+        )
+        loaded = LoadedContextData(retrieved_memories=(mem,))
+        assert len(loaded.retrieved_memories) == 1
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -529,3 +626,138 @@ class TestModuleIdentity:
             memory_items=(item,),
         )
         assert isinstance(bundle, ContextBundle)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Approved memory ID contract — full pipeline
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestApprovedMemoryIdContract:
+    """Approved memory always maps to its persisted canonical UUID.
+
+    Covers the end-to-end path:
+    ``RetrievedMemory -> LoadedContextData -> build_context_bundle ->
+    build_envelope`` and asserts the source map contract: an approved
+    memory's local reference maps to the real persisted UUID — never to
+    the local reference itself (``mem-1 -> mem-1``).
+    """
+
+    _REAL_UUID = "550e8400-e29b-41d4-a716-446655440000"
+
+    def _approved_memory(self, source_id: str = _REAL_UUID):
+        from backend.memory import RetrievedMemory
+        return RetrievedMemory(
+            content="Approved pipeline fact",
+            tags=("pipeline",),
+            source_id=source_id,
+            confidence=0.9,
+            provenance=Provenance.USER_CONFIRMED,
+            epistemic_status=EpistemicStatus.APPROVED,
+            approved=True,
+            metadata_version=1,
+        )
+
+    def test_pipeline_source_map_contains_real_uuid(self):
+        """source_map["mem-1"] maps to the real persisted UUID."""
+        loaded = LoadedContextData(retrieved_memories=(self._approved_memory(),))
+        bundle = build_context_bundle(
+            trusted_policy="Policy.", loaded_data=loaded
+        )
+        result = build_envelope(bundle, "Hi")
+
+        assert "mem-1" in result.source_map, "Local ref must be in source_map"
+        assert result.source_map["mem-1"] == self._REAL_UUID, \
+            "source_map must map local ref to real UUID"
+
+    def test_approved_memory_never_maps_local_ref_to_itself(self):
+        """Approved memory never produces mem-1 -> mem-1."""
+        loaded = LoadedContextData(retrieved_memories=(self._approved_memory(),))
+        bundle = build_context_bundle(
+            trusted_policy="Policy.", loaded_data=loaded
+        )
+        result = build_envelope(bundle, "Hi")
+
+        assert result.source_map["mem-1"] != "mem-1", \
+            "Approved memory must never fall back to the local reference"
+
+    def test_uuid_not_in_provider_messages(self):
+        """The real UUID never appears in provider-bound messages."""
+        loaded = LoadedContextData(retrieved_memories=(self._approved_memory(),))
+        bundle = build_context_bundle(
+            trusted_policy="Policy.", loaded_data=loaded
+        )
+        result = build_envelope(bundle, "Hi")
+
+        serialized = json.dumps(result.messages)
+        assert self._REAL_UUID not in serialized, \
+            "Real UUID leaked into provider messages"
+
+    def test_rejected_uuid_not_in_exception_or_log(self, caplog):
+        """Rejected non-canonical UUID never appears in error or logs."""
+        caplog.set_level(logging.DEBUG)
+        non_canonical = "550E8400-E29B-41D4-A716-446655440000"
+        with pytest.raises(TrustedContextError) as exc_info:
+            LoadedContextData(
+                retrieved_memories=(
+                    self._approved_memory(source_id=non_canonical),
+                ),
+            )
+        # Error carries only the structured code — never the UUID.
+        assert non_canonical not in str(exc_info.value)
+        assert non_canonical not in repr(exc_info.value)
+        assert non_canonical not in caplog.text, \
+            "Rejected UUID leaked into logs"
+
+    def test_builder_fails_closed_without_persisted_uuid(self):
+        """build_envelope fails closed if an approved memory without UUID reaches it.
+
+        Constructs a ``ContextItem`` directly via ``object.__new__`` to
+        bypass ``__post_init__`` — simulating the state the constructor
+        normally prevents — and verifies the envelope builder rejects it
+        instead of falling back to the local reference.
+        """
+        item = object.__new__(ContextItem)
+        object.__setattr__(item, "kind", "memory")
+        object.__setattr__(item, "content", "Approved fact")
+        object.__setattr__(item, "provenance", Provenance.USER_CONFIRMED)
+        object.__setattr__(item, "confidence", 0.9)
+        object.__setattr__(item, "epistemic_status", EpistemicStatus.APPROVED)
+        object.__setattr__(item, "source_id", "mem-1")
+        object.__setattr__(item, "internal_id", "")
+
+        bundle = ContextBundle(
+            trusted_policy="Policy.",
+            memory_items=(item,),
+        )
+        with pytest.raises(
+            TrustedContextError,
+            match="missing_approved_memory_internal_id",
+        ):
+            build_envelope(bundle, "Hi")
+
+    def test_profile_persona_still_accept_empty_internal_id(self):
+        """Profile/persona without persisted ID keep working with internal_id=""."""
+        profile = ContextItem(
+            kind="profile", content='{"name":"User"}',
+            provenance=Provenance.LEGACY_PROFILE,
+            confidence=0.3, epistemic_status=EpistemicStatus.UNKNOWN,
+            source_id="profile-1",
+        )
+        persona = ContextItem(
+            kind="persona", content="Katherine",
+            provenance=Provenance.LEGACY_PERSONA,
+            confidence=0.3, epistemic_status=EpistemicStatus.UNKNOWN,
+            source_id="persona-1",
+        )
+        assert profile.internal_id == ""
+        assert persona.internal_id == ""
+
+        bundle = ContextBundle(
+            trusted_policy="Policy.",
+            profile_items=(profile,),
+            persona_items=(persona,),
+        )
+        result = build_envelope(bundle, "Hi")
+        # Documented fallback: no persisted ID -> local reference itself.
+        assert result.source_map["profile-1"] == "profile-1"
+        assert result.source_map["persona-1"] == "persona-1"

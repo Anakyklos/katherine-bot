@@ -83,7 +83,16 @@ class ContextItem:
     confidence: float      # [0.0, 1.0], rejects bool/None/NaN/inf
     epistemic_status: str  # from EpistemicStatus allowlist
     source_id: str         # opaque local reference
+    internal_id: str = ""  # canonical UUID; required for approved memory
 ```
+
+The `internal_id` is an optional canonical UUID for lateral tracking only.
+Empty string is accepted **only** for profile/persona items without a
+persisted ID.  Approved memory (`kind == "memory"` with
+`epistemic_status == APPROVED`) must always carry a canonical UUID —
+`internal_id=""` raises `missing_approved_memory_internal_id`.  The
+source map for approved memory maps the local reference to this persisted
+UUID and never falls back to the local reference.
 
 ### `ContextBundle`
 
@@ -155,7 +164,10 @@ and confidence is independent of retrieval score.
 A memory entry enters the context bundle **only** when:
 
 1. The row belongs to the authenticated user (enforced by DB query).
-2. The UUID returned is structurally valid — parsable by `uuid.UUID()`, never empty.
+2. The UUID returned is **canonical** — lowercase, hyphenated, no braces
+   or prefix, exactly equal to `str(uuid.UUID(id))`; never empty.
+   Non‑canonical representations (uppercase, braces, no hyphens) are
+   rejected, never silently normalized.
 3. Content is valid (non‑empty string).
 4. Metadata has the exact supported version (`SUPPORTED_MEMORY_METADATA_SCHEMA_VERSION == 1`).
    Rejected: absent, bool, zero, negative, future (>1), string, float.
@@ -263,9 +275,13 @@ docs/
    factual confidence.
 7. **Fail closed before provider.**  Budget validation and structural
    checks happen before any network call.
-8. **UUID validation.**  Source IDs from RPC must be structurally valid
-   UUIDs (parsable by `uuid.UUID()`).  Real UUIDs appear only in
-   `source_map` — never in messages or logs.
+8. **UUID validation.**  Source IDs from RPC and approved‑memory
+   `internal_id` must be **canonical** UUIDs — lowercase, hyphenated, no
+   braces or prefix, exactly equal to `str(uuid.UUID(id))`.  Approved
+   memory always maps its local reference to the persisted UUID in
+   `source_map` — never to the local reference itself
+   (`missing_approved_memory_internal_id` otherwise).  Real UUIDs appear
+   only in `source_map` — never in messages or logs.
 9. **Sort key stability.**  History is ordered by `(created_at, id)`.
    Identical timestamps are tie‑broken by ascending `id`.
 10. **TruncationReport aggregation.**  Pre‑existing truncation codes

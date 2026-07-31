@@ -965,6 +965,7 @@ class TestEpistemicContracts:
             confidence=0.9,
             epistemic_status=EpistemicStatus.APPROVED,
             source_id="mem-1",
+            internal_id="550e8400-e29b-41d4-a716-446655440000",
         )
         bundle = ContextBundle(
             trusted_policy="Policy.",
@@ -1257,6 +1258,7 @@ class TestUserIsolation:
             provenance=Provenance.USER_CONFIRMED,
             confidence=0.9, epistemic_status=EpistemicStatus.APPROVED,
             source_id="a1",
+            internal_id="550e8400-e29b-41d4-a716-446655440000",
         )
         bundle_a = ContextBundle(
             trusted_policy="Policy.",

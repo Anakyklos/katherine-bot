@@ -256,8 +256,12 @@ class ContextItem:
 
     ``internal_id``
         Optional real database UUID for internal tracking only.  Empty
-        string means the real ID is unknown or not yet wired.
-        Never logged or sent to the provider.
+        string is allowed only for profile and persona items without a
+        persisted ID.  Approved memories (``kind == "memory"`` with
+        ``epistemic_status == APPROVED``) must always carry a canonical
+        UUID (lowercase, hyphenated, no braces or prefix); the empty
+        string is rejected so the source map never falls back to the
+        local reference.  Never logged or sent to the provider.
     """
 
     kind: str
@@ -308,16 +312,25 @@ class ContextItem:
         # Validate internal_id — strict type check first
         if not isinstance(self.internal_id, str):
             raise TrustedContextError("invalid_internal_id_type")
+
+        is_approved_memory = (
+            self.kind == "memory"
+            and self.epistemic_status == EpistemicStatus.APPROVED
+        )
+
+        # Approved memory must always carry a persisted ID — never the
+        # empty string, so the source map can never fall back to the
+        # local reference.
+        if is_approved_memory and self.internal_id == "":
+            raise TrustedContextError("missing_approved_memory_internal_id")
+
         # Empty string is allowed for items without a persisted ID
         if self.internal_id:
             if not self.internal_id.strip():
                 raise TrustedContextError("invalid_internal_id_empty")
-            # Non-empty internal_id for approved memories must be valid UUID
-            if self.kind == "memory" and self.epistemic_status == EpistemicStatus.APPROVED:
-                try:
-                    uuid.UUID(self.internal_id)
-                except (ValueError, AttributeError):
-                    raise TrustedContextError("invalid_internal_id_not_uuid")
+            # Non-empty internal_id for approved memories must be canonical UUID
+            if is_approved_memory:
+                _validate_canonical_uuid(self.internal_id, "invalid_internal_id_not_uuid")
 
     def to_json_dict(self) -> dict:
         """Return a JSON‑safe dict for the untrusted context payload.
@@ -482,15 +495,12 @@ class LoadedContextData:
                 raise TrustedContextError("invalid_loaded_memory_approved")
             if not mem.approved:
                 raise TrustedContextError("invalid_loaded_memory_not_approved")
-            # Must have source_id as valid UUID string
+            # Must have source_id as valid canonical UUID string
             if not hasattr(mem, "source_id"):
                 raise TrustedContextError("invalid_loaded_memory_source_id")
             if not isinstance(mem.source_id, str) or not mem.source_id:
                 raise TrustedContextError("invalid_loaded_memory_source_id")
-            try:
-                uuid.UUID(mem.source_id)
-            except (ValueError, AttributeError):
-                raise TrustedContextError("invalid_loaded_memory_source_id")
+            _validate_canonical_uuid(mem.source_id, "invalid_loaded_memory_source_id")
             # Must have provenance in allowlist
             if not hasattr(mem, "provenance") or not Provenance.is_valid(mem.provenance):
                 raise TrustedContextError("invalid_loaded_memory_provenance")
@@ -983,7 +993,21 @@ def build_envelope(
         ref = item.source_id
         if ref in source_map:
             raise TrustedContextError("duplicate_source_ref")
-        source_map[ref] = item.internal_id or ref
+        is_approved_memory = (
+            item.kind == "memory"
+            and item.epistemic_status == EpistemicStatus.APPROVED
+        )
+        if is_approved_memory:
+            # Approved memory must always map to its persisted UUID — never
+            # the local reference.  Fail closed if the UUID is somehow
+            # missing, even though the constructor normally prevents this.
+            if not item.internal_id:
+                raise TrustedContextError("missing_approved_memory_internal_id")
+            source_map[ref] = item.internal_id
+        else:
+            # Profile/persona (and non-approved memory) without a persisted
+            # ID keep the documented fallback policy.
+            source_map[ref] = item.internal_id or ref
 
     # 8. Final validation --------------------------------------------------
     total_units = _estimate_messages_units(final_messages)
@@ -1035,6 +1059,29 @@ def build_envelope(
 # ---------------------------------------------------------------------------
 # Validation helpers
 # ---------------------------------------------------------------------------
+
+
+def _validate_canonical_uuid(value: str, error_code: str) -> None:
+    """Validate that *value* is a canonical UUID string.
+
+    Accepted representation:
+    - lowercase
+    - with hyphens
+    - no braces
+    - no prefix
+    - exactly equal to ``str(uuid.UUID(value))``
+
+    Raises ``TrustedContextError(error_code)`` for values that are not
+    parseable as a UUID or that are not in the canonical representation.
+    The input is never silently normalized.
+    """
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError):
+        raise TrustedContextError(error_code)
+
+    if str(parsed) != value:
+        raise TrustedContextError(error_code)
 
 
 def _validate_max_units(value: object) -> None:
