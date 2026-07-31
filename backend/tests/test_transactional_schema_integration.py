@@ -236,12 +236,14 @@ def test_service_role_outbox_crud(service_client):
         assert len(select_res.data) == 1
         assert select_res.data[0]["event_type"] == "memory_indexed"
 
-        # Claim → processing (coherent processing shape).
+        # Claim → processing (coherent processing shape: no scheduling field
+        # may remain — processing requires next_attempt_at IS NULL).
         update_res = service_client.table("outbox_events").update({
             "status": "processing",
             "lease_owner": "worker-integration",
             "lease_expires_at": "2099-01-01T00:00:00Z",
             "attempts": 1,
+            "next_attempt_at": None,
         }).eq("id", internal_id).execute()
         assert len(update_res.data) == 1
         assert update_res.data[0]["status"] == "processing"
@@ -423,6 +425,107 @@ def test_outbox_payload_forbids_unknown_top_level_key(service_client):
         payload["payload"] = {"ref": "turn-1", "unknown_key": 1}
         with pytest.raises(APIError) as exc:
             service_client.table("outbox_events").insert(payload).execute()
+        assert getattr(exc.value, "code", None) == "23514"
+    finally:
+        service_client.table("outbox_events").delete().eq("user_id", user_id).execute()
+        service_client.table("profiles").delete().eq("user_id", user_id).execute()
+
+
+def test_outbox_payload_rejects_long_ref(service_client):
+    """A reference field must be bounded: raw/long content under `ref` is
+    rejected by the value contract even without any forbidden key."""
+    user_id = _uid("ol")
+    service_client.table("profiles").upsert({"user_id": user_id}).execute()
+    try:
+        payload = _valid_outbox_payload(user_id, f"idem_{user_id}")
+        payload["payload"] = {"ref": "x" * 129}
+        with pytest.raises(APIError) as exc:
+            service_client.table("outbox_events").insert(payload).execute()
+        assert getattr(exc.value, "code", None) == "23514"
+    finally:
+        service_client.table("outbox_events").delete().eq("user_id", user_id).execute()
+        service_client.table("profiles").delete().eq("user_id", user_id).execute()
+
+
+def test_outbox_payload_rejects_nested_object_under_ref(service_client):
+    """Arbitrary objects must not fit under an allowed key, even when no
+    denylist key is present at any depth."""
+    user_id = _uid("oo")
+    service_client.table("profiles").upsert({"user_id": user_id}).execute()
+    try:
+        payload = _valid_outbox_payload(user_id, f"idem_{user_id}")
+        payload["payload"] = {"ref": {"text": "conteudo sem chave proibida"}}
+        with pytest.raises(APIError) as exc:
+            service_client.table("outbox_events").insert(payload).execute()
+        assert getattr(exc.value, "code", None) == "23514"
+    finally:
+        service_client.table("outbox_events").delete().eq("user_id", user_id).execute()
+        service_client.table("profiles").delete().eq("user_id", user_id).execute()
+
+
+def test_outbox_payload_rejects_invalid_version(service_client):
+    """`version` must be an integer in the documented range."""
+    user_id = _uid("ov")
+    service_client.table("profiles").upsert({"user_id": user_id}).execute()
+    try:
+        for bad in ({"version": "abc"}, {"version": 0}, {"version": 1001}):
+            payload = _valid_outbox_payload(user_id, f"idem_{user_id}_{len(str(bad))}")
+            payload["payload"] = bad
+            with pytest.raises(APIError) as exc:
+                service_client.table("outbox_events").insert(payload).execute()
+            assert getattr(exc.value, "code", None) == "23514"
+    finally:
+        service_client.table("outbox_events").delete().eq("user_id", user_id).execute()
+        service_client.table("profiles").delete().eq("user_id", user_id).execute()
+
+
+def test_outbox_payload_rejects_json_null_values(service_client):
+    """JSON null is not a valid contract value for any allowed field."""
+    user_id = _uid("onul")
+    service_client.table("profiles").upsert({"user_id": user_id}).execute()
+    try:
+        for bad in ({"ref": None}, {"version": None}):
+            payload = _valid_outbox_payload(user_id, f"idem_{user_id}_{len(str(bad))}")
+            payload["payload"] = bad
+            with pytest.raises(APIError) as exc:
+                service_client.table("outbox_events").insert(payload).execute()
+            assert getattr(exc.value, "code", None) == "23514"
+    finally:
+        service_client.table("outbox_events").delete().eq("user_id", user_id).execute()
+        service_client.table("profiles").delete().eq("user_id", user_id).execute()
+
+
+def test_outbox_payload_accepts_conforming_values(service_client):
+    """Scalar, sanitized and bounded values under the allowed keys pass."""
+    user_id = _uid("ok")
+    service_client.table("profiles").upsert({"user_id": user_id}).execute()
+    try:
+        payload = _valid_outbox_payload(user_id, f"idem_{user_id}")
+        payload["payload"] = {"ref": "turn-1", "kind": "memory_indexed", "version": 1}
+        res = service_client.table("outbox_events").insert(payload).execute()
+        assert len(res.data) == 1
+    finally:
+        service_client.table("outbox_events").delete().eq("user_id", user_id).execute()
+        service_client.table("profiles").delete().eq("user_id", user_id).execute()
+
+
+def test_processing_with_next_attempt_at_rejected(service_client):
+    """processing must not carry the pending/failed scheduling field."""
+    user_id = _uid("pn")
+    service_client.table("profiles").upsert({"user_id": user_id}).execute()
+    try:
+        insert_res = service_client.table("outbox_events").insert(
+            _valid_outbox_payload(user_id, f"idem_{user_id}")
+        ).execute()
+        internal_id = insert_res.data[0]["id"]
+        with pytest.raises(APIError) as exc:
+            service_client.table("outbox_events").update({
+                "status": "processing",
+                "lease_owner": "worker-integration",
+                "lease_expires_at": "2099-01-01T00:00:00Z",
+                "attempts": 1,
+                "next_attempt_at": "2099-01-01T00:00:00Z",
+            }).eq("id", internal_id).execute()
         assert getattr(exc.value, "code", None) == "23514"
     finally:
         service_client.table("outbox_events").delete().eq("user_id", user_id).execute()

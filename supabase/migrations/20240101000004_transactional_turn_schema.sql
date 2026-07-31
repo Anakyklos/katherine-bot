@@ -12,8 +12,15 @@
 --    request/event can never reference rows of another user.
 --  * Recursive payload validation with an explicit allowlist, so prompts,
 --    messages and internal fields are rejected even when nested.
---  * Exact, mutually exclusive outbox states.
+--  * Exact, mutually exclusive outbox states (including next_attempt_at
+--    being NULL while processing).
+--  * Value contract for the outbox payload: reference/identifier fields are
+--    scalar, sanitized and bounded; version is an integer in a defined
+--    range. Arbitrary objects/arrays can never hide raw content under an
+--    allowed key.
 --  * Sanitized identifier bounds for lease_owner / idempotency_key.
+--  * SECURITY DEFINER trigger function has EXECUTE revoked from
+--    PUBLIC/anon/authenticated (fail-closed, granted to service_role only).
 
 -- =================================================================
 -- 0. PREFLIGHT: fail closed on unexpected schema drift
@@ -49,6 +56,7 @@ BEGIN
           AND p.proname IN (
               'jsonb_has_forbidden_key',
               'jsonb_keys_subset_of',
+              'jsonb_outbox_payload_value_contract',
               'turn_requests_null_message_refs'
           )
     ) THEN
@@ -152,12 +160,71 @@ BEGIN
 END;
 $$;
 
+-- Value contract for the outbox payload document. Key-name allowlists are
+-- not enough: a value like {"ref": "<conteúdo bruto>"} or
+-- {"ref": {"text": "..."}} would pass a pure key check. This helper
+-- validates the TYPES and FORMATS of every allowed field:
+--  * ref / request_id / turn_id / message_id / entity_id / kind: scalar
+--    string, sanitized charset, bounded length (1..128). Arbitrary
+--    objects/arrays can never be stored under these keys.
+--  * version: JSON number that is an integer in [1, 1000].
+CREATE FUNCTION public.jsonb_outbox_payload_value_contract(
+    payload jsonb
+) RETURNS boolean
+LANGUAGE plpgsql
+IMMUTABLE
+AS $$
+DECLARE
+    v_key text;
+    v_value jsonb;
+    v_text text;
+BEGIN
+    IF payload IS NULL OR jsonb_typeof(payload) <> 'object' THEN
+        RETURN FALSE;
+    END IF;
+
+    FOR v_key, v_value IN SELECT * FROM jsonb_each(payload) LOOP
+        -- jsonb_each yields SQL NULL for a JSON null value; NULL guards are
+        -- explicit because NULL comparisons never satisfy the checks below
+        -- (fail-closed: null values are not valid contract values).
+        IF v_value IS NULL THEN
+            RETURN FALSE;
+        END IF;
+        IF v_key = 'version' THEN
+            -- version must be an integer within the documented range.
+            IF jsonb_typeof(v_value) <> 'number' THEN
+                RETURN FALSE;
+            END IF;
+            v_text := v_value::text;
+            IF NOT (v_text ~ '^[0-9]{1,4}$') THEN
+                RETURN FALSE;
+            END IF;
+            IF v_text::integer < 1 OR v_text::integer > 1000 THEN
+                RETURN FALSE;
+            END IF;
+        ELSE
+            -- Reference/identifier fields are scalar, sanitized, bounded.
+            IF jsonb_typeof(v_value) <> 'string' THEN
+                RETURN FALSE;
+            END IF;
+            v_text := v_value #>> '{}';
+            IF NOT (v_text ~ '^[A-Za-z0-9_.:-]{1,128}$') THEN
+                RETURN FALSE;
+            END IF;
+        END IF;
+    END LOOP;
+    RETURN TRUE;
+END;
+$$;
+
 -- Fail-closed grant posture for the helpers (they expose no data, but
 -- clients must not be able to call server-owned internals).
 REVOKE ALL ON FUNCTION public.jsonb_has_forbidden_key(jsonb, text[]) FROM PUBLIC, anon, authenticated;
 REVOKE ALL ON FUNCTION public.jsonb_keys_subset_of(jsonb, text[]) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.jsonb_outbox_payload_value_contract(jsonb) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.jsonb_has_forbidden_key(jsonb, text[]) TO service_role;
 GRANT EXECUTE ON FUNCTION public.jsonb_keys_subset_of(jsonb, text[]) TO service_role;
+GRANT EXECUTE ON FUNCTION public.jsonb_outbox_payload_value_contract(jsonb) TO service_role;
 
 -- =================================================================
 -- 3. turn_requests
@@ -289,6 +356,13 @@ BEGIN
 END;
 $$;
 
+-- SECURITY DEFINER functions keep EXECUTE for PUBLIC by default. This
+-- function runs exclusively through the trigger below (no runtime caller),
+-- so EXECUTE is revoked from PUBLIC/anon/authenticated and granted only to
+-- service_role for operational use — fail-closed privilege boundary.
+REVOKE ALL ON FUNCTION public.turn_requests_null_message_refs() FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.turn_requests_null_message_refs() TO service_role;
+
 DROP TRIGGER IF EXISTS turn_requests_message_refs_null_trigger ON public.chat_logs;
 CREATE TRIGGER turn_requests_message_refs_null_trigger
     BEFORE DELETE ON public.chat_logs
@@ -370,6 +444,7 @@ CREATE TABLE public.outbox_events (
             OR
             (status = 'processing' AND processed_at IS NULL
                 AND dead_lettered_at IS NULL AND retention_until IS NULL
+                AND next_attempt_at IS NULL
                 AND lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL
                 AND attempts BETWEEN 1 AND 10
                 AND error_code IS NULL)
@@ -415,6 +490,7 @@ CREATE TABLE public.outbox_events (
                       'internal_instructions', 'message',
                       'user_message', 'assistant_message', 'content']
             )
+            AND public.jsonb_outbox_payload_value_contract(payload)
         )
 );
 

@@ -554,6 +554,34 @@ SELECT throws_ok(
      )$$,
   '23514', NULL, 'processing event with error_code is rejected'
 );
+SELECT throws_ok(
+  $$INSERT INTO public.outbox_events (
+       event_type, contract_version, user_id, turn_request_id, payload,
+       status, attempts, next_attempt_at, lease_owner, lease_expires_at,
+       idempotency_key
+     ) VALUES (
+       'memory_indexed', 1, 'pgtap_tr_user', NULL, '{"ref":"x"}'::jsonb,
+       'processing', 1, now(), 'worker-z', now() + interval '5 minutes',
+       'pgtap-idem-proc-na'
+     )$$,
+  '23514', NULL, 'processing event with next_attempt_at is rejected'
+);
+
+-- Valid processing shape (lease + attempts, no scheduling/retry field) is accepted
+INSERT INTO public.outbox_events (
+  event_type, contract_version, user_id, turn_request_id, payload,
+  status, attempts, next_attempt_at, lease_owner, lease_expires_at,
+  idempotency_key
+) VALUES (
+  'memory_indexed', 1, 'pgtap_tr_user', NULL, '{"ref":"turn-1"}'::jsonb,
+  'processing', 1, NULL, 'worker-z', now() + interval '5 minutes',
+  'pgtap-idem-proc-valid'
+);
+SELECT is(
+  (SELECT count(*)::integer FROM public.outbox_events WHERE idempotency_key = 'pgtap-idem-proc-valid'),
+  1,
+  'valid processing event is inserted'
+);
 
 -- Valid dead_letter event with a full exact shape is accepted
 INSERT INTO public.outbox_events (
@@ -663,6 +691,124 @@ SELECT throws_ok(
   '23514', NULL, 'outbox payload with unknown top-level key is rejected'
 );
 
+-- Value contract: references/identifiers are scalar, sanitized and bounded.
+-- Raw content must never fit under an allowed key.
+SELECT throws_ok(
+  $$INSERT INTO public.outbox_events (
+       event_type, contract_version, user_id, turn_request_id, payload,
+       status, attempts, next_attempt_at, idempotency_key
+     ) VALUES (
+       'memory_indexed', 1, 'pgtap_tr_user', NULL,
+       '{"ref": "' || repeat('x', 129) || '"}'::jsonb,
+       'pending', 0, now(), 'pgtap-idem-reflong'
+     )$$,
+  '23514', NULL, 'outbox ref over 128 chars is rejected'
+);
+SELECT throws_ok(
+  $$INSERT INTO public.outbox_events (
+       event_type, contract_version, user_id, turn_request_id, payload,
+       status, attempts, next_attempt_at, idempotency_key
+     ) VALUES (
+       'memory_indexed', 1, 'pgtap_tr_user', NULL,
+       '{"ref": {"text": "conteudo sem chave proibida"}}'::jsonb,
+       'pending', 0, now(), 'pgtap-idem-refobj'
+     )$$,
+  '23514', NULL, 'nested object under ref without denylist keys is rejected'
+);
+SELECT throws_ok(
+  $$INSERT INTO public.outbox_events (
+       event_type, contract_version, user_id, turn_request_id, payload,
+       status, attempts, next_attempt_at, idempotency_key
+     ) VALUES (
+       'memory_indexed', 1, 'pgtap_tr_user', NULL,
+       '{"ref": ["item"]}'::jsonb,
+       'pending', 0, now(), 'pgtap-idem-refarr'
+     )$$,
+  '23514', NULL, 'array under ref is rejected'
+);
+SELECT throws_ok(
+  $$INSERT INTO public.outbox_events (
+       event_type, contract_version, user_id, turn_request_id, payload,
+       status, attempts, next_attempt_at, idempotency_key
+     ) VALUES (
+       'memory_indexed', 1, 'pgtap_tr_user', NULL,
+       '{"ref": "conteudo com espaco"}'::jsonb,
+       'pending', 0, now(), 'pgtap-idem-refspace'
+     )$$,
+  '23514', NULL, 'outbox ref with invalid characters is rejected'
+);
+SELECT throws_ok(
+  $$INSERT INTO public.outbox_events (
+       event_type, contract_version, user_id, turn_request_id, payload,
+       status, attempts, next_attempt_at, idempotency_key
+     ) VALUES (
+       'memory_indexed', 1, 'pgtap_tr_user', NULL,
+       '{"version": "abc"}'::jsonb,
+       'pending', 0, now(), 'pgtap-idem-verstr'
+     )$$,
+  '23514', NULL, 'outbox version as string is rejected'
+);
+SELECT throws_ok(
+  $$INSERT INTO public.outbox_events (
+       event_type, contract_version, user_id, turn_request_id, payload,
+       status, attempts, next_attempt_at, idempotency_key
+     ) VALUES (
+       'memory_indexed', 1, 'pgtap_tr_user', NULL,
+       '{"version": 0}'::jsonb,
+       'pending', 0, now(), 'pgtap-idem-ver0'
+     )$$,
+  '23514', NULL, 'outbox version below range is rejected'
+);
+SELECT throws_ok(
+  $$INSERT INTO public.outbox_events (
+       event_type, contract_version, user_id, turn_request_id, payload,
+       status, attempts, next_attempt_at, idempotency_key
+     ) VALUES (
+       'memory_indexed', 1, 'pgtap_tr_user', NULL,
+       '{"version": 1001}'::jsonb,
+       'pending', 0, now(), 'pgtap-idem-ver1001'
+     )$$,
+  '23514', NULL, 'outbox version above range is rejected'
+);
+-- JSON null values are not valid contract values (fail-closed)
+SELECT throws_ok(
+  $$INSERT INTO public.outbox_events (
+       event_type, contract_version, user_id, turn_request_id, payload,
+       status, attempts, next_attempt_at, idempotency_key
+     ) VALUES (
+       'memory_indexed', 1, 'pgtap_tr_user', NULL,
+       '{"ref": null}'::jsonb,
+       'pending', 0, now(), 'pgtap-idem-refnull'
+     )$$,
+  '23514', NULL, 'outbox ref as JSON null is rejected'
+);
+SELECT throws_ok(
+  $$INSERT INTO public.outbox_events (
+       event_type, contract_version, user_id, turn_request_id, payload,
+       status, attempts, next_attempt_at, idempotency_key
+     ) VALUES (
+       'memory_indexed', 1, 'pgtap_tr_user', NULL,
+       '{"version": null}'::jsonb,
+       'pending', 0, now(), 'pgtap-idem-vernull'
+     )$$,
+  '23514', NULL, 'outbox version as JSON null is rejected'
+);
+
+-- A conforming payload (scalar ref, kind, version in range) is accepted
+INSERT INTO public.outbox_events (
+  event_type, contract_version, user_id, turn_request_id, payload,
+  status, attempts, next_attempt_at, idempotency_key
+) VALUES (
+  'memory_indexed', 1, 'pgtap_tr_user', NULL,
+  '{"ref": "turn-1", "kind": "memory_indexed", "version": 1}'::jsonb,
+  'pending', 0, now(), 'pgtap-idem-validvalue'
+);
+SELECT is(
+  (SELECT count(*)::integer FROM public.outbox_events WHERE idempotency_key = 'pgtap-idem-validvalue'),
+  1,
+  'outbox payload with conforming scalar values is inserted'
+);
+
 -- turn_requests replay_payload forbids internal fields too (top level + nested)
 SELECT throws_ok(
   $$INSERT INTO public.turn_requests (
@@ -758,18 +904,72 @@ SELECT ok(
   'PUBLIC has no privileges on outbox_events'
 );
 
--- Payload helpers are server-only (anon cannot execute)
+-- Payload helpers and trigger function are server-only: the exact EXECUTE
+-- matrix is asserted for every function created by the migration (helpers +
+-- SECURITY DEFINER trigger function).
+SELECT ok(
+  NOT has_function_privilege('public', 'public.jsonb_has_forbidden_key(jsonb, text[])', 'EXECUTE'),
+  'PUBLIC cannot execute jsonb_has_forbidden_key'
+);
+SELECT ok(
+  NOT has_function_privilege('authenticated', 'public.jsonb_has_forbidden_key(jsonb, text[])', 'EXECUTE'),
+  'authenticated cannot execute jsonb_has_forbidden_key'
+);
 SELECT ok(
   NOT has_function_privilege('anon', 'public.jsonb_has_forbidden_key(jsonb, text[])', 'EXECUTE'),
   'anon cannot execute jsonb_has_forbidden_key'
+);
+SELECT ok(
+  NOT has_function_privilege('public', 'public.jsonb_keys_subset_of(jsonb, text[])', 'EXECUTE'),
+  'PUBLIC cannot execute jsonb_keys_subset_of'
+);
+SELECT ok(
+  NOT has_function_privilege('authenticated', 'public.jsonb_keys_subset_of(jsonb, text[])', 'EXECUTE'),
+  'authenticated cannot execute jsonb_keys_subset_of'
 );
 SELECT ok(
   NOT has_function_privilege('anon', 'public.jsonb_keys_subset_of(jsonb, text[])', 'EXECUTE'),
   'anon cannot execute jsonb_keys_subset_of'
 );
 SELECT ok(
+  NOT has_function_privilege('public', 'public.jsonb_outbox_payload_value_contract(jsonb)', 'EXECUTE'),
+  'PUBLIC cannot execute jsonb_outbox_payload_value_contract'
+);
+SELECT ok(
+  NOT has_function_privilege('authenticated', 'public.jsonb_outbox_payload_value_contract(jsonb)', 'EXECUTE'),
+  'authenticated cannot execute jsonb_outbox_payload_value_contract'
+);
+SELECT ok(
+  NOT has_function_privilege('anon', 'public.jsonb_outbox_payload_value_contract(jsonb)', 'EXECUTE'),
+  'anon cannot execute jsonb_outbox_payload_value_contract'
+);
+SELECT ok(
+  NOT has_function_privilege('public', 'public.turn_requests_null_message_refs()', 'EXECUTE'),
+  'PUBLIC cannot execute turn_requests_null_message_refs (SECURITY DEFINER)'
+);
+SELECT ok(
+  NOT has_function_privilege('authenticated', 'public.turn_requests_null_message_refs()', 'EXECUTE'),
+  'authenticated cannot execute turn_requests_null_message_refs'
+);
+SELECT ok(
+  NOT has_function_privilege('anon', 'public.turn_requests_null_message_refs()', 'EXECUTE'),
+  'anon cannot execute turn_requests_null_message_refs'
+);
+SELECT ok(
   has_function_privilege('service_role', 'public.jsonb_has_forbidden_key(jsonb, text[])', 'EXECUTE'),
   'service_role can execute jsonb_has_forbidden_key'
+);
+SELECT ok(
+  has_function_privilege('service_role', 'public.jsonb_keys_subset_of(jsonb, text[])', 'EXECUTE'),
+  'service_role can execute jsonb_keys_subset_of'
+);
+SELECT ok(
+  has_function_privilege('service_role', 'public.jsonb_outbox_payload_value_contract(jsonb)', 'EXECUTE'),
+  'service_role can execute jsonb_outbox_payload_value_contract'
+);
+SELECT ok(
+  has_function_privilege('service_role', 'public.turn_requests_null_message_refs()', 'EXECUTE'),
+  'service_role can execute turn_requests_null_message_refs'
 );
 
 -- =================================================================
@@ -867,6 +1067,11 @@ SELECT throws_ok(
   $$CREATE FUNCTION public.jsonb_has_forbidden_key(jsonb, text[]) RETURNS boolean
     LANGUAGE sql IMMUTABLE AS 'SELECT true'$$,
   '42723', NULL, 're-creating jsonb_has_forbidden_key fails (drift)'
+);
+SELECT throws_ok(
+  $$CREATE FUNCTION public.jsonb_outbox_payload_value_contract(jsonb) RETURNS boolean
+    LANGUAGE sql IMMUTABLE AS 'SELECT true'$$,
+  '42723', NULL, 're-creating jsonb_outbox_payload_value_contract fails (drift)'
 );
 
 -- =================================================================

@@ -114,10 +114,28 @@ jobs:
           PYTHONPATH: "."
         run: |
           set -euo pipefail
-          migration="supabase/migrations/20240101000003_admission_ledger.sql"
-          hidden="${migration}.legacy-test-hidden"
-          mv "$migration" "$hidden"
-          trap 'mv "$hidden" "$migration"' EXIT
+          # Hide every migration AFTER the hardening target (02) — now 03 and
+          # 04 — so the legacy upgrade scenario starts from a true
+          # baseline-only database. Restored in a trap, including on failure.
+          migrations=(
+            "supabase/migrations/20240101000003_admission_ledger.sql"
+            "supabase/migrations/20240101000004_transactional_turn_schema.sql"
+          )
+          hidden=()
+          restore_migrations() {
+            for f in "${hidden[@]:-}"; do
+              if [[ -f "$f.legacy-test-hidden" ]]; then
+                mv "$f.legacy-test-hidden" "$f"
+              fi
+            done
+          }
+          trap restore_migrations EXIT
+          for migration in "${migrations[@]}"; do
+            if [[ -f "$migration" ]]; then
+              mv "$migration" "$migration.legacy-test-hidden"
+              hidden+=("$migration")
+            fi
+          done
           python -m pytest -q -ra backend/tests/test_legacy_upgrade.py
 
       - name: Reset database for transactional schema legacy tests

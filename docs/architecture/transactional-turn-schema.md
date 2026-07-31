@@ -146,7 +146,7 @@ on their presence — the `replay_payload` is authoritative for replay.
 | Status | Meaning | Required shape (exact, mutually exclusive) |
 |---|---|---|
 | `pending` | Available for claim | `processed_at`/`dead_lettered_at`/`retention_until` NULL; no lease; `next_attempt_at` set; `attempts = 0`; no error |
-| `processing` | Leased by a worker | `processed_at`/`dead_lettered_at`/`retention_until` NULL; lease set; `attempts` 1..10; no error |
+| `processing` | Leased by a worker | `processed_at`/`dead_lettered_at`/`retention_until` NULL; **`next_attempt_at` NULL**; lease set; `attempts` 1..10; no error |
 | `completed` | Delivered successfully | `processed_at` set; `dead_lettered_at` NULL; `next_attempt_at` NULL; no lease; `attempts` 1..10; no error; `retention_until` set |
 | `failed` | Retryable failure | `processed_at`/`dead_lettered_at`/`retention_until` NULL; no lease; `next_attempt_at` set; `attempts` 1..9; error set |
 | `dead_letter` | Exhausted retries | `dead_lettered_at` set; `retention_until` set; `next_attempt_at` NULL; no lease; `attempts = 10`; error set |
@@ -154,8 +154,9 @@ on their presence — the `replay_payload` is authoritative for replay.
 The `outbox_events_status_coherence_check` gives every status an exact,
 mutually exclusive shape — no field of another state can leak in
 (`completed` cannot carry `next_attempt_at` or dead-letter fields;
-`dead_letter` requires error + retention; `processing` cannot carry failure
-fields), fail-closed.
+`processing` requires `next_attempt_at IS NULL` so a claimed event cannot
+keep the pending/failed scheduling field; `dead_letter` requires error +
+retention; `processing` cannot carry failure fields), fail-closed.
 
 ---
 
@@ -167,6 +168,27 @@ fields), fail-closed.
 - A duplicate key within the same user is rejected by the unique constraint,
   making repeated publication attempts idempotent without a worker-side
   lock. The bound prevents unbounded index/storage growth.
+
+## 7b. Outbox payload value contract
+
+The outbox payload document must be **minimal, non-duplicating, and
+structured**. Key-name allowlists alone are not enough: raw content must
+never fit under an allowed key. The `jsonb_outbox_payload_value_contract`
+helper therefore validates **types and formats**, not just names:
+
+| Field | Type | Format / bound |
+|---|---|---|
+| `ref`, `request_id`, `turn_id`, `message_id`, `entity_id`, `kind` | string (scalar) | `^[A-Za-z0-9_.:-]{1,128}$` — sanitized, bounded, no arbitrary objects/arrays |
+| `version` | JSON number (integer) | `1..1000` |
+
+- Objects/arrays under `ref` or any identifier key are rejected even when
+  they contain no forbidden key — a nested `{"text": "..."}` can never be
+  smuggled in as "metadata".
+- `version` must be an integer in range; strings, floats and out-of-range
+  values are rejected.
+- Combined with the top-level allowlist and the recursive forbidden-key
+  check, the value contract guarantees the outbox never stores prompts,
+  messages, metacognition or arbitrary nested content.
 
 ---
 
@@ -270,6 +292,7 @@ DROP TABLE IF EXISTS public.turn_requests;
 ALTER TABLE public.profiles DROP COLUMN IF EXISTS revision;
 DROP FUNCTION IF EXISTS public.jsonb_has_forbidden_key(jsonb, text[]);
 DROP FUNCTION IF EXISTS public.jsonb_keys_subset_of(jsonb, text[]);
+DROP FUNCTION IF EXISTS public.jsonb_outbox_payload_value_contract(jsonb);
 ```
 
 This is exercised by `test_transactional_schema_legacy.py` and is safe only
@@ -295,10 +318,14 @@ No client-authenticated role can reach `turn_requests` or `outbox_events`,
 directly or through the PostgREST API. The pgTAP suite asserts the exact
 grant matrix.
 
-The payload validation helpers (`jsonb_has_forbidden_key`,
-`jsonb_keys_subset_of`) are server-only too: EXECUTE is revoked from
-`PUBLIC`, `anon` and `authenticated`, and granted only to `service_role`
-(asserted by pgTAP).
+The payload helpers (`jsonb_has_forbidden_key`, `jsonb_keys_subset_of`,
+`jsonb_outbox_payload_value_contract`) and the SECURITY DEFINER trigger
+function (`turn_requests_null_message_refs`) are server-only: PostgreSQL
+grants EXECUTE to PUBLIC by default, so the migration explicitly revokes
+EXECUTE from `PUBLIC`, `anon` and `authenticated` and grants it **only** to
+`service_role`. The trigger function runs exclusively through the trigger;
+the service_role grant is for operational use. The exact EXECUTE matrix for
+al four functions is asserted by pgTAP.
 
 ---
 

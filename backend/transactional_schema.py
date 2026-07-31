@@ -117,7 +117,12 @@ def canonical_payload_hash(payload: Mapping[str, Any]) -> str:
 
 
 def _deep_freeze(value: Any) -> Any:
-    if isinstance(value, dict):
+    # Any Mapping accepted by the contract (dict, MappingProxyType, UserDict,
+    # OrderedDict, ...) is copied into a brand-new plain dict first, so the
+    # frozen view can never stay connected to external mutable storage. The
+    # copy happens BEFORE freezing, so a MappingProxyType backed by a mutable
+    # dict is detached at construction time.
+    if isinstance(value, Mapping):
         return MappingProxyType({k: _deep_freeze(v) for k, v in value.items()})
     if isinstance(value, (list, tuple)):
         return tuple(_deep_freeze(v) for v in value)

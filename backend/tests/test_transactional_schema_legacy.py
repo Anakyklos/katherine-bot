@@ -287,6 +287,7 @@ def test_operational_rollback(supabase_service_client):
         "ALTER TABLE public.profiles DROP COLUMN IF EXISTS revision;\n"
         "DROP FUNCTION IF EXISTS public.jsonb_has_forbidden_key(jsonb, text[]);\n"
         "DROP FUNCTION IF EXISTS public.jsonb_keys_subset_of(jsonb, text[]);\n"
+        "DROP FUNCTION IF EXISTS public.jsonb_outbox_payload_value_contract(jsonb);\n"
     )
 
     # Objects are gone after rollback.
@@ -316,6 +317,7 @@ def test_operational_rollback(supabase_service_client):
         "WHERE n.nspname = 'public' "
         "AND p.proname IN ("
         "  'jsonb_has_forbidden_key', 'jsonb_keys_subset_of', "
+        "  'jsonb_outbox_payload_value_contract', "
         "  'turn_requests_null_message_refs')"
         ") AS result",
         "result",

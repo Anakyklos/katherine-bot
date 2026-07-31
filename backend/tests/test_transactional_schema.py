@@ -288,6 +288,55 @@ class TestTurnRequestRecord:
         import json
         json.dumps(record.to_db_row()["replay_payload"])
 
+    def test_replay_payload_immutable_for_mapping_proxy(self):
+        """A MappingProxyType source must be copied, not referenced: mutating
+        the backing dict after construction must not affect the record."""
+        from types import MappingProxyType
+
+        backing = {"response": "ok", "emotion_state": {"name": "calm"}}
+        source = MappingProxyType(backing)
+        record = TurnRequestRecord(
+            user_id="u-1",
+            request_id="11111111-1111-4111-8111-111111111111",
+            payload_hash_sha256="a" * 64,
+            status="completed",
+            committed_revision=1,
+            replay_payload=source,
+        )
+        backing["response"] = "mutated"
+        backing["emotion_state"]["name"] = "mutated"
+        assert record.replay_payload["response"] == "ok"
+        assert record.replay_payload["emotion_state"]["name"] == "calm"
+        # The stored payload is still deeply immutable.
+        with pytest.raises(TypeError):
+            record.replay_payload["response"] = "x"  # type: ignore[index]
+        with pytest.raises(TypeError):
+            record.replay_payload["emotion_state"]["name"] = "x"  # type: ignore[index]
+
+    def test_replay_payload_immutable_for_user_dict(self):
+        """A UserDict source must be copied, not referenced: the mutable
+        underlying dict must not be shared with the record."""
+        from collections import UserDict
+
+        source = UserDict({"response": "ok", "meta": {"n": 1}})
+        record = TurnRequestRecord(
+            user_id="u-1",
+            request_id="11111111-1111-4111-8111-111111111111",
+            payload_hash_sha256="a" * 64,
+            status="completed",
+            committed_revision=1,
+            replay_payload=source,
+        )
+        source.data["response"] = "mutated"
+        source.data["meta"]["n"] = 2
+        assert record.replay_payload["response"] == "ok"
+        assert record.replay_payload["meta"]["n"] == 1
+        with pytest.raises(TypeError):
+            record.replay_payload["meta"]["n"] = 9  # type: ignore[index]
+        # Serialization still yields plain JSON structures.
+        import json
+        json.dumps(record.to_db_row()["replay_payload"])
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # 12–15. OutboxEventRecord
@@ -360,6 +409,49 @@ class TestOutboxEventRecord:
             record.payload["meta"]["n"] = 3  # type: ignore[index]
         import json
         json.dumps(record.to_db_row()["payload"])
+
+    def test_payload_immutable_for_mapping_proxy(self):
+        """Outbox payload frozen from a MappingProxyType must not be tied to
+        the mutable backing dict."""
+        from types import MappingProxyType
+
+        backing = {"ref": "turn-1", "meta": {"n": 1}}
+        source = MappingProxyType(backing)
+        record = OutboxEventRecord(
+            event_type="memory_indexed",
+            user_id="u-1",
+            payload=source,
+            status="pending",
+            idempotency_key="idem-1",
+        )
+        backing["ref"] = "mutated"
+        backing["meta"]["n"] = 2
+        assert record.payload["ref"] == "turn-1"
+        assert record.payload["meta"]["n"] == 1
+        with pytest.raises(TypeError):
+            record.payload["ref"] = "x"  # type: ignore[index]
+        with pytest.raises(TypeError):
+            record.payload["meta"]["n"] = 5  # type: ignore[index]
+
+    def test_payload_immutable_for_user_dict(self):
+        """Outbox payload frozen from a UserDict must not share the mutable
+        underlying dict."""
+        from collections import UserDict
+
+        source = UserDict({"ref": "turn-1", "meta": {"n": 1}})
+        record = OutboxEventRecord(
+            event_type="memory_indexed",
+            user_id="u-1",
+            payload=source,
+            status="pending",
+            idempotency_key="idem-1",
+        )
+        source.data["ref"] = "mutated"
+        source.data["meta"]["n"] = 2
+        assert record.payload["ref"] == "turn-1"
+        assert record.payload["meta"]["n"] == 1
+        with pytest.raises(TypeError):
+            record.payload["meta"]["n"] = 7  # type: ignore[index]
 
 
 # ═══════════════════════════════════════════════════════════════════════
