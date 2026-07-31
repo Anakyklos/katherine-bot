@@ -146,15 +146,16 @@ def test_load_recent_history_validation_failures():
 
     # Case 11: valid payload with extra keys normalized to only role and content
     mock_resp_valid_extra = MagicMock()
-    mock_resp_valid_extra.data = [{"role": "user", "content": "hello", "extra_key": "some_value", "id": 1}]
+    mock_resp_valid_extra.data = [{"role": "user", "content": "hello", "extra_key": "some_value", "id": 1, "created_at": "2026-07-30T00:00:00"}]
     mock_resp_valid_extra.error = None
     mm.supabase.table.return_value.select.return_value.eq.return_value.order.return_value.order.return_value.limit.return_value.execute.return_value = mock_resp_valid_extra
     history = mm.load_recent_history("user123")
-    # load_recent_history now includes "id" field for stable ordering
+    # load_recent_history now includes "id" and "created_at" fields for stable ordering
     assert len(history) == 1
     assert history[0]["role"] == "user"
     assert history[0]["content"] == "hello"
     assert history[0]["id"] == 1
+    assert history[0]["created_at"] == "2026-07-30T00:00:00"
     assert "extra_key" not in history[0]
 
 
@@ -299,14 +300,14 @@ def test_user_history_isolation():
     mock_limit = mock_order2.return_value.limit
     
     mock_resp = MagicMock()
-    mock_resp.data = [{"role": "user", "content": "hello", "id": 1}]
+    mock_resp.data = [{"role": "user", "content": "hello", "id": 1, "created_at": "2026-07-30T00:00:00"}]
     mock_resp.error = None
     mock_limit.return_value.execute.return_value = mock_resp
     
     history = mm.load_recent_history("userA")
     
     # Assert query filters strictly by userA
-    mock_select.assert_called_with("id, role, content")
+    mock_select.assert_called_with("id, role, content, created_at")
     mock_eq.assert_called_with("user_id", "userA")
     assert len(history) == 1
     assert history[0]["id"] == 1
@@ -323,10 +324,10 @@ def test_deterministic_ordering_calls():
     
     mock_resp = MagicMock()
     mock_resp.data = [
-        {"role": "assistant", "content": "reply2", "id": 4},
-        {"role": "user", "content": "msg2", "id": 3},
-        {"role": "assistant", "content": "reply1", "id": 2},
-        {"role": "user", "content": "msg1", "id": 1},
+        {"role": "assistant", "content": "reply2", "id": 4, "created_at": "2026-07-30T00:00:03"},
+        {"role": "user", "content": "msg2", "id": 3, "created_at": "2026-07-30T00:00:02"},
+        {"role": "assistant", "content": "reply1", "id": 2, "created_at": "2026-07-30T00:00:01"},
+        {"role": "user", "content": "msg1", "id": 1, "created_at": "2026-07-30T00:00:00"},
     ]
     mock_resp.error = None
     mock_limit.return_value.execute.return_value = mock_resp
@@ -342,9 +343,11 @@ def test_deterministic_ordering_calls():
     assert history[0]["role"] == "user"
     assert history[0]["content"] == "msg1"
     assert history[0]["id"] == 1
+    assert history[0]["created_at"] == "2026-07-30T00:00:00"
     assert history[3]["role"] == "assistant"
     assert history[3]["content"] == "reply2"
     assert history[3]["id"] == 4
+    assert history[3]["created_at"] == "2026-07-30T00:00:03"
 
 def test_tied_timestamps_ordering():
     mm = MemoryManager()

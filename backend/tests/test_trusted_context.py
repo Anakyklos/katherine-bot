@@ -2011,7 +2011,7 @@ class TestUuidPipeline:
 
         assert real_uuid not in caplog.text, "Real UUID leaked into logs"
 
-    def test_uuid_pipeline_end_to_end(self, monkeypatch):
+    def test_uuid_pipeline_end_to_end(self, monkeypatch, caplog):
         """Full RPC row → RetrievedMemory → LoadedContextData → ContextBundle → ContextBuildResult.
 
         Verifies source_map contains the real internal_id and no UUID leaks into messages or logs.
@@ -2020,8 +2020,7 @@ class TestUuidPipeline:
         from backend.trusted_context import build_context_bundle
         import uuid
 
-        caplog = logging.getLogger()
-        caplog.setLevel(logging.DEBUG)
+        caplog.set_level(logging.DEBUG)
 
         real_uuid = "770e8400-e29b-41d4-a716-446655440002"
         approved_mem = RetrievedMemory(
