@@ -99,16 +99,17 @@ class CommittedTurn:
 
 
 @dataclass(frozen=True)
-class ConflictError:
+class ConflictError(Exception):
     """Raised when a concurrent modification is detected.
 
     Carries the database-provided details so the caller can implement
-    retry/backoff logic.
+    retry/backoff logic. Subclasses Exception so it can be raised/caught
+    in normal control flow.
     """
 
     code: str
     message: str
-    expected_revision: int
+    expected_revision: Optional[int] = None
     actual_revision: Optional[int] = None
     request_id: Optional[str] = None
 
@@ -124,8 +125,12 @@ class ConflictError:
 
 
 @dataclass(frozen=True)
-class ValidationError:
-    """Raised when input validation fails before the transaction."""
+class ValidationError(Exception):
+    """Raised when input validation fails before the transaction.
+
+    Subclasses Exception so it can be used with `pytest.raises` and normal
+    exception handling.
+    """
 
     code: str
     message: str
@@ -189,7 +194,8 @@ def _validate_error_code(code: Optional[str]) -> None:
             "invalid_error_code",
             f"must be 1-{_MAX_ERROR_CODE_LENGTH} characters",
         )
-    if not all(c.isalnum() or c == "_" for c in code):
+    # Only allow lowercase letters, digits and underscore
+    if not all(c.isalnum() or c == "_" for c in code) or code.lower() != code:
         raise ValidationError(
             "invalid_error_code",
             "must contain only lowercase alphanumeric characters and '_'",
