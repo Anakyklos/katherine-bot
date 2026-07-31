@@ -36,6 +36,7 @@ from backend.atomic_turn_commit import (
     _validate_lease_owner,
     _validate_error_code,
     _validate_replay_payload,
+    _validate_snapshot_payload,
 )
 from backend.transactional_schema import (
     FORBIDDEN_PAYLOAD_KEYS,
@@ -492,7 +493,8 @@ class TestParseCommitTurnResult:
     def test_parse_empty_outbox_events(self, success_result):
         success_result["outbox_events"] = []
         result = parse_commit_turn_result(success_result)
-        assert result.outbox_events == []
+        # outbox_events is now a tuple for deep immutability
+        assert result.outbox_events == ()
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -546,10 +548,19 @@ class TestConflictError:
         assert "actual_revision=6" in error_str
         assert "request_id=req_123" in error_str
 
-    def test_immutable(self):
-        error = ConflictError(code="test", message="test")
-        with pytest.raises(FrozenInstanceError):
-            error.code = "modified"
+    def test_is_exception(self):
+        """Test that ConflictError is an Exception subclass."""
+        error = ConflictError(code="test", message="test", expected_revision=0)
+        assert isinstance(error, Exception)
+        assert isinstance(error, ConflictError)
+
+    def test_slots(self):
+        """Test that ConflictError uses __slots__ for memory efficiency."""
+        error = ConflictError(code="test", message="test", expected_revision=0)
+        assert hasattr(type(error), "__slots__")
+        assert error.code == "test"
+        assert error.message == "test"
+        assert error.expected_revision == 0
 
 
 class TestValidationError:
@@ -557,10 +568,18 @@ class TestValidationError:
         error = ValidationError(code="test_error", message="Test message")
         assert str(error) == "test_error: Test message"
 
-    def test_immutable(self):
+    def test_is_exception(self):
+        """Test that ValidationError is an Exception subclass."""
         error = ValidationError(code="test", message="test")
-        with pytest.raises(FrozenInstanceError):
-            error.code = "modified"
+        assert isinstance(error, Exception)
+        assert isinstance(error, ValidationError)
+
+    def test_slots(self):
+        """Test that ValidationError uses __slots__ for memory efficiency."""
+        error = ValidationError(code="test", message="test")
+        assert hasattr(type(error), "__slots__")
+        assert error.code == "test"
+        assert error.message == "test"
 
 
 class TestMessageRef:

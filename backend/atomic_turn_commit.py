@@ -32,6 +32,7 @@ Security notes:
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Mapping, Optional
 
 from backend.transactional_schema import (
@@ -40,6 +41,8 @@ from backend.transactional_schema import (
     canonical_payload_hash,
     TurnRequestRecord,
     OutboxEventRecord,
+    _deep_freeze,
+    _deep_unfreeze,
 )
 
 
@@ -51,6 +54,9 @@ _MAX_ERROR_CODE_LENGTH = 64
 # Maximum payload sizes (bytes, UTF-8 encoded).
 _MAX_REPLAY_PAYLOAD_BYTES = 8192
 _MAX_OUTBOX_PAYLOAD_BYTES = 8192
+
+# Snapshot validation forbidden keys (same as payload validation)
+_SNAPSHOT_FORBIDDEN_KEYS = FORBIDDEN_PAYLOAD_KEYS
 
 
 @dataclass(frozen=True)
@@ -67,6 +73,7 @@ class CommittedTurn:
 
     Fields mirror the database outputs of the commit_turn RPC.
     All server-owned IDs and timestamps are populated by the database.
+    All nested structures are deeply immutable.
     """
 
     user_id: str
@@ -81,6 +88,11 @@ class CommittedTurn:
     created_at: str
     completed_at: str
 
+    def __post_init__(self) -> None:
+        # Deep-freeze nested structures for true immutability
+        object.__setattr__(self, "replay_payload", _deep_freeze(self.replay_payload))
+        object.__setattr__(self, "outbox_events", tuple(_deep_freeze(e) for e in self.outbox_events))
+
     def to_db_row(self) -> dict[str, Any]:
         """Serialize for database result consumption."""
         return {
@@ -91,26 +103,35 @@ class CommittedTurn:
             "assistant_message_chat_log_id": self.assistant_message_chat_log_id,
             "user_message_id": self.user_message_id,
             "assistant_message_id": self.assistant_message_id,
-            "replay_payload": dict(self.replay_payload),
-            "outbox_events": [e.to_db_row() for e in self.outbox_events],
+            "replay_payload": _deep_unfreeze(self.replay_payload),
+            "outbox_events": [_deep_unfreeze(e) for e in self.outbox_events],
             "created_at": self.created_at,
             "completed_at": self.completed_at,
         }
 
 
-@dataclass(frozen=True)
-class ConflictError:
+class ConflictError(Exception):
     """Raised when a concurrent modification is detected.
 
     Carries the database-provided details so the caller can implement
     retry/backoff logic.
     """
 
-    code: str
-    message: str
-    expected_revision: int
-    actual_revision: Optional[int] = None
-    request_id: Optional[str] = None
+    __slots__ = ("code", "message", "expected_revision", "actual_revision", "request_id")
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        expected_revision: int,
+        actual_revision: Optional[int] = None,
+        request_id: Optional[str] = None,
+    ) -> None:
+        self.code = code
+        self.message = message
+        self.expected_revision = expected_revision
+        self.actual_revision = actual_revision
+        self.request_id = request_id
 
     def __str__(self) -> str:
         parts = [f"{self.code}: {self.message}"]
@@ -123,12 +144,14 @@ class ConflictError:
         return " | ".join(parts)
 
 
-@dataclass(frozen=True)
-class ValidationError:
+class ValidationError(Exception):
     """Raised when input validation fails before the transaction."""
 
-    code: str
-    message: str
+    __slots__ = ("code", "message")
+
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        self.message = message
 
     def __str__(self) -> str:
         return f"{self.code}: {self.message}"
@@ -141,6 +164,45 @@ TURN_REQUEST_STATUS_EXPIRED = "expired"
 
 # Valid status values for outbox_events (mirrors database CHECK).
 OUTBOX_STATUS_PENDING = "pending"
+
+
+def _validate_snapshot_payload(payload: Optional[Mapping[str, Any]], field_name: str) -> None:
+    """Validate snapshot payloads (emotional_state, relationship_state) against forbidden keys."""
+    if payload is None:
+        return
+    if not isinstance(payload, Mapping):
+        raise ValidationError(f"invalid_{field_name}", f"must be a mapping or None")
+    
+    # Check for forbidden keys recursively
+    def _has_forbidden(obj: Any) -> bool:
+        if isinstance(obj, Mapping):
+            for k, v in obj.items():
+                if k in _SNAPSHOT_FORBIDDEN_KEYS or _has_forbidden(v):
+                    return True
+        elif isinstance(obj, (list, tuple)):
+            for v in obj:
+                if _has_forbidden(v):
+                    return True
+        return False
+
+    if _has_forbidden(payload):
+        raise ValidationError(
+            f"invalid_{field_name}",
+            "contains forbidden keys",
+        )
+    
+    # Check size for snapshots (same limit as replay_payload)
+    try:
+        import json
+        serialized = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError):
+        raise ValidationError(f"invalid_{field_name}", "not JSON-serializable")
+    
+    if len(serialized.encode("utf-8")) > _MAX_REPLAY_PAYLOAD_BYTES:
+        raise ValidationError(
+            f"invalid_{field_name}",
+            f"exceeds {_MAX_REPLAY_PAYLOAD_BYTES} bytes",
+        )
 
 
 def _validate_idempotency_key(key: str) -> None:
@@ -189,7 +251,8 @@ def _validate_error_code(code: Optional[str]) -> None:
             "invalid_error_code",
             f"must be 1-{_MAX_ERROR_CODE_LENGTH} characters",
         )
-    if not all(c.isalnum() or c == "_" for c in code):
+    # Must be lowercase alphanumeric with underscores only
+    if not all((c.isalnum() and c.islower()) or c == "_" for c in code):
         raise ValidationError(
             "invalid_error_code",
             "must contain only lowercase alphanumeric characters and '_'",
@@ -282,7 +345,12 @@ def validate_atomic_commit_input(
     if not isinstance(request_id, str) or not request_id:
         raise ValidationError("invalid_request_id", "must be a non-empty string")
 
-    if not isinstance(expected_revision, int) or expected_revision < 0:
+    # expected_revision must be an integer, not bool (bool is subclass of int in Python)
+    if not isinstance(expected_revision, int) or isinstance(expected_revision, bool):
+        raise ValidationError(
+            "invalid_expected_revision", "must be a non-negative integer"
+        )
+    if expected_revision < 0:
         raise ValidationError(
             "invalid_expected_revision", "must be a non-negative integer"
         )
@@ -293,15 +361,9 @@ def validate_atomic_commit_input(
     if not isinstance(assistant_message, str):
         raise ValidationError("invalid_assistant_message", "must be a string")
 
-    if emotional_state is not None and not isinstance(emotional_state, Mapping):
-        raise ValidationError("invalid_emotional_state", "must be a mapping or None")
-
-    if relationship_state is not None and not isinstance(
-        relationship_state, Mapping
-    ):
-        raise ValidationError(
-            "invalid_relationship_state", "must be a mapping or None"
-        )
+    # Validate snapshots
+    _validate_snapshot_payload(emotional_state, "emotional_state")
+    _validate_snapshot_payload(relationship_state, "relationship_state")
 
     if not isinstance(public_response, str):
         raise ValidationError("invalid_public_response", "must be a string")
@@ -339,7 +401,7 @@ def build_commit_turn_rpc_payload(
 ) -> dict[str, Any]:
     """Build the payload for the commit_turn PostgreSQL RPC function.
 
-    The RPC function signature in SQL is:
+    The RPC function signature in SQL is (corrected order):
     ```sql
     commit_turn(
         p_authenticated_user_id text,
@@ -347,15 +409,18 @@ def build_commit_turn_rpc_payload(
         p_expected_revision bigint,
         p_user_message text,
         p_assistant_message text,
+        p_payload_hash_sha256 text,
         p_emotional_state jsonb,
         p_relationship_state jsonb,
         p_public_response text,
-        p_outbox_events jsonb,  -- array of event objects
         p_replay_payload jsonb,
-        p_payload_hash_sha256 text,
+        p_outbox_events jsonb DEFAULT '[]'::jsonb,
         p_lease_owner text DEFAULT NULL
     ) RETURNS jsonb
     ```
+    
+    Note: Parameter order has been corrected so all required parameters
+    come before optional parameters (to avoid SQLSTATE 42P13).
 
     Args:
         All parameters as described in validate_atomic_commit_input.
@@ -386,14 +451,12 @@ def build_commit_turn_rpc_payload(
         "p_expected_revision": expected_revision,
         "p_user_message": user_message,
         "p_assistant_message": assistant_message,
-        "p_emotional_state": dict(emotional_state) if emotional_state else None,
-        "p_relationship_state": (
-            dict(relationship_state) if relationship_state else None
-        ),
-        "p_public_response": public_response,
-        "p_outbox_events": outbox_array,
-        "p_replay_payload": dict(replay_payload),
         "p_payload_hash_sha256": payload_hash_sha256,
+        "p_emotional_state": dict(emotional_state) if emotional_state else None,
+        "p_relationship_state": dict(relationship_state) if relationship_state else None,
+        "p_public_response": public_response,
+        "p_replay_payload": dict(replay_payload),
+        "p_outbox_events": outbox_array,
         "p_lease_owner": lease_owner,
     }
 
@@ -557,9 +620,9 @@ async def commit_turn(
 
     # Compute payload hash
     # The canonical payload for hashing should include all the inputs
-    # that determine the turn's identity and content
+    # that determine the turn's identity, content, and side effects (outbox, replay)
     canonical_payload = {
-        "user_id": authenticated_user_id,
+        "authenticated_user_id": authenticated_user_id,
         "request_id": request_id,
         "expected_revision": expected_revision,
         "user_message": user_message,
@@ -567,6 +630,11 @@ async def commit_turn(
         "emotional_state": emotional_state,
         "relationship_state": relationship_state,
         "public_response": public_response,
+        "replay_payload": replay_payload,
+        "outbox_events": [
+            {"event_type": et, "payload": pl, "idempotency_key": ik}
+            for et, pl, ik in outbox_events
+        ],
     }
     payload_hash_sha256 = canonical_payload_hash(canonical_payload)
 
