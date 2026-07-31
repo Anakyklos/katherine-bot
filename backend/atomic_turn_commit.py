@@ -159,6 +159,24 @@ class ValidationError(Exception):
         return f"{self.code}: {self.message}"
 
 
+class DatabaseError(Exception):
+    """Raised when an unexpected database persistence error occurs.
+    
+    This is separate from ConflictError (which is for concurrent modification)
+    and ValidationError (which is for input validation before the transaction).
+    DatabaseError represents internal failures that should be retried or escalated.
+    """
+
+    __slots__ = ("code", "message")
+
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        self.message = message
+
+    def __str__(self) -> str:
+        return f"{self.code}: {self.message}"
+
+
 # Valid status values for turn_requests (mirrors database CHECK).
 TURN_REQUEST_STATUS_PENDING = "pending"
 TURN_REQUEST_STATUS_COMPLETED = "completed"
@@ -614,7 +632,7 @@ def parse_commit_turn_result(result: Mapping[str, Any]) -> CommittedTurn:
             actual = error_info.get("actual_revision")
             request = error_info.get("request_id")
             # Only raise ConflictError for known conflict codes
-            # database_error should raise a different exception
+            # database_error should raise DatabaseError (separate from ConflictError)
             if code in ("revision_mismatch", "request_payload_conflict", "request_lease_conflict"):
                 raise ConflictError(
                     code=code,
@@ -623,8 +641,11 @@ def parse_commit_turn_result(result: Mapping[str, Any]) -> CommittedTurn:
                     actual_revision=actual if isinstance(actual, int) else None,
                     request_id=request if isinstance(request, str) else None,
                 )
+            elif code == "database_error":
+                # Database persistence errors are separate from validation and conflict errors
+                raise DatabaseError(code, message)
             else:
-                # For database_error and other unknown errors, raise ValidationError
+                # For other unknown errors, raise ValidationError
                 raise ValidationError(code, message)
         else:
             raise ValidationError("invalid_error_format", "error field must be a mapping")

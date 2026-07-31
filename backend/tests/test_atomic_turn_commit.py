@@ -29,6 +29,7 @@ from backend.atomic_turn_commit import (
     CommittedTurn,
     ConflictError,
     ValidationError,
+    DatabaseError,
     validate_atomic_commit_input,
     build_commit_turn_rpc_payload,
     parse_commit_turn_result,
@@ -523,6 +524,35 @@ class TestParseCommitTurnResult:
         assert error.code == "request_payload_conflict"
         assert error.request_id == "12345678-1234-1234-1234-123456789abc"
 
+    def test_parse_error_result_database_error(self):
+        error_result = {
+            "error": {
+                "code": "database_error",
+                "message": "internal database error",
+            }
+        }
+        with pytest.raises(DatabaseError) as exc:
+            parse_commit_turn_result(error_result)
+
+        error = exc.value
+        assert error.code == "database_error"
+        assert error.message == "internal database error"
+
+    def test_parse_error_result_lease_conflict(self):
+        error_result = {
+            "error": {
+                "code": "request_lease_conflict",
+                "message": "Request ID has active lease owned by another worker",
+                "request_id": "12345678-1234-1234-1234-123456789abc",
+            }
+        }
+        with pytest.raises(ConflictError) as exc:
+            parse_commit_turn_result(error_result)
+
+        error = exc.value
+        assert error.code == "request_lease_conflict"
+        assert error.request_id == "12345678-1234-1234-1234-123456789abc"
+
     def test_parse_invalid_result_not_mapping(self):
         with pytest.raises(ValidationError) as exc:
             parse_commit_turn_result("not a mapping")
@@ -624,6 +654,25 @@ class TestValidationError:
         assert hasattr(type(error), "__slots__")
         assert error.code == "test"
         assert error.message == "test"
+
+
+class TestDatabaseError:
+    def test_str_representation(self):
+        error = DatabaseError(code="database_error", message="Internal database error")
+        assert str(error) == "database_error: Internal database error"
+
+    def test_is_exception(self):
+        """Test that DatabaseError is an Exception subclass."""
+        error = DatabaseError(code="database_error", message="error")
+        assert isinstance(error, Exception)
+        assert isinstance(error, DatabaseError)
+
+    def test_slots(self):
+        """Test that DatabaseError uses __slots__ for memory efficiency."""
+        error = DatabaseError(code="database_error", message="error")
+        assert hasattr(type(error), "__slots__")
+        assert error.code == "database_error"
+        assert error.message == "error"
 
 
 class TestMessageRef:
