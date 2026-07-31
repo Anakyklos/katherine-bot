@@ -120,7 +120,7 @@ END $$;
 --
 -- Error codes:
 --   - revision_mismatch: profile revision doesn't match expected_revision
---   - request_payload_conflict: (user_id, request_id) already exists with different payload (for non-expired requests)
+--   - request_payload_conflict: (user_id, request_id) already exists with different payload hash, or has active lease
 --   - profile_upsert_failed: could not create/lock profile
 --   - message_insert_failed: could not insert messages
 --   - turn_request_insert_failed: could not insert/update turn_request
@@ -345,62 +345,96 @@ BEGIN
         FROM public.turn_requests
         WHERE user_id = p_authenticated_user_id AND request_id = p_request_id;
         
-        -- If the payload hash matches, this is an idempotent retry
-        -- Return the EXACT stored result including committed_revision, outbox_events, etc.
+        -- First, check the status to determine reclaim eligibility
+        -- Same-hash classification must check status FIRST:
+        -- - completed + same hash: idempotent replay (return stored result)
+        -- - pending/expired + same hash: follow lease/claim semantics
+        -- - different hash: ALWAYS conflict, regardless of status
+        
         IF v_existing_payload_hash = p_payload_hash_sha256 THEN
-            -- Reconstruct the outbox events for this request
-            SELECT jsonb_agg(to_jsonb(outbox_events.*))
-            INTO v_outbox_results
-            FROM public.outbox_events
-            WHERE turn_request_id = (
-                SELECT id FROM public.turn_requests
-                WHERE user_id = p_authenticated_user_id AND request_id = p_request_id
-            );
-            
-            IF v_outbox_results IS NULL THEN
-                v_outbox_results := '[]'::jsonb;
-            END IF;
-            
-            -- Return the stored assistant_message_id for reproducibility
-            -- Use the chat_log_id directly as string (durable, doesn't depend on chat_logs existence)
-            v_result := jsonb_build_object(
-                'user_id', p_authenticated_user_id,
-                'request_id', p_request_id::text,
-                'committed_revision', v_existing_committed_revision,
-                'user_message_chat_log_id', v_existing_user_message_chat_log_id,
-                'assistant_message_chat_log_id', v_existing_assistant_message_chat_log_id,
-                'user_message_id', p_request_id::text,
-                'assistant_message_id', v_existing_assistant_message_chat_log_id::text,
-                'replay_payload', COALESCE(v_existing_replay_payload, '{}'::jsonb),
-                'outbox_events', v_outbox_results,
-                'created_at', v_existing_created_at::text,
-                'completed_at', COALESCE(v_existing_completed_at::text, v_existing_created_at::text)
-            );
-            RETURN v_result;
-        ELSE
-            -- Payload differs: conflict
-            -- Check if the existing request can be reclaimed
-            IF v_existing_status = 'expired' THEN
-                -- For expired requests with different payload, we reclaim the existing row
-                -- Use the existing turn_request_id for FK consistency
-                v_turn_request_id := v_existing_turn_request_id;
-                -- Continue to CAS validation and will UPDATE the existing row
-            ELSIF v_existing_status = 'pending' AND v_existing_lease_expires_at IS NOT NULL AND v_existing_lease_expires_at <= v_now THEN
-                -- Pending request with expired lease: treat as expired and reclaim
-                v_turn_request_id := v_existing_turn_request_id;
-                -- Continue to CAS validation and will UPDATE the existing row
-            ELSE
-                -- Active request with different payload - true conflict
+            -- Same hash: check status for replay vs lease semantics
+            IF v_existing_status = 'completed' THEN
+                -- Idempotent replay: return the EXACT stored result
+                -- Reconstruct the outbox events for this request with ORDER BY for determinism
+                SELECT jsonb_agg(to_jsonb(outbox_events.*) ORDER BY outbox_events.id)
+                INTO v_outbox_results
+                FROM public.outbox_events
+                WHERE turn_request_id = (
+                    SELECT id FROM public.turn_requests
+                    WHERE user_id = p_authenticated_user_id AND request_id = p_request_id
+                );
+                
+                IF v_outbox_results IS NULL THEN
+                    v_outbox_results := '[]'::jsonb;
+                END IF;
+                
+                -- Return the stored assistant_message_id for reproducibility
+                -- Use the chat_log_id directly as string (durable, doesn't depend on chat_logs existence)
                 v_result := jsonb_build_object(
-                    'error', jsonb_build_object(
-                        'code', 'request_payload_conflict',
-                        'message', 'Request ID already exists with different payload',
-                        'expected_revision', p_expected_revision,
-                        'request_id', p_request_id::text
-                    )
+                    'user_id', p_authenticated_user_id,
+                    'request_id', p_request_id::text,
+                    'committed_revision', v_existing_committed_revision,
+                    'user_message_chat_log_id', v_existing_user_message_chat_log_id,
+                    'assistant_message_chat_log_id', v_existing_assistant_message_chat_log_id,
+                    'user_message_id', p_request_id::text,
+                    'assistant_message_id', v_existing_assistant_message_chat_log_id::text,
+                    'replay_payload', COALESCE(v_existing_replay_payload, '{}'::jsonb),
+                    'outbox_events', v_outbox_results,
+                    'created_at', v_existing_created_at::text,
+                    'completed_at', COALESCE(v_existing_completed_at::text, v_existing_created_at::text)
                 );
                 RETURN v_result;
+            ELSE
+                -- Same hash but not completed: pending or expired
+                -- Must follow lease/claim semantics, not simple replay
+                -- Enforce lease ownership: check p_lease_owner against existing lease, block if active and owned by another
+                IF v_existing_lease_owner IS NOT NULL AND v_existing_lease_expires_at IS NOT NULL AND v_existing_lease_expires_at > v_now THEN
+                    -- Active lease exists
+                    IF v_existing_lease_owner = p_lease_owner THEN
+                        -- Caller owns the active lease - can continue with same hash
+                        v_turn_request_id := v_existing_turn_request_id;
+                        -- Continue to CAS validation and will UPDATE the existing row
+                    ELSE
+                        -- Active lease owned by someone else - conflict
+                        v_result := jsonb_build_object(
+                            'error', jsonb_build_object(
+                                'code', 'request_payload_conflict',
+                                'message', 'Request ID exists with active lease owned by another worker',
+                                'expected_revision', p_expected_revision,
+                                'request_id', p_request_id::text
+                            )
+                        );
+                        RETURN v_result;
+                    END IF;
+                ELSIF v_existing_lease_owner IS NULL OR v_existing_lease_expires_at IS NULL OR v_existing_lease_expires_at <= v_now THEN
+                    -- No active lease or expired lease: can reclaim
+                    v_turn_request_id := v_existing_turn_request_id;
+                    -- Continue to CAS validation and will UPDATE the existing row
+                ELSE
+                    -- Should not reach here, but safety net
+                    v_result := jsonb_build_object(
+                        'error', jsonb_build_object(
+                            'code', 'request_payload_conflict',
+                            'message', 'Request ID exists with lease in unknown state',
+                            'expected_revision', p_expected_revision,
+                            'request_id', p_request_id::text
+                        )
+                    );
+                    RETURN v_result;
+                END IF;
             END IF;
+        ELSE
+            -- Different hash: ALWAYS conflict, regardless of status
+            -- Reclaim is NOT allowed for different payloads - only same-hash requests may replay
+            v_result := jsonb_build_object(
+                'error', jsonb_build_object(
+                    'code', 'request_payload_conflict',
+                    'message', 'Request ID already exists with different payload hash',
+                    'expected_revision', p_expected_revision,
+                    'request_id', p_request_id::text
+                )
+            );
+            RETURN v_result;
         END IF;
     END IF;
 
@@ -465,7 +499,22 @@ BEGIN
     -- For expired request reclaim: UPDATE existing row with new payload
     -- =============================================================
     IF v_turn_request_id IS NOT NULL THEN
-        -- Reclaiming an expired request: UPDATE the existing row
+        -- Reclaiming an expired/expired-lease request: UPDATE the existing row
+        -- Must clear lease_owner and lease_expires_at to satisfy turn_requests_status_coherence_check
+        -- Safety net: enforce lease ownership check (also checked in same-hash logic above)
+        IF p_lease_owner IS NOT NULL AND v_existing_lease_owner IS NOT NULL AND v_existing_lease_expires_at > v_now AND v_existing_lease_owner <> p_lease_owner THEN
+            -- Active lease owned by someone else - cannot reclaim
+            v_result := jsonb_build_object(
+                'error', jsonb_build_object(
+                    'code', 'request_payload_conflict',
+                    'message', 'Request ID has active lease owned by another worker',
+                    'expected_revision', p_expected_revision,
+                    'request_id', p_request_id::text
+                )
+            );
+            RETURN v_result;
+        END IF;
+        
         UPDATE public.turn_requests
         SET 
             payload_hash_sha256 = p_payload_hash_sha256,
@@ -477,7 +526,9 @@ BEGIN
             replay_payload = COALESCE(p_replay_payload, '{}'::jsonb),
             updated_at = v_now,
             completed_at = v_now,
-            error_code = NULL
+            error_code = NULL,
+            lease_owner = NULL,
+            lease_expires_at = NULL
         WHERE id = v_turn_request_id
             AND user_id = p_authenticated_user_id
             AND request_id = p_request_id;
