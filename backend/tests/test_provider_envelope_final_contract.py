@@ -351,12 +351,17 @@ class TestRpcResponseValidation:
         """Valid docs before/after invalid entries (whitespace, empty, missing keys)."""
         rpc_mock = MagicMock()
         response = MagicMock()
+        _valid_meta = {
+            "schema_version": 1, "approved": True,
+            "provenance": "user_confirmed", "confidence": 0.8,
+            "epistemic_status": "approved", "tags": ["tag1"],
+        }
         response.data = [
-            {"content": "First valid memory.", "metadata": {"tags": ["tag1"]}},
+            {"id": "11111111-1111-4111-8111-111111111111", "content": "First valid memory.", "metadata": _valid_meta},
             {"content": "   ", "metadata": {"tags": []}},
-            {"content": "Second valid memory.", "metadata": {"tags": ["tag2"]}},
+            {"id": "22222222-2222-4222-8222-222222222222", "content": "Second valid memory.", "metadata": dict(_valid_meta, tags=["tag2"])},
             {"content": "", "metadata": {"tags": []}},
-            {"content": "Third valid memory.", "metadata": {"tags": ["tag3"]}},
+            {"id": "33333333-3333-4333-8333-333333333333", "content": "Third valid memory.", "metadata": dict(_valid_meta, tags=["tag3"])},
             {},
         ]
         rpc_mock.execute.return_value = response
@@ -370,38 +375,39 @@ class TestRpcResponseValidation:
     def test_invalid_metadata_isolated_to_document(self, manager):
         """Non-dict metadata (string, None, int) does not crash the batch.
 
-        Documents with invalid metadata are still included; the tag policy
-        handles non-dict metadata gracefully by falling back to empty tags.
+        Documents with invalid metadata are excluded; valid adjacent
+        documents are preserved. The contract requires approved=True,
+        schema_version >= 1, valid UUID id, provenance, confidence,
+        and epistemic_status — documents without these are fail-closed.
         """
         rpc_mock = MagicMock()
         response = MagicMock()
+        _valid_meta = {
+            "schema_version": 1, "approved": True,
+            "provenance": "user_confirmed", "confidence": 0.8,
+            "epistemic_status": "approved", "tags": ["tag1"],
+        }
         response.data = [
-            {"content": "First valid memory.", "metadata": {"tags": ["tag1"]}},
-            {"content": "Memory with bad metadata.", "metadata": "invalid_string"},
-            {"content": "Memory with None metadata.", "metadata": None},
-            {"content": "Second valid memory.", "metadata": {"tags": ["tag2"]}},
-            {"content": "Memory with int metadata.", "metadata": 42},
-            {"content": "Third valid memory.", "metadata": {"tags": ["tag3"]}},
+            {"id": "11111111-1111-4111-8111-111111111111", "content": "First valid memory.", "metadata": dict(_valid_meta, tags=["tag1"])},
+            {"id": "22222222-2222-4222-8222-222222222222", "content": "Memory with bad metadata.", "metadata": "invalid_string"},
+            {"id": "33333333-3333-4333-8333-333333333333", "content": "Memory with None metadata.", "metadata": None},
+            {"id": "44444444-4444-4444-8444-444444444444", "content": "Second valid memory.", "metadata": dict(_valid_meta, tags=["tag2"])},
+            {"id": "55555555-5555-4555-8555-555555555555", "content": "Memory with int metadata.", "metadata": 42},
+            {"id": "66666666-6666-4666-8666-666666666666", "content": "Third valid memory.", "metadata": dict(_valid_meta, tags=["tag3"])},
         ]
         rpc_mock.execute.return_value = response
         manager.supabase.rpc.return_value = rpc_mock
         result = manager._retrieve_relevant_entries("user-id", "query")
 
-        # All 6 documents returned; invalid metadata entries get empty tags
+        # Only 3 valid documents returned; invalid metadata entries are excluded
         assert [entry.content for entry in result] == [
             "First valid memory.",
-            "Memory with bad metadata.",
-            "Memory with None metadata.",
             "Second valid memory.",
-            "Memory with int metadata.",
             "Third valid memory.",
         ]
         assert [entry.tags for entry in result] == [
             ("tag1",),
-            (),
-            (),
             ("tag2",),
-            (),
             ("tag3",),
         ]
 
@@ -428,35 +434,49 @@ class TestRetrievedMemoryRealPath:
     def test_invalid_metadata_does_not_discard_adjacent_documents(self):
         manager = _memory_manager_with_rpc_documents([
             {
+                "id": "11111111-1111-4111-8111-111111111111",
                 "content": "First valid memory.",
-                "metadata": {"tags": ["first", "shared"]},
+                "metadata": {
+                    "schema_version": 1, "approved": True,
+                    "provenance": "user_confirmed", "confidence": 0.8,
+                    "epistemic_status": "approved", "tags": ["first", "shared"],
+                },
             },
             {
+                "id": "22222222-2222-4222-8222-222222222222",
                 "content": "Valid content with invalid metadata.",
                 "metadata": ["not", "a", "mapping"],
             },
             {
+                "id": "33333333-3333-4333-8333-333333333333",
                 "content": "Last valid memory.",
-                "metadata": {"tags": ["last"]},
+                "metadata": {
+                    "schema_version": 1, "approved": True,
+                    "provenance": "user_confirmed", "confidence": 0.7,
+                    "epistemic_status": "approved", "tags": ["last"],
+                },
             },
         ])
         entries = manager._retrieve_relevant_entries("user-1", "query")
         assert [entry.content for entry in entries] == [
             "First valid memory.",
-            "Valid content with invalid metadata.",
             "Last valid memory.",
         ]
         assert [entry.tags for entry in entries] == [
             ("first", "shared"),
-            (),
             ("last",),
         ]
 
     def test_rpc_relevance_order_is_preserved(self):
+        _valid_meta = {
+            "schema_version": 1, "approved": True,
+            "provenance": "user_confirmed", "confidence": 0.8,
+            "epistemic_status": "approved",
+        }
         manager = _memory_manager_with_rpc_documents([
-            {"content": "Most relevant", "metadata": {"tags": ["one"]}},
-            {"content": "Second relevant", "metadata": {"tags": ["two"]}},
-            {"content": "Third relevant", "metadata": {"tags": ["three"]}},
+            {"id": "11111111-1111-4111-8111-111111111111", "content": "Most relevant", "metadata": dict(_valid_meta, tags=["one"])},
+            {"id": "22222222-2222-4222-8222-222222222222", "content": "Second relevant", "metadata": dict(_valid_meta, tags=["two"])},
+            {"id": "33333333-3333-4333-8333-333333333333", "content": "Third relevant", "metadata": dict(_valid_meta, tags=["three"])},
         ])
         entries = manager._retrieve_relevant_entries("user-2", "query")
         assert [entry.content for entry in entries] == [

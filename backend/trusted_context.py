@@ -298,9 +298,19 @@ class ContextItem:
         if not isinstance(self.source_id, str) or not self.source_id:
             raise TrustedContextError("invalid_source_id")
 
-        # Validate internal_id if present
-        if self.internal_id and not isinstance(self.internal_id, str):
-            raise TrustedContextError("invalid_internal_id_type")
+        # Validate internal_id if present — only non-empty strings accepted
+        if self.internal_id:
+            if not isinstance(self.internal_id, str):
+                raise TrustedContextError("invalid_internal_id_type")
+            if not self.internal_id.strip():
+                raise TrustedContextError("invalid_internal_id_empty")
+            # Non-empty internal_id for approved memories must be valid UUID
+            if self.kind == "memory" and self.epistemic_status == EpistemicStatus.APPROVED:
+                import uuid
+                try:
+                    uuid.UUID(self.internal_id)
+                except (ValueError, AttributeError):
+                    raise TrustedContextError("invalid_internal_id_not_uuid")
 
     def to_json_dict(self) -> dict:
         """Return a JSON‑safe dict for the untrusted context payload.
@@ -389,6 +399,25 @@ class LoadedContextData:
     retrieved_memories: tuple = ()
     profile_snapshot: dict = field(default_factory=dict)
     persona_snapshot: str = ""
+
+    def __post_init__(self) -> None:
+        # Validate history_rows is tuple of mappings with required keys
+        if not isinstance(self.history_rows, tuple):
+            raise TrustedContextError("invalid_loaded_data_history_type")
+        for row in self.history_rows:
+            if not isinstance(row, dict):
+                raise TrustedContextError("invalid_loaded_data_history_row_type")
+            if "role" not in row or "content" not in row or "id" not in row or "created_at" not in row:
+                raise TrustedContextError("invalid_loaded_data_history_row_keys")
+        # Validate retrieved_memories is tuple
+        if not isinstance(self.retrieved_memories, tuple):
+            raise TrustedContextError("invalid_loaded_data_memories_type")
+        # Validate profile_snapshot is dict
+        if not isinstance(self.profile_snapshot, dict):
+            raise TrustedContextError("invalid_loaded_data_profile_type")
+        # Validate persona_snapshot is string
+        if not isinstance(self.persona_snapshot, str):
+            raise TrustedContextError("invalid_loaded_data_persona_type")
 
 
 @dataclass(frozen=True)
@@ -521,15 +550,18 @@ def build_context_bundle(
     ``loaded_data``
         The ``LoadedContextData`` produced during ``load_context``.
     """
-    # Convert history rows to ChatMessages
+    # Convert history rows to ChatMessages with stable sort_key
+    # sort_key = (created_at_normalized, id) for deterministic ordering
     chat_messages: list[ChatMessage] = []
     for i, msg in enumerate(loaded_data.history_rows):
         source_ref = f"msg-{i + 1}"
+        created_at = msg.get("created_at", "")
+        msg_id = msg.get("id", 0)
         chat_messages.append(ChatMessage(
             role=msg["role"],
             content=msg["content"],
             source_id=source_ref,
-            sort_key=(msg.get("id", 0), i),
+            sort_key=(created_at, msg_id),
         ))
 
     # Convert retrieved memories to ContextItems
@@ -817,16 +849,27 @@ def build_envelope(
     if omitted_persona_count > 0:
         truncation_codes.append("persona_omitted")
 
+    # Aggregate with any pre-existing truncation report from the bundle
+    existing = bundle.truncation_report
+    all_codes = list(existing.codes) + truncation_codes
+    # Deduplicate preserving order
+    seen_codes: set[str] = set()
+    deduped_codes: list[str] = []
+    for code in all_codes:
+        if code not in seen_codes:
+            seen_codes.add(code)
+            deduped_codes.append(code)
+
     report = TruncationReport(
-        codes=tuple(truncation_codes),
-        omitted_history_count=omitted_history_count,
-        omitted_memory_count=omitted_memory_count,
-        omitted_profile_count=omitted_profile_count,
-        omitted_persona_count=omitted_persona_count,
-        selected_history_count=len(selected_history),
-        selected_memory_count=sum(1 for i in selected_items if i.kind == 'memory'),
-        selected_profile_count=sum(1 for i in selected_items if i.kind == 'profile'),
-        selected_persona_count=sum(1 for i in selected_items if i.kind == 'persona'),
+        codes=tuple(deduped_codes),
+        omitted_history_count=existing.omitted_history_count + omitted_history_count,
+        omitted_memory_count=existing.omitted_memory_count + omitted_memory_count,
+        omitted_profile_count=existing.omitted_profile_count + omitted_profile_count,
+        omitted_persona_count=existing.omitted_persona_count + omitted_persona_count,
+        selected_history_count=existing.selected_history_count + len(selected_history),
+        selected_memory_count=existing.selected_memory_count + sum(1 for i in selected_items if i.kind == 'memory'),
+        selected_profile_count=existing.selected_profile_count + sum(1 for i in selected_items if i.kind == 'profile'),
+        selected_persona_count=existing.selected_persona_count + sum(1 for i in selected_items if i.kind == 'persona'),
     )
 
     return ContextBuildResult(

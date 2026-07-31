@@ -1111,7 +1111,7 @@ class TestRetrievedMemoryIntegration:
         mem = RetrievedMemory(
             content="Test memory",
             tags=("test",),
-            source_id="uuid-abc",
+            source_id="11111111-1111-4111-8111-111111111111",
             confidence=0.8,
             provenance=Provenance.USER_CONFIRMED,
             epistemic_status=EpistemicStatus.APPROVED,
@@ -1124,6 +1124,7 @@ class TestRetrievedMemoryIntegration:
         assert item.epistemic_status == EpistemicStatus.APPROVED
         assert item.confidence == 0.8
         assert item.source_id == "mem-1"
+        assert item.internal_id == "11111111-1111-4111-8111-111111111111"
 
     def test_memory_without_approved_excluded(self):
         """Memory without approved=True is excluded."""
@@ -1168,7 +1169,7 @@ class TestBuildContextBundle:
         approved_current = RetrievedMemory(
             content="Approved current memory",
             tags=("keep",),
-            source_id="uuid-abc",
+            source_id="11111111-1111-4111-8111-111111111111",
             confidence=0.9,
             provenance=Provenance.USER_CONFIRMED,
             epistemic_status=EpistemicStatus.APPROVED,
@@ -1273,8 +1274,8 @@ class TestBuildContextBundle:
         )
 
         fake_history = [
-            {"role": "user", "content": "Hi there", "id": 1},
-            {"role": "assistant", "content": "Hello!", "id": 2},
+            {"role": "user", "content": "Hi there", "id": 1, "created_at": "2026-07-30T00:00:00"},
+            {"role": "assistant", "content": "Hello!", "id": 2, "created_at": "2026-07-30T00:00:01"},
         ]
 
         mm = MemoryManager()
@@ -1353,8 +1354,8 @@ class TestEngineGenerationPath:
             from backend.trusted_context import LoadedContextData
             return LoadedContextData(
                 history_rows=(
-                    {"role": "user", "content": "Hello", "id": 1},
-                    {"role": "assistant", "content": "Hi there", "id": 2},
+                    {"role": "user", "content": "Hello", "id": 1, "created_at": "2026-07-30T00:00:00"},
+                    {"role": "assistant", "content": "Hi there", "id": 2, "created_at": "2026-07-30T00:00:01"},
                 ),
                 retrieved_memories=(),
                 profile_snapshot={},
@@ -1461,7 +1462,7 @@ class TestEngineGenerationPath:
             load_count += 1
             from backend.trusted_context import LoadedContextData
             return LoadedContextData(
-                history_rows=({"role": "user", "content": "Hi", "id": 1},),
+                history_rows=({"role": "user", "content": "Hi", "id": 1, "created_at": "2026-07-30T00:00:00"},),
                 retrieved_memories=(),
                 profile_snapshot={},
                 persona_snapshot="",

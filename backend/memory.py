@@ -42,6 +42,7 @@ class RetrievedMemory:
     epistemic_status: str = EpistemicStatus.UNKNOWN
     approved: bool = False
     metadata_version: int = 0
+    retrieval_similarity: float | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.content, str) or not self.content.strip():
@@ -90,6 +91,17 @@ class RetrievedMemory:
         if self.metadata_version < 0:
             raise ValueError("RetrievedMemory metadata_version must be >= 0")
 
+        # Validate retrieval_similarity (not confused with confidence)
+        if self.retrieval_similarity is not None:
+            if isinstance(self.retrieval_similarity, bool):
+                raise ValueError("RetrievedMemory retrieval_similarity must not be bool")
+            if not isinstance(self.retrieval_similarity, (int, float)):
+                raise ValueError("RetrievedMemory retrieval_similarity must be numeric")
+            if math.isnan(self.retrieval_similarity) or math.isinf(self.retrieval_similarity):
+                raise ValueError("RetrievedMemory retrieval_similarity must be finite")
+            if not (-1.0 <= self.retrieval_similarity <= 1.0):
+                raise ValueError("RetrievedMemory retrieval_similarity must be in [-1.0, 1.0]")
+
     def to_prompt_text(self) -> str:
         """Format this memory entry deterministically for a system prompt.
 
@@ -122,6 +134,18 @@ class RetrievedMemory:
 logger = logging.getLogger(__name__)
 
 MAX_MESSAGE_LENGTH = 10000  # Limite máximo de caracteres por mensagem no histórico para evitar sobrecarga de contexto
+
+SUPPORTED_MEMORY_METADATA_SCHEMA_VERSION = 1
+"""The only metadata schema version accepted for memory documents.
+
+Rejected values:
+- absent key
+- bool
+- zero or negative
+- future version
+- numeric string
+- float
+"""
 
 class StatePersistenceError(Exception):
     """Exception raised when user state cannot be persisted safely."""
@@ -280,7 +304,7 @@ class MemoryManager:
         if not self.supabase:
             raise ContextLoadError("Serviço de persistência indisponível.")
         try:
-            response = self.supabase.table("chat_logs").select("id, role, content").eq("user_id", user_id).order("created_at", desc=True).order("id", desc=True).limit(limit).execute()
+            response = self.supabase.table("chat_logs").select("id, role, content, created_at").eq("user_id", user_id).order("created_at", desc=True).order("id", desc=True).limit(limit).execute()
             if response is None:
                 raise ContextLoadError("Sem resposta do banco de dados na leitura do histórico.")
             if hasattr(response, 'error') and response.error:
@@ -300,15 +324,18 @@ class MemoryManager:
                 role = item["role"]
                 content = item["content"]
                 msg_id = item["id"]
+                created_at = item.get("created_at")
                 if role not in ("user", "assistant"):
                     raise ContextLoadError("Role inválida no histórico recente.")
                 if not isinstance(content, str):
                     raise ContextLoadError("Conteúdo da mensagem não é uma string.")
                 if len(content) > MAX_MESSAGE_LENGTH:
                     raise ContextLoadError("Mensagem no histórico excede o limite máximo de caracteres permitido.")
-                if not isinstance(msg_id, int) or msg_id <= 0:
+                if isinstance(msg_id, bool) or not isinstance(msg_id, int) or msg_id <= 0:
                     raise ContextLoadError("ID do histórico inválido.")
-                normalized.append({"role": role, "content": content, "id": msg_id})
+                if created_at is None or not isinstance(created_at, str):
+                    raise ContextLoadError("created_at ausente ou inválido no histórico.")
+                normalized.append({"role": role, "content": content, "id": msg_id, "created_at": created_at})
             return normalized[::-1]
         except ContextLoadError as e:
             logger.error(f"Erro ao carregar histórico: {type(e).__name__}")
@@ -569,16 +596,18 @@ class MemoryManager:
                     continue
 
                 # Parse metadata according to the official contract
-                # Valid metadata must be a dict with schema_version >= 1
+                # Valid metadata must be a dict with SUPPORTED_MEMORY_METADATA_SCHEMA_VERSION
+                import uuid
+
                 metadata = doc.get("metadata", {})
                 if not isinstance(metadata, dict):
                     continue
 
                 schema_version = metadata.get("schema_version", 0)
+                # Reject: absent (defaulted to 0), bool, zero, negative, future, string, float
                 if isinstance(schema_version, bool) or not isinstance(schema_version, int):
                     continue
-                if schema_version < 1:
-                    # Legacy metadata — silently ignore
+                if schema_version != SUPPORTED_MEMORY_METADATA_SCHEMA_VERSION:
                     continue
 
                 # Extract tags
@@ -624,10 +653,26 @@ class MemoryManager:
                 if not (0.0 <= raw_confidence <= 1.0):
                     continue
 
-                # Extract source UUID (must be non-empty valid string)
+                # Extract source UUID (must be non-empty valid UUID string)
                 doc_id = doc.get("id", "")
                 if not isinstance(doc_id, str) or not doc_id:
                     continue
+                try:
+                    uuid.UUID(doc_id)
+                except (ValueError, AttributeError):
+                    continue
+
+                # Extract retrieval_similarity (never used as confidence)
+                raw_similarity = doc.get("similarity", None)
+                if raw_similarity is not None:
+                    if isinstance(raw_similarity, bool):
+                        raw_similarity = None
+                    elif not isinstance(raw_similarity, (int, float)):
+                        raw_similarity = None
+                    elif math.isnan(raw_similarity) or math.isinf(raw_similarity):
+                        raw_similarity = None
+                    elif not (-1.0 <= raw_similarity <= 1.0):
+                        raw_similarity = None
 
                 entry = RetrievedMemory(
                     content=content,
@@ -638,6 +683,7 @@ class MemoryManager:
                     epistemic_status=raw_epistemic,
                     approved=doc_approved,
                     metadata_version=schema_version,
+                    retrieval_similarity=raw_similarity,
                 )
                 entries.append(entry)
             except Exception:
