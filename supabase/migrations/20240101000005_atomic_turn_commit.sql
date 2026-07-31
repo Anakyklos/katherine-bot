@@ -107,6 +107,7 @@ END $$;
 --   - outbox_insert_failed: could not insert outbox events
 --   - validation_failed: payload validation failed
 
+
 CREATE OR REPLACE FUNCTION public.commit_turn(
     p_authenticated_user_id text,
     p_request_id uuid,
@@ -136,13 +137,7 @@ DECLARE
     v_request_exists boolean;
     v_existing_request_record jsonb;
     v_existing_payload_hash text;
-    v_existing_turn_request_id uuid;
-    v_existing_committed_revision bigint;
-    v_existing_user_message_chat_log_id bigint;
-    v_existing_assistant_message_chat_log_id bigint;
-    v_existing_created_at timestamptz;
-    v_existing_completed_at timestamptz;
-    v_request_status text;
+    v_turn_request_id uuid;
     
     -- Message IDs
     v_user_message_id bigint;
@@ -216,55 +211,48 @@ BEGIN
     -- =============================================================
     -- Step 2: Check existing profile and get current revision
     -- =============================================================
-    SELECT id, user_id, revision INTO v_profile_user_id, v_profile_user_id, v_current_revision
+    SELECT user_id, revision INTO v_profile_user_id, v_current_revision
     FROM public.profiles
     WHERE user_id = p_authenticated_user_id
     FOR UPDATE;
-
-    -- Fallback if profile not present
-    IF NOT FOUND THEN
-        v_profile_exists := FALSE;
+    
+    v_profile_exists := (v_profile_user_id IS NOT NULL);
+    
+    -- If profile doesn't exist, we'll create it with revision 0
+    IF NOT v_profile_exists THEN
         v_current_revision := 0;
-    ELSE
-        v_profile_exists := TRUE;
     END IF;
 
     -- =============================================================
     -- Step 3: Check for existing request with same (user_id, request_id)
-    -- Inspect and classify under the per-user lock before applying CAS
+    -- (This runs BEFORE CAS validation to allow exact replays to succeed)
     -- =============================================================
-    SELECT id, payload_hash_sha256, status, replay_payload,
-           committed_revision, user_message_chat_log_id, assistant_message_chat_log_id,
-           created_at, completed_at
-    INTO v_existing_turn_request_id, v_existing_payload_hash, v_request_status, v_existing_request_record,
-         v_existing_committed_revision, v_existing_user_message_chat_log_id, v_existing_assistant_message_chat_log_id,
-         v_existing_created_at, v_existing_completed_at
-    FROM public.turn_requests
-    WHERE user_id = p_authenticated_user_id AND request_id = p_request_id;
-
-    IF FOUND THEN
-        v_request_exists := TRUE;
-        -- If the payload hash matches, this is an idempotent retry: reconstruct and return stored result
+    SELECT EXISTS (
+        SELECT 1 FROM public.turn_requests
+        WHERE user_id = p_authenticated_user_id AND request_id = p_request_id
+    ) INTO v_request_exists;
+    
+    IF v_request_exists THEN
+        -- Get the existing request to check payload hash and status
+        SELECT jsonb_build_object(
+            'payload_hash_sha256', payload_hash_sha256,
+            'status', status,
+            'replay_payload', replay_payload,
+            'committed_revision', committed_revision,
+            'user_message_chat_log_id', user_message_chat_log_id,
+            'assistant_message_chat_log_id', assistant_message_chat_log_id,
+            'created_at', created_at,
+            'completed_at', completed_at
+        ) INTO v_existing_request_record
+        FROM public.turn_requests
+        WHERE user_id = p_authenticated_user_id AND request_id = p_request_id;
+        
+        v_existing_payload_hash := v_existing_request_record->>'payload_hash_sha256';
+        
+        -- If the payload hash matches, this is an idempotent retry
+        -- Return the existing result without creating duplicates
         IF v_existing_payload_hash = p_payload_hash_sha256 THEN
-            SELECT COALESCE(jsonb_agg(to_jsonb(o.*) ORDER BY o.id), '[]'::jsonb) INTO v_outbox_results
-            FROM public.outbox_events o
-            WHERE o.turn_request_id = v_existing_turn_request_id;
-
-            v_result := jsonb_build_object(
-                'user_id', p_authenticated_user_id,
-                'request_id', p_request_id::text,
-                'committed_revision', v_existing_committed_revision,
-                'user_message_chat_log_id', v_existing_user_message_chat_log_id,
-                'assistant_message_chat_log_id', v_existing_assistant_message_chat_log_id,
-                'user_message_id', p_request_id::text,
-                -- Use stable assistant identifier based on stored chat_log id for reproducibility
-                'assistant_message_id', v_existing_assistant_message_chat_log_id::text,
-                'replay_payload', v_existing_request_record->'replay_payload',
-                'outbox_events', v_outbox_results,
-                'created_at', v_existing_created_at,
-                'completed_at', v_existing_completed_at
-            );
-            RETURN v_result;
+            RETURN v_existing_request_record || jsonb_build_object('user_id', p_authenticated_user_id, 'request_id', p_request_id::text);
         ELSE
             -- Payload differs: conflict
             v_result := jsonb_build_object(
@@ -272,19 +260,16 @@ BEGIN
                     'code', 'request_payload_conflict',
                     'message', 'Request ID already exists with different payload',
                     'expected_revision', p_expected_revision,
-                    'request_id', p_request_id::text,
-                    'actual_committed_revision', v_existing_committed_revision
+                    'request_id', p_request_id::text
                 )
             );
             RETURN v_result;
         END IF;
-    ELSE
-        v_request_exists := FALSE;
     END IF;
 
     -- =============================================================
     -- Step 4: Validate CAS: expected_revision must match current revision
-    -- Apply CAS only for genuinely new/reclaimed execution
+    -- (Only applied for new executions where no existing completed request exists)
     -- =============================================================
     IF v_current_revision <> p_expected_revision THEN
         v_result := jsonb_build_object(
@@ -338,7 +323,7 @@ BEGIN
     END IF;
 
     -- =============================================================
-    -- Step 8: Insert into turn_requests
+    -- Step 8: Insert into turn_requests (capture DB id)
     -- =============================================================
     INSERT INTO public.turn_requests (
         user_id, request_id, payload_hash_sha256, status,
@@ -350,10 +335,10 @@ BEGIN
         p_expected_revision, v_new_revision,
         v_user_message_id, v_assistant_message_id,
         p_replay_payload, v_now, v_now, v_now
-    ) RETURNING id INTO v_outbox_turn_request_id;
+    ) RETURNING id INTO v_turn_request_id;
 
     -- =============================================================
-    -- Step 8: Insert outbox events (idempotent)
+    -- Step 9: Insert outbox events (idempotent) referencing DB turn_request id
     -- =============================================================
     v_outbox_count := jsonb_array_length(p_outbox_events);
     
@@ -383,13 +368,13 @@ BEGIN
             RAISE EXCEPTION 'Outbox event payload violates value contract' USING ERRCODE = 'P0001';
         END IF;
         
-        -- Insert outbox event with reference to turn_request
+        -- Insert outbox event with reference to DB turn_request id
         INSERT INTO public.outbox_events (
             event_type, user_id, turn_request_id, payload, status,
             attempts, next_attempt_at, idempotency_key,
             contract_version, created_at, updated_at
         ) VALUES (
-            v_event_type, p_authenticated_user_id, v_outbox_turn_request_id,
+            v_event_type, p_authenticated_user_id, v_turn_request_id,
             v_event_payload, 'pending',
             0, v_now + INTERVAL '1 second', v_event_idempotency_key,
             1, v_now, v_now
@@ -401,7 +386,7 @@ BEGIN
     END LOOP;
 
     -- =============================================================
-    -- Step 9: Build and return success result
+    -- Step 10: Build and return success result
     -- =============================================================
     v_result := jsonb_build_object(
         'user_id', p_authenticated_user_id,
@@ -410,7 +395,7 @@ BEGIN
         'user_message_chat_log_id', v_user_message_id,
         'assistant_message_chat_log_id', v_assistant_message_id,
         'user_message_id', p_request_id::text,
-        'assistant_message_id', v_assistant_message_id::text,
+        'assistant_message_id', gen_random_uuid()::text,
         'replay_payload', p_replay_payload,
         'outbox_events', v_outbox_results,
         'created_at', v_now::text,
@@ -422,16 +407,21 @@ BEGIN
 EXCEPTION
     WHEN OTHERS THEN
         -- On any error, the transaction will roll back automatically
-        -- Return a sanitized error envelope; diagnostics should be recorded in observability only
+        -- Return a sanitized error with SQLSTATE only (avoid leaking SQLERRM)
+        v_error_code := SQLSTATE;
+        v_error_message := 'internal database error';
+        
         v_result := jsonb_build_object(
             'error', jsonb_build_object(
-                'code', 'internal_database_error',
-                'message', 'internal server error'
+                'code', 'database_error',
+                'message', v_error_message,
+                'sqlstate', v_error_code
             )
         );
         RETURN v_result;
 END;
 $$;
+
 
 -- =================================================================
 -- 2. Grants for commit_turn function

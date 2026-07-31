@@ -99,17 +99,16 @@ class CommittedTurn:
 
 
 @dataclass(frozen=True)
-class ConflictError(Exception):
+class ConflictError:
     """Raised when a concurrent modification is detected.
 
     Carries the database-provided details so the caller can implement
-    retry/backoff logic. Subclasses Exception so it can be raised/caught
-    in normal control flow.
+    retry/backoff logic.
     """
 
     code: str
     message: str
-    expected_revision: Optional[int] = None
+    expected_revision: int
     actual_revision: Optional[int] = None
     request_id: Optional[str] = None
 
@@ -125,12 +124,8 @@ class ConflictError(Exception):
 
 
 @dataclass(frozen=True)
-class ValidationError(Exception):
-    """Raised when input validation fails before the transaction.
-
-    Subclasses Exception so it can be used with `pytest.raises` and normal
-    exception handling.
-    """
+class ValidationError:
+    """Raised when input validation fails before the transaction."""
 
     code: str
     message: str
@@ -194,8 +189,7 @@ def _validate_error_code(code: Optional[str]) -> None:
             "invalid_error_code",
             f"must be 1-{_MAX_ERROR_CODE_LENGTH} characters",
         )
-    # Only allow lowercase letters, digits and underscore
-    if not all(c.isalnum() or c == "_" for c in code) or code.lower() != code:
+    if not all(c.isalnum() or c == "_" for c in code):
         raise ValidationError(
             "invalid_error_code",
             "must contain only lowercase alphanumeric characters and '_'",
@@ -356,9 +350,9 @@ def build_commit_turn_rpc_payload(
         p_emotional_state jsonb,
         p_relationship_state jsonb,
         p_public_response text,
-        p_payload_hash_sha256 text,
         p_outbox_events jsonb,  -- array of event objects
         p_replay_payload jsonb,
+        p_payload_hash_sha256 text,
         p_lease_owner text DEFAULT NULL
     ) RETURNS jsonb
     ```
