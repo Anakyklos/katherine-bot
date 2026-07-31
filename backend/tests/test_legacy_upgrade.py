@@ -13,6 +13,7 @@ import json
 import os
 import logging
 import subprocess
+import time
 import pytest
 
 from backend.supabase_cli import run_supabase_op
@@ -79,6 +80,100 @@ def _run_fixture_file(filepath: str):
         raise AssertionError(
             f"Fixture execution failed: {filepath} (exited {result.returncode})"
         )
+
+
+# ---------------------------------------------------------------------------
+# PostgREST schema cache helpers
+# ---------------------------------------------------------------------------
+
+
+def _reload_postgrest_schema():
+    """Force PostgREST to refresh its schema cache.
+
+    ``supabase migration up --local`` applies migrations directly and does
+    not reliably refresh PostgREST's cached schema, so queries against the
+    migrated tables can fail with PGRST205 ("Could not find the table in the
+    schema cache").  PostgREST reloads its schema cache when it receives
+    ``NOTIFY pgrst, 'reload schema'``; the reload is processed
+    asynchronously, so callers must also wait for the tables to become
+    visible again (see ``_wait_for_postgrest_table``).
+    """
+    _run_supabase(
+        "legacy_state_query",
+        [
+            "db", "query", "--agent=no", "--output", "json",
+            "select pg_notify('pgrst', 'reload schema')",
+        ],
+    )
+
+
+def _restart_postgrest_container():
+    """Restart the local PostgREST container to force a fresh schema cache.
+
+    The notification-based reload (``NOTIFY pgrst, 'reload schema'``)
+    requires PostgREST to be listening on its reload channel; if it is not
+    available, restarting the container guarantees the schema cache is
+    rebuilt from the current database state.
+    """
+    result = subprocess.run(
+        ["docker", "ps", "--format", "{{.Names}}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    candidates = [
+        name
+        for name in result.stdout.splitlines()
+        if "supabase" in name and "rest" in name
+    ]
+    if not candidates:
+        raise AssertionError(
+            "PostgREST container not found for schema cache restart"
+        )
+    restarted = subprocess.run(
+        ["docker", "restart", candidates[0]],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if restarted.returncode != 0:
+        raise AssertionError(
+            "Failed to restart PostgREST container for schema cache"
+        )
+
+
+def _wait_for_postgrest_table(client, table: str, timeout: float = 30.0):
+    """Wait until PostgREST exposes *table* in its schema cache.
+
+    PostgREST serves the refreshed schema cache asynchronously after a
+    reload; immediately after a raw migration apply the cache can still be
+    stale (PGRST205).  Poll a trivial query until it succeeds or *timeout*
+    seconds elapse, then fall back to restarting the PostgREST container
+    once and poll again.
+
+    Raises:
+        AssertionError: If *table* is still not visible after the retries.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            client.table(table).select("user_id").limit(1).execute()
+            return
+        except Exception:
+            time.sleep(1)
+
+    _restart_postgrest_container()
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            client.table(table).select("user_id").limit(1).execute()
+            return
+        except Exception:
+            time.sleep(1)
+    raise AssertionError(
+        f"PostgREST schema cache did not expose table '{table}' after reload"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +337,13 @@ def test_valid_legacy_upgrade(supabase_service_client):
 
         _restore_hardening()
         _run_supabase("legacy_hardening_apply", ["migration", "up", "--local"])
+
+        # PostgREST caches the schema and a raw `supabase migration up
+        # --local` does not reliably refresh it, so force a reload and wait
+        # until the migrated tables are visible through PostgREST (a stale
+        # cache would otherwise surface as PGRST205).
+        _reload_postgrest_schema()
+        _wait_for_postgrest_table(supabase_service_client, "profiles")
 
         # ---- Verify migration timestamp ----
         assert _query_scalar_bool(_MIGRATION_VERSION_SQL, "result"), (

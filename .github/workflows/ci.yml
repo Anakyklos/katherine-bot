@@ -114,11 +114,52 @@ jobs:
           PYTHONPATH: "."
         run: |
           set -euo pipefail
-          migration="supabase/migrations/20240101000003_admission_ledger.sql"
-          hidden="${migration}.legacy-test-hidden"
-          mv "$migration" "$hidden"
-          trap 'mv "$hidden" "$migration"' EXIT
+          # Hide every migration AFTER the hardening target (02) — now 03 and
+          # 04 — so the legacy upgrade scenario starts from a true
+          # baseline-only database. Restored in a trap, including on failure.
+          migrations=(
+            "supabase/migrations/20240101000003_admission_ledger.sql"
+            "supabase/migrations/20240101000004_transactional_turn_schema.sql"
+          )
+          hidden=()
+          restore_migrations() {
+            for f in "${hidden[@]:-}"; do
+              if [[ -f "$f.legacy-test-hidden" ]]; then
+                mv "$f.legacy-test-hidden" "$f"
+              fi
+            done
+          }
+          trap restore_migrations EXIT
+          for migration in "${migrations[@]}"; do
+            if [[ -f "$migration" ]]; then
+              mv "$migration" "$migration.legacy-test-hidden"
+              hidden+=("$migration")
+            fi
+          done
           python -m pytest -q -ra backend/tests/test_legacy_upgrade.py
+
+      - name: Reset database for transactional schema legacy tests
+        run: |
+          set -euo pipefail
+          supabase db reset
+
+      - name: Run Transactional Schema Legacy Test
+        env:
+          SUPABASE_URL: "http://127.0.0.1:54321"
+          PYTHONPATH: "."
+        run: |
+          python -m pytest -q -ra backend/tests/test_transactional_schema_legacy.py
+
+      - name: Reset database for transactional schema integration tests
+        run: |
+          supabase db reset
+
+      - name: Run Transactional Schema Integration Tests
+        env:
+          SUPABASE_URL: "http://127.0.0.1:54321"
+          PYTHONPATH: "."
+        run: |
+          python -m pytest -q -ra backend/tests/test_transactional_schema_integration.py
 
       - name: Reset database for authorization tests
         run: |
@@ -179,6 +220,8 @@ jobs:
               --ignore=backend/tests/test_database_authorization_integration.py \
               --ignore=backend/tests/test_admission_ledger_integration.py \
               --ignore=backend/tests/test_legacy_upgrade.py \
+              --ignore=backend/tests/test_transactional_schema_legacy.py \
+              --ignore=backend/tests/test_transactional_schema_integration.py \
               -ra
 
   frontend:
