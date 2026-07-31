@@ -343,7 +343,7 @@ def test_valid_legacy_upgrade(supabase_service_client):
         # until the migrated tables are visible through PostgREST (a stale
         # cache would otherwise surface as PGRST205).
         _reload_postgrest_schema()
-        _wait_for_postgrest_table(supabase_service_client)
+        _wait_for_postgrest_table(supabase_service_client, "profiles")
 
         # ---- Verify migration timestamp ----
         assert _query_scalar_bool(_MIGRATION_VERSION_SQL, "result"), (
