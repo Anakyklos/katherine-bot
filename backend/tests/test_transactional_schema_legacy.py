@@ -177,14 +177,14 @@ def test_valid_legacy_upgrade(supabase_service_client):
         for tbl in ("turn_requests", "outbox_events"):
             assert _query_scalar_bool(
                 "SELECT EXISTS("
-                "SELECT 1 FROM pg_class WHERE oid = '{tbl}'::regclass "
+                "SELECT 1 FROM pg_class WHERE oid = to_regclass('{tbl}') "
                 "AND relrowsecurity = true"
                 ") AS result".format(tbl=tbl),
                 "result",
             ), f"RLS not enabled for {tbl}"
             assert _query_scalar_bool(
                 "SELECT EXISTS("
-                "SELECT 1 FROM pg_class WHERE oid = '{tbl}'::regclass "
+                "SELECT 1 FROM pg_class WHERE oid = to_regclass('{tbl}') "
                 "AND relforcerowsecurity = true"
                 ") AS result".format(tbl=tbl),
                 "result",
@@ -262,14 +262,14 @@ def test_operational_rollback(supabase_service_client):
     for tbl in ("turn_requests", "outbox_events"):
         assert _query_scalar_bool(
             "SELECT EXISTS("
-            "SELECT 1 FROM pg_class WHERE oid = '{tbl}'::regclass"
+            "SELECT 1 FROM pg_class WHERE oid = to_regclass('{tbl}')"
             ") AS result".format(tbl=tbl),
             "result",
         ), f"{tbl} missing before rollback"
     assert _query_scalar_bool(
         "SELECT EXISTS("
         "SELECT 1 FROM pg_attribute "
-        "WHERE attrelid = 'profiles'::regclass AND attname = 'revision'"
+        "WHERE attrelid = to_regclass('profiles') AND attname = 'revision'"
         ") AS result",
         "result",
     ), "profiles.revision missing before rollback"
@@ -294,14 +294,14 @@ def test_operational_rollback(supabase_service_client):
     for tbl in ("turn_requests", "outbox_events"):
         assert not _query_scalar_bool(
             "SELECT EXISTS("
-            "SELECT 1 FROM pg_class WHERE oid = '{tbl}'::regclass"
+            "SELECT 1 FROM pg_class WHERE oid = to_regclass('{tbl}')"
             ") AS result".format(tbl=tbl),
             "result",
         ), f"{tbl} still exists after rollback"
     assert not _query_scalar_bool(
         "SELECT EXISTS("
         "SELECT 1 FROM pg_attribute "
-        "WHERE attrelid = 'profiles'::regclass AND attname = 'revision'"
+        "WHERE attrelid = to_regclass('profiles') AND attname = 'revision'"
         ") AS result",
         "result",
     ), "profiles.revision still exists after rollback"
