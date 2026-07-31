@@ -2,16 +2,18 @@
 Tests for ``backend.atomic_turn_commit`` (#271).
 
 Covers:
- 1. Pure importability from subprocess (no heavy deps, no env/socket)
- 2. Input validation: types, ranges, constraints
+ 1. Pure importability from subprocess (no heavy deps, no env/socket/clock/
+    randomness/filesystem at import)
+ 2. Input validation: types, ranges, constraints, snapshots, outbox shape
  3. Canonical payload hash consistency
- 4. RPC payload building
- 5. Result parsing: success and error cases
- 6. Conflict detection and error handling
+ 4. RPC payload building (empty mappings preserved as {})
+ 5. Result parsing: success and error cases (strict contract validation)
+ 6. Conflict / validation / persistence error classification
  7. Immutability of result objects
  8. No shared mutable state
  9. Defense-in-depth validation before RPC
- 10. Edge cases: empty strings, None values, boundary conditions
+10. Async commit_turn entry point (validation, hash, payload, awaited once,
+    success/conflict/in-progress/persistence/malformed)
 """
 
 import json
@@ -20,16 +22,16 @@ import sys
 import os
 
 import pytest
-from dataclasses import FrozenInstanceError, asdict
+from dataclasses import FrozenInstanceError
 from typing import Mapping, Any, Optional
 
 # Import under test
 from backend.atomic_turn_commit import (
-    MessageRef,
     CommittedTurn,
+    CommittedOutboxRef,
     ConflictError,
     ValidationError,
-    DatabaseError,
+    PersistenceError,
     validate_atomic_commit_input,
     build_commit_turn_rpc_payload,
     parse_commit_turn_result,
@@ -44,9 +46,26 @@ from backend.transactional_schema import (
     FORBIDDEN_PAYLOAD_KEYS,
     REPLAY_PAYLOAD_ALLOWED_KEYS,
     canonical_payload_hash,
-    TurnRequestRecord,
-    OutboxEventRecord,
 )
+
+VALID_REQUEST_ID = "12345678-1234-1234-1234-123456789abc"
+VALID_MESSAGE_ID = "87654321-4321-4321-4321-cba987654321"
+
+
+def _valid_replay_payload(response: str = "Hi there!") -> dict:
+    return {
+        "response": response,
+        "message_id": VALID_MESSAGE_ID,
+        "duration_ms": 100,
+    }
+
+
+def _valid_emotional_state() -> dict:
+    return {"schema_version": 1, "pleasure": 0.4, "arousal": 0.3, "dominance": 0.2}
+
+
+def _valid_relationship_state() -> dict:
+    return {"schema_version": 1, "trust": 0.8, "affection": 0.6, "tension": 0.1}
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -56,7 +75,9 @@ from backend.transactional_schema import (
 _PURITY_SCRIPT = '''
 import sys
 import os as _os
-import socket
+import socket as _socket
+import time as _time
+import random as _random
 
 class _FailEnv:
     def __getitem__(self, key):
@@ -84,29 +105,60 @@ def _raise_getenv(key, default=None):
     raise RuntimeError(f"os.getenv read: {key!r}")
 _os.getenv = _raise_getenv
 
-# Patch socket.socket directly (not _os.socket)
-_original_socket = socket.socket
+# Block socket (network)
 def _raise_socket(*args, **kwargs):
     raise OSError("socket.socket blocked")
-socket.socket = _raise_socket
-
-# Also patch _os.socket for backward compatibility
+def _raise_create_connection(*args, **kwargs):
+    raise OSError("socket.create_connection blocked")
+_socket.socket = _raise_socket
+_socket.create_connection = _raise_create_connection
 _os.socket = _raise_socket
 
-_BLOCKED = frozenset({
+# Block clock
+def _raise_time(*args, **kwargs):
+    raise RuntimeError("clock access blocked")
+for _name in ("time", "monotonic", "perf_counter", "process_time"):
+    setattr(_time, _name, _raise_time)
+
+# Block randomness
+def _raise_random(*args, **kwargs):
+    raise RuntimeError("randomness blocked")
+for _name in ("random", "randrange", "randint", "uniform", "choices"):
+    setattr(_random, _name, _raise_random)
+
+# Block filesystem access
+import builtins as _builtins
+_original_open = _builtins.open
+def _raise_open(*args, **kwargs):
+    raise RuntimeError("filesystem access blocked")
+_builtins.open = _raise_open
+try:
+    _os.open = _raise_open
+except Exception:
+    pass
+
+_BLOCKED_TOP = frozenset({
     "fastapi", "groq", "supabase", "sentence_transformers",
-    "pydantic", "httpx", "httpcore", "anyio",
+    "pydantic", "httpx", "httpcore", "anyio", "torch", "numpy",
+})
+_BLOCKED_FULL = frozenset({
     "backend.engine", "backend.memory", "backend.trusted_context",
 })
 
-# Allow backend.transactional_schema but block others
-_BLOCKED_PREFIXES = ("backend.engine", "backend.memory", "backend.trusted_context",
-                    "tests.", "backend.tests.")
-
+# backend.transactional_schema is explicitly allowed; everything else
+# under backend.* that is not the module under test is blocked.
 class _BlockImport:
-    @classmethod
-    def find_spec(cls, fullname, path, target=None):
-        if fullname in _BLOCKED or fullname.startswith(_BLOCKED_PREFIXES):
+    def find_spec(self, fullname, path, target=None):
+        if fullname in _BLOCKED_FULL:
+            raise ImportError(f"blocked: {fullname}")
+        top = fullname.split(".")[0]
+        if top in _BLOCKED_TOP:
+            raise ImportError(f"blocked: {fullname}")
+        if fullname.startswith("backend.") and fullname not in (
+            "backend",
+            "backend.atomic_turn_commit",
+            "backend.transactional_schema",
+        ):
             raise ImportError(f"blocked: {fullname}")
         return None
 
@@ -121,7 +173,8 @@ class TestImportability:
     """Import the module in a subprocess with all external resources blocked."""
 
     def test_import_purity(self):
-        """Module imports without touching env, socket, or blocked packages."""
+        """Module imports without touching env, socket, clock, randomness,
+        filesystem, or blocked packages."""
         proc = subprocess.run(
             [sys.executable, "-c", _PURITY_SCRIPT],
             capture_output=True,
@@ -157,6 +210,13 @@ class TestValidateIdempotencyKey:
             _validate_idempotency_key("test space")
         assert "invalid_idempotency_key" in str(exc.value)
 
+    def test_unicode_rejected(self):
+        # str.isalnum() would accept these; the explicit ASCII regex must not.
+        for key in ("chave_é", "ключ", "キー", "abc\u00e9"):
+            with pytest.raises(ValidationError) as exc:
+                _validate_idempotency_key(key)
+            assert "invalid_idempotency_key" in str(exc.value)
+
     def test_not_string(self):
         with pytest.raises(ValidationError) as exc:
             _validate_idempotency_key(123)
@@ -179,6 +239,12 @@ class TestValidateLeaseOwner:
             _validate_lease_owner("worker space")
         assert "invalid_lease_owner" in str(exc.value)
 
+    def test_unicode_rejected(self):
+        for owner in ("worker_ç", "worker\u00e9"):
+            with pytest.raises(ValidationError) as exc:
+                _validate_lease_owner(owner)
+            assert "invalid_lease_owner" in str(exc.value)
+
 
 class TestValidateErrorCode:
     def test_valid_code(self):
@@ -199,32 +265,145 @@ class TestValidateErrorCode:
 
 class TestValidateReplayPayload:
     def test_valid_payload(self):
-        payload = {"response": "test", "duration_ms": 100}
-        _validate_replay_payload(payload)
+        _validate_replay_payload(_valid_replay_payload())
 
-    def test_empty_payload(self):
-        _validate_replay_payload({})
+    def test_empty_payload_rejected(self):
+        # response is mandatory: {} is not a valid replay payload.
+        with pytest.raises(ValidationError) as exc:
+            _validate_replay_payload({})
+        assert "invalid_replay_payload" in str(exc.value)
+
+    def test_missing_message_id(self):
+        with pytest.raises(ValidationError) as exc:
+            _validate_replay_payload({"response": "Hi", "duration_ms": 100})
+        assert "invalid_replay_payload" in str(exc.value)
+
+    def test_invalid_message_id(self):
+        with pytest.raises(ValidationError) as exc:
+            _validate_replay_payload(
+                {"response": "Hi", "message_id": "not-a-uuid", "duration_ms": 100}
+            )
+        assert "invalid_replay_payload" in str(exc.value)
 
     def test_forbidden_key_top_level(self):
         for key in FORBIDDEN_PAYLOAD_KEYS:
             with pytest.raises(ValidationError) as exc:
-                _validate_replay_payload({key: "value"})
+                _validate_replay_payload({**{"response": "x", "message_id": VALID_MESSAGE_ID}, key: "value"})
             assert "invalid_replay_payload" in str(exc.value)
 
     def test_forbidden_key_nested(self):
         with pytest.raises(ValidationError) as exc:
-            _validate_replay_payload({"response": {"message": "nested"}})
+            _validate_replay_payload(
+                {"response": {"message": "nested"}, "message_id": VALID_MESSAGE_ID}
+            )
         assert "invalid_replay_payload" in str(exc.value)
 
     def test_unknown_key(self):
         with pytest.raises(ValidationError) as exc:
-            _validate_replay_payload({"unknown_key": "value"})
+            _validate_replay_payload(
+                {"response": "x", "message_id": VALID_MESSAGE_ID, "unknown_key": "value"}
+            )
         assert "invalid_replay_payload" in str(exc.value)
 
     def test_not_mapping(self):
         with pytest.raises(ValidationError) as exc:
             _validate_replay_payload("not a mapping")
         assert "invalid_replay_payload" in str(exc.value)
+
+
+class TestValidateSnapshotPayload:
+    def test_none_ok(self):
+        _validate_snapshot_payload(None, "emotional_state")
+        _validate_snapshot_payload(None, "relationship_state")
+
+    def test_valid_emotional(self):
+        _validate_snapshot_payload(_valid_emotional_state(), "emotional_state")
+
+    def test_valid_relationship(self):
+        _validate_snapshot_payload(_valid_relationship_state(), "relationship_state")
+
+    def test_not_mapping(self):
+        with pytest.raises(ValidationError):
+            _validate_snapshot_payload("x", "emotional_state")
+        with pytest.raises(ValidationError):
+            _validate_snapshot_payload([], "relationship_state")
+
+    def test_schema_version_bool_rejected(self):
+        for bad in (True, False):
+            with pytest.raises(ValidationError) as exc:
+                _validate_snapshot_payload(
+                    {"schema_version": bad, "pleasure": 0.1, "arousal": 0.2, "dominance": 0.3},
+                    "emotional_state",
+                )
+            assert "schema_version" in str(exc.value)
+
+    def test_schema_version_string_rejected(self):
+        with pytest.raises(ValidationError):
+            _validate_snapshot_payload(
+                {"schema_version": "1", "pleasure": 0.1, "arousal": 0.2, "dominance": 0.3},
+                "emotional_state",
+            )
+
+    def test_schema_version_float_rejected(self):
+        with pytest.raises(ValidationError):
+            _validate_snapshot_payload(
+                {"schema_version": 1.0, "pleasure": 0.1, "arousal": 0.2, "dominance": 0.3},
+                "emotional_state",
+            )
+
+    def test_schema_version_not_1(self):
+        with pytest.raises(ValidationError):
+            _validate_snapshot_payload(
+                {"schema_version": 2, "pleasure": 0.1, "arousal": 0.2, "dominance": 0.3},
+                "emotional_state",
+            )
+
+    def test_user_id_rejected_at_any_depth(self):
+        payload = {
+            "schema_version": 1,
+            "pleasure": 0.1,
+            "arousal": 0.2,
+            "dominance": {"inner": {"user_id": "attacker"}},
+        }
+        with pytest.raises(ValidationError):
+            _validate_snapshot_payload(payload, "emotional_state")
+
+    def test_bond_label_rejected_at_any_depth(self):
+        payload = {
+            "schema_version": 1,
+            "trust": 0.8,
+            "affection": 0.6,
+            "tension": [{"bond_label": "x"}],
+        }
+        with pytest.raises(ValidationError):
+            _validate_snapshot_payload(payload, "relationship_state")
+
+    def test_prompt_rejected_at_any_depth(self):
+        payload = {
+            "schema_version": 1,
+            "pleasure": 0.1,
+            "arousal": 0.2,
+            "dominance": 0.3,
+            "nested": {"prompt": "hidden"},
+        }
+        with pytest.raises(ValidationError):
+            _validate_snapshot_payload(payload, "emotional_state")
+
+    def test_missing_fundamental_emotional(self):
+        with pytest.raises(ValidationError) as exc:
+            _validate_snapshot_payload(
+                {"schema_version": 1, "pleasure": 0.1},
+                "emotional_state",
+            )
+        assert "missing fundamental fields" in str(exc.value)
+
+    def test_missing_fundamental_relationship(self):
+        with pytest.raises(ValidationError) as exc:
+            _validate_snapshot_payload(
+                {"schema_version": 1, "trust": 0.8},
+                "relationship_state",
+            )
+        assert "missing fundamental fields" in str(exc.value)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -237,15 +416,15 @@ class TestValidateAtomicCommitInput:
     def valid_inputs(self):
         return {
             "authenticated_user_id": "user_123",
-            "request_id": "12345678-1234-1234-1234-123456789abc",
+            "request_id": VALID_REQUEST_ID,
             "expected_revision": 0,
             "user_message": "Hello",
             "assistant_message": "Hi there!",
-            "emotional_state": {"schema_version": 1, "mood": "happy"},
-            "relationship_state": {"schema_version": 1, "trust": 0.8},
+            "emotional_state": _valid_emotional_state(),
+            "relationship_state": _valid_relationship_state(),
             "public_response": "Hi there!",
             "outbox_events": [("turn_completed", {"ref": "turn_1"}, "turn_1_priv")],
-            "replay_payload": {"response": "Hi there!", "duration_ms": 100},
+            "replay_payload": _valid_replay_payload(),
         }
 
     def test_valid_input(self, valid_inputs):
@@ -272,6 +451,12 @@ class TestValidateAtomicCommitInput:
 
     def test_negative_revision(self, valid_inputs):
         valid_inputs["expected_revision"] = -1
+        with pytest.raises(ValidationError) as exc:
+            validate_atomic_commit_input(**valid_inputs)
+        assert "invalid_expected_revision" in str(exc.value)
+
+    def test_bool_revision_rejected(self, valid_inputs):
+        valid_inputs["expected_revision"] = True
         with pytest.raises(ValidationError) as exc:
             validate_atomic_commit_input(**valid_inputs)
         assert "invalid_expected_revision" in str(exc.value)
@@ -306,8 +491,34 @@ class TestValidateAtomicCommitInput:
             validate_atomic_commit_input(**valid_inputs)
         assert "invalid_public_response" in str(exc.value)
 
+    def test_public_response_mismatch(self, valid_inputs):
+        valid_inputs["public_response"] = "Different response"
+        with pytest.raises(ValidationError) as exc:
+            validate_atomic_commit_input(**valid_inputs)
+        assert "invalid_public_response" in str(exc.value)
+        assert "equal replay_payload.response" in str(exc.value)
+
     def test_non_list_outbox_events(self, valid_inputs):
         valid_inputs["outbox_events"] = "not a list"
+        with pytest.raises(ValidationError) as exc:
+            validate_atomic_commit_input(**valid_inputs)
+        assert "invalid_outbox_events" in str(exc.value)
+
+    def test_outbox_event_wrong_arity_2(self, valid_inputs):
+        valid_inputs["outbox_events"] = [("turn_completed", {"ref": "x"})]
+        with pytest.raises(ValidationError) as exc:
+            validate_atomic_commit_input(**valid_inputs)
+        assert "invalid_outbox_events" in str(exc.value)
+        assert "exactly three elements" in str(exc.value)
+
+    def test_outbox_event_wrong_arity_4(self, valid_inputs):
+        valid_inputs["outbox_events"] = [("turn_completed", {"ref": "x"}, "k", "extra")]
+        with pytest.raises(ValidationError) as exc:
+            validate_atomic_commit_input(**valid_inputs)
+        assert "invalid_outbox_events" in str(exc.value)
+
+    def test_outbox_event_not_sequence(self, valid_inputs):
+        valid_inputs["outbox_events"] = ["not-a-sequence"]
         with pytest.raises(ValidationError) as exc:
             validate_atomic_commit_input(**valid_inputs)
         assert "invalid_outbox_events" in str(exc.value)
@@ -320,6 +531,12 @@ class TestValidateAtomicCommitInput:
 
     def test_non_mapping_outbox_payload(self, valid_inputs):
         valid_inputs["outbox_events"] = [("turn_completed", "not mapping", "key")]
+        with pytest.raises(ValidationError) as exc:
+            validate_atomic_commit_input(**valid_inputs)
+        assert "invalid_outbox_events" in str(exc.value)
+
+    def test_outbox_payload_forbidden_key(self, valid_inputs):
+        valid_inputs["outbox_events"] = [("turn_completed", {"ref": "x", "prompt": "p"}, "key")]
         with pytest.raises(ValidationError) as exc:
             validate_atomic_commit_input(**valid_inputs)
         assert "invalid_outbox_events" in str(exc.value)
@@ -341,31 +558,22 @@ class TestValidateAtomicCommitInput:
         validate_atomic_commit_input(**valid_inputs)
 
     def test_emotional_state_missing_schema_version(self, valid_inputs):
-        valid_inputs["emotional_state"] = {"mood": "happy"}
+        valid_inputs["emotional_state"] = {"pleasure": 0.1, "arousal": 0.2, "dominance": 0.3}
         with pytest.raises(ValidationError) as exc:
             validate_atomic_commit_input(**valid_inputs)
         assert "invalid_emotional_state" in str(exc.value)
         assert "schema_version" in str(exc.value)
 
     def test_emotional_state_invalid_schema_version(self, valid_inputs):
-        valid_inputs["emotional_state"] = {"schema_version": 2, "mood": "happy"}
+        valid_inputs["emotional_state"] = {
+            "schema_version": 2,
+            "pleasure": 0.1,
+            "arousal": 0.2,
+            "dominance": 0.3,
+        }
         with pytest.raises(ValidationError) as exc:
             validate_atomic_commit_input(**valid_inputs)
         assert "invalid_emotional_state" in str(exc.value)
-        assert "schema_version must be 1" in str(exc.value)
-
-    def test_relationship_state_missing_schema_version(self, valid_inputs):
-        valid_inputs["relationship_state"] = {"trust": 0.8}
-        with pytest.raises(ValidationError) as exc:
-            validate_atomic_commit_input(**valid_inputs)
-        assert "invalid_relationship_state" in str(exc.value)
-        assert "schema_version" in str(exc.value)
-
-    def test_relationship_state_invalid_schema_version(self, valid_inputs):
-        valid_inputs["relationship_state"] = {"schema_version": 0, "trust": 0.8}
-        with pytest.raises(ValidationError) as exc:
-            validate_atomic_commit_input(**valid_inputs)
-        assert "invalid_relationship_state" in str(exc.value)
         assert "schema_version must be 1" in str(exc.value)
 
     def test_empty_outbox_events(self, valid_inputs):
@@ -383,18 +591,18 @@ class TestBuildCommitTurnRpcPayload:
     def base_params(self):
         return {
             "authenticated_user_id": "user_123",
-            "request_id": "12345678-1234-1234-1234-123456789abc",
+            "request_id": VALID_REQUEST_ID,
             "expected_revision": 0,
             "user_message": "Hello",
             "assistant_message": "Hi there!",
-            "emotional_state": {"mood": "happy"},
-            "relationship_state": {"trust": 0.8},
+            "emotional_state": _valid_emotional_state(),
+            "relationship_state": _valid_relationship_state(),
             "public_response": "Hi there!",
             "outbox_events": [
                 ("turn_completed", {"ref": "turn_1"}, "turn_1_key"),
                 ("memory_updated", {"entity_id": "mem_1"}, "mem_1_key"),
             ],
-            "replay_payload": {"response": "Hi there!", "duration_ms": 100},
+            "replay_payload": _valid_replay_payload(),
             "payload_hash_sha256": "a" * 64,
             "lease_owner": "worker-1",
         }
@@ -428,6 +636,16 @@ class TestBuildCommitTurnRpcPayload:
         result = build_commit_turn_rpc_payload(**base_params)
         assert result["p_emotional_state"] is None
 
+    def test_preserves_empty_mapping_as_empty(self, base_params):
+        # Empty mappings must be preserved as {} — never converted to NULL.
+        base_params["emotional_state"] = {}
+        base_params["relationship_state"] = {}
+        base_params["replay_payload"] = {}
+        result = build_commit_turn_rpc_payload(**base_params)
+        assert result["p_emotional_state"] == {}
+        assert result["p_relationship_state"] == {}
+        assert result["p_replay_payload"] == {}
+
     def test_handles_none_relationship_state(self, base_params):
         base_params["relationship_state"] = None
         result = build_commit_turn_rpc_payload(**base_params)
@@ -449,49 +667,48 @@ class TestBuildCommitTurnRpcPayload:
 # ═══════════════════════════════════════════════════════════════════════
 
 
-class TestParseCommitTurnResult:
-    @pytest.fixture
-    def success_result(self):
-        return {
-            "user_id": "user_123",
-            "request_id": "12345678-1234-1234-1234-123456789abc",
-            "committed_revision": 1,
-            "user_message_chat_log_id": 100,
-            "assistant_message_chat_log_id": 101,
-            "user_message_id": "12345678-1234-1234-1234-123456789abc",
-            "assistant_message_id": "87654321-4321-4321-4321-cba987654321",
-            "replay_payload": {"response": "Hi!", "duration_ms": 50},
-            "outbox_events": [
-                {
-                    "id": "evt_1",
-                    "event_type": "turn_completed",
-                    "user_id": "user_123",
-                    "payload": {"ref": "turn_1"},
-                    "status": "pending",
-                    "contract_version": 1,
-                    "idempotency_key": "turn_1_key",
-                    "turn_request_id": "12345678-1234-1234-1234-123456789abc",
-                    "attempts": 0,
-                    "next_attempt_at": "2024-01-01T00:00:01Z",
-                    "created_at": "2024-01-01T00:00:00Z",
-                    "updated_at": "2024-01-01T00:00:00Z",
-                }
-            ],
-            "created_at": "2024-01-01T00:00:00Z",
-            "completed_at": "2024-01-01T00:00:00Z",
-        }
+def _success_result() -> dict:
+    return {
+        "user_id": "user_123",
+        "request_id": VALID_REQUEST_ID,
+        "committed_revision": 1,
+        "user_message_id": VALID_REQUEST_ID,
+        "assistant_message_id": VALID_MESSAGE_ID,
+        "replay_payload": _valid_replay_payload(),
+        "outbox_events": [
+            {
+                "id": "11111111-1111-1111-1111-111111111111",
+                "event_type": "turn_completed",
+                "idempotency_key": "turn_1_key",
+                "turn_request_id": VALID_REQUEST_ID,
+                "contract_version": 1,
+            }
+        ],
+        "created_at": "2024-01-01T00:00:00Z",
+        "completed_at": "2024-01-01T00:00:00Z",
+    }
 
-    def test_parse_success_result(self, success_result):
-        result = parse_commit_turn_result(success_result)
+
+class TestParseCommitTurnResult:
+    def test_parse_success_result(self):
+        result = parse_commit_turn_result(_success_result())
 
         assert isinstance(result, CommittedTurn)
         assert result.user_id == "user_123"
-        assert result.request_id == "12345678-1234-1234-1234-123456789abc"
+        assert result.request_id == VALID_REQUEST_ID
         assert result.committed_revision == 1
-        assert result.user_message_chat_log_id == 100
-        assert result.assistant_message_chat_log_id == 101
-        assert result.replay_payload == {"response": "Hi!", "duration_ms": 50}
+        # user_message_id derived from request_id; assistant from replay message_id
+        assert result.user_message_id == VALID_REQUEST_ID
+        assert result.assistant_message_id == VALID_MESSAGE_ID
+        assert result.replay_payload["response"] == "Hi there!"
         assert len(result.outbox_events) == 1
+        assert isinstance(result.outbox_events[0], CommittedOutboxRef)
+        assert result.outbox_events[0].event_type == "turn_completed"
+        assert result.outbox_events[0].contract_version == 1
+        # Operational fields must never leak into the public contract.
+        assert not hasattr(result.outbox_events[0], "status")
+        assert not hasattr(result.outbox_events[0], "attempts")
+        assert not hasattr(result.outbox_events[0], "lease_owner")
 
     def test_parse_error_result_conflict(self):
         error_result = {
@@ -516,7 +733,7 @@ class TestParseCommitTurnResult:
             "error": {
                 "code": "request_payload_conflict",
                 "message": "Request ID already exists with different payload",
-                "request_id": "12345678-1234-1234-1234-123456789abc",
+                "request_id": VALID_REQUEST_ID,
             }
         }
         with pytest.raises(ConflictError) as exc:
@@ -524,53 +741,125 @@ class TestParseCommitTurnResult:
 
         error = exc.value
         assert error.code == "request_payload_conflict"
-        assert error.request_id == "12345678-1234-1234-1234-123456789abc"
+        assert error.request_id == VALID_REQUEST_ID
 
-    def test_parse_error_result_database_error(self):
+    def test_parse_error_result_request_in_progress(self):
+        error_result = {
+            "error": {
+                "code": "request_in_progress",
+                "message": "Request is already in progress by another worker",
+                "request_id": VALID_REQUEST_ID,
+            }
+        }
+        with pytest.raises(ConflictError) as exc:
+            parse_commit_turn_result(error_result)
+        assert exc.value.code == "request_in_progress"
+
+    def test_parse_error_result_lease_conflict(self):
+        error_result = {
+            "error": {
+                "code": "lease_conflict",
+                "message": "Request state changed; reclaim failed",
+                "request_id": VALID_REQUEST_ID,
+            }
+        }
+        with pytest.raises(ConflictError) as exc:
+            parse_commit_turn_result(error_result)
+        assert exc.value.code == "lease_conflict"
+
+    def test_parse_error_result_validation_failed(self):
+        error_result = {
+            "error": {
+                "code": "validation_failed",
+                "message": "replay_payload must contain response",
+            }
+        }
+        with pytest.raises(ValidationError) as exc:
+            parse_commit_turn_result(error_result)
+        assert exc.value.code == "validation_failed"
+
+    def test_parse_error_result_database_error_is_persistence(self):
+        # database_error must NEVER be classified as ValidationError/ConflictError.
         error_result = {
             "error": {
                 "code": "database_error",
                 "message": "internal database error",
             }
         }
-        with pytest.raises(DatabaseError) as exc:
+        with pytest.raises(PersistenceError) as exc:
             parse_commit_turn_result(error_result)
+        assert exc.value.code == "database_error"
 
-        error = exc.value
-        assert error.code == "database_error"
-        assert error.message == "internal database error"
-
-    def test_parse_error_result_lease_conflict(self):
-        error_result = {
-            "error": {
-                "code": "request_lease_conflict",
-                "message": "Request ID has active lease owned by another worker",
-                "request_id": "12345678-1234-1234-1234-123456789abc",
-            }
-        }
-        with pytest.raises(ConflictError) as exc:
+    def test_parse_error_result_unknown_code_fails_closed(self):
+        error_result = {"error": {"code": "mystery_code", "message": "x"}}
+        with pytest.raises(PersistenceError):
             parse_commit_turn_result(error_result)
-
-        error = exc.value
-        assert error.code == "request_lease_conflict"
-        assert error.request_id == "12345678-1234-1234-1234-123456789abc"
 
     def test_parse_invalid_result_not_mapping(self):
         with pytest.raises(ValidationError) as exc:
             parse_commit_turn_result("not a mapping")
         assert "invalid_rpc_result" in str(exc.value)
 
-    def test_parse_missing_field(self, success_result):
-        del success_result["user_id"]
+    def test_parse_malformed_error_envelope(self):
+        with pytest.raises(ValidationError):
+            parse_commit_turn_result({"error": "not a mapping"})
+        with pytest.raises(ValidationError):
+            parse_commit_turn_result({"error": {"message": "no code"}})
+
+    def test_parse_missing_field(self):
+        result = _success_result()
+        del result["user_id"]
         with pytest.raises(ValidationError) as exc:
-            parse_commit_turn_result(success_result)
+            parse_commit_turn_result(result)
         assert "missing field" in str(exc.value)
 
-    def test_parse_empty_outbox_events(self, success_result):
-        success_result["outbox_events"] = []
-        result = parse_commit_turn_result(success_result)
-        # outbox_events is now a tuple for deep immutability
-        assert result.outbox_events == ()
+    def test_parse_extra_field_rejected(self):
+        result = _success_result()
+        result["user_message_chat_log_id"] = 100
+        with pytest.raises(ValidationError) as exc:
+            parse_commit_turn_result(result)
+        assert "unexpected field" in str(exc.value)
+
+    def test_parse_bool_revision_rejected(self):
+        result = _success_result()
+        result["committed_revision"] = True
+        with pytest.raises(ValidationError) as exc:
+            parse_commit_turn_result(result)
+        assert "invalid_committed_revision" in str(exc.value)
+
+    def test_parse_negative_revision_rejected(self):
+        result = _success_result()
+        result["committed_revision"] = -1
+        with pytest.raises(ValidationError) as exc:
+            parse_commit_turn_result(result)
+        assert "invalid_committed_revision" in str(exc.value)
+
+    def test_parse_user_message_id_must_equal_request_id(self):
+        result = _success_result()
+        result["user_message_id"] = "99999999-9999-9999-9999-999999999999"
+        with pytest.raises(ValidationError) as exc:
+            parse_commit_turn_result(result)
+        assert "invalid_user_message_id" in str(exc.value)
+
+    def test_parse_assistant_message_id_must_match_replay(self):
+        result = _success_result()
+        result["assistant_message_id"] = "99999999-9999-9999-9999-999999999999"
+        with pytest.raises(ValidationError) as exc:
+            parse_commit_turn_result(result)
+        assert "invalid_assistant_message_id" in str(exc.value)
+
+    def test_parse_empty_outbox_events(self):
+        result = _success_result()
+        result["outbox_events"] = []
+        parsed = parse_commit_turn_result(result)
+        assert parsed.outbox_events == ()
+
+    def test_parse_outbox_ref_with_operational_fields_rejected(self):
+        result = _success_result()
+        result["outbox_events"][0]["status"] = "pending"
+        with pytest.raises(ValidationError) as exc:
+            parse_commit_turn_result(result)
+        assert "unexpected outbox ref field" in str(exc.value)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -583,14 +872,20 @@ class TestCommittedTurn:
     def committed_turn(self):
         return CommittedTurn(
             user_id="user_123",
-            request_id="87654321-4321-4321-4321-cba987654321",
+            request_id=VALID_REQUEST_ID,
             committed_revision=1,
-            user_message_chat_log_id=100,
-            assistant_message_chat_log_id=101,
-            user_message_id="msg_1",
-            assistant_message_id="msg_2",
-            replay_payload={"response": "Hi!"},
-            outbox_events=[],
+            user_message_id=VALID_REQUEST_ID,
+            assistant_message_id=VALID_MESSAGE_ID,
+            replay_payload=_valid_replay_payload(),
+            outbox_events=[
+                CommittedOutboxRef(
+                    id="11111111-1111-1111-1111-111111111111",
+                    event_type="turn_completed",
+                    idempotency_key="turn_1_key",
+                    turn_request_id=VALID_REQUEST_ID,
+                    contract_version=1,
+                )
+            ],
             created_at="2024-01-01T00:00:00Z",
             completed_at="2024-01-01T00:00:01Z",
         )
@@ -598,14 +893,31 @@ class TestCommittedTurn:
     def test_to_db_row(self, committed_turn):
         row = committed_turn.to_db_row()
         assert row["user_id"] == "user_123"
-        assert row["request_id"] == "87654321-4321-4321-4321-cba987654321"
+        assert row["request_id"] == VALID_REQUEST_ID
         assert row["committed_revision"] == 1
+        assert row["user_message_id"] == VALID_REQUEST_ID
         assert isinstance(row["replay_payload"], dict)
         assert isinstance(row["outbox_events"], list)
+        assert set(row["outbox_events"][0]) == {
+            "id", "event_type", "idempotency_key", "turn_request_id", "contract_version",
+        }
 
     def test_immutable(self, committed_turn):
         with pytest.raises(FrozenInstanceError):
             committed_turn.user_id = "modified"
+
+
+class TestCommittedOutboxRef:
+    def test_immutable(self):
+        ref = CommittedOutboxRef(
+            id="11111111-1111-1111-1111-111111111111",
+            event_type="turn_completed",
+            idempotency_key="k",
+            turn_request_id=VALID_REQUEST_ID,
+            contract_version=1,
+        )
+        with pytest.raises(FrozenInstanceError):
+            ref.id = "x"
 
 
 class TestConflictError:
@@ -615,23 +927,21 @@ class TestConflictError:
             message="Revision mismatch",
             expected_revision=5,
             actual_revision=6,
-            request_id="12345678-1234-1234-1234-123456789abc",
+            request_id=VALID_REQUEST_ID,
         )
         error_str = str(error)
         assert "revision_mismatch" in error_str
         assert "Revision mismatch" in error_str
         assert "expected_revision=5" in error_str
         assert "actual_revision=6" in error_str
-        assert "request_id=12345678-1234-1234-1234-123456789abc" in error_str
+        assert f"request_id={VALID_REQUEST_ID}" in error_str
 
     def test_is_exception(self):
-        """Test that ConflictError is an Exception subclass."""
         error = ConflictError(code="test", message="test", expected_revision=0)
         assert isinstance(error, Exception)
         assert isinstance(error, ConflictError)
 
     def test_slots(self):
-        """Test that ConflictError uses __slots__ for memory efficiency."""
         error = ConflictError(code="test", message="test", expected_revision=0)
         assert hasattr(type(error), "__slots__")
         assert error.code == "test"
@@ -645,48 +955,35 @@ class TestValidationError:
         assert str(error) == "test_error: Test message"
 
     def test_is_exception(self):
-        """Test that ValidationError is an Exception subclass."""
         error = ValidationError(code="test", message="test")
         assert isinstance(error, Exception)
         assert isinstance(error, ValidationError)
 
     def test_slots(self):
-        """Test that ValidationError uses __slots__ for memory efficiency."""
         error = ValidationError(code="test", message="test")
         assert hasattr(type(error), "__slots__")
         assert error.code == "test"
         assert error.message == "test"
 
 
-class TestDatabaseError:
+class TestPersistenceError:
     def test_str_representation(self):
-        error = DatabaseError(code="database_error", message="Internal database error")
-        assert str(error) == "database_error: Internal database error"
+        error = PersistenceError(code="database_error", message="persistence error")
+        assert str(error) == "database_error: persistence error"
 
     def test_is_exception(self):
-        """Test that DatabaseError is an Exception subclass."""
-        error = DatabaseError(code="database_error", message="error")
+        error = PersistenceError(code="database_error", message="error")
         assert isinstance(error, Exception)
-        assert isinstance(error, DatabaseError)
+        assert isinstance(error, PersistenceError)
+        # Must not be classified as validation or conflict.
+        assert not isinstance(error, ValidationError)
+        assert not isinstance(error, ConflictError)
 
     def test_slots(self):
-        """Test that DatabaseError uses __slots__ for memory efficiency."""
-        error = DatabaseError(code="database_error", message="error")
+        error = PersistenceError(code="database_error", message="error")
         assert hasattr(type(error), "__slots__")
         assert error.code == "database_error"
         assert error.message == "error"
-
-
-class TestMessageRef:
-    def test_creation(self):
-        ref = MessageRef(user_id="user_123", chat_log_id=100)
-        assert ref.user_id == "user_123"
-        assert ref.chat_log_id == 100
-
-    def test_immutable(self):
-        ref = MessageRef(user_id="user_123", chat_log_id=100)
-        with pytest.raises(FrozenInstanceError):
-            ref.user_id = "modified"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -700,19 +997,15 @@ class TestNoSharedMutableState:
     def test_no_module_mutable_state(self):
         import backend.atomic_turn_commit as module
 
-        # Check that no module-level variables are mutable
         for name in dir(module):
             if not name.startswith("_"):
                 obj = getattr(module, name)
                 if isinstance(obj, (dict, list, set)):
-                    # Ensure it's a constant (tuple or frozenset)
                     assert isinstance(obj, (frozenset, tuple)), (
                         f"Module-level mutable state: {name} is {type(obj).__name__}"
                     )
 
     def test_validation_is_stateless(self):
-        """Validation functions don't retain state between calls."""
-        # Call validation multiple times with different inputs
         validate_atomic_commit_input(
             authenticated_user_id="user_1",
             request_id="11111111-1111-1111-1111-111111111111",
@@ -723,7 +1016,7 @@ class TestNoSharedMutableState:
             relationship_state=None,
             public_response="Hi",
             outbox_events=[],
-            replay_payload={},
+            replay_payload=_valid_replay_payload("Hi"),
         )
         validate_atomic_commit_input(
             authenticated_user_id="user_2",
@@ -735,11 +1028,10 @@ class TestNoSharedMutableState:
             relationship_state=None,
             public_response="Bye",
             outbox_events=[],
-            replay_payload={},
+            replay_payload=_valid_replay_payload("Bye"),
         )
 
     def test_payload_building_is_stateless(self):
-        """Payload building doesn't retain state between calls."""
         result1 = build_commit_turn_rpc_payload(
             authenticated_user_id="user_1",
             request_id="11111111-1111-1111-1111-111111111111",
@@ -750,7 +1042,7 @@ class TestNoSharedMutableState:
             relationship_state=None,
             public_response="Hi",
             outbox_events=[],
-            replay_payload={},
+            replay_payload=_valid_replay_payload("Hi"),
             payload_hash_sha256="a" * 64,
             lease_owner=None,
         )
@@ -764,7 +1056,7 @@ class TestNoSharedMutableState:
             relationship_state=None,
             public_response="Hi",
             outbox_events=[],
-            replay_payload={},
+            replay_payload=_valid_replay_payload("Hi"),
             payload_hash_sha256="b" * 64,
             lease_owner=None,
         )
@@ -779,46 +1071,36 @@ class TestNoSharedMutableState:
 
 class TestEdgeCases:
     def test_max_length_idempotency_key(self):
-        key = "a" * 128
-        _validate_idempotency_key(key)
+        _validate_idempotency_key("a" * 128)
 
     def test_max_length_lease_owner(self):
-        owner = "a" * 64
-        _validate_lease_owner(owner)
+        _validate_lease_owner("a" * 64)
 
     def test_max_length_error_code(self):
-        code = "a" * 64
-        _validate_error_code(code)
+        _validate_error_code("a" * 64)
 
     def test_exactly_128_char_key(self):
-        key = "a" * 128
-        _validate_idempotency_key(key)
-        # 129 should fail
+        _validate_idempotency_key("a" * 128)
         with pytest.raises(ValidationError):
             _validate_idempotency_key("a" * 129)
 
     def test_exactly_64_char_owner(self):
-        owner = "a" * 64
-        _validate_lease_owner(owner)
-        # 65 should fail
+        _validate_lease_owner("a" * 64)
         with pytest.raises(ValidationError):
             _validate_lease_owner("a" * 65)
 
     def test_all_valid_idempotency_chars(self):
-        # All valid characters: alphanumeric, ., _, :, -
-        key = "ABCabc012._:-"
-        _validate_idempotency_key(key)
+        _validate_idempotency_key("ABCabc012._:-")
 
     def test_valid_lease_owner_chars(self):
-        owner = "Worker-1.2:test"
-        _validate_lease_owner(owner)
+        _validate_lease_owner("Worker-1.2:test")
 
     def test_replay_payload_with_all_allowed_keys(self):
         payload = {
             "response": "test",
             "emotion_state": {},
-            "message_id": "msg_1",
-            "request_id": "11111111-1111-1111-1111-111111111111",
+            "message_id": VALID_MESSAGE_ID,
+            "request_id": VALID_REQUEST_ID,
             "duration_ms": 100,
         }
         _validate_replay_payload(payload)
@@ -827,14 +1109,14 @@ class TestEdgeCases:
         validate_atomic_commit_input(
             authenticated_user_id="user_1",
             request_id="11111111-1111-1111-1111-111111111111",
-            expected_revision=2**60,  # Large but valid
+            expected_revision=2**60,
             user_message="Hello",
             assistant_message="Hi",
             emotional_state=None,
             relationship_state=None,
             public_response="Hi",
             outbox_events=[],
-            replay_payload={},
+            replay_payload=_valid_replay_payload("Hi"),
         )
 
     def test_validation_with_zero_revision(self):
@@ -848,106 +1130,185 @@ class TestEdgeCases:
             relationship_state=None,
             public_response="Hi",
             outbox_events=[],
-            replay_payload={},
+            replay_payload=_valid_replay_payload("Hi"),
         )
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# 10. Async commit_turn path
+# 9. Async commit_turn entry point
 # ═══════════════════════════════════════════════════════════════════════
 
 
 class TestAsyncCommitTurn:
-    """Test the async commit_turn function directly."""
+    """Direct tests of the async commit_turn() entry point."""
 
     @pytest.fixture
     def valid_inputs(self):
         return {
             "authenticated_user_id": "user_123",
-            "request_id": "12345678-1234-1234-1234-123456789abc",
+            "request_id": VALID_REQUEST_ID,
             "expected_revision": 0,
             "user_message": "Hello",
             "assistant_message": "Hi there!",
-            "emotional_state": {"schema_version": 1, "mood": "happy"},
-            "relationship_state": {"schema_version": 1, "trust": 0.8},
+            "emotional_state": _valid_emotional_state(),
+            "relationship_state": _valid_relationship_state(),
             "public_response": "Hi there!",
             "outbox_events": [("turn_completed", {"ref": "turn_1"}, "turn_1_key")],
-            "replay_payload": {"response": "Hi there!", "duration_ms": 100},
+            "replay_payload": _valid_replay_payload(),
         }
 
     @pytest.fixture
-    def mock_rpc_client(self):
-        """Create a mock RPC client that returns a successful result."""
-        async def _mock_rpc(name: str, params: dict) -> Mapping[str, Any]:
-            return {
-                "user_id": "user_123",
-                "request_id": "12345678-1234-1234-1234-123456789abc",
-                "committed_revision": 1,
-                "user_message_chat_log_id": 100,
-                "assistant_message_chat_log_id": 101,
-                "user_message_id": "12345678-1234-1234-1234-123456789abc",
-                "assistant_message_id": "87654321-4321-4321-4321-cba987654321",
-                "replay_payload": {"response": "Hi there!", "duration_ms": 100},
-                "outbox_events": [
-                    {
-                        "id": "evt_1",
-                        "event_type": "turn_completed",
-                        "user_id": "user_123",
-                        "payload": {"ref": "turn_1"},
-                        "status": "pending",
-                        "idempotency_key": "turn_1_key",
-                        "turn_request_id": "12345678-1234-1234-1234-123456789abc",
-                        "contract_version": 1,
-                        "attempts": 0,
-                        "next_attempt_at": "2024-01-01T00:00:01Z",
-                        "created_at": "2024-01-01T00:00:00Z",
-                        "updated_at": "2024-01-01T00:00:00Z",
-                    }
-                ],
-                "created_at": "2024-01-01T00:00:00Z",
-                "completed_at": "2024-01-01T00:00:00Z",
-            }
-        return _mock_rpc
+    def recording_rpc_client(self):
+        """An async rpc client that records calls and returns a success result."""
+
+        class _Recording:
+            def __init__(self):
+                self.calls = []
+
+            async def __call__(self, name, params):
+                self.calls.append((name, dict(params)))
+                return _success_result()
+
+        return _Recording()
 
     @pytest.mark.asyncio
-    async def test_commit_turn_success(self, valid_inputs, mock_rpc_client):
-        """Test that commit_turn successfully validates, builds payload, calls RPC, and parses result."""
+    async def test_success(self, valid_inputs, recording_rpc_client):
         result = await commit_turn(
-            rpc_client=mock_rpc_client,
+            rpc_client=recording_rpc_client,
             **valid_inputs,
         )
-
         assert isinstance(result, CommittedTurn)
         assert result.user_id == "user_123"
-        assert result.request_id == "12345678-1234-1234-1234-123456789abc"
+        assert result.request_id == VALID_REQUEST_ID
         assert result.committed_revision == 1
 
     @pytest.mark.asyncio
-    async def test_commit_turn_validation_error(self, mock_rpc_client):
-        """Test that commit_turn raises ValidationError for invalid input."""
-        with pytest.raises(ValidationError) as exc:
-            await commit_turn(
-                rpc_client=mock_rpc_client,
-                authenticated_user_id="",  # Invalid: empty
-                request_id="12345678-1234-1234-1234-123456789abc",
-                expected_revision=0,
-                user_message="Hello",
-                assistant_message="Hi",
-                emotional_state=None,
-                relationship_state=None,
-                public_response="Hi",
-                outbox_events=[],
-                replay_payload={},
-            )
-        assert "invalid_user_id" in str(exc.value)
+    async def test_rpc_called_once_with_commit_turn(self, valid_inputs, recording_rpc_client):
+        await commit_turn(rpc_client=recording_rpc_client, **valid_inputs)
+        assert len(recording_rpc_client.calls) == 1
+        name, _ = recording_rpc_client.calls[0]
+        assert name == "commit_turn"
 
     @pytest.mark.asyncio
-    async def test_commit_turn_with_lease_owner(self, valid_inputs, mock_rpc_client):
-        """Test that commit_turn accepts lease_owner parameter."""
+    async def test_payload_sent(self, valid_inputs, recording_rpc_client):
+        await commit_turn(rpc_client=recording_rpc_client, **valid_inputs)
+        _, params = recording_rpc_client.calls[0]
+        assert params["p_authenticated_user_id"] == "user_123"
+        assert params["p_request_id"] == VALID_REQUEST_ID
+        assert params["p_expected_revision"] == 0
+        assert params["p_user_message"] == "Hello"
+        assert params["p_assistant_message"] == "Hi there!"
+        assert params["p_public_response"] == "Hi there!"
+        assert params["p_replay_payload"]["message_id"] == VALID_MESSAGE_ID
+        assert params["p_outbox_events"][0]["event_type"] == "turn_completed"
+
+    @pytest.mark.asyncio
+    async def test_canonical_hash_sent(self, valid_inputs, recording_rpc_client):
+        await commit_turn(rpc_client=recording_rpc_client, **valid_inputs)
+        _, params = recording_rpc_client.calls[0]
+        sent_hash = params["p_payload_hash_sha256"]
+        assert isinstance(sent_hash, str) and len(sent_hash) == 64
+        assert all(c in "0123456789abcdef" for c in sent_hash)
+        # Recompute the canonical hash independently and compare.
+        canonical = {
+            "authenticated_user_id": "user_123",
+            "request_id": VALID_REQUEST_ID,
+            "expected_revision": 0,
+            "user_message": "Hello",
+            "assistant_message": "Hi there!",
+            "emotional_state": _valid_emotional_state(),
+            "relationship_state": _valid_relationship_state(),
+            "public_response": "Hi there!",
+            "replay_payload": _valid_replay_payload(),
+            "outbox_events": [
+                {"event_type": "turn_completed", "payload": {"ref": "turn_1"}, "idempotency_key": "turn_1_key"}
+            ],
+        }
+        assert sent_hash == canonical_payload_hash(canonical)
+
+    @pytest.mark.asyncio
+    async def test_rpc_not_called_on_invalid_input(self, valid_inputs, recording_rpc_client):
+        valid_inputs["authenticated_user_id"] = ""
+        with pytest.raises(ValidationError):
+            await commit_turn(rpc_client=recording_rpc_client, **valid_inputs)
+        assert len(recording_rpc_client.calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_validation_before_rpc(self, valid_inputs, recording_rpc_client):
+        valid_inputs["replay_payload"] = {"response": "mismatch"}
+        with pytest.raises(ValidationError):
+            await commit_turn(rpc_client=recording_rpc_client, **valid_inputs)
+        assert len(recording_rpc_client.calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_invalid_lease_owner_rejected_before_rpc(self, valid_inputs, recording_rpc_client):
+        with pytest.raises(ValidationError):
+            await commit_turn(
+                rpc_client=recording_rpc_client,
+                lease_owner="worker space",
+                **valid_inputs,
+            )
+        assert len(recording_rpc_client.calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_conflict_maps_to_conflict_error(self, valid_inputs):
+        async def _conflict(name, params):
+            return {
+                "error": {
+                    "code": "revision_mismatch",
+                    "message": "Profile revision does not match",
+                    "expected_revision": 0,
+                    "actual_revision": 3,
+                }
+            }
+
+        with pytest.raises(ConflictError) as exc:
+            await commit_turn(rpc_client=_conflict, **valid_inputs)
+        assert exc.value.code == "revision_mismatch"
+        assert exc.value.actual_revision == 3
+
+    @pytest.mark.asyncio
+    async def test_request_in_progress_maps_to_conflict_error(self, valid_inputs):
+        async def _in_progress(name, params):
+            return {
+                "error": {
+                    "code": "request_in_progress",
+                    "message": "Request is already in progress by another worker",
+                    "request_id": VALID_REQUEST_ID,
+                }
+            }
+
+        with pytest.raises(ConflictError) as exc:
+            await commit_turn(rpc_client=_in_progress, **valid_inputs)
+        assert exc.value.code == "request_in_progress"
+
+    @pytest.mark.asyncio
+    async def test_persistence_error_maps_to_persistence_error(self, valid_inputs):
+        async def _boom(name, params):
+            raise RuntimeError("underlying postgres failure detail")
+
+        with pytest.raises(PersistenceError) as exc:
+            await commit_turn(rpc_client=_boom, **valid_inputs)
+        assert exc.value.code == "database_error"
+        assert "underlying postgres failure detail" not in str(exc.value)
+        assert str(exc.value) == "database_error: persistence error"
+
+    @pytest.mark.asyncio
+    async def test_malformed_result_fails_closed(self, valid_inputs):
+        async def _malformed(name, params):
+            return {"weird": "payload"}
+
+        with pytest.raises(ValidationError) as exc:
+            await commit_turn(rpc_client=_malformed, **valid_inputs)
+        assert "invalid_rpc_result" in str(exc.value)
+
+    @pytest.mark.asyncio
+    async def test_with_lease_owner(self, valid_inputs, recording_rpc_client):
         result = await commit_turn(
-            rpc_client=mock_rpc_client,
+            rpc_client=recording_rpc_client,
             lease_owner="worker-1",
             **valid_inputs,
         )
-
         assert isinstance(result, CommittedTurn)
+        _, params = recording_rpc_client.calls[0]
+        assert params["p_lease_owner"] == "worker-1"

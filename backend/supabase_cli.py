@@ -7,6 +7,7 @@ Provides a wrapper around subprocess.run that:
 - Only exposes a constant operation identifier in exception messages
 - Never includes command, query, path, payload, keys, or raw output in public messages
 """
+import os
 import subprocess
 import logging
 
@@ -40,12 +41,20 @@ def run_supabase_op(op_id: str, args: list[str], check: bool = True) -> subproce
 
     cmd = ["supabase"] + args
 
+    # Disable CLI telemetry: the PostHog analytics flush intermittently times
+    # out and converts a successful SQL command into a non-zero exit code,
+    # which would make database integration tests flaky.
+    child_env = dict(os.environ)
+    child_env["SUPABASE_TELEMETRY_DISABLED"] = "1"
+    child_env["SUPABASE_ANALYTICS_ENABLED"] = "false"
+
     try:
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             check=False,
+            env=child_env,
         )
     except FileNotFoundError:
         raise RuntimeError(f"Supabase operation failed: {op_id} (binary not found)")

@@ -2,27 +2,57 @@
 -- Atomic turn commit RPC function (#271).
 --
 -- Implements the transactional commit of a complete turn unit:
--- 1. Acquire per-user lock (advisory or row-level)
--- 2. Check for existing request and handle idempotent replay
--- 3. Validate CAS (Compare-And-Swap) on profile revision
--- 4. Create profile if missing (race-safe upsert)
--- 5. Reject divergent payload for active requests; reclaim expired/expired-lease requests
--- 6. Insert user and assistant messages with stable IDs
+-- 1. Input validation that returns stable, sanitized error envelopes
+-- 2. Acquire per-user lock (64-bit advisory key, not 32-bit hashtext)
+-- 3. Check for existing request and handle idempotent replay / lease reclaim
+-- 4. Validate CAS (Compare-And-Swap) on profile revision
+-- 5. Create profile if missing (race-safe upsert)
+-- 6. Insert user and assistant messages
 -- 7. Update profile snapshots and increment revision exactly once
--- 8. Complete turn_requests with reproducible result
+-- 8. Complete turn_requests (new insert OR atomic conditional reclaim)
 -- 9. Insert idempotent outbox events
--- 10. Commit all or rollback all
+-- 10. Build the public result from persisted rows (same path as replay)
+-- 11. Commit all or roll back all
 --
 -- Design and rationale: docs/architecture/transactional-turn-schema.md
 -- Issue: #271
 -- Depends on: #270 (transactional schema foundation)
 --
+-- Public result contract (both fresh commit and replay):
+--   {
+--     "user_id": text,
+--     "request_id": uuid (text),
+--     "committed_revision": bigint,
+--     "user_message_id": uuid (text, always equal to request_id),
+--     "assistant_message_id": uuid (text, from replay_payload.message_id),
+--     "replay_payload": jsonb (authoritative public result),
+--     "outbox_events": [ {"id", "event_type", "idempotency_key",
+--                         "turn_request_id", "contract_version"} ],
+--     "created_at": timestamptz (text),
+--     "completed_at": timestamptz (text)
+--   }
+-- Outbox references expose ONLY stable, immutable fields. Operational state
+-- (status, attempts, next_attempt_at, leases, updated_at, processed_at,
+-- error_code) is never returned. Internal chat_logs identifiers are not part
+-- of the public contract: they can be nulled by pruning, so replay must never
+-- depend on them.
+--
+-- Error envelopes (stable domain results):
+--   {"error": {"code": "revision_mismatch", ...}}
+--   {"error": {"code": "request_payload_conflict", ...}}
+--   {"error": {"code": "request_in_progress", ...}}   (active lease, other worker)
+--   {"error": {"code": "lease_conflict", ...}}        (claim/reclaim race)
+--   {"error": {"code": "validation_failed", ...}}
+-- Unexpected PostgreSQL failures are NOT returned as normal RPC success: the
+-- handler raises a constant sanitized message so the failure propagates to the
+-- client as a persistence error (rollback is automatic).
+--
 -- Security notes:
 -- - Runs with SECURITY DEFINER as service_role
 -- - EXECUTE revoked from PUBLIC/anon/authenticated
--- - All user_id values come from authenticated context
+-- - All user_id values come from authenticated context; identity inside
+--   snapshots is rejected (user_id / bond_label forbidden at any depth)
 -- - No network, LLM, or embedding calls inside the transaction
--- - Payload validation leverages existing CHECK constraints
 -- - Fail-closed: any error rolls back the entire transaction
 
 -- =================================================================
@@ -96,38 +126,166 @@ BEGIN
 END $$;
 
 -- =================================================================
+-- 0.1 Snapshot validation helper
+-- =================================================================
+-- Validates the fundamental structure of a persisted snapshot without
+-- duplicating the whole emotional/relationship domain inside SQL:
+--   * must be a JSON object (NULL passes; callers treat NULL as "no change")
+--   * schema_version must be a JSON number that is an integer exactly 1
+--     (rejects bool, string "1", floats and any other type)
+--   * user_id / bond_label forbidden at ANY depth (identity is never stored)
+--   * prompts / metacognition / messages / internal instructions forbidden
+--   * size limited to 8192 bytes
+--   * the minimal fundamental keys for each snapshot kind are required
+CREATE OR REPLACE FUNCTION public.jsonb_snapshot_contract(
+    payload jsonb,
+    p_snapshot_kind text
+) RETURNS boolean
+LANGUAGE plpgsql
+IMMUTABLE
+AS $$
+DECLARE
+    v_schema_version jsonb;
+BEGIN
+    IF payload IS NULL THEN
+        RETURN TRUE;
+    END IF;
+
+    IF jsonb_typeof(payload) <> 'object' THEN
+        RETURN FALSE;
+    END IF;
+
+    -- schema_version must be a JSON number that is an integer.
+    v_schema_version := payload->'schema_version';
+    IF v_schema_version IS NULL OR jsonb_typeof(v_schema_version) <> 'number' THEN
+        RETURN FALSE;
+    END IF;
+    -- jsonb has no separate integer type: reject floats / exponents / signs
+    -- ("1.0", "1e0", "-1" must not pass as version 1).
+    IF NOT ((payload->>'schema_version') ~ '^[0-9]+$') THEN
+        RETURN FALSE;
+    END IF;
+    IF (payload->>'schema_version')::bigint <> 1 THEN
+        RETURN FALSE;
+    END IF;
+
+    -- Identity and internal fields are forbidden at any depth.
+    IF public.jsonb_has_forbidden_key(
+        payload,
+        ARRAY[
+            'user_id', 'bond_label',
+            'prompt', 'system_prompt', 'meta_cognition',
+            'internal_instructions', 'message', 'user_message',
+            'assistant_message', 'content'
+        ]
+    ) THEN
+        RETURN FALSE;
+    END IF;
+
+    -- Size limit (mirrors the replay_payload / outbox payload bounds).
+    IF octet_length(payload::text) > 8192 THEN
+        RETURN FALSE;
+    END IF;
+
+    -- Minimal fundamental structure per snapshot kind.
+    IF p_snapshot_kind = 'emotional' THEN
+        IF NOT (payload ? 'pleasure')
+           OR NOT (payload ? 'arousal')
+           OR NOT (payload ? 'dominance') THEN
+            RETURN FALSE;
+        END IF;
+    ELSIF p_snapshot_kind = 'relationship' THEN
+        IF NOT (payload ? 'trust')
+           OR NOT (payload ? 'affection')
+           OR NOT (payload ? 'tension') THEN
+            RETURN FALSE;
+        END IF;
+    END IF;
+
+    RETURN TRUE;
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.jsonb_snapshot_contract(jsonb, text) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.jsonb_snapshot_contract(jsonb, text) TO service_role;
+
+-- =================================================================
+-- 0.2 Public result builder (single authoritative path)
+-- =================================================================
+-- Builds the canonical public result from PERSISTED rows. Used both by the
+-- fresh commit path (after writing) and by the idempotent replay path, so the
+-- initial response and every retry are assembled by exactly the same code.
+-- Never reads chat_logs: message identifiers come from request_id and
+-- replay_payload.message_id, both of which survive message pruning.
+CREATE OR REPLACE FUNCTION public.commit_turn_build_result(
+    p_user_id text,
+    p_request_id uuid
+) RETURNS jsonb
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+    v_row public.turn_requests%ROWTYPE;
+    v_outbox jsonb;
+BEGIN
+    SELECT * INTO v_row
+    FROM public.turn_requests
+    WHERE user_id = p_user_id AND request_id = p_request_id;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'persistence error' USING ERRCODE = 'P0001';
+    END IF;
+
+    -- Stable, deterministic outbox references (ORDER BY id).
+    SELECT COALESCE(
+        jsonb_agg(
+            jsonb_build_object(
+                'id', e.id::text,
+                'event_type', e.event_type,
+                'idempotency_key', e.idempotency_key,
+                'turn_request_id', e.turn_request_id::text,
+                'contract_version', e.contract_version
+            ) ORDER BY e.id
+        ),
+        '[]'::jsonb
+    )
+    INTO v_outbox
+    FROM public.outbox_events e
+    WHERE e.user_id = p_user_id AND e.turn_request_id = v_row.id;
+
+    RETURN jsonb_build_object(
+        'user_id', v_row.user_id,
+        'request_id', v_row.request_id::text,
+        'committed_revision', v_row.committed_revision,
+        'user_message_id', v_row.request_id::text,
+        'assistant_message_id', v_row.replay_payload->>'message_id',
+        'replay_payload', COALESCE(v_row.replay_payload, '{}'::jsonb),
+        'outbox_events', v_outbox,
+        'created_at', v_row.created_at::text,
+        'completed_at', COALESCE(v_row.completed_at::text, v_row.created_at::text)
+    );
+END;
+$$;
+
+REVOKE ALL ON FUNCTION public.commit_turn_build_result(text, uuid) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.commit_turn_build_result(text, uuid) TO service_role;
+
+-- =================================================================
 -- 1. RPC function: commit_turn
 -- =================================================================
 -- Main atomic commit function. Executes all steps in a single transaction.
 --
--- Returns a JSON object with:
---   {
---     "user_id": text,
---     "request_id": uuid,
---     "committed_revision": bigint,
---     "user_message_chat_log_id": bigint,
---     "assistant_message_chat_log_id": bigint,
---     "user_message_id": uuid (the request_id, for symmetry),
---     "assistant_message_id": uuid (generated for assistant message),
---     "replay_payload": jsonb,
---     "outbox_events": jsonb (array of event records),
---     "created_at": timestamptz,
---     "completed_at": timestamptz
---   }
---
--- On conflict, returns:
---   {"error": {"code": "...", "message": "...", "expected_revision": ..., "actual_revision": ...}}
---
--- Error codes:
+-- Return contract documented in the header. Error codes:
 --   - revision_mismatch: profile revision doesn't match expected_revision
---   - request_payload_conflict: (user_id, request_id) already exists with different payload hash
---   - request_lease_conflict: request has active lease owned by another worker
---   - profile_upsert_failed: could not create/lock profile
---   - message_insert_failed: could not insert messages
---   - turn_request_insert_failed: could not insert/update turn_request
---   - outbox_insert_failed: could not insert outbox events
---   - validation_failed: payload validation failed
---   - database_error: unexpected database error (sanitized)
+--   - request_payload_conflict: (user_id, request_id) exists with a DIFFERENT
+--     payload hash (any status)
+--   - request_in_progress: request pending with an ACTIVE lease owned by
+--     another worker (same payload hash)
+--   - lease_conflict: claim/reclaim raced; the conditional UPDATE matched no
+--     row, or a lease owner was required but not provided
+--   - validation_failed: input violated the contract (sanitized message)
+--   - persistence error (raised): unexpected PostgreSQL failure, sanitized
 
 CREATE OR REPLACE FUNCTION public.commit_turn(
     p_authenticated_user_id text,
@@ -153,14 +311,12 @@ DECLARE
     v_current_revision bigint;
     v_new_revision bigint;
     v_profile_user_id text;
-    
+
     -- Request state
     v_request_exists boolean;
     v_existing_payload_hash text;
     v_existing_status text;
     v_existing_committed_revision bigint;
-    v_existing_user_message_chat_log_id bigint;
-    v_existing_assistant_message_chat_log_id bigint;
     v_existing_replay_payload jsonb;
     v_existing_created_at timestamptz;
     v_existing_completed_at timestamptz;
@@ -168,145 +324,280 @@ DECLARE
     v_existing_lease_expires_at timestamptz;
     v_turn_request_id uuid;
     v_existing_turn_request_id uuid;
-    
+    v_reclaim_updated uuid;
+
     -- Message IDs
     v_user_message_id bigint;
     v_assistant_message_id bigint;
-    
-    -- Outbox state
-    v_outbox_results jsonb := '[]'::jsonb;
-    
+
     -- Result building
     v_result jsonb;
-    
-    -- Error handling
-    v_error_code text;
-    v_error_message text;
-    
+
     -- Timestamp
     v_now timestamptz := timezone('utc'::text, now());
-    
+
     -- Loop counters
     v_i integer;
     v_outbox_count integer;
-    
+
     -- Temporary variables for outbox processing
     v_event_obj jsonb;
     v_event_type text;
     v_event_payload jsonb;
     v_event_idempotency_key text;
-    v_outbox_event_record jsonb;
-    
-    -- Snapshot validation forbidden keys
-    v_snapshot_forbidden_keys text[] := ARRAY[
-        'prompt', 'system_prompt', 'meta_cognition', 'internal_instructions',
-        'message', 'user_message', 'assistant_message', 'content'
+
+    -- Replay payload forbidden keys (prompts / internal instructions)
+    v_replay_forbidden text[] := ARRAY[
+        'prompt', 'system_prompt', 'meta_cognition',
+        'internal_instructions', 'message', 'user_message',
+        'assistant_message', 'content'
     ];
 BEGIN
     -- =============================================================
-    -- Step 0: Input validation (fail fast, before any writes)
+    -- Step 0: Input validation (fail fast, stable envelopes)
     -- =============================================================
-    
-    -- Validate authenticated_user_id is not empty
+
     IF p_authenticated_user_id IS NULL OR p_authenticated_user_id = '' THEN
-        RAISE EXCEPTION 'authenticated_user_id is required' USING ERRCODE = 'P0001';
+        RETURN jsonb_build_object(
+            'error', jsonb_build_object(
+                'code', 'validation_failed',
+                'message', 'authenticated_user_id is required'
+            )
+        );
     END IF;
-    
-    -- Validate request_id is not NULL
+
     IF p_request_id IS NULL THEN
-        RAISE EXCEPTION 'request_id is required' USING ERRCODE = 'P0001';
+        RETURN jsonb_build_object(
+            'error', jsonb_build_object(
+                'code', 'validation_failed',
+                'message', 'request_id is required'
+            )
+        );
     END IF;
-    
-    -- Validate expected_revision is not negative
-    IF p_expected_revision < 0 THEN
-        RAISE EXCEPTION 'expected_revision must be non-negative' USING ERRCODE = 'P0001';
+
+    IF p_expected_revision IS NULL OR p_expected_revision < 0 THEN
+        RETURN jsonb_build_object(
+            'error', jsonb_build_object(
+                'code', 'validation_failed',
+                'message', 'expected_revision must be non-negative'
+            )
+        );
     END IF;
-    
-    -- Validate messages are not NULL
+
     IF p_user_message IS NULL THEN
-        RAISE EXCEPTION 'user_message is required' USING ERRCODE = 'P0001';
+        RETURN jsonb_build_object(
+            'error', jsonb_build_object(
+                'code', 'validation_failed',
+                'message', 'user_message is required'
+            )
+        );
     END IF;
+
     IF p_assistant_message IS NULL THEN
-        RAISE EXCEPTION 'assistant_message is required' USING ERRCODE = 'P0001';
-    END IF;
-    
-    -- Validate payload_hash format
-    IF p_payload_hash_sha256 IS NULL THEN
-        RAISE EXCEPTION 'payload_hash_sha256 is required' USING ERRCODE = 'P0001';
-    END IF;
-    IF NOT (p_payload_hash_sha256 ~ '^[0-9a-f]{64}$') THEN
-        RAISE EXCEPTION 'payload_hash_sha256 must be a 64-character hex string' USING ERRCODE = 'P0001';
+        RETURN jsonb_build_object(
+            'error', jsonb_build_object(
+                'code', 'validation_failed',
+                'message', 'assistant_message is required'
+            )
+        );
     END IF;
 
-    -- Validate replay_payload keys (must be allowed keys only, no forbidden keys)
-    IF p_replay_payload IS NOT NULL AND jsonb_typeof(p_replay_payload) = 'object' THEN
+    IF p_payload_hash_sha256 IS NULL OR NOT (p_payload_hash_sha256 ~ '^[0-9a-f]{64}$') THEN
+        RETURN jsonb_build_object(
+            'error', jsonb_build_object(
+                'code', 'validation_failed',
+                'message', 'payload_hash_sha256 must be a 64-character hex string'
+            )
+        );
+    END IF;
+
+    -- replay_payload is the authoritative public result. It MUST be a JSON
+    -- object containing response (== p_public_response) and message_id (the
+    -- public identifier returned as assistant_message_id).
+    IF p_replay_payload IS NULL OR jsonb_typeof(p_replay_payload) <> 'object' THEN
+        RETURN jsonb_build_object(
+            'error', jsonb_build_object(
+                'code', 'validation_failed',
+                'message', 'replay_payload must be a JSON object'
+            )
+        );
+    END IF;
+
+    IF NOT public.jsonb_keys_subset_of(
+        p_replay_payload,
+        ARRAY['response', 'emotion_state', 'message_id', 'request_id', 'duration_ms']
+    ) THEN
+        RETURN jsonb_build_object(
+            'error', jsonb_build_object(
+                'code', 'validation_failed',
+                'message', 'replay_payload has invalid keys'
+            )
+        );
+    END IF;
+
+    IF public.jsonb_has_forbidden_key(p_replay_payload, v_replay_forbidden) THEN
+        RETURN jsonb_build_object(
+            'error', jsonb_build_object(
+                'code', 'validation_failed',
+                'message', 'replay_payload contains forbidden keys'
+            )
+        );
+    END IF;
+
+    IF (p_replay_payload->>'response') IS NULL THEN
+        RETURN jsonb_build_object(
+            'error', jsonb_build_object(
+                'code', 'validation_failed',
+                'message', 'replay_payload must contain response'
+            )
+        );
+    END IF;
+
+    -- Single authoritative source for the public response: p_public_response
+    -- must be byte-equal to the persisted replay_payload.response.
+    IF p_public_response IS NULL OR p_public_response <> (p_replay_payload->>'response') THEN
+        RETURN jsonb_build_object(
+            'error', jsonb_build_object(
+                'code', 'validation_failed',
+                'message', 'public_response must equal replay_payload.response'
+            )
+        );
+    END IF;
+
+    IF (p_replay_payload->>'message_id') IS NULL
+       OR NOT ((p_replay_payload->>'message_id') ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') THEN
+        RETURN jsonb_build_object(
+            'error', jsonb_build_object(
+                'code', 'validation_failed',
+                'message', 'replay_payload.message_id must be a valid UUID'
+            )
+        );
+    END IF;
+
+    IF octet_length(p_replay_payload::text) > 8192 THEN
+        RETURN jsonb_build_object(
+            'error', jsonb_build_object(
+                'code', 'validation_failed',
+                'message', 'replay_payload exceeds 8192 bytes'
+            )
+        );
+    END IF;
+
+    -- Snapshot validation (object with schema_version=1, no identity/internal
+    -- keys, fundamental structure present, size-bounded).
+    IF NOT public.jsonb_snapshot_contract(p_emotional_state, 'emotional') THEN
+        RETURN jsonb_build_object(
+            'error', jsonb_build_object(
+                'code', 'validation_failed',
+                'message', 'emotional_state violates the snapshot contract'
+            )
+        );
+    END IF;
+
+    IF NOT public.jsonb_snapshot_contract(p_relationship_state, 'relationship') THEN
+        RETURN jsonb_build_object(
+            'error', jsonb_build_object(
+                'code', 'validation_failed',
+                'message', 'relationship_state violates the snapshot contract'
+            )
+        );
+    END IF;
+
+    -- Lease owner, when provided, must satisfy the sanitized identifier regex.
+    IF p_lease_owner IS NOT NULL
+       AND NOT (p_lease_owner ~ '^[A-Za-z0-9_.:-]{1,64}$') THEN
+        RETURN jsonb_build_object(
+            'error', jsonb_build_object(
+                'code', 'validation_failed',
+                'message', 'lease_owner is invalid'
+            )
+        );
+    END IF;
+
+    -- Outbox events validation (shape, types, keys, value contract).
+    v_outbox_count := jsonb_array_length(p_outbox_events);
+    FOR v_i IN 1..v_outbox_count LOOP
+        v_event_obj := p_outbox_events->(v_i-1);
+
+        IF v_event_obj IS NULL OR jsonb_typeof(v_event_obj) <> 'object' THEN
+            RETURN jsonb_build_object(
+                'error', jsonb_build_object(
+                    'code', 'validation_failed',
+                    'message', 'outbox event must be a JSON object'
+                )
+            );
+        END IF;
+
+        v_event_type := v_event_obj->>'event_type';
+        v_event_payload := v_event_obj->'payload';
+        v_event_idempotency_key := v_event_obj->>'idempotency_key';
+
+        IF v_event_type IS NULL OR NOT (v_event_type ~ '^[a-z0-9_]{1,64}$') THEN
+            RETURN jsonb_build_object(
+                'error', jsonb_build_object(
+                    'code', 'validation_failed',
+                    'message', 'outbox event_type is invalid'
+                )
+            );
+        END IF;
+
+        IF v_event_payload IS NULL OR jsonb_typeof(v_event_payload) <> 'object' THEN
+            RETURN jsonb_build_object(
+                'error', jsonb_build_object(
+                    'code', 'validation_failed',
+                    'message', 'outbox event payload must be a JSON object'
+                )
+            );
+        END IF;
+
         IF NOT public.jsonb_keys_subset_of(
-            p_replay_payload,
-            ARRAY['response', 'emotion_state', 'message_id', 'request_id', 'duration_ms']
+            v_event_payload,
+            ARRAY['ref', 'request_id', 'turn_id', 'message_id', 'entity_id', 'kind', 'version']
         ) THEN
-            RAISE EXCEPTION 'replay_payload has invalid keys' USING ERRCODE = 'P0001';
+            RETURN jsonb_build_object(
+                'error', jsonb_build_object(
+                    'code', 'validation_failed',
+                    'message', 'outbox event payload has invalid keys'
+                )
+            );
         END IF;
-        IF public.jsonb_has_forbidden_key(p_replay_payload, v_snapshot_forbidden_keys) THEN
-            RAISE EXCEPTION 'replay_payload contains forbidden keys' USING ERRCODE = 'P0001';
-        END IF;
-    END IF;
-    
-    -- Validate public_response matches replay_payload.response to prevent divergence
-    -- p_public_response participates in the hash and must equal replay_payload.response
-    IF p_replay_payload IS NOT NULL AND jsonb_typeof(p_replay_payload) = 'object' THEN
-        IF (p_replay_payload->>'response') IS NULL THEN
-            RAISE EXCEPTION 'replay_payload must contain response field' USING ERRCODE = 'P0001';
-        END IF;
-        IF p_public_response IS NULL OR (p_replay_payload->>'response') IS NULL THEN
-            RAISE EXCEPTION 'public_response and replay_payload.response must both be present' USING ERRCODE = 'P0001';
-        END IF;
-        IF p_public_response <> (p_replay_payload->>'response') THEN
-            RAISE EXCEPTION 'public_response must equal replay_payload.response' USING ERRCODE = 'P0001';
-        END IF;
-    END IF;
 
-    -- Validate emotional_state snapshot (must be object or null, has schema_version, no forbidden keys)
-    IF p_emotional_state IS NOT NULL THEN
-        IF jsonb_typeof(p_emotional_state) <> 'object' THEN
-            RAISE EXCEPTION 'emotional_state must be a JSON object or null' USING ERRCODE = 'P0001';
+        IF public.jsonb_has_forbidden_key(v_event_payload, v_replay_forbidden) THEN
+            RETURN jsonb_build_object(
+                'error', jsonb_build_object(
+                    'code', 'validation_failed',
+                    'message', 'outbox event payload contains forbidden keys'
+                )
+            );
         END IF;
-        -- Require schema_version field
-        IF (p_emotional_state->>'schema_version') IS NULL THEN
-            RAISE EXCEPTION 'emotional_state must have schema_version' USING ERRCODE = 'P0001';
-        END IF;
-        -- schema_version must be numeric integer 1 (not string "1")
-        IF (p_emotional_state->>'schema_version')::numeric <> 1 THEN
-            RAISE EXCEPTION 'emotional_state schema_version must be numeric 1' USING ERRCODE = 'P0001';
-        END IF;
-        -- Check for forbidden keys
-        IF public.jsonb_has_forbidden_key(p_emotional_state, v_snapshot_forbidden_keys) THEN
-            RAISE EXCEPTION 'emotional_state contains forbidden keys' USING ERRCODE = 'P0001';
-        END IF;
-    END IF;
 
-    -- Validate relationship_state snapshot (must be object or null, has schema_version, no forbidden keys)
-    IF p_relationship_state IS NOT NULL THEN
-        IF jsonb_typeof(p_relationship_state) <> 'object' THEN
-            RAISE EXCEPTION 'relationship_state must be a JSON object or null' USING ERRCODE = 'P0001';
+        IF NOT public.jsonb_outbox_payload_value_contract(v_event_payload) THEN
+            RETURN jsonb_build_object(
+                'error', jsonb_build_object(
+                    'code', 'validation_failed',
+                    'message', 'outbox event payload violates the value contract'
+                )
+            );
         END IF;
-        -- Require schema_version field
-        IF (p_relationship_state->>'schema_version') IS NULL THEN
-            RAISE EXCEPTION 'relationship_state must have schema_version' USING ERRCODE = 'P0001';
+
+        IF v_event_idempotency_key IS NULL
+           OR NOT (v_event_idempotency_key ~ '^[A-Za-z0-9_.:-]{1,128}$') THEN
+            RETURN jsonb_build_object(
+                'error', jsonb_build_object(
+                    'code', 'validation_failed',
+                    'message', 'outbox idempotency_key is invalid'
+                )
+            );
         END IF;
-        -- schema_version must be numeric integer 1 (not string "1")
-        IF (p_relationship_state->>'schema_version')::numeric <> 1 THEN
-            RAISE EXCEPTION 'relationship_state schema_version must be numeric 1' USING ERRCODE = 'P0001';
-        END IF;
-        -- Check for forbidden keys
-        IF public.jsonb_has_forbidden_key(p_relationship_state, v_snapshot_forbidden_keys) THEN
-            RAISE EXCEPTION 'relationship_state contains forbidden keys' USING ERRCODE = 'P0001';
-        END IF;
-    END IF;
+    END LOOP;
 
     -- =============================================================
-    -- Step 1: Acquire per-user lock using advisory lock
+    -- Step 1: Acquire per-user lock (64-bit advisory key)
     -- =============================================================
-    PERFORM pg_advisory_xact_lock(hashtext(p_authenticated_user_id));
+    -- hashtextextended returns a bigint (64-bit) key, avoiding the 32-bit
+    -- hashtext collision space. Different users (almost surely) map to
+    -- different keys, so distinct users are never globally serialized.
+    PERFORM pg_advisory_xact_lock(hashtextextended(p_authenticated_user_id, 0));
 
     -- =============================================================
     -- Step 2: Check existing profile and get current revision
@@ -315,43 +606,38 @@ BEGIN
     FROM public.profiles
     WHERE user_id = p_authenticated_user_id
     FOR UPDATE;
-    
+
     v_profile_exists := (v_profile_user_id IS NOT NULL);
-    
+
     IF NOT v_profile_exists THEN
         v_current_revision := 0;
     END IF;
 
     -- =============================================================
     -- Step 3: Check for existing request with same (user_id, request_id)
-    -- This MUST run BEFORE CAS validation to allow exact replays to succeed
+    -- MUST run BEFORE CAS so exact replays and lease reclaims work
     -- =============================================================
     SELECT EXISTS (
         SELECT 1 FROM public.turn_requests
         WHERE user_id = p_authenticated_user_id AND request_id = p_request_id
     ) INTO v_request_exists;
-    
+
     IF v_request_exists THEN
-        -- Get the existing request to check payload hash, status, and all needed fields
-        SELECT 
+        SELECT
             id,
             payload_hash_sha256,
             status,
             committed_revision,
-            user_message_chat_log_id,
-            assistant_message_chat_log_id,
             replay_payload,
             created_at,
             completed_at,
             lease_owner,
             lease_expires_at
-        INTO 
+        INTO
             v_existing_turn_request_id,
             v_existing_payload_hash,
             v_existing_status,
             v_existing_committed_revision,
-            v_existing_user_message_chat_log_id,
-            v_existing_assistant_message_chat_log_id,
             v_existing_replay_payload,
             v_existing_created_at,
             v_existing_completed_at,
@@ -359,149 +645,83 @@ BEGIN
             v_existing_lease_expires_at
         FROM public.turn_requests
         WHERE user_id = p_authenticated_user_id AND request_id = p_request_id;
-        
-        -- First, check the status to determine reclaim eligibility
-        -- Same-hash classification must check status FIRST:
-        -- - completed + same hash: idempotent replay (return stored result)
-        -- - pending/expired + same hash: follow lease/claim semantics
-        -- - different hash: ALWAYS conflict, regardless of status
-        
-        IF v_existing_payload_hash = p_payload_hash_sha256 THEN
-            -- Same hash: check status for replay vs lease semantics
-            IF v_existing_status = 'completed' THEN
-                -- Idempotent replay: return the EXACT stored result
-                -- Use only immutable fields from stored turn_requests row
-                -- Do NOT query chat_logs (durable references only)
-                -- Use stable projection: only immutable outbox fields that were part of the original commit
-                SELECT jsonb_agg(
-                    jsonb_build_object(
-                        'id', outbox_events.id,
-                        'event_type', outbox_events.event_type,
-                        'user_id', outbox_events.user_id,
-                        'turn_request_id', outbox_events.turn_request_id,
-                        'payload', outbox_events.payload,
-                        'status', outbox_events.status,
-                        'idempotency_key', outbox_events.idempotency_key,
-                        'contract_version', outbox_events.contract_version,
-                        'created_at', outbox_events.created_at::text
-                    ) ORDER BY outbox_events.id
-                )
-                INTO v_outbox_results
-                FROM public.outbox_events
-                WHERE turn_request_id = v_existing_turn_request_id;
-                
-                IF v_outbox_results IS NULL THEN
-                    v_outbox_results := '[]'::jsonb;
-                END IF;
-                
-                -- Return the stored result for reproducibility
-                -- assistant_message_id uses the stored chat_log_id (durable, doesn't depend on chat_logs existence)
-                v_result := jsonb_build_object(
-                    'user_id', p_authenticated_user_id,
-                    'request_id', p_request_id::text,
-                    'committed_revision', v_existing_committed_revision,
-                    'user_message_chat_log_id', v_existing_user_message_chat_log_id,
-                    'assistant_message_chat_log_id', v_existing_assistant_message_chat_log_id,
-                    'user_message_id', p_request_id::text,
-                    'assistant_message_id', v_existing_assistant_message_chat_log_id::text,
-                    'replay_payload', COALESCE(v_existing_replay_payload, '{}'::jsonb),
-                    'outbox_events', v_outbox_results,
-                    'created_at', v_existing_created_at::text,
-                    'completed_at', COALESCE(v_existing_completed_at::text, v_existing_created_at::text)
-                );
-                RETURN v_result;
-            ELSE
-                -- Same hash but not completed: pending or expired
-                -- Must follow lease/claim semantics, not simple replay
-                -- Enforce lease ownership: check p_lease_owner against existing lease, block if active and owned by another
-                IF v_existing_lease_owner IS NOT NULL AND v_existing_lease_expires_at IS NOT NULL AND v_existing_lease_expires_at > v_now THEN
-                    -- Active lease exists
-                    IF v_existing_lease_owner = p_lease_owner THEN
-                        -- Caller owns the active lease - can continue with same hash
-                        v_turn_request_id := v_existing_turn_request_id;
-                        -- Continue to CAS validation and will UPDATE the existing row
-                    ELSE
-                        -- Active lease owned by someone else - conflict
-                        v_result := jsonb_build_object(
-                            'error', jsonb_build_object(
-                                'code', 'request_lease_conflict',
-                                'message', 'Request ID exists with active lease owned by another worker',
-                                'expected_revision', p_expected_revision,
-                                'request_id', p_request_id::text
-                            )
-                        );
-                        RETURN v_result;
-                    END IF;
-                ELSIF v_existing_lease_owner IS NULL OR v_existing_lease_expires_at IS NULL OR v_existing_lease_expires_at <= v_now THEN
-                    -- No active lease or expired lease: can reclaim
-                    v_turn_request_id := v_existing_turn_request_id;
-                    -- Continue to CAS validation and will UPDATE the existing row
-                ELSE
-                    -- Should not reach here, but safety net
-                    v_result := jsonb_build_object(
-                        'error', jsonb_build_object(
-                            'code', 'request_lease_conflict',
-                            'message', 'Request ID exists with lease in unknown state',
-                            'expected_revision', p_expected_revision,
-                            'request_id', p_request_id::text
-                        )
-                    );
-                    RETURN v_result;
-                END IF;
-            END IF;
-        ELSE
-            -- Different hash: ALWAYS conflict, regardless of status
-            -- Reclaim is NOT allowed for different payloads - only same-hash requests may replay
-            v_result := jsonb_build_object(
+
+        -- Any status + different hash: ALWAYS a payload conflict. Reclaim is
+        -- only ever allowed for the SAME hash.
+        IF v_existing_payload_hash <> p_payload_hash_sha256 THEN
+            RETURN jsonb_build_object(
                 'error', jsonb_build_object(
                     'code', 'request_payload_conflict',
-                    'message', 'Request ID already exists with different payload hash',
+                    'message', 'Request ID already exists with a different payload hash',
                     'expected_revision', p_expected_revision,
                     'request_id', p_request_id::text
                 )
             );
-            RETURN v_result;
         END IF;
+
+        -- completed + same hash: idempotent replay WITHOUT any writes.
+        IF v_existing_status = 'completed' THEN
+            RETURN public.commit_turn_build_result(p_authenticated_user_id, p_request_id);
+        END IF;
+
+        -- pending/expired + same hash: lease / reclaim semantics.
+        IF v_existing_status = 'pending'
+           AND v_existing_lease_expires_at IS NOT NULL
+           AND v_existing_lease_expires_at > v_now
+           AND (p_lease_owner IS NULL OR v_existing_lease_owner <> p_lease_owner) THEN
+            -- Active lease owned by another worker: stable result.
+            RETURN jsonb_build_object(
+                'error', jsonb_build_object(
+                    'code', 'request_in_progress',
+                    'message', 'Request is already in progress by another worker',
+                    'expected_revision', p_expected_revision,
+                    'request_id', p_request_id::text
+                )
+            );
+        END IF;
+
+        -- Reclaim (expired lease or expired request) requires a lease owner.
+        IF p_lease_owner IS NULL THEN
+            RETURN jsonb_build_object(
+                'error', jsonb_build_object(
+                    'code', 'lease_conflict',
+                    'message', 'lease_owner is required to claim or reclaim a request',
+                    'expected_revision', p_expected_revision,
+                    'request_id', p_request_id::text
+                )
+            );
+        END IF;
+
+        -- Proceed: the atomic conditional UPDATE below is the reclaim.
+        v_turn_request_id := v_existing_turn_request_id;
     END IF;
 
     -- =============================================================
     -- Step 4: Validate CAS: expected_revision must match current revision
-    -- Only applied for new executions or expired request reclaim
+    -- Only applies to write paths (never to the completed replay above).
     -- =============================================================
     IF v_current_revision <> p_expected_revision THEN
-        v_result := jsonb_build_object(
+        RETURN jsonb_build_object(
             'error', jsonb_build_object(
                 'code', 'revision_mismatch',
-                'message', 'Profile revision does not match expected value',
+                'message', 'Profile revision does not match the expected value',
                 'expected_revision', p_expected_revision,
                 'actual_revision', v_current_revision
             )
         );
-        RETURN v_result;
     END IF;
 
     -- =============================================================
-    -- Step 5: Insert user message into chat_logs
-    -- =============================================================
-    INSERT INTO public.chat_logs (user_id, role, content, created_at)
-    VALUES (p_authenticated_user_id, 'user', p_user_message, v_now)
-    RETURNING id INTO v_user_message_id;
-
-    -- =============================================================
-    -- Step 6: Insert assistant message into chat_logs
-    -- =============================================================
-    INSERT INTO public.chat_logs (user_id, role, content, created_at)
-    VALUES (p_authenticated_user_id, 'assistant', p_assistant_message, v_now)
-    RETURNING id INTO v_assistant_message_id;
-
-    -- =============================================================
-    -- Step 7: Update or create profile with new snapshots and increment revision
+    -- Step 5: Update or create profile BEFORE inserting messages
+    -- (chat_logs.user_id references profiles, so the profile must
+    -- exist before any message row is written). Snapshots are applied
+    -- and revision is incremented exactly once here.
     -- =============================================================
     v_new_revision := v_current_revision + 1;
-    
+
     IF v_profile_exists THEN
         UPDATE public.profiles
-        SET 
+        SET
             emotional_state = COALESCE(p_emotional_state, emotional_state),
             relationship_state = COALESCE(p_relationship_state, relationship_state),
             revision = v_new_revision,
@@ -509,81 +729,82 @@ BEGIN
         WHERE user_id = p_authenticated_user_id;
     ELSE
         INSERT INTO public.profiles (
-            user_id, persona_config, user_profile, relationship_state, emotional_state, 
+            user_id, persona_config, user_profile, relationship_state, emotional_state,
             revision, updated_at
         ) VALUES (
-            p_authenticated_user_id, NULL, NULL, 
-            COALESCE(p_relationship_state, '{}'::jsonb), 
+            p_authenticated_user_id, NULL, NULL,
+            COALESCE(p_relationship_state, '{}'::jsonb),
             COALESCE(p_emotional_state, '{}'::jsonb),
             v_new_revision, v_now
         );
     END IF;
 
     -- =============================================================
-    -- Step 8: Insert or Update turn_requests (capture DB id)
-    -- For new requests: INSERT
-    -- For expired request reclaim: UPDATE existing row with new payload
+    -- Step 6: Insert user message into chat_logs
+    -- =============================================================
+    INSERT INTO public.chat_logs (user_id, role, content, created_at)
+    VALUES (p_authenticated_user_id, 'user', p_user_message, v_now)
+    RETURNING id INTO v_user_message_id;
+
+    -- =============================================================
+    -- Step 7: Insert assistant message into chat_logs
+    -- =============================================================
+    INSERT INTO public.chat_logs (user_id, role, content, created_at)
+    VALUES (p_authenticated_user_id, 'assistant', p_assistant_message, v_now)
+    RETURNING id INTO v_assistant_message_id;
+
+    -- =============================================================
+    -- Step 8: Complete turn_requests
+    --   - New request: INSERT (status completed)
+    --   - pending/expired with same hash: ATOMIC conditional reclaim via
+    --     UPDATE ... WHERE ... RETURNING confirming id, user_id, request_id,
+    --     payload hash, expected status, lease ownership and lease expiry.
     -- =============================================================
     IF v_turn_request_id IS NOT NULL THEN
-        -- Reclaiming an expired/expired-lease request: UPDATE the existing row
-        -- Must clear lease_owner and lease_expires_at to satisfy turn_requests_status_coherence_check
-        -- Safety net: enforce lease ownership check (also checked in same-hash logic above)
-        IF p_lease_owner IS NOT NULL AND v_existing_lease_owner IS NOT NULL AND v_existing_lease_expires_at > v_now AND v_existing_lease_owner <> p_lease_owner THEN
-            -- Active lease owned by someone else - cannot reclaim
-            v_result := jsonb_build_object(
-                'error', jsonb_build_object(
-                    'code', 'request_lease_conflict',
-                    'message', 'Request ID has active lease owned by another worker',
-                    'expected_revision', p_expected_revision,
-                    'request_id', p_request_id::text
-                )
-            );
-            RETURN v_result;
-        END IF;
-        
-        -- Atomic conditional transition: only update if the row is in the expected state
-        -- For same-hash pending/expired: must have matching hash and expired/missing lease
-        -- This ensures atomicity: the UPDATE checks all preconditions in a single statement
-        UPDATE public.turn_requests
-        SET 
-            payload_hash_sha256 = p_payload_hash_sha256,
+        UPDATE public.turn_requests tr
+        SET
             status = 'completed',
-            expected_revision = p_expected_revision,
             committed_revision = v_new_revision,
             user_message_chat_log_id = v_user_message_id,
             assistant_message_chat_log_id = v_assistant_message_id,
-            replay_payload = COALESCE(p_replay_payload, '{}'::jsonb),
+            replay_payload = p_replay_payload,
             updated_at = v_now,
             completed_at = v_now,
             error_code = NULL,
             lease_owner = NULL,
             lease_expires_at = NULL
-        WHERE id = v_turn_request_id
-            AND user_id = p_authenticated_user_id
-            AND request_id = p_request_id
-            -- Only reclaim if status is pending or expired
-            AND status IN ('pending', 'expired')
-            -- For same-hash: verify hash matches (already checked in IF above, but safety net)
-            AND (payload_hash_sha256 = p_payload_hash_sha256 OR payload_hash_sha256 IS NULL)
-            -- Verify lease is expired or matches caller
-            AND (v_existing_lease_owner IS NULL OR v_existing_lease_expires_at IS NULL OR v_existing_lease_expires_at <= v_now OR v_existing_lease_owner = p_lease_owner)
-        ;
-        
-        -- Check if the UPDATE affected any row
-        IF NOT FOUND THEN
-            -- Race condition: the row state changed between SELECT and UPDATE
-            v_result := jsonb_build_object(
+        WHERE tr.id = v_turn_request_id
+          AND tr.user_id = p_authenticated_user_id
+          AND tr.request_id = p_request_id
+          AND tr.payload_hash_sha256 = p_payload_hash_sha256
+          AND tr.status IN ('pending', 'expired')
+          AND (
+                -- pending with ACTIVE lease of the same worker: continue
+                (tr.status = 'pending'
+                 AND tr.lease_expires_at > v_now
+                 AND tr.lease_owner = p_lease_owner)
+                OR
+                -- pending with EXPIRED lease: reclaim
+                (tr.status = 'pending' AND tr.lease_expires_at <= v_now)
+                OR
+                -- expired request (no lease): reclaim
+                (tr.status = 'expired')
+          )
+        RETURNING tr.id INTO v_reclaim_updated;
+
+        IF v_reclaim_updated IS NULL THEN
+            -- The row changed between the SELECT and the UPDATE (or the lease
+            -- was re-taken): controlled conflict, never a payload rewrite.
+            RETURN jsonb_build_object(
                 'error', jsonb_build_object(
-                    'code', 'request_lease_conflict',
-                    'message', 'Request state changed - lease reclaim failed',
+                    'code', 'lease_conflict',
+                    'message', 'Request state changed; reclaim failed',
                     'expected_revision', p_expected_revision,
                     'request_id', p_request_id::text
                 )
             );
-            RETURN v_result;
         END IF;
     ELSE
-        -- New request: INSERT
         INSERT INTO public.turn_requests (
             user_id, request_id, payload_hash_sha256, status,
             expected_revision, committed_revision,
@@ -593,57 +814,22 @@ BEGIN
             p_authenticated_user_id, p_request_id, p_payload_hash_sha256, 'completed',
             p_expected_revision, v_new_revision,
             v_user_message_id, v_assistant_message_id,
-            COALESCE(p_replay_payload, '{}'::jsonb), v_now, v_now, v_now
+            p_replay_payload, v_now, v_now, v_now
         ) RETURNING id INTO v_turn_request_id;
     END IF;
 
     -- =============================================================
-    -- Step 9: Insert outbox events (idempotent) referencing DB turn_request id
+    -- Step 9: Insert outbox events (idempotent, FK to turn_request id)
     -- =============================================================
     v_outbox_count := jsonb_array_length(p_outbox_events);
-    
+
     FOR v_i IN 1..v_outbox_count LOOP
         v_event_obj := p_outbox_events->(v_i-1);
         v_event_type := v_event_obj->>'event_type';
         v_event_payload := v_event_obj->'payload';
         v_event_idempotency_key := v_event_obj->>'idempotency_key';
-        
-        -- Validate outbox event type
-        IF v_event_type IS NULL OR NOT (v_event_type ~ '^[a-z0-9_]{1,64}$') THEN
-            RAISE EXCEPTION 'Invalid outbox event_type' USING ERRCODE = 'P0001';
-        END IF;
-        
-        -- Validate outbox payload (reuse existing validation function)
-        IF v_event_payload IS NULL OR jsonb_typeof(v_event_payload) <> 'object' THEN
-            RAISE EXCEPTION 'Outbox event payload must be a non-null JSON object' USING ERRCODE = 'P0001';
-        END IF;
-        
-        IF NOT public.jsonb_keys_subset_of(
-            v_event_payload,
-            ARRAY['ref', 'request_id', 'turn_id', 'message_id', 'entity_id', 'kind', 'version']
-        ) THEN
-            RAISE EXCEPTION 'Outbox event payload has invalid keys' USING ERRCODE = 'P0001';
-        END IF;
-        
-        IF public.jsonb_has_forbidden_key(
-            v_event_payload,
-            ARRAY['prompt', 'system_prompt', 'meta_cognition', 'internal_instructions',
-                  'message', 'user_message', 'assistant_message', 'content']
-        ) THEN
-            RAISE EXCEPTION 'Outbox event payload contains forbidden keys' USING ERRCODE = 'P0001';
-        END IF;
-        
-        IF NOT public.jsonb_outbox_payload_value_contract(v_event_payload) THEN
-            RAISE EXCEPTION 'Outbox event payload violates value contract' USING ERRCODE = 'P0001';
-        END IF;
-        
-        -- Validate idempotency key
-        IF v_event_idempotency_key IS NULL OR NOT (v_event_idempotency_key ~ '^[A-Za-z0-9_.:-]{1,128}$') THEN
-            RAISE EXCEPTION 'Invalid idempotency_key for outbox event' USING ERRCODE = 'P0001';
-        END IF;
-        
-        -- Insert outbox event with reference to DB turn_request id (NOT p_request_id)
-        -- This ensures the FK (user_id, turn_request_id) -> turn_requests(user_id, id) is valid
+
+        -- (Validated in Step 0; repeated defensively before insert.)
         INSERT INTO public.outbox_events (
             event_type, user_id, turn_request_id, payload, status,
             attempts, next_attempt_at, idempotency_key,
@@ -653,43 +839,22 @@ BEGIN
             v_event_payload, 'pending',
             0, v_now + INTERVAL '1 second', v_event_idempotency_key,
             1, v_now, v_now
-        )
-        RETURNING to_jsonb(outbox_events.*) INTO v_outbox_event_record;
-        
-        -- Accumulate outbox results
-        v_outbox_results := v_outbox_results || jsonb_build_array(v_outbox_event_record);
+        );
     END LOOP;
 
     -- =============================================================
-    -- Step 10: Build and return success result
+    -- Step 10: Build and return the public result from PERSISTED rows
+    -- (identical to the replay path).
     -- =============================================================
-    v_result := jsonb_build_object(
-        'user_id', p_authenticated_user_id,
-        'request_id', p_request_id::text,
-        'committed_revision', v_new_revision,
-        'user_message_chat_log_id', v_user_message_id,
-        'assistant_message_chat_log_id', v_assistant_message_id,
-        'user_message_id', p_request_id::text,
-        'assistant_message_id', v_assistant_message_id::text,
-        'replay_payload', COALESCE(p_replay_payload, '{}'::jsonb),
-        'outbox_events', v_outbox_results,
-        'created_at', v_now::text,
-        'completed_at', v_now::text
-    );
-    
-    RETURN v_result;
+    RETURN public.commit_turn_build_result(p_authenticated_user_id, p_request_id);
 
 EXCEPTION
     WHEN OTHERS THEN
-        -- On any error, the transaction will roll back automatically
-        -- Return a sanitized error WITHOUT leaking SQLERRM or SQLSTATE details
-        v_result := jsonb_build_object(
-            'error', jsonb_build_object(
-                'code', 'database_error',
-                'message', 'internal database error'
-            )
-        );
-        RETURN v_result;
+        -- Unexpected PostgreSQL failure. Never expose SQLERRM, SQLSTATE,
+        -- constraint names or payload; propagate a constant sanitized message
+        -- so the RPC fails (rollback is automatic) and the Python layer maps
+        -- it to PersistenceError.
+        RAISE EXCEPTION 'persistence error' USING ERRCODE = 'P0001';
 END;
 $$;
 
@@ -709,4 +874,4 @@ GRANT EXECUTE ON FUNCTION public.commit_turn(
 -- =================================================================
 COMMENT ON FUNCTION public.commit_turn(
     text, uuid, bigint, text, text, text, jsonb, jsonb, text, jsonb, jsonb, text
-) IS 'Atomic turn commit RPC (#271). Executes complete turn as a single transaction: profile CAS, message inserts, snapshot update, turn_request completion, outbox events. Fail-closed: any error rolls back everything. Replay-safe: idempotent retries return the exact stored result.';
+) IS 'Atomic turn commit RPC (#271). Executes a complete turn as a single transaction: profile CAS, message inserts, snapshot update, turn_request completion, outbox events. Fail-closed: any error rolls back everything. Replay-safe: idempotent retries return the exact stored public result without writes. Lease/reclaim is protected by an atomic conditional UPDATE ... RETURNING.';
