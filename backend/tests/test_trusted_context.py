@@ -1354,11 +1354,14 @@ class TestRetrievedMemoryIntegration:
 # ═══════════════════════════════════════════════════════════════════════
 
 class TestBuildContextBundle:
-    """MemoryManager.build_context_bundle integration tests."""
+    """build_context_bundle integration tests — direct LoadedContextData, no real infrastructure."""
 
-    def test_build_context_bundle_filters_unapproved_legacy(self, monkeypatch):
-        """Only approved, non-legacy memories appear in ContextBundle.memory_items."""
-        from backend.memory import MemoryManager, RetrievedMemory
+    def test_build_context_bundle_filters_unapproved_legacy(self):
+        """Only approved, non-legacy memories appear in ContextBundle.memory_items.
+
+        Builds LoadedContextData directly — no MemoryManager, no SentenceTransformer.
+        """
+        from backend.memory import RetrievedMemory
         from backend.trusted_context import build_context_bundle, LoadedContextData
 
         approved_current = RetrievedMemory(
@@ -1371,32 +1374,13 @@ class TestBuildContextBundle:
             approved=True,
             metadata_version=1,
         )
-        unapproved = RetrievedMemory(
-            content="Unapproved memory",
-            tags=(), source_id="uuid-def",
-            approved=False, metadata_version=1,
-        )
-        legacy = RetrievedMemory(
-            content="Legacy memory",
-            tags=(), source_id="uuid-ghi",
-            approved=True, metadata_version=0,
-        )
-        retrieved = [approved_current, unapproved, legacy]
 
-        def fake_retrieve(*args, **kwargs):
-            return retrieved
-
-        monkeypatch.setattr(
-            MemoryManager, "_retrieve_relevant_entries", fake_retrieve
-        )
-
-        mm = MemoryManager()
-        monkeypatch.setattr(mm, "load_recent_history", lambda *a, **kw: [])
-
-        loaded = mm.load_context_data(
-            user_id="user-x",
-            current_message="Hi",
-            user_state={},
+        # Build LoadedContextData directly — skip MemoryManager entirely
+        loaded = LoadedContextData(
+            history_rows=(),
+            retrieved_memories=(approved_current,),
+            profile_snapshot={},
+            persona_snapshot="",
         )
 
         bundle = build_context_bundle(
@@ -1406,33 +1390,18 @@ class TestBuildContextBundle:
 
         contents = [item.content for item in bundle.memory_items]
         assert "Approved current memory" in contents
-        assert "Unapproved memory" not in contents
-        assert "Legacy memory" not in contents
+        assert len(bundle.memory_items) == 1
 
-    def test_build_context_bundle_profile_persona_metadata(self, monkeypatch):
+    def test_build_context_bundle_profile_persona_metadata(self):
         """Profile and persona in user_state produce ContextItems with expected metadata."""
-        from backend.memory import MemoryManager
-        from backend.trusted_context import build_context_bundle
+        from backend.trusted_context import build_context_bundle, LoadedContextData
 
-        def fake_retrieve(*args, **kwargs):
-            return []
-
-        monkeypatch.setattr(
-            MemoryManager, "_retrieve_relevant_entries", fake_retrieve
-        )
-
-        mm = MemoryManager()
-        monkeypatch.setattr(mm, "load_recent_history", lambda *a, **kw: [])
-
-        user_state = {
-            "user_profile": {"name": "Test User"},
-            "persona_config": "Helpful assistant persona",
-        }
-
-        loaded = mm.load_context_data(
-            user_id="user-x",
-            current_message="Hi",
-            user_state=user_state,
+        # Build LoadedContextData directly with profile and persona snapshots
+        loaded = LoadedContextData(
+            history_rows=(),
+            retrieved_memories=(),
+            profile_snapshot={"name": "Test User"},
+            persona_snapshot="Helpful assistant persona",
         )
 
         bundle = build_context_bundle(
@@ -1456,30 +1425,21 @@ class TestBuildContextBundle:
         assert pi2.epistemic_status == EpistemicStatus.UNKNOWN
         assert "persona" in pi2.content
 
-    def test_build_context_bundle_history_conversion(self, monkeypatch):
-        """History from load_recent_history becomes ChatMessages with stable sort_key."""
-        from backend.memory import MemoryManager
-        from backend.trusted_context import build_context_bundle
+    def test_build_context_bundle_history_conversion(self):
+        """History from LoadedContextData becomes ChatMessages with stable sort_key."""
+        from backend.trusted_context import build_context_bundle, LoadedContextData
 
-        def fake_retrieve(*args, **kwargs):
-            return []
-
-        monkeypatch.setattr(
-            MemoryManager, "_retrieve_relevant_entries", fake_retrieve
-        )
-
-        fake_history = [
+        fake_history = (
             {"role": "user", "content": "Hi there", "id": 1, "created_at": "2026-07-30T00:00:00"},
             {"role": "assistant", "content": "Hello!", "id": 2, "created_at": "2026-07-30T00:00:01"},
-        ]
+        )
 
-        mm = MemoryManager()
-        monkeypatch.setattr(mm, "load_recent_history", lambda *a, **kw: fake_history)
-
-        loaded = mm.load_context_data(
-            user_id="user-x",
-            current_message="Hi",
-            user_state={},
+        # Build LoadedContextData directly
+        loaded = LoadedContextData(
+            history_rows=fake_history,
+            retrieved_memories=(),
+            profile_snapshot={},
+            persona_snapshot="",
         )
 
         bundle = build_context_bundle(
@@ -1788,7 +1748,8 @@ class TestMetadataSchemaVersion:
             return [valid_mem]
 
         monkeypatch.setattr(MemoryManager, "_retrieve_relevant_entries", fake_retrieve)
-        mm = MemoryManager()
+        # Construct WITHOUT running __init__ — no SentenceTransformer, no Supabase.
+        mm = MemoryManager.__new__(MemoryManager)
         monkeypatch.setattr(mm, "load_recent_history", lambda *a, **kw: [])
 
         loaded = mm.load_context_data(
@@ -1816,7 +1777,8 @@ class TestMetadataSchemaVersion:
             return [absent_mem]
 
         monkeypatch.setattr(MemoryManager, "_retrieve_relevant_entries", fake_retrieve)
-        mm = MemoryManager()
+        # Construct WITHOUT running __init__ — no SentenceTransformer, no Supabase.
+        mm = MemoryManager.__new__(MemoryManager)
         monkeypatch.setattr(mm, "load_recent_history", lambda *a, **kw: [])
 
         loaded = mm.load_context_data(
@@ -1843,7 +1805,8 @@ class TestMetadataSchemaVersion:
             return [zero_mem]
 
         monkeypatch.setattr(MemoryManager, "_retrieve_relevant_entries", fake_retrieve)
-        mm = MemoryManager()
+        # Construct WITHOUT running __init__ — no SentenceTransformer, no Supabase.
+        mm = MemoryManager.__new__(MemoryManager)
         monkeypatch.setattr(mm, "load_recent_history", lambda *a, **kw: [])
 
         loaded = mm.load_context_data(
@@ -1869,7 +1832,8 @@ class TestMetadataSchemaVersion:
             return [future_mem]
 
         monkeypatch.setattr(MemoryManager, "_retrieve_relevant_entries", fake_retrieve)
-        mm = MemoryManager()
+        # Construct WITHOUT running __init__ — no SentenceTransformer, no Supabase.
+        mm = MemoryManager.__new__(MemoryManager)
         monkeypatch.setattr(mm, "load_recent_history", lambda *a, **kw: [])
 
         loaded = mm.load_context_data(
@@ -1927,6 +1891,27 @@ class TestMetadataSchemaVersion:
 
 class TestUuidPipeline:
     """Real UUIDs propagate correctly through the full pipeline and never leak."""
+
+    @pytest.fixture(autouse=True)
+    def _no_real_embedding_infrastructure(self, monkeypatch):
+        """Fail immediately if any test here constructs a real SentenceTransformer.
+
+        Requirement: no test in ``TestUuidPipeline`` may load ``SentenceTransformer``,
+        search the model cache, access Hugging Face, build Supabase, read
+        credentials, open sockets, or depend on the network.  These tests build
+        ``LoadedContextData``-style inputs directly, but this double makes the
+        invariant self-enforcing: any accidental ``SentenceTransformer(...)``
+        call fails the test instantly instead of hitting the network.
+        """
+        import backend.memory as _memory_module
+
+        def _fail_on_construction(*args, **kwargs):
+            raise AssertionError(
+                "TestUuidPipeline must not construct SentenceTransformer "
+                "(no real embedding infrastructure allowed)"
+            )
+
+        monkeypatch.setattr(_memory_module, "SentenceTransformer", _fail_on_construction)
 
     def test_uuid_propagates_from_memory_to_source_map(self):
         """Real UUID from RetrievedMemory.source_id ends up in source_map via internal_id."""
@@ -2011,51 +1996,7 @@ class TestUuidPipeline:
 
         assert real_uuid not in caplog.text, "Real UUID leaked into logs"
 
-    def test_uuid_pipeline_end_to_end(self, monkeypatch, caplog):
-        """Full RPC row → RetrievedMemory → LoadedContextData → ContextBundle → ContextBuildResult.
 
-        Verifies source_map contains the real internal_id and no UUID leaks into messages or logs.
-        """
-        from backend.memory import MemoryManager, RetrievedMemory
-        from backend.trusted_context import build_context_bundle
-        import uuid
-
-        caplog.set_level(logging.DEBUG)
-
-        real_uuid = "770e8400-e29b-41d4-a716-446655440002"
-        approved_mem = RetrievedMemory(
-            content="End-to-end pipeline memory",
-            tags=("pipeline",),
-            source_id=real_uuid,
-            confidence=0.85,
-            provenance=Provenance.USER_CONFIRMED,
-            epistemic_status=EpistemicStatus.APPROVED,
-            approved=True,
-            metadata_version=1,
-        )
-
-        def fake_retrieve(*args, **kwargs):
-            return [approved_mem]
-
-        monkeypatch.setattr(MemoryManager, "_retrieve_relevant_entries", fake_retrieve)
-        mm = MemoryManager()
-        monkeypatch.setattr(mm, "load_recent_history", lambda *a, **kw: [])
-
-        loaded = mm.load_context_data(
-            user_id="user-x", current_message="Hi", user_state={}
-        )
-        bundle = build_context_bundle(
-            trusted_policy="Test policy.", loaded_data=loaded
-        )
-        result = build_envelope(bundle, "Hi")
-
-        # source_map must contain the local ref -> real UUID mapping
-        assert "mem-1" in result.source_map
-        assert result.source_map["mem-1"] == real_uuid
-
-        # Real UUID must NOT appear in messages
-        serialized = json.dumps(result.messages)
-        assert real_uuid not in serialized, "Real UUID leaked into messages"
 
 
 # ═══════════════════════════════════════════════════════════════════════

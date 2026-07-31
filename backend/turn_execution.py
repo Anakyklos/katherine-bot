@@ -120,6 +120,7 @@ async def run_blocking_read(
     supabase_timeout: float,
     func: Callable[..., T],
     *args: Any,
+    allowlist_exceptions: tuple = (),
     **kwargs: Any,
 ) -> T:
     """Run a **read-only** blocking operation with deadline enforcement.
@@ -134,11 +135,19 @@ async def run_blocking_read(
 
     On **timeout**: raises ``DeadlineExceeded`` (``turn_timeout``).
     On **cancellation**: propagates ``asyncio.CancelledError``.
+    On **allowlisted exception**: propagates as-is.
     On **any other exception**: wraps into ``TurnExecutionError(persistence_unavailable)``.
+
+    ``allowlist_exceptions`` is a tuple of exception types that propagate
+    as-is instead of being wrapped into ``persistence_unavailable``.  It is
+    used for domain errors that must be converted by the caller into a
+    more specific ``TurnErrorCode`` (e.g. ``TrustedContextError`` for
+    structurally invalid loaded context data).
 
     Raises:
         DeadlineExceeded: When the budget is exhausted before or during the operation.
         TurnExecutionError(persistence_unavailable): On operation failure.
+        Exception subtypes in ``allowlist_exceptions``: Propagated as-is.
         asyncio.CancelledError: When the coroutine is cancelled.
     """
     remaining = budget.remaining_before_reserve
@@ -159,7 +168,9 @@ async def run_blocking_read(
         raise
     except TurnExecutionError:
         raise
-    except Exception:
+    except Exception as exc:
+        if allowlist_exceptions and isinstance(exc, allowlist_exceptions):
+            raise
         raise TurnExecutionError(
             TurnErrorCode.persistence_unavailable,
             f"Stage {stage_label} failed.",

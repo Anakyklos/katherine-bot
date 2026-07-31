@@ -46,11 +46,17 @@ def mock_external_dependencies():
         if not k.startswith("PYTEST_"):
             os.environ[k] = v
 
-    # Restore sys.modules exactly
-    for key in list(sys.modules.keys()):
-        if key not in _original_sys_modules:
-            del sys.modules[key]
-    sys.modules.update(_original_sys_modules)
+    # Restore ONLY the modules this fixture explicitly mocked.
+    # Never iterate over all sys.modules keys or all backend.* modules:
+    # doing so destroys class identity for modules imported naturally by
+    # other test files during the same session (e.g. backend.trusted_context,
+    # backend.memory, backend.engine).
+    for _key in ('sentence_transformers', 'supabase'):
+        _original = _original_sys_modules.get(_key)
+        if _original is not None:
+            sys.modules[_key] = _original
+        elif _key in sys.modules:
+            del sys.modules[_key]
 
 
 @pytest.fixture(scope="module")
@@ -228,8 +234,15 @@ async def test_process_turn_schedules_background_task(backend):
         "emotional_state": _valid_legacy_emotion_dict(),
         "relationship_state": {}
     })
-    engine.memory_manager.get_context = MagicMock(return_value="context")
-    engine._perceive = MagicMock(return_value={})
+    # load_context_data returns an empty valid LoadedContextData — the engine
+    # calls the module-level build_context_bundle directly (no mock needed).
+    from backend.trusted_context import LoadedContextData
+    engine.memory_manager.load_context_data = MagicMock(return_value=LoadedContextData(
+        history_rows=(),
+        retrieved_memories=(),
+        profile_snapshot={},
+        persona_snapshot="",
+    ))
     
     # Mock save_turn and sync_state to track order
     call_order = []
@@ -243,12 +256,6 @@ async def test_process_turn_schedules_background_task(backend):
         
     engine.memory_manager.save_turn = MagicMock(side_effect=mock_save_turn)
     engine.memory_manager.sync_state = MagicMock(side_effect=mock_sync_state)
-    
-    # Mock build_context_bundle for the trusted context flow
-    from backend.trusted_context import ContextBundle
-    engine.memory_manager.build_context_bundle = MagicMock(return_value=ContextBundle(
-        trusted_policy="You are a helpful assistant.",
-    ))
     
     from unittest.mock import AsyncMock
     
@@ -302,19 +309,20 @@ async def test_process_turn_does_not_schedule_when_extraction_disabled(backend):
         "emotional_state": _valid_legacy_emotion_dict(),
         "relationship_state": {}
     })
-    engine.memory_manager.get_context = MagicMock(return_value="context")
-    engine._perceive = MagicMock(return_value={})
+    # load_context_data returns an empty valid LoadedContextData — the engine
+    # calls the module-level build_context_bundle directly (no mock needed).
+    from backend.trusted_context import LoadedContextData
+    engine.memory_manager.load_context_data = MagicMock(return_value=LoadedContextData(
+        history_rows=(),
+        retrieved_memories=(),
+        profile_snapshot={},
+        persona_snapshot="",
+    ))
     
     engine.memory_manager.save_turn = MagicMock(return_value=backend.PersistedTurnRef(
         user_id="user123", source_chat_log_id=1, assistant_chat_log_id=2
     ))
     engine.memory_manager.sync_state = MagicMock()
-    
-    # Mock build_context_bundle for the trusted context flow
-    from backend.trusted_context import ContextBundle
-    engine.memory_manager.build_context_bundle = MagicMock(return_value=ContextBundle(
-        trusted_policy="You are a helpful assistant.",
-    ))
     
     from unittest.mock import AsyncMock
     

@@ -347,13 +347,28 @@ class ConversationEngine:
         try:
             loaded_context_data = await run_blocking_read(
                 "load_context", budget, supabase_timeout,
-                self.memory_manager.load_context_data, user_id, user_message, user_state
+                self.memory_manager.load_context_data, user_id, user_message, user_state,
+                allowlist_exceptions=(TrustedContextError,),
             )
         except DeadlineExceeded:
             await self._emit_stage_event(StageEvent(
                 stage=TurnStage.load_context, outcome=StageOutcome.timeout, code=TurnErrorCode.turn_timeout,
             ))
             raise
+        except TrustedContextError:
+            # Structurally invalid loaded context data — detected during the
+            # load_context stage, BEFORE any provider call.  Emit a sanitized
+            # low-cardinality event and convert to provider_invalid_request.
+            # No content, IDs, labels, or user data are logged.
+            await self._emit_stage_event(StageEvent(
+                stage=TurnStage.load_context, outcome=StageOutcome.failed,
+                code=TurnErrorCode.provider_invalid_request,
+            ))
+            logger.error("event=provider_input_invalid stage=load_context")
+            raise TurnExecutionError(
+                TurnErrorCode.provider_invalid_request,
+                "Loaded context data is structurally invalid.",
+            )
         except TurnExecutionError:
             await self._emit_stage_event(StageEvent(
                 stage=TurnStage.load_context, outcome=StageOutcome.failed, code=TurnErrorCode.persistence_unavailable,

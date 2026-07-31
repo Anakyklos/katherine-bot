@@ -49,7 +49,9 @@ from __future__ import annotations
 
 import json
 import math
+import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 
 from .admission_contracts import PROVIDER_INPUT_MAX_ESTIMATED_UNITS
@@ -303,15 +305,15 @@ class ContextItem:
         if not isinstance(self.source_id, str) or not self.source_id:
             raise TrustedContextError("invalid_source_id")
 
-        # Validate internal_id if present — only non-empty strings accepted
+        # Validate internal_id — strict type check first
+        if not isinstance(self.internal_id, str):
+            raise TrustedContextError("invalid_internal_id_type")
+        # Empty string is allowed for items without a persisted ID
         if self.internal_id:
-            if not isinstance(self.internal_id, str):
-                raise TrustedContextError("invalid_internal_id_type")
             if not self.internal_id.strip():
                 raise TrustedContextError("invalid_internal_id_empty")
             # Non-empty internal_id for approved memories must be valid UUID
             if self.kind == "memory" and self.epistemic_status == EpistemicStatus.APPROVED:
-                import uuid
                 try:
                     uuid.UUID(self.internal_id)
                 except (ValueError, AttributeError):
@@ -439,9 +441,74 @@ class LoadedContextData:
                 raise TrustedContextError("invalid_loaded_data_history_row_type")
             if "role" not in row or "content" not in row or "id" not in row or "created_at" not in row:
                 raise TrustedContextError("invalid_loaded_data_history_row_keys")
+            # Validate role must be exactly "user" or "assistant"
+            role_val = row.get("role")
+            if role_val not in ("user", "assistant"):
+                raise TrustedContextError("invalid_loaded_data_history_role")
+            # Validate content must be non-empty string after trim
+            content_val = row.get("content")
+            if not isinstance(content_val, str) or not content_val.strip():
+                raise TrustedContextError("invalid_loaded_data_history_content")
+            # Validate id must be positive integer and not bool
+            id_val = row.get("id")
+            if isinstance(id_val, bool) or not isinstance(id_val, int) or id_val <= 0:
+                raise TrustedContextError("invalid_loaded_data_history_id")
+            # Validate created_at must be a parseable timestamp string
+            created_val = row.get("created_at")
+            if not isinstance(created_val, str) or not created_val.strip():
+                raise TrustedContextError("invalid_loaded_data_history_timestamp")
+            # Attempt parse to verify format (no timezone required for legacy)
+            try:
+                _parse_timestamp(created_val)
+            except (ValueError, TypeError):
+                raise TrustedContextError("invalid_loaded_data_history_timestamp")
         # Validate retrieved_memories is tuple
         if not isinstance(self.retrieved_memories, tuple):
             raise TrustedContextError("invalid_loaded_data_memories_type")
+        # Each memory must be a valid object with required contract
+        for mem in self.retrieved_memories:
+            # Must have to_context_item method
+            if not hasattr(mem, "to_context_item") or not callable(mem.to_context_item):
+                raise TrustedContextError("invalid_loaded_memory_contract")
+            # Must have metadata_version = 1 (the only supported version)
+            if not hasattr(mem, "metadata_version"):
+                raise TrustedContextError("invalid_loaded_memory_metadata")
+            if isinstance(mem.metadata_version, bool) or not isinstance(mem.metadata_version, int):
+                raise TrustedContextError("invalid_loaded_memory_metadata")
+            if mem.metadata_version != 1:
+                raise TrustedContextError("invalid_loaded_memory_metadata")
+            # Must have approved bool
+            if not hasattr(mem, "approved") or not isinstance(mem.approved, bool):
+                raise TrustedContextError("invalid_loaded_memory_approved")
+            if not mem.approved:
+                raise TrustedContextError("invalid_loaded_memory_not_approved")
+            # Must have source_id as valid UUID string
+            if not hasattr(mem, "source_id"):
+                raise TrustedContextError("invalid_loaded_memory_source_id")
+            if not isinstance(mem.source_id, str) or not mem.source_id:
+                raise TrustedContextError("invalid_loaded_memory_source_id")
+            try:
+                uuid.UUID(mem.source_id)
+            except (ValueError, AttributeError):
+                raise TrustedContextError("invalid_loaded_memory_source_id")
+            # Must have provenance in allowlist
+            if not hasattr(mem, "provenance") or not Provenance.is_valid(mem.provenance):
+                raise TrustedContextError("invalid_loaded_memory_provenance")
+            # Must have epistemic_status in allowlist
+            if not hasattr(mem, "epistemic_status") or not EpistemicStatus.is_valid(mem.epistemic_status):
+                raise TrustedContextError("invalid_loaded_memory_epistemic_status")
+            # Must have confidence in [0.0, 1.0]
+            if not hasattr(mem, "confidence"):
+                raise TrustedContextError("invalid_loaded_memory_confidence")
+            conf = mem.confidence
+            if isinstance(conf, bool) or conf is None:
+                raise TrustedContextError("invalid_loaded_memory_confidence")
+            if not isinstance(conf, (int, float)):
+                raise TrustedContextError("invalid_loaded_memory_confidence")
+            if math.isnan(conf) or math.isinf(conf):
+                raise TrustedContextError("invalid_loaded_memory_confidence")
+            if not (0.0 <= conf <= 1.0):
+                raise TrustedContextError("invalid_loaded_memory_confidence")
         # Validate profile_snapshot is dict
         if not isinstance(self.profile_snapshot, dict):
             raise TrustedContextError("invalid_loaded_data_profile_type")
@@ -611,25 +678,49 @@ def build_context_bundle(
     ``loaded_data``
         The ``LoadedContextData`` produced during ``load_context``.
     """
+    # Validate loaded_data type before any field access
+    if not isinstance(loaded_data, LoadedContextData):
+        raise TrustedContextError("invalid_loaded_data_type")
+
     # Convert history rows to ChatMessages with stable sort_key
-    # sort_key = (created_at_normalized, id) for deterministic ordering
+    # sort_key = (normalized_utc_datetime, msg_id) for deterministic ordering
     chat_messages: list[ChatMessage] = []
     for i, msg in enumerate(loaded_data.history_rows):
         source_ref = f"msg-{i + 1}"
-        created_at = msg.get("created_at", "")
-        msg_id = msg.get("id", 0)
+        try:
+            role_val = msg["role"]
+            content_val = msg["content"]
+            created_at_val = msg["created_at"]
+            msg_id_val = msg["id"]
+        except KeyError:
+            raise TrustedContextError("invalid_loaded_history_row")
+
+        # Normalize created_at to UTC datetime for stable ordering
+        try:
+            normalized_dt = _normalize_timestamp(created_at_val)
+        except (ValueError, TypeError):
+            raise TrustedContextError("invalid_history_timestamp")
+
         chat_messages.append(ChatMessage(
-            role=msg["role"],
-            content=msg["content"],
+            role=role_val,
+            content=content_val,
             source_id=source_ref,
-            sort_key=(created_at, msg_id),
+            sort_key=(normalized_dt, msg_id_val),
         ))
 
     # Convert retrieved memories to ContextItems
     memory_items: list[ContextItem] = []
     for j, mem in enumerate(loaded_data.retrieved_memories):
         source_ref = f"mem-{j + 1}"
-        memory_items.append(mem.to_context_item(source_ref))
+        if not hasattr(mem, "to_context_item") or not callable(mem.to_context_item):
+            raise TrustedContextError("invalid_loaded_memory")
+        try:
+            context_item = mem.to_context_item(source_ref)
+        except Exception:
+            raise TrustedContextError("context_item_conversion_failed")
+        if not isinstance(context_item, ContextItem):
+            raise TrustedContextError("context_item_conversion_failed")
+        memory_items.append(context_item)
 
     # Profile as ContextItem
     profile_items: list[ContextItem] = []
@@ -973,6 +1064,52 @@ def _validate_unique_refs(bundle: ContextBundle) -> None:
         if ref in seen:
             raise TrustedContextError("duplicate_source_ref")
         seen.add(ref)
+
+
+# ---------------------------------------------------------------------------
+# Timestamp normalization helpers
+# ---------------------------------------------------------------------------
+
+
+def _parse_timestamp(value: str) -> datetime:
+    """Parse an ISO 8601 timestamp string into a naive datetime.
+
+    Supports formats with and without timezone offset.  Timezone-aware
+    timestamps are converted to UTC and then made naive (normalized to
+    UTC).  Raises ``ValueError`` on invalid input.
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("invalid timestamp")
+
+    # Try parsing with timezone first (datetime.fromisoformat handles +/-HH:MM)
+    try:
+        dt = datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        raise ValueError("invalid timestamp")
+
+    # Convert to UTC if timezone-aware
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+    return dt
+
+
+def _normalize_timestamp(value: str) -> str:
+    """Normalize a timestamp string to a comparable UTC ISO 8601 representation.
+
+    Parses ISO 8601, converts to UTC, and returns a string in the format
+    ``"YYYY-MM-DDTHH:MM:SS.ffffff"`` (naive UTC).  This representation is
+    lexicographically comparable and deterministic for timestamps with
+    different timezone offsets that represent the same instant.
+
+    Examples::
+
+        _normalize_timestamp("2026-07-30T10:00:00-04:00")  # 14:00 UTC
+        _normalize_timestamp("2026-07-30T14:00:00+00:00")  # same instant
+        # Both produce "2026-07-30T14:00:00"
+    """
+    dt = _parse_timestamp(value)
+    return dt.isoformat()
 
 
 # ---------------------------------------------------------------------------
