@@ -6,7 +6,7 @@
 -- 2. Check for existing request and handle idempotent replay
 -- 3. Validate CAS (Compare-And-Swap) on profile revision
 -- 4. Create profile if missing (race-safe upsert)
--- 5. Reject divergent payload for existing request
+-- 5. Reject divergent payload for active requests; reclaim expired/expired-lease requests
 -- 6. Insert user and assistant messages with stable IDs
 -- 7. Update profile snapshots and increment revision exactly once
 -- 8. Complete turn_requests with reproducible result
@@ -120,13 +120,13 @@ END $$;
 --
 -- Error codes:
 --   - revision_mismatch: profile revision doesn't match expected_revision
---   - request_payload_conflict: (user_id, request_id) already exists with different payload
---   - request_expired: the existing request has expired and cannot be replayed with different payload
+--   - request_payload_conflict: (user_id, request_id) already exists with different payload (for non-expired requests)
 --   - profile_upsert_failed: could not create/lock profile
 --   - message_insert_failed: could not insert messages
 --   - turn_request_insert_failed: could not insert/update turn_request
 --   - outbox_insert_failed: could not insert outbox events
 --   - validation_failed: payload validation failed
+--   - database_error: unexpected database error (sanitized)
 
 CREATE OR REPLACE FUNCTION public.commit_turn(
     p_authenticated_user_id text,
@@ -163,7 +163,10 @@ DECLARE
     v_existing_replay_payload jsonb;
     v_existing_created_at timestamptz;
     v_existing_completed_at timestamptz;
+    v_existing_lease_owner text;
+    v_existing_lease_expires_at timestamptz;
     v_turn_request_id uuid;
+    v_existing_turn_request_id uuid;
     
     -- Message IDs
     v_user_message_id bigint;
@@ -191,6 +194,7 @@ DECLARE
     v_event_type text;
     v_event_payload jsonb;
     v_event_idempotency_key text;
+    v_outbox_event_record jsonb;
     
     -- Snapshot validation forbidden keys
     v_snapshot_forbidden_keys text[] := ARRAY[
@@ -291,6 +295,7 @@ BEGIN
     IF v_request_exists THEN
         -- Get the existing request to check payload hash, status, and all needed fields
         SELECT 
+            id,
             payload_hash_sha256,
             status,
             committed_revision,
@@ -298,8 +303,11 @@ BEGIN
             assistant_message_chat_log_id,
             replay_payload,
             created_at,
-            completed_at
+            completed_at,
+            lease_owner,
+            lease_expires_at
         INTO 
+            v_existing_turn_request_id,
             v_existing_payload_hash,
             v_existing_status,
             v_existing_committed_revision,
@@ -307,7 +315,9 @@ BEGIN
             v_existing_assistant_message_chat_log_id,
             v_existing_replay_payload,
             v_existing_created_at,
-            v_existing_completed_at
+            v_existing_completed_at,
+            v_existing_lease_owner,
+            v_existing_lease_expires_at
         FROM public.turn_requests
         WHERE user_id = p_authenticated_user_id AND request_id = p_request_id;
         
@@ -348,11 +358,16 @@ BEGIN
             RETURN v_result;
         ELSE
             -- Payload differs: conflict
-            -- Check if the existing request is expired - if so, we allow reclaim
+            -- Check if the existing request can be reclaimed
             IF v_existing_status = 'expired' THEN
-                -- For expired requests, we allow the new commit to proceed
-                -- Continue to CAS validation
-                NULL;
+                -- For expired requests with different payload, we reclaim the existing row
+                -- Use the existing turn_request_id for FK consistency
+                v_turn_request_id := v_existing_turn_request_id;
+                -- Continue to CAS validation and will UPDATE the existing row
+            ELSIF v_existing_status = 'pending' AND v_existing_lease_expires_at IS NOT NULL AND v_existing_lease_expires_at <= v_now THEN
+                -- Pending request with expired lease: treat as expired and reclaim
+                v_turn_request_id := v_existing_turn_request_id;
+                -- Continue to CAS validation and will UPDATE the existing row
             ELSE
                 -- Active request with different payload - true conflict
                 v_result := jsonb_build_object(
@@ -424,19 +439,41 @@ BEGIN
     END IF;
 
     -- =============================================================
-    -- Step 8: Insert into turn_requests (capture DB id)
+    -- Step 8: Insert or Update turn_requests (capture DB id)
+    -- For new requests: INSERT
+    -- For expired request reclaim: UPDATE existing row with new payload
     -- =============================================================
-    INSERT INTO public.turn_requests (
-        user_id, request_id, payload_hash_sha256, status,
-        expected_revision, committed_revision,
-        user_message_chat_log_id, assistant_message_chat_log_id,
-        replay_payload, created_at, updated_at, completed_at
-    ) VALUES (
-        p_authenticated_user_id, p_request_id, p_payload_hash_sha256, 'completed',
-        p_expected_revision, v_new_revision,
-        v_user_message_id, v_assistant_message_id,
-        COALESCE(p_replay_payload, '{}'::jsonb), v_now, v_now, v_now
-    ) RETURNING id INTO v_turn_request_id;
+    IF v_turn_request_id IS NOT NULL THEN
+        -- Reclaiming an expired request: UPDATE the existing row
+        UPDATE public.turn_requests
+        SET 
+            payload_hash_sha256 = p_payload_hash_sha256,
+            status = 'completed',
+            expected_revision = p_expected_revision,
+            committed_revision = v_new_revision,
+            user_message_chat_log_id = v_user_message_id,
+            assistant_message_chat_log_id = v_assistant_message_id,
+            replay_payload = COALESCE(p_replay_payload, '{}'::jsonb),
+            updated_at = v_now,
+            completed_at = v_now,
+            error_code = NULL
+        WHERE id = v_turn_request_id
+            AND user_id = p_authenticated_user_id
+            AND request_id = p_request_id;
+    ELSE
+        -- New request: INSERT
+        INSERT INTO public.turn_requests (
+            user_id, request_id, payload_hash_sha256, status,
+            expected_revision, committed_revision,
+            user_message_chat_log_id, assistant_message_chat_log_id,
+            replay_payload, created_at, updated_at, completed_at
+        ) VALUES (
+            p_authenticated_user_id, p_request_id, p_payload_hash_sha256, 'completed',
+            p_expected_revision, v_new_revision,
+            v_user_message_id, v_assistant_message_id,
+            COALESCE(p_replay_payload, '{}'::jsonb), v_now, v_now, v_now
+        ) RETURNING id INTO v_turn_request_id;
+    END IF;
 
     -- =============================================================
     -- Step 9: Insert outbox events (idempotent) referencing DB turn_request id

@@ -6,7 +6,7 @@ This module provides the transactional commit functionality that atomically:
 2. Validates CAS (Compare-And-Swap) on profile revision
 3. Creates profile if missing (race-safe)
 4. Validates (user_id, request_id) uniqueness
-5. Rejects divergent payload for existing request
+5. Rejects divergent payload for active requests; reclaims expired/expired-lease requests
 6. Inserts user and assistant messages with stable IDs
 7. Updates profile snapshots and increments revision exactly once
 8. Completes turn_requests with reproducible result
