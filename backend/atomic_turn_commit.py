@@ -615,7 +615,7 @@ def parse_commit_turn_result(result: Mapping[str, Any]) -> CommittedTurn:
             request = error_info.get("request_id")
             # Only raise ConflictError for known conflict codes
             # database_error should raise a different exception
-            if code in ("revision_mismatch", "request_payload_conflict"):
+            if code in ("revision_mismatch", "request_payload_conflict", "request_lease_conflict"):
                 raise ConflictError(
                     code=code,
                     message=message,

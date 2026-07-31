@@ -120,7 +120,8 @@ END $$;
 --
 -- Error codes:
 --   - revision_mismatch: profile revision doesn't match expected_revision
---   - request_payload_conflict: (user_id, request_id) already exists with different payload hash, or has active lease
+--   - request_payload_conflict: (user_id, request_id) already exists with different payload hash
+--   - request_lease_conflict: request has active lease owned by another worker
 --   - profile_upsert_failed: could not create/lock profile
 --   - message_insert_failed: could not insert messages
 --   - turn_request_insert_failed: could not insert/update turn_request
@@ -249,6 +250,20 @@ BEGIN
             RAISE EXCEPTION 'replay_payload contains forbidden keys' USING ERRCODE = 'P0001';
         END IF;
     END IF;
+    
+    -- Validate public_response matches replay_payload.response to prevent divergence
+    -- p_public_response participates in the hash and must equal replay_payload.response
+    IF p_replay_payload IS NOT NULL AND jsonb_typeof(p_replay_payload) = 'object' THEN
+        IF (p_replay_payload->>'response') IS NULL THEN
+            RAISE EXCEPTION 'replay_payload must contain response field' USING ERRCODE = 'P0001';
+        END IF;
+        IF p_public_response IS NULL OR (p_replay_payload->>'response') IS NULL THEN
+            RAISE EXCEPTION 'public_response and replay_payload.response must both be present' USING ERRCODE = 'P0001';
+        END IF;
+        IF p_public_response <> (p_replay_payload->>'response') THEN
+            RAISE EXCEPTION 'public_response must equal replay_payload.response' USING ERRCODE = 'P0001';
+        END IF;
+    END IF;
 
     -- Validate emotional_state snapshot (must be object or null, has schema_version, no forbidden keys)
     IF p_emotional_state IS NOT NULL THEN
@@ -259,9 +274,9 @@ BEGIN
         IF (p_emotional_state->>'schema_version') IS NULL THEN
             RAISE EXCEPTION 'emotional_state must have schema_version' USING ERRCODE = 'P0001';
         END IF;
-        -- schema_version must be integer 1
-        IF (p_emotional_state->>'schema_version')::text <> '1' THEN
-            RAISE EXCEPTION 'emotional_state schema_version must be 1' USING ERRCODE = 'P0001';
+        -- schema_version must be numeric integer 1 (not string "1")
+        IF (p_emotional_state->>'schema_version')::numeric <> 1 THEN
+            RAISE EXCEPTION 'emotional_state schema_version must be numeric 1' USING ERRCODE = 'P0001';
         END IF;
         -- Check for forbidden keys
         IF public.jsonb_has_forbidden_key(p_emotional_state, v_snapshot_forbidden_keys) THEN
@@ -278,9 +293,9 @@ BEGIN
         IF (p_relationship_state->>'schema_version') IS NULL THEN
             RAISE EXCEPTION 'relationship_state must have schema_version' USING ERRCODE = 'P0001';
         END IF;
-        -- schema_version must be integer 1
-        IF (p_relationship_state->>'schema_version')::text <> '1' THEN
-            RAISE EXCEPTION 'relationship_state schema_version must be 1' USING ERRCODE = 'P0001';
+        -- schema_version must be numeric integer 1 (not string "1")
+        IF (p_relationship_state->>'schema_version')::numeric <> 1 THEN
+            RAISE EXCEPTION 'relationship_state schema_version must be numeric 1' USING ERRCODE = 'P0001';
         END IF;
         -- Check for forbidden keys
         IF public.jsonb_has_forbidden_key(p_relationship_state, v_snapshot_forbidden_keys) THEN
@@ -398,7 +413,7 @@ BEGIN
                         -- Active lease owned by someone else - conflict
                         v_result := jsonb_build_object(
                             'error', jsonb_build_object(
-                                'code', 'request_payload_conflict',
+                                'code', 'request_lease_conflict',
                                 'message', 'Request ID exists with active lease owned by another worker',
                                 'expected_revision', p_expected_revision,
                                 'request_id', p_request_id::text
@@ -414,7 +429,7 @@ BEGIN
                     -- Should not reach here, but safety net
                     v_result := jsonb_build_object(
                         'error', jsonb_build_object(
-                            'code', 'request_payload_conflict',
+                            'code', 'request_lease_conflict',
                             'message', 'Request ID exists with lease in unknown state',
                             'expected_revision', p_expected_revision,
                             'request_id', p_request_id::text
@@ -506,7 +521,7 @@ BEGIN
             -- Active lease owned by someone else - cannot reclaim
             v_result := jsonb_build_object(
                 'error', jsonb_build_object(
-                    'code', 'request_payload_conflict',
+                    'code', 'request_lease_conflict',
                     'message', 'Request ID has active lease owned by another worker',
                     'expected_revision', p_expected_revision,
                     'request_id', p_request_id::text
@@ -515,6 +530,9 @@ BEGIN
             RETURN v_result;
         END IF;
         
+        -- Atomic conditional transition: only update if the row is in the expected state
+        -- For same-hash pending/expired: must have matching hash and expired/missing lease
+        -- This ensures atomicity: the UPDATE checks all preconditions in a single statement
         UPDATE public.turn_requests
         SET 
             payload_hash_sha256 = p_payload_hash_sha256,
@@ -531,7 +549,28 @@ BEGIN
             lease_expires_at = NULL
         WHERE id = v_turn_request_id
             AND user_id = p_authenticated_user_id
-            AND request_id = p_request_id;
+            AND request_id = p_request_id
+            -- Only reclaim if status is pending or expired
+            AND status IN ('pending', 'expired')
+            -- For same-hash: verify hash matches (already checked in IF above, but safety net)
+            AND (payload_hash_sha256 = p_payload_hash_sha256 OR payload_hash_sha256 IS NULL)
+            -- Verify lease is expired or matches caller
+            AND (v_existing_lease_owner IS NULL OR v_existing_lease_expires_at IS NULL OR v_existing_lease_expires_at <= v_now OR v_existing_lease_owner = p_lease_owner)
+        ;
+        
+        -- Check if the UPDATE affected any row
+        IF NOT FOUND THEN
+            -- Race condition: the row state changed between SELECT and UPDATE
+            v_result := jsonb_build_object(
+                'error', jsonb_build_object(
+                    'code', 'request_lease_conflict',
+                    'message', 'Request state changed - lease reclaim failed',
+                    'expected_revision', p_expected_revision,
+                    'request_id', p_request_id::text
+                )
+            );
+            RETURN v_result;
+        END IF;
     ELSE
         -- New request: INSERT
         INSERT INTO public.turn_requests (
