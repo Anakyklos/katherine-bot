@@ -61,6 +61,16 @@ _MAX_OUTBOX_PAYLOAD_BYTES = 8192
 _SNAPSHOT_FORBIDDEN_KEYS = FORBIDDEN_PAYLOAD_KEYS
 
 
+def _is_ascii_alnum(c: str) -> bool:
+    """Check if a single character is ASCII alphanumeric (matches SQL's alnum concept)."""
+    return ('a' <= c <= 'z') or ('A' <= c <= 'Z') or ('0' <= c <= '9')
+
+
+def _is_ascii_alnum_lower(c: str) -> bool:
+    """Check if a single character is ASCII lowercase alphanumeric (matches SQL's [a-z0-9])."""
+    return ('a' <= c <= 'z') or ('0' <= c <= '9')
+
+
 @dataclass(frozen=True)
 class MessageRef:
     """Reference to a message in chat_logs."""
@@ -265,11 +275,11 @@ def _validate_idempotency_key(key: str) -> None:
             "invalid_idempotency_key",
             f"must be 1-{_MAX_IDEMPOTENCY_KEY_LENGTH} characters",
         )
-    # Mirror database regex: alphanumeric, period, underscore, colon, hyphen
-    if not all(c.isalnum() or c in "._:-" for c in key):
+    # Mirror database regex: ^[A-Za-z0-9_.:-]{1,128}$
+    if not all(_is_ascii_alnum(c) or c in "._:-" for c in key):
         raise ValidationError(
             "invalid_idempotency_key",
-            "must contain only alphanumeric characters, '.', '_', ':', '-'",
+            "must contain only ASCII alphanumeric characters, '.', '_', ':', '-'",
         )
 
 
@@ -284,10 +294,11 @@ def _validate_lease_owner(owner: Optional[str]) -> None:
             "invalid_lease_owner",
             f"must be 1-{_MAX_LEASE_OWNER_LENGTH} characters",
         )
-    if not all(c.isalnum() or c in "._:-" for c in owner):
+    # Mirror database regex: ^[A-Za-z0-9_.:-]{1,64}$
+    if not all(_is_ascii_alnum(c) or c in "._:-" for c in owner):
         raise ValidationError(
             "invalid_lease_owner",
-            "must contain only alphanumeric characters, '.', '_', ':', '-'",
+            "must contain only ASCII alphanumeric characters, '.', '_', ':', '-'",
         )
 
 
@@ -302,11 +313,11 @@ def _validate_error_code(code: Optional[str]) -> None:
             "invalid_error_code",
             f"must be 1-{_MAX_ERROR_CODE_LENGTH} characters",
         )
-    # Must be lowercase alphanumeric with underscores only
-    if not all((c.isalnum() and c.islower()) or c == "_" for c in code):
+    # Mirror database regex: ^[a-z0-9_]{1,64}$
+    if not all(_is_ascii_alnum_lower(c) or c == "_" for c in code):
         raise ValidationError(
             "invalid_error_code",
-            "must contain only lowercase alphanumeric characters and '_'",
+            "must contain only lowercase ASCII alphanumeric characters and '_'",
         )
 
 
@@ -341,6 +352,21 @@ def _validate_outbox_event_payload(payload: Mapping[str, Any], event_index: int)
         raise ValidationError(
             "invalid_outbox_events",
             f"event {event_index}: payload contains forbidden keys",
+        )
+    
+    # Validate size (encode to UTF-8 to match database octet_length)
+    import json
+    try:
+        serialized = json.dumps(payload, ensure_ascii=False, allow_nan=False)
+    except (TypeError, ValueError):
+        raise ValidationError(
+            "invalid_outbox_events",
+            f"event {event_index}: payload is not JSON-serializable",
+        )
+    if len(serialized.encode("utf-8")) > _MAX_OUTBOX_PAYLOAD_BYTES:
+        raise ValidationError(
+            "invalid_outbox_events",
+            f"event {event_index}: payload exceeds {_MAX_OUTBOX_PAYLOAD_BYTES} bytes",
         )
     
     # Validate value contract for each field
