@@ -389,9 +389,9 @@ class MemoryManager:
             if not mem.approved:
                 logger.debug("event=context_memory_unapproved")
                 continue
-            if mem.metadata_version == 0:
-                # Legacy memory without metadata version — skip
-                logger.debug("event=context_item_rejected code=memory_legacy")
+            if mem.metadata_version != SUPPORTED_MEMORY_METADATA_SCHEMA_VERSION:
+                # Unsupported metadata version — reject
+                logger.debug("event=context_item_rejected code=unsupported_metadata_version")
                 continue
             valid_memories.append(mem)
 

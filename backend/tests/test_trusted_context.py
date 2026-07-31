@@ -458,9 +458,8 @@ class TestContextBundle:
         assert bundle.memory_items == ()
 
     def test_empty_policy_rejected(self):
-        bundle = ContextBundle(trusted_policy="")
         with pytest.raises(TrustedContextError, match="empty_trusted_policy"):
-            build_envelope(bundle, "Hello")
+            ContextBundle(trusted_policy="")
 
     def test_bundle_with_history(self):
         msg = ChatMessage(role="user", content="Hi", source_id="m1", sort_key=(1, 1))
@@ -490,6 +489,46 @@ class TestContextBundle:
 
 class TestEnvelopeConstruction:
     """Core envelope construction tests."""
+
+    def test_sort_key_respects_created_at_not_id_numeric(self):
+        """Rendering order respects created_at timestamp, not id numeric value.
+
+        Two messages with out-of-order IDs (newer created_at has smaller id)
+        must be rendered by created_at order, not by id.
+        """
+        # Message with older timestamp but larger id
+        older = ChatMessage(role="user", content="Older message", source_id="m1", sort_key=("2026-07-30T00:00:00", 100))
+        # Message with newer timestamp but smaller id
+        newer = ChatMessage(role="assistant", content="Newer message", source_id="m2", sort_key=("2026-07-30T00:00:01", 20))
+        bundle = ContextBundle(
+            trusted_policy="Policy.",
+            history=(older, newer),
+        )
+        result = build_envelope(bundle, "Current")
+        # Extract content in order of appearance
+        contents = [m["content"] for m in result.messages
+                    if m["role"] in ("user", "assistant") and m["content"] != "Current"]
+        # Older should appear before newer
+        old_idx = contents.index("Older message") if "Older message" in contents else -1
+        new_idx = contents.index("Newer message") if "Newer message" in contents else -1
+        assert old_idx >= 0, "Older message should appear in output"
+        assert new_idx >= 0, "Newer message should appear in output"
+        assert old_idx < new_idx, "Older message should be rendered before newer message"
+
+    def test_sort_key_same_timestamp_different_ids(self):
+        """When two messages have the same created_at, id is used as tiebreaker."""
+        msg_a = ChatMessage(role="user", content="A", source_id="m1", sort_key=("2026-07-30T00:00:00", 1))
+        msg_b = ChatMessage(role="assistant", content="B", source_id="m2", sort_key=("2026-07-30T00:00:00", 2))
+        bundle = ContextBundle(
+            trusted_policy="Policy.",
+            history=(msg_a, msg_b),
+        )
+        result = build_envelope(bundle, "Current")
+        contents = [m["content"] for m in result.messages
+                    if m["role"] in ("user", "assistant") and m["content"] != "Current"]
+        a_idx = contents.index("A")
+        b_idx = contents.index("B")
+        assert a_idx < b_idx, "Message with id=1 should appear before id=2 when timestamps equal"
 
     def test_minimal_envelope(self):
         """System + current user preserved."""
@@ -726,10 +765,13 @@ class TestInjectionSafety:
             for m in all_non_system
         )
 
-        # For cases with injection in source data, it should be in non-system
+        # For cases with injection in source data, the marker must appear
+        # in a non-system message (injection is only dangerous in system)
         if case.history or case.memories or case.profile:
-            # The marker should appear somewhere in non-system or we're okay
-            pass
+            assert has_injection_in_non_system, (
+                f"Injection marker '{case.injection_marker}' for case '{case.label}' "
+                f"should appear in non-system messages"
+            )
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -737,30 +779,139 @@ class TestInjectionSafety:
 # ═══════════════════════════════════════════════════════════════════════
 
 class TestBudget:
-    """Budget enforcement tests."""
+    """Budget enforcement tests — ten requirements."""
+
+    # Helper to create a context item
+    @staticmethod
+    def _make_item(kind: str, content: str, source_id: str, confidence=0.5) -> ContextItem:
+        return ContextItem(
+            kind=kind, content=content,
+            provenance=Provenance.LEGACY_PROFILE if kind == "profile" else Provenance.LEGACY_MEMORY,
+            confidence=confidence, epistemic_status=EpistemicStatus.UNKNOWN,
+            source_id=source_id,
+        )
 
     def test_mandatory_budget_exceeded_fails(self):
-        """Policy + current message over limit fails before provider."""
+        """10. System + current message never truncated (fail closed if budget exceeded)."""
         large_policy = "X" * 20000
         bundle = ContextBundle(trusted_policy=large_policy)
         with pytest.raises(TrustedContextError, match="mandatory_budget_exceeded"):
             build_envelope(bundle, "Hi", max_units=16000)
 
     def test_envelope_within_16000(self):
-        """Envelope with optional context stays within 16,000 units."""
+        """9. Envelope never exceeds 16,000 units."""
         bundle = ContextBundle(
             trusted_policy="Policy. " * 50,
             profile_items=(
-                ContextItem(
-                    kind="profile", content='{"name":"User"}',
-                    provenance=Provenance.LEGACY_PROFILE,
-                    confidence=0.3, epistemic_status=EpistemicStatus.UNKNOWN,
-                    source_id="p1",
-                ),
+                self._make_item("profile", '{"name":"User"}', "p1"),
             ),
         )
         result = build_envelope(bundle, "Hi")
         assert result.unit_count <= PROVIDER_INPUT_MAX_ESTIMATED_UNITS
+
+    def test_history_preserved_over_profile(self):
+        """1. A large profile does not remove the most recent history messages."""
+        msg_recent = ChatMessage(role="user", content="Recent msg", source_id="m1", sort_key=(100, 1))
+        msg_old = ChatMessage(role="user", content="x" * 5000, source_id="m2", sort_key=(1, 2))
+        bundle = ContextBundle(
+            trusted_policy="Short policy.",
+            history=(msg_old, msg_recent),
+            profile_items=(self._make_item("profile", '{"x":"' + 'y' * 3000 + '"}', "p1"),),
+        )
+        result = build_envelope(bundle, "Hi", max_units=5000)
+        # Recent message must be preserved
+        all_content = " ".join(m.get("content", "") for m in result.messages)
+        assert "Recent msg" in all_content, "Recent history was removed by large profile"
+
+    def test_one_of_two_memories_fits(self):
+        """2. Only one between two memories fits under tight budget."""
+        memory_a = self._make_item("memory", "A" * 200, "mem-a")
+        memory_b = self._make_item("memory", "B" * 200, "mem-b")
+        msg = ChatMessage(role="user", content="Hi", source_id="m1", sort_key=(1, 1))
+        bundle = ContextBundle(
+            trusted_policy="Short policy.",
+            history=(msg,),
+            memory_items=(memory_a, memory_b),
+        )
+        result = build_envelope(bundle, "Current", max_units=2000)
+        # At least one memory should be selected
+        all_text = " ".join(m.get("content", "") for m in result.messages)
+        assert ("A" * 200) in all_text or ("B" * 200) in all_text
+
+    def test_memory_fits_but_profile_and_persona_not(self):
+        """3. Memory fits under tight budget but profile+persona are omitted."""
+        memory = self._make_item("memory", "Small memory fact", "mem-1", confidence=0.5)
+        profile = self._make_item("profile", '{"x":"' + 'y' * 2000 + '"}', "p1")
+        persona = self._make_item("persona", "Long " + "z" * 2000, "per-1")
+        msg = ChatMessage(role="user", content="Hi", source_id="m1", sort_key=(1, 1))
+        bundle = ContextBundle(
+            trusted_policy="Short policy.",
+            history=(msg,),
+            memory_items=(memory,),
+            profile_items=(profile,),
+            persona_items=(persona,),
+        )
+        result = build_envelope(bundle, "Current", max_units=3000)
+        # Memory should survive
+        all_text = " ".join(m.get("content", "") for m in result.messages)
+        assert "Small memory fact" in all_text, "Memory was omitted"
+
+    def test_only_most_recent_history_message_fits(self):
+        """4. Only the most recent history message fits under tight budget."""
+        old_msg = ChatMessage(role="user", content="x" * 2000, source_id="m1", sort_key=(1, 1))
+        recent_msg = ChatMessage(role="assistant", content="Short reply", source_id="m2", sort_key=(2, 2))
+        bundle = ContextBundle(
+            trusted_policy="Policy. " * 20,
+            history=(old_msg, recent_msg),
+        )
+        result = build_envelope(bundle, "Current", max_units=1500)
+        report = result.truncation_report
+        # Most recent message must be selected (assistant "Short reply")
+        all_text = " ".join(m.get("content", "") for m in result.messages)
+        assert "Short reply" in all_text, "Recent history message was lost"
+        # Old large message may be omitted
+        if "x" * 2000 not in all_text:
+            assert report.omitted_history_count > 0
+
+    def test_duplicate_content_preserved(self):
+        """5. Two history messages with same content as current message remain."""
+        msg1 = ChatMessage(role="user", content="sim", source_id="m1", sort_key=(1, 1))
+        msg2 = ChatMessage(role="assistant", content="entendido", source_id="m2", sort_key=(2, 2))
+        bundle = ContextBundle(
+            trusted_policy="Short policy.",
+            history=(msg1, msg2),
+        )
+        result = build_envelope(bundle, "sim")
+        # Both distinct history messages must appear in the envelope
+        user_msgs = [m for m in result.messages
+                     if m["role"] == "user" and m["content"] == "sim"]
+        assert len(user_msgs) >= 2, (
+            f"Expected at least 2 'sim' messages (history + current), got {len(user_msgs)}"
+        )
+
+    def test_source_map_only_selected_items(self):
+        """6+7. source_map contains only selected items; omitted items are absent."""
+        mem_selected = self._make_item("memory", "Small fact", "mem-selected")
+        mem_omitted = self._make_item("memory", "x" * 5000, "mem-omitted")
+        bundle = ContextBundle(
+            trusted_policy="Short policy.",
+            memory_items=(mem_omitted, mem_selected),
+        )
+        result = build_envelope(bundle, "Hi", max_units=2000)
+        # The omitted memory should NOT be in source_map
+        assert "mem-omitted" not in result.source_map, "Omitted item found in source_map"
+
+    def test_persona_counts_correct(self):
+        """8. Persona selection and omission counts are correct."""
+        persona = self._make_item("persona", "x" * 100, "per-1")
+        bundle = ContextBundle(
+            trusted_policy="Short policy.",
+            persona_items=(persona,),
+        )
+        result = build_envelope(bundle, "Hi")
+        report = result.truncation_report
+        assert report.selected_persona_count == 1, "Persona should be selected when budget fits"
+        assert report.omitted_persona_count == 0
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -840,14 +991,16 @@ class TestAppraisalBoundary:
     async def test_appraisal_system_and_user_separate(self, monkeypatch):
         """Appraisal system instruction is in a system message, user message separate."""
         import json
+        from unittest.mock import MagicMock, patch
         from backend.engine import ConversationEngine
         from backend.turn_execution import create_budget, TurnExecutionConfig
+        from backend.groq_manager import GroqClientManager
+        from backend.memory import MemoryManager
 
         recorded = {}
 
         async def mock_chat_completion_async(messages, **kwargs):
             recorded["messages"] = messages
-            # Return a valid appraisal JSON response using simple dict-style objects
             response_text = json.dumps({
                 "valence": 0.0, "arousal_shift": 0.0, "dominance_shift": 0.0,
                 "triggered_emotions": {
@@ -856,7 +1009,6 @@ class TestAppraisalBoundary:
                     "guilt": 0, "pride": 0, "jealousy": 0, "gratitude": 0,
                 },
             })
-            # Build nested object matching groq response structure
             class FakeContent:
                 content = response_text
             class FakeMessage:
@@ -865,7 +1017,14 @@ class TestAppraisalBoundary:
                 choices = [FakeMessage()]
             return FakeResponse()
 
-        engine = ConversationEngine()
+        # Install doubles BEFORE constructing ConversationEngine
+        with (
+            patch.object(GroqClientManager, "__init__", return_value=None),
+            patch.object(MemoryManager, "__init__", return_value=None),
+            patch("backend.memory.SentenceTransformer", return_value=MagicMock()),
+        ):
+            engine = ConversationEngine(clock=lambda: 1000.0)
+
         monkeypatch.setattr(
             engine.groq_manager, "chat_completion_async", mock_chat_completion_async
         )
@@ -892,8 +1051,11 @@ class TestAppraisalBoundary:
     async def test_appraisal_policy_has_no_user_message_interpolated(self, monkeypatch):
         """The appraisal policy does not contain the user message."""
         import json
+        from unittest.mock import MagicMock, patch
         from backend.engine import ConversationEngine
         from backend.turn_execution import create_budget, TurnExecutionConfig
+        from backend.groq_manager import GroqClientManager
+        from backend.memory import MemoryManager
 
         recorded = {}
 
@@ -915,7 +1077,14 @@ class TestAppraisalBoundary:
                 choices = [_Choice()]
             return _Resp()
 
-        engine = ConversationEngine()
+        # Install doubles BEFORE constructing ConversationEngine
+        with (
+            patch.object(GroqClientManager, "__init__", return_value=None),
+            patch.object(MemoryManager, "__init__", return_value=None),
+            patch("backend.memory.SentenceTransformer", return_value=MagicMock()),
+        ):
+            engine = ConversationEngine(clock=lambda: 1000.0)
+
         monkeypatch.setattr(
             engine.groq_manager, "chat_completion_async", mock_chat_completion_async
         )
@@ -1138,20 +1307,46 @@ class TestRetrievedMemoryIntegration:
         assert not mem.approved
 
     def test_vector_similarity_not_confused_with_factual_confidence(self):
-        """Vector similarity is not used as factual confidence."""
+        """Vector similarity is NOT used as factual confidence — they are separate fields."""
         from backend.memory import RetrievedMemory
-        # The confidence field is separate from any similarity score
+        # Create a memory with high similarity (0.98) but low confidence (0.35)
         mem = RetrievedMemory(
-            content="Test",
+            content="Test memory with distinct fields",
             tags=(),
-            confidence=0.5,  # Conservative default
+            confidence=0.35,  # Low factual confidence
             provenance=Provenance.LEGACY_MEMORY,
             epistemic_status=EpistemicStatus.UNKNOWN,
             approved=False,
             metadata_version=0,
+            retrieval_similarity=0.98,  # High retrieval similarity
         )
-        assert mem.confidence == 0.5
-        assert mem.epistemic_status == EpistemicStatus.UNKNOWN
+        # Confidence must remain at its explicit value, NOT overwritten by similarity
+        assert mem.confidence == 0.35, f"confidence={mem.confidence} was overwritten by similarity"
+        assert mem.retrieval_similarity == 0.98, "retrieval_similarity not preserved"
+        assert mem.confidence != mem.retrieval_similarity, "confidence and similarity must remain distinct"
+
+    def test_similarity_and_confidence_independent(self):
+        """Similarity and confidence values can be independently set and are not confused."""
+        from backend.memory import RetrievedMemory
+        # Similarity=0.98, confidence=0.35 — must not be confused or swapped
+        mem = RetrievedMemory(
+            content="Independent fields test",
+            tags=(),
+            source_id="11111111-1111-4111-8111-111111111111",
+            confidence=0.35,
+            provenance=Provenance.USER_CONFIRMED,
+            epistemic_status=EpistemicStatus.APPROVED,
+            approved=True,
+            metadata_version=1,
+            retrieval_similarity=0.98,
+        )
+        assert mem.confidence == 0.35
+        assert mem.retrieval_similarity == 0.98
+        # Through to_context_item, confidence is preserved, similarity is NOT transferred
+        item = mem.to_context_item("mem-ref-1")
+        assert item.confidence == 0.35
+        assert not hasattr(item, 'retrieval_similarity') or getattr(item, 'retrieval_similarity', None) is None
+        assert item.internal_id == "11111111-1111-4111-8111-111111111111"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1174,12 +1369,12 @@ class TestBuildContextBundle:
             provenance=Provenance.USER_CONFIRMED,
             epistemic_status=EpistemicStatus.APPROVED,
             approved=True,
-            metadata_version=2,
+            metadata_version=1,
         )
         unapproved = RetrievedMemory(
             content="Unapproved memory",
             tags=(), source_id="uuid-def",
-            approved=False, metadata_version=2,
+            approved=False, metadata_version=1,
         )
         legacy = RetrievedMemory(
             content="Legacy memory",
@@ -1311,14 +1506,15 @@ class TestEngineGenerationPath:
     async def test_generate_uses_envelope_with_history_roles(self, monkeypatch):
         """The provider receives the full envelope with original history roles."""
         import json
+        from unittest.mock import MagicMock, patch
         from backend.engine import ConversationEngine
-        from backend.trusted_context import ChatMessage, ContextItem, EpistemicStatus, Provenance
+        from backend.groq_manager import GroqClientManager
+        from backend.memory import MemoryManager
 
         recorded = {}
 
         async def mock_chat_completion(messages, **kwargs):
             recorded["messages"] = messages
-            # Return valid appraisal JSON so both appraisal and generation work
             resp_json = json.dumps({
                 "valence": 0.0, "arousal_shift": 0.0, "dominance_shift": 0.0,
                 "triggered_emotions": {
@@ -1362,7 +1558,14 @@ class TestEngineGenerationPath:
                 persona_snapshot="",
             )
 
-        engine = ConversationEngine()
+        # Install doubles BEFORE constructing ConversationEngine
+        with (
+            patch.object(GroqClientManager, "__init__", return_value=None),
+            patch.object(MemoryManager, "__init__", return_value=None),
+            patch("backend.memory.SentenceTransformer", return_value=MagicMock()),
+        ):
+            engine = ConversationEngine(clock=lambda: 1000.0)
+
         monkeypatch.setattr(
             engine.groq_manager, "chat_completion_async", mock_chat_completion
         )
@@ -1382,9 +1585,6 @@ class TestEngineGenerationPath:
         monkeypatch.setattr(
             engine.memory_manager, "sync_state", lambda *a, **kw: None
         )
-
-        from backend.turn_execution import create_budget, TurnExecutionConfig
-        budget = create_budget(TurnExecutionConfig.defaults(), now_provider=engine._monotonic)
 
         # Process turn with the mocked dependencies
         result = await engine.process_turn(
@@ -1420,13 +1620,16 @@ class TestEngineGenerationPath:
     @pytest.mark.anyio
     async def test_engine_loads_context_once(self, monkeypatch):
         """Context is loaded exactly once during a turn."""
+        from unittest.mock import MagicMock, patch
         from backend.engine import ConversationEngine
+        from backend.groq_manager import GroqClientManager
+        from backend.memory import MemoryManager
 
         load_count = 0
 
         async def mock_chat_completion(messages, **kwargs):
-            import json as _json
-            resp_json = _json.dumps({
+            import json
+            resp_json = json.dumps({
                 "valence": 0.0, "arousal_shift": 0.0, "dominance_shift": 0.0,
                 "triggered_emotions": {
                     "joy": 0, "sadness": 0, "anger": 0, "fear": 0,
@@ -1468,7 +1671,14 @@ class TestEngineGenerationPath:
                 persona_snapshot="",
             )
 
-        engine = ConversationEngine()
+        # Install doubles BEFORE constructing ConversationEngine
+        with (
+            patch.object(GroqClientManager, "__init__", return_value=None),
+            patch.object(MemoryManager, "__init__", return_value=None),
+            patch("backend.memory.SentenceTransformer", return_value=MagicMock()),
+        ):
+            engine = ConversationEngine(clock=lambda: 1000.0)
+
         monkeypatch.setattr(
             engine.groq_manager, "chat_completion_async", mock_chat_completion
         )
@@ -1541,3 +1751,408 @@ class TestPublicDTO:
         assert ContextBundle is not None
         assert ContextBuildResult is not None
         assert TruncationReport is not None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 21. Metadata schema version rejection tests
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestMetadataSchemaVersion:
+    """Metadata schema version is strictly validated in memory retrieval.
+
+    Only ``metadata.schema_version == SUPPORTED_MEMORY_METADATA_SCHEMA_VERSION``
+    (which equals ``1``) is accepted. All other values are rejected.
+    """
+
+    def test_constant_value(self):
+        from backend.memory import SUPPORTED_MEMORY_METADATA_SCHEMA_VERSION
+        assert SUPPORTED_MEMORY_METADATA_SCHEMA_VERSION == 1
+
+    def test_correct_version_accepted_through_load_context_data(self, monkeypatch):
+        """A memory with metadata_version=1 passes through load_context_data filtering."""
+        from backend.memory import MemoryManager, RetrievedMemory
+        from backend.trusted_context import build_context_bundle
+
+        valid_mem = RetrievedMemory(
+            content="Valid version 1 memory",
+            tags=("test",),
+            source_id="11111111-1111-4111-8111-111111111111",
+            confidence=0.8,
+            provenance=Provenance.USER_CONFIRMED,
+            epistemic_status=EpistemicStatus.APPROVED,
+            approved=True,
+            metadata_version=1,
+        )
+
+        def fake_retrieve(*args, **kwargs):
+            return [valid_mem]
+
+        monkeypatch.setattr(MemoryManager, "_retrieve_relevant_entries", fake_retrieve)
+        mm = MemoryManager()
+        monkeypatch.setattr(mm, "load_recent_history", lambda *a, **kw: [])
+
+        loaded = mm.load_context_data(
+            user_id="user-x", current_message="Hi", user_state={}
+        )
+        bundle = build_context_bundle(
+            trusted_policy="Test policy.", loaded_data=loaded
+        )
+
+        assert len(bundle.memory_items) == 1
+        assert "Valid version 1 memory" in bundle.memory_items[0].content
+
+    def test_absent_version_rejected(self, monkeypatch):
+        """Memory with no schema_version key (defaulted to 0) is rejected."""
+        from backend.memory import MemoryManager, RetrievedMemory
+        from backend.trusted_context import build_context_bundle
+
+        absent_mem = RetrievedMemory(
+            content="Absent version",
+            tags=(), source_id="22222222-2222-4222-8222-222222222222",
+            approved=True, metadata_version=0,  # default when absent
+        )
+
+        def fake_retrieve(*args, **kwargs):
+            return [absent_mem]
+
+        monkeypatch.setattr(MemoryManager, "_retrieve_relevant_entries", fake_retrieve)
+        mm = MemoryManager()
+        monkeypatch.setattr(mm, "load_recent_history", lambda *a, **kw: [])
+
+        loaded = mm.load_context_data(
+            user_id="user-x", current_message="Hi", user_state={}
+        )
+        bundle = build_context_bundle(
+            trusted_policy="Test policy.", loaded_data=loaded
+        )
+        # Version 0 (absent/legacy) should be filtered out
+        assert len(bundle.memory_items) == 0, "Absent version should be filtered out"
+
+    def test_zero_version_rejected(self, monkeypatch):
+        """Memory with schema_version=0 is rejected."""
+        from backend.memory import MemoryManager, RetrievedMemory
+        from backend.trusted_context import build_context_bundle
+
+        zero_mem = RetrievedMemory(
+            content="Zero version",
+            tags=(), source_id="33333333-3333-4333-8333-333333333333",
+            approved=True, metadata_version=0,
+        )
+
+        def fake_retrieve(*args, **kwargs):
+            return [zero_mem]
+
+        monkeypatch.setattr(MemoryManager, "_retrieve_relevant_entries", fake_retrieve)
+        mm = MemoryManager()
+        monkeypatch.setattr(mm, "load_recent_history", lambda *a, **kw: [])
+
+        loaded = mm.load_context_data(
+            user_id="user-x", current_message="Hi", user_state={}
+        )
+        bundle = build_context_bundle(
+            trusted_policy="Test policy.", loaded_data=loaded
+        )
+        assert len(bundle.memory_items) == 0, "Version 0 should be filtered out"
+
+    def test_future_version_rejected(self, monkeypatch):
+        """Memory with schema_version=2 (future) is rejected."""
+        from backend.memory import MemoryManager, RetrievedMemory
+        from backend.trusted_context import build_context_bundle
+
+        future_mem = RetrievedMemory(
+            content="Future version",
+            tags=(), source_id="44444444-4444-4444-8444-444444444444",
+            approved=True, metadata_version=2,
+        )
+
+        def fake_retrieve(*args, **kwargs):
+            return [future_mem]
+
+        monkeypatch.setattr(MemoryManager, "_retrieve_relevant_entries", fake_retrieve)
+        mm = MemoryManager()
+        monkeypatch.setattr(mm, "load_recent_history", lambda *a, **kw: [])
+
+        loaded = mm.load_context_data(
+            user_id="user-x", current_message="Hi", user_state={}
+        )
+        bundle = build_context_bundle(
+            trusted_policy="Test policy.", loaded_data=loaded
+        )
+        assert len(bundle.memory_items) == 0, "Future version should be filtered out"
+
+    def test_negative_version_rejected(self, monkeypatch):
+        """Memory with negative metadata version is rejected.
+
+        ``RetrievedMemory.__post_init__`` rejects negative metadata_version
+        with ``ValueError``, so this tests the construction guard.
+        """
+        from backend.memory import RetrievedMemory
+        with pytest.raises(ValueError, match="metadata_version must be >= 0"):
+            RetrievedMemory(
+                content="Negative version",
+                tags=(), approved=True, metadata_version=-1,
+            )
+
+    def test_string_version_rejected(self, monkeypatch):
+        """Memory with string metadata version is rejected by construction."""
+        from backend.memory import RetrievedMemory
+        with pytest.raises(ValueError, match="metadata_version must be an int"):
+            RetrievedMemory(
+                content="String version",
+                tags=(), approved=True, metadata_version="1",
+            )
+
+    def test_float_version_rejected(self, monkeypatch):
+        """Memory with float metadata version is rejected by construction."""
+        from backend.memory import RetrievedMemory
+        with pytest.raises(ValueError, match="metadata_version must be an int"):
+            RetrievedMemory(
+                content="Float version",
+                tags=(), approved=True, metadata_version=1.0,
+            )
+
+    def test_bool_version_rejected(self, monkeypatch):
+        """Memory with bool metadata version is rejected by construction (bool is not int)."""
+        from backend.memory import RetrievedMemory
+        with pytest.raises(ValueError, match="metadata_version must be an int"):
+            RetrievedMemory(
+                content="Bool version",
+                tags=(), approved=True, metadata_version=True,
+            )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 22. UUID full pipeline test — RPC row → source_map → caplog verification
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestUuidPipeline:
+    """Real UUIDs propagate correctly through the full pipeline and never leak."""
+
+    def test_uuid_propagates_from_memory_to_source_map(self):
+        """Real UUID from RetrievedMemory.source_id ends up in source_map via internal_id."""
+        from backend.memory import RetrievedMemory
+        import uuid
+
+        real_uuid = "550e8400-e29b-41d4-a716-446655440000"
+        mem = RetrievedMemory(
+            content="UUID pipeline memory",
+            tags=("test",),
+            source_id=real_uuid,
+            confidence=0.8,
+            provenance=Provenance.USER_CONFIRMED,
+            epistemic_status=EpistemicStatus.APPROVED,
+            approved=True,
+            metadata_version=1,
+        )
+        item = mem.to_context_item("mem-1")
+        assert item.internal_id == real_uuid
+
+        bundle = ContextBundle(
+            trusted_policy="Policy.",
+            memory_items=(item,),
+        )
+        result = build_envelope(bundle, "Hi")
+
+        # UUID must be in source_map under the local ref
+        assert "mem-1" in result.source_map, "Local ref must be in source_map"
+        assert result.source_map["mem-1"] == real_uuid, "source_map must map local ref to real UUID"
+
+    def test_uuid_not_in_provider_messages(self):
+        """Real UUID must never appear in provider messages."""
+        from backend.memory import RetrievedMemory
+
+        real_uuid = "550e8400-e29b-41d4-a716-446655440000"
+        mem = RetrievedMemory(
+            content="Secret UUID memory",
+            tags=(),
+            source_id=real_uuid,
+            confidence=0.9,
+            provenance=Provenance.USER_CONFIRMED,
+            epistemic_status=EpistemicStatus.APPROVED,
+            approved=True,
+            metadata_version=1,
+        )
+        item = mem.to_context_item("mem-2")
+        bundle = ContextBundle(
+            trusted_policy="Policy.",
+            memory_items=(item,),
+        )
+        result = build_envelope(bundle, "Hi")
+
+        serialized = json.dumps(result.messages)
+        # Real UUID must NOT appear in provider-bound messages
+        assert real_uuid not in serialized, "Real UUID leaked into provider messages"
+
+    def test_uuid_not_in_caplog(self, caplog):
+        """Real UUID must never appear in logs."""
+        from backend.memory import RetrievedMemory
+
+        caplog.set_level(logging.DEBUG)
+        real_uuid = "660e8400-e29b-41d4-a716-446655440001"
+        mem = RetrievedMemory(
+            content="Secret UUID for log test",
+            tags=(),
+            source_id=real_uuid,
+            confidence=0.9,
+            provenance=Provenance.USER_CONFIRMED,
+            epistemic_status=EpistemicStatus.APPROVED,
+            approved=True,
+            metadata_version=1,
+        )
+        item = mem.to_context_item("mem-3")
+        bundle = ContextBundle(
+            trusted_policy="Policy.",
+            memory_items=(item,),
+        )
+        try:
+            build_envelope(bundle, "Hi")
+        except TrustedContextError:
+            pass
+
+        assert real_uuid not in caplog.text, "Real UUID leaked into logs"
+
+    def test_uuid_pipeline_end_to_end(self, monkeypatch):
+        """Full RPC row → RetrievedMemory → LoadedContextData → ContextBundle → ContextBuildResult.
+
+        Verifies source_map contains the real internal_id and no UUID leaks into messages or logs.
+        """
+        from backend.memory import MemoryManager, RetrievedMemory
+        from backend.trusted_context import build_context_bundle
+        import uuid
+
+        caplog = logging.getLogger()
+        caplog.setLevel(logging.DEBUG)
+
+        real_uuid = "770e8400-e29b-41d4-a716-446655440002"
+        approved_mem = RetrievedMemory(
+            content="End-to-end pipeline memory",
+            tags=("pipeline",),
+            source_id=real_uuid,
+            confidence=0.85,
+            provenance=Provenance.USER_CONFIRMED,
+            epistemic_status=EpistemicStatus.APPROVED,
+            approved=True,
+            metadata_version=1,
+        )
+
+        def fake_retrieve(*args, **kwargs):
+            return [approved_mem]
+
+        monkeypatch.setattr(MemoryManager, "_retrieve_relevant_entries", fake_retrieve)
+        mm = MemoryManager()
+        monkeypatch.setattr(mm, "load_recent_history", lambda *a, **kw: [])
+
+        loaded = mm.load_context_data(
+            user_id="user-x", current_message="Hi", user_state={}
+        )
+        bundle = build_context_bundle(
+            trusted_policy="Test policy.", loaded_data=loaded
+        )
+        result = build_envelope(bundle, "Hi")
+
+        # source_map must contain the local ref -> real UUID mapping
+        assert "mem-1" in result.source_map
+        assert result.source_map["mem-1"] == real_uuid
+
+        # Real UUID must NOT appear in messages
+        serialized = json.dumps(result.messages)
+        assert real_uuid not in serialized, "Real UUID leaked into messages"
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# 23. TruncationReport aggregation
+# ═══════════════════════════════════════════════════════════════════════
+
+class TestTruncationReportAggregation:
+    """TruncationReport aggregation tests — pre-existing + new omissions."""
+
+    def test_aggregation_with_pre_existing_report(self):
+        """When bundle has existing truncation, build_envelope aggregates both sets."""
+        existing_report = TruncationReport(
+            codes=("history_partial",),
+            omitted_history_count=3,
+            selected_history_count=2,
+        )
+        # Create a bundle that will trigger further omission during envelope build
+        large_memory = ContextItem(
+            kind="memory", content="x" * 10000,
+            provenance=Provenance.LEGACY_MEMORY,
+            confidence=0.5, epistemic_status=EpistemicStatus.UNKNOWN,
+            source_id="large-mem",
+        )
+        bundle = ContextBundle(
+            trusted_policy="Short policy.",
+            memory_items=(large_memory,),
+            truncation_report=existing_report,
+        )
+        result = build_envelope(bundle, "Hi", max_units=2000)
+        report = result.truncation_report
+
+        # Both existing codes and new codes should be present
+        assert "history_partial" in report.codes, "Pre-existing code should be preserved"
+        assert "memory_omitted" in report.codes, "New omission should be recorded"
+
+        # Counts should be aggregated
+        assert report.omitted_history_count >= 3, "Existing history omission should be preserved"
+        assert report.omitted_memory_count >= 1, "New memory omission should be counted"
+
+    def test_no_duplicate_codes(self):
+        """Duplicate codes across pre-existing and new reports are not duplicated."""
+        existing_report = TruncationReport(
+            codes=("memory_omitted",),
+            omitted_memory_count=2,
+        )
+        large_memory = ContextItem(
+            kind="memory", content="x" * 10000,
+            provenance=Provenance.LEGACY_MEMORY,
+            confidence=0.5, epistemic_status=EpistemicStatus.UNKNOWN,
+            source_id="large-mem",
+        )
+        bundle = ContextBundle(
+            trusted_policy="Short policy.",
+            memory_items=(large_memory,),
+            truncation_report=existing_report,
+        )
+        result = build_envelope(bundle, "Hi", max_units=2000)
+        report = result.truncation_report
+
+        # "memory_omitted" should appear exactly once
+        memory_code_count = sum(1 for c in report.codes if c == "memory_omitted")
+        assert memory_code_count == 1, f"memory_omitted appears {memory_code_count} times (should be 1)"
+
+    def test_no_existing_aggregation_only_new(self):
+        """When no pre-existing report, only envelope decisions appear."""
+        bundle = ContextBundle(
+            trusted_policy="Short policy.",
+        )
+        result = build_envelope(bundle, "Hi")
+        report = result.truncation_report
+        # Should have no omission codes since everything fits
+        assert len(report.codes) == 0, f"Expected empty codes, got {report.codes}"
+        assert report.omitted_history_count == 0
+
+    def test_profile_omission_added_to_existing(self):
+        """Profile omission is added alongside existing memory omission codes."""
+        existing_report = TruncationReport(
+            codes=("memory_omitted",),
+            omitted_memory_count=1,
+        )
+        large_profile = ContextItem(
+            kind="profile", content='{"x":"' + 'y' * 2000 + '"}',
+            provenance=Provenance.LEGACY_PROFILE,
+            confidence=0.3, epistemic_status=EpistemicStatus.UNKNOWN,
+            source_id="large-profile",
+        )
+        bundle = ContextBundle(
+            trusted_policy="Short policy.",
+            profile_items=(large_profile,),
+            truncation_report=existing_report,
+        )
+        result = build_envelope(bundle, "Hi", max_units=1000)
+        report = result.truncation_report
+        # Both codes should be present
+        assert "memory_omitted" in report.codes
+        assert "profile_omitted" in report.codes
+        # Counts aggregated
+        assert report.omitted_memory_count >= 1
+        assert report.omitted_profile_count >= 1

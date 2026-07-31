@@ -68,6 +68,11 @@ VALID_MESSAGE_ROLES: frozenset = frozenset({"system", "user", "assistant"})
 UNTRUSTED_CONTEXT_MARKER = "untrusted_context"
 """Constant record_type marker for untrusted context payload."""
 
+_TRUNCATION_VALID_CODES: frozenset = frozenset({
+    "history_partial", "memory_omitted", "profile_omitted", "persona_omitted",
+})
+"""Allowlisted truncation event codes for ``TruncationReport.codes``."""
+
 
 # ---------------------------------------------------------------------------
 # Epistemic status — explicit allowlist
@@ -372,6 +377,31 @@ class TruncationReport:
     selected_profile_count: int = 0
     selected_persona_count: int = 0
 
+    def __post_init__(self) -> None:
+        # Validate codes is a tuple of strings
+        if not isinstance(self.codes, tuple):
+            raise TrustedContextError("invalid_truncation_codes_type")
+        for code in self.codes:
+            if not isinstance(code, str):
+                raise TrustedContextError("invalid_truncation_code_type")
+            if code not in _TRUNCATION_VALID_CODES:
+                raise TrustedContextError("invalid_truncation_code")
+
+        # Validate count fields are non-negative integers (not bools)
+        for field_name in (
+            "omitted_history_count", "omitted_memory_count",
+            "omitted_profile_count", "omitted_persona_count",
+            "selected_history_count", "selected_memory_count",
+            "selected_profile_count", "selected_persona_count",
+        ):
+            val = getattr(self, field_name)
+            if isinstance(val, bool):
+                raise TrustedContextError(f"invalid_{field_name}_bool")
+            if not isinstance(val, int):
+                raise TrustedContextError(f"invalid_{field_name}_type")
+            if val < 0:
+                raise TrustedContextError(f"invalid_{field_name}_negative")
+
 
 @dataclass(frozen=True)
 class LoadedContextData:
@@ -451,6 +481,37 @@ class ContextBundle:
     memory_items: tuple[ContextItem, ...] = ()
     persona_items: tuple[ContextItem, ...] = ()
     truncation_report: TruncationReport = field(default_factory=TruncationReport)
+
+    def __post_init__(self) -> None:
+        # Validate trusted_policy is a non-empty string (after trim)
+        if not isinstance(self.trusted_policy, str):
+            raise TrustedContextError("invalid_trusted_policy_type")
+        if not self.trusted_policy.strip():
+            raise TrustedContextError("empty_trusted_policy")
+
+        # Validate history is tuple of ChatMessage
+        if not isinstance(self.history, tuple):
+            raise TrustedContextError("invalid_history_type")
+        for msg in self.history:
+            if not isinstance(msg, ChatMessage):
+                raise TrustedContextError("invalid_history_item")
+
+        # Validate context item collections are tuples
+        for field_name, field_label in (
+            ("profile_items", "profile"),
+            ("memory_items", "memory"),
+            ("persona_items", "persona"),
+        ):
+            items = getattr(self, field_name)
+            if not isinstance(items, tuple):
+                raise TrustedContextError(f"invalid_{field_label}_items_type")
+            for item in items:
+                if not isinstance(item, ContextItem):
+                    raise TrustedContextError(f"invalid_{field_label}_item")
+
+        # Validate truncation_report is TruncationReport
+        if not isinstance(self.truncation_report, TruncationReport):
+            raise TrustedContextError("invalid_truncation_report_type")
 
 
 @dataclass(frozen=True)

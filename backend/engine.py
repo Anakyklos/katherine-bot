@@ -440,26 +440,26 @@ class ConversationEngine:
             new_state, relationship, adaptation_strategy
         )
 
-        # Convert loaded context into bundle using PURE domain function (no I/O)
-        context_bundle = build_context_bundle(
-            trusted_policy=trusted_policy,
-            loaded_data=loaded_context_data,
-        )
-
-        # Build envelope with budget-aware selection
+        # Convert loaded context into bundle and build envelope (pure domain, no I/O).
+        # Both operations must complete before any provider call.  A TrustedContextError
+        # at either stage is converted to a TurnExecutionError with sanitized logging.
         try:
+            context_bundle = build_context_bundle(
+                trusted_policy=trusted_policy,
+                loaded_data=loaded_context_data,
+            )
             envelope_result = build_envelope(
                 context_bundle,
                 user_message,
             )
             generation_messages = envelope_result.messages
         except TrustedContextError:
-            # Mandatory messages alone already exceed the provider budget.
-            # Fail closed before any client creation or network call.
-            logger.error("event=provider_input_budget_exceeded stage=generation")
+            # Builder failure — emit sanitized low-cardinality event.
+            # No content, IDs, labels, or user data are logged.
+            logger.error("event=provider_input_invalid stage=generation")
             raise TurnExecutionError(
                 TurnErrorCode.provider_invalid_request,
-                "Provider input budget exceeded.",
+                "Provider input envelope construction failed.",
             )
 
         t0 = self._monotonic()
