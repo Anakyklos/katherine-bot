@@ -116,9 +116,9 @@ CREATE OR REPLACE FUNCTION public.commit_turn(
     p_emotional_state jsonb,
     p_relationship_state jsonb,
     p_public_response text,
+    p_payload_hash_sha256 text,
     p_outbox_events jsonb DEFAULT '[]'::jsonb,
     p_replay_payload jsonb DEFAULT '{}'::jsonb,
-    p_payload_hash_sha256 text,
     p_lease_owner text DEFAULT NULL
 ) RETURNS jsonb
 LANGUAGE plpgsql
@@ -136,6 +136,13 @@ DECLARE
     v_request_exists boolean;
     v_existing_request_record jsonb;
     v_existing_payload_hash text;
+    v_existing_turn_request_id uuid;
+    v_existing_committed_revision bigint;
+    v_existing_user_message_chat_log_id bigint;
+    v_existing_assistant_message_chat_log_id bigint;
+    v_existing_created_at timestamptz;
+    v_existing_completed_at timestamptz;
+    v_request_status text;
     
     -- Message IDs
     v_user_message_id bigint;
@@ -209,19 +216,76 @@ BEGIN
     -- =============================================================
     -- Step 2: Check existing profile and get current revision
     -- =============================================================
-    SELECT user_id, revision INTO v_profile_user_id, v_current_revision
+    SELECT id, user_id, revision INTO v_profile_user_id, v_profile_user_id, v_current_revision
     FROM public.profiles
     WHERE user_id = p_authenticated_user_id
     FOR UPDATE;
-    
-    v_profile_exists := (v_profile_user_id IS NOT NULL);
-    
-    -- If profile doesn't exist, we'll create it with revision 0
-    IF NOT v_profile_exists THEN
+
+    -- Fallback if profile not present
+    IF NOT FOUND THEN
+        v_profile_exists := FALSE;
         v_current_revision := 0;
+    ELSE
+        v_profile_exists := TRUE;
     END IF;
-    
-    -- Validate CAS: expected_revision must match current revision
+
+    -- =============================================================
+    -- Step 3: Check for existing request with same (user_id, request_id)
+    -- Inspect and classify under the per-user lock before applying CAS
+    -- =============================================================
+    SELECT id, payload_hash_sha256, status, replay_payload,
+           committed_revision, user_message_chat_log_id, assistant_message_chat_log_id,
+           created_at, completed_at
+    INTO v_existing_turn_request_id, v_existing_payload_hash, v_request_status, v_existing_request_record,
+         v_existing_committed_revision, v_existing_user_message_chat_log_id, v_existing_assistant_message_chat_log_id,
+         v_existing_created_at, v_existing_completed_at
+    FROM public.turn_requests
+    WHERE user_id = p_authenticated_user_id AND request_id = p_request_id;
+
+    IF FOUND THEN
+        v_request_exists := TRUE;
+        -- If the payload hash matches, this is an idempotent retry: reconstruct and return stored result
+        IF v_existing_payload_hash = p_payload_hash_sha256 THEN
+            SELECT COALESCE(jsonb_agg(to_jsonb(o.*) ORDER BY o.id), '[]'::jsonb) INTO v_outbox_results
+            FROM public.outbox_events o
+            WHERE o.turn_request_id = v_existing_turn_request_id;
+
+            v_result := jsonb_build_object(
+                'user_id', p_authenticated_user_id,
+                'request_id', p_request_id::text,
+                'committed_revision', v_existing_committed_revision,
+                'user_message_chat_log_id', v_existing_user_message_chat_log_id,
+                'assistant_message_chat_log_id', v_existing_assistant_message_chat_log_id,
+                'user_message_id', p_request_id::text,
+                -- Use stable assistant identifier based on stored chat_log id for reproducibility
+                'assistant_message_id', v_existing_assistant_message_chat_log_id::text,
+                'replay_payload', v_existing_request_record->'replay_payload',
+                'outbox_events', v_outbox_results,
+                'created_at', v_existing_created_at,
+                'completed_at', v_existing_completed_at
+            );
+            RETURN v_result;
+        ELSE
+            -- Payload differs: conflict
+            v_result := jsonb_build_object(
+                'error', jsonb_build_object(
+                    'code', 'request_payload_conflict',
+                    'message', 'Request ID already exists with different payload',
+                    'expected_revision', p_expected_revision,
+                    'request_id', p_request_id::text,
+                    'actual_committed_revision', v_existing_committed_revision
+                )
+            );
+            RETURN v_result;
+        END IF;
+    ELSE
+        v_request_exists := FALSE;
+    END IF;
+
+    -- =============================================================
+    -- Step 4: Validate CAS: expected_revision must match current revision
+    -- Apply CAS only for genuinely new/reclaimed execution
+    -- =============================================================
     IF v_current_revision <> p_expected_revision THEN
         v_result := jsonb_build_object(
             'error', jsonb_build_object(
@@ -235,77 +299,21 @@ BEGIN
     END IF;
 
     -- =============================================================
-    -- Step 3: Check for existing request with same (user_id, request_id)
-    -- =============================================================
-    SELECT EXISTS (
-        SELECT 1 FROM public.turn_requests
-        WHERE user_id = p_authenticated_user_id AND request_id = p_request_id
-    ) INTO v_request_exists;
-    
-    IF v_request_exists THEN
-        -- Get the existing request to check payload hash
-        SELECT jsonb_build_object(
-            'payload_hash_sha256', payload_hash_sha256,
-            'status', status,
-            'replay_payload', replay_payload
-        ) INTO v_existing_request_record
-        FROM public.turn_requests
-        WHERE user_id = p_authenticated_user_id AND request_id = p_request_id;
-        
-        v_existing_payload_hash := v_existing_request_record->>'payload_hash_sha256';
-        
-        -- If the payload hash matches, this is an idempotent retry
-        -- Return the existing result without creating duplicates
-        IF v_existing_payload_hash = p_payload_hash_sha256 THEN
-            -- For idempotent retry, return the existing committed data
-            -- Note: This is a simplified response; full implementation would
-            -- need to reconstruct the complete result from existing data
-            SELECT jsonb_build_object(
-                'user_id', p_authenticated_user_id,
-                'request_id', p_request_id,
-                'committed_revision', v_existing_request_record->>'committed_revision',
-                'user_message_chat_log_id', user_message_chat_log_id,
-                'assistant_message_chat_log_id', assistant_message_chat_log_id,
-                'user_message_id', p_request_id::text,
-                'assistant_message_id', gen_random_uuid()::text,
-                'replay_payload', v_existing_request_record->'replay_payload',
-                'outbox_events', '[]'::jsonb,
-                'created_at', created_at,
-                'completed_at', completed_at
-            ) INTO v_result
-            FROM public.turn_requests
-            WHERE user_id = p_authenticated_user_id AND request_id = p_request_id;
-            RETURN v_result;
-        ELSE
-            -- Payload differs: conflict
-            v_result := jsonb_build_object(
-                'error', jsonb_build_object(
-                    'code', 'request_payload_conflict',
-                    'message', 'Request ID already exists with different payload',
-                    'expected_revision', p_expected_revision,
-                    'request_id', p_request_id::text
-                )
-            );
-            RETURN v_result;
-        END IF;
-    END IF;
-
-    -- =============================================================
-    -- Step 4: Insert user message into chat_logs
+    -- Step 5: Insert user message into chat_logs
     -- =============================================================
     INSERT INTO public.chat_logs (user_id, role, content, created_at)
     VALUES (p_authenticated_user_id, 'user', p_user_message, v_now)
     RETURNING id INTO v_user_message_id;
 
     -- =============================================================
-    -- Step 5: Insert assistant message into chat_logs
+    -- Step 6: Insert assistant message into chat_logs
     -- =============================================================
     INSERT INTO public.chat_logs (user_id, role, content, created_at)
     VALUES (p_authenticated_user_id, 'assistant', p_assistant_message, v_now)
     RETURNING id INTO v_assistant_message_id;
 
     -- =============================================================
-    -- Step 6: Update or create profile with new snapshots and increment revision
+    -- Step 7: Update or create profile with new snapshots and increment revision
     -- =============================================================
     v_new_revision := v_current_revision + 1;
     
@@ -330,7 +338,7 @@ BEGIN
     END IF;
 
     -- =============================================================
-    -- Step 7: Insert into turn_requests
+    -- Step 8: Insert into turn_requests
     -- =============================================================
     INSERT INTO public.turn_requests (
         user_id, request_id, payload_hash_sha256, status,
@@ -342,7 +350,7 @@ BEGIN
         p_expected_revision, v_new_revision,
         v_user_message_id, v_assistant_message_id,
         p_replay_payload, v_now, v_now, v_now
-    );
+    ) RETURNING id INTO v_outbox_turn_request_id;
 
     -- =============================================================
     -- Step 8: Insert outbox events (idempotent)
@@ -381,7 +389,7 @@ BEGIN
             attempts, next_attempt_at, idempotency_key,
             contract_version, created_at, updated_at
         ) VALUES (
-            v_event_type, p_authenticated_user_id, p_request_id,
+            v_event_type, p_authenticated_user_id, v_outbox_turn_request_id,
             v_event_payload, 'pending',
             0, v_now + INTERVAL '1 second', v_event_idempotency_key,
             1, v_now, v_now
@@ -402,7 +410,7 @@ BEGIN
         'user_message_chat_log_id', v_user_message_id,
         'assistant_message_chat_log_id', v_assistant_message_id,
         'user_message_id', p_request_id::text,
-        'assistant_message_id', gen_random_uuid()::text,
+        'assistant_message_id', v_assistant_message_id::text,
         'replay_payload', p_replay_payload,
         'outbox_events', v_outbox_results,
         'created_at', v_now::text,
@@ -414,15 +422,11 @@ BEGIN
 EXCEPTION
     WHEN OTHERS THEN
         -- On any error, the transaction will roll back automatically
-        -- Return error information
-        v_error_code := SQLERRM;
-        v_error_message := SQLSTATE;
-        
+        -- Return a sanitized error envelope; diagnostics should be recorded in observability only
         v_result := jsonb_build_object(
             'error', jsonb_build_object(
-                'code', 'database_error',
-                'message', v_error_code,
-                'sqlstate', v_error_message
+                'code', 'internal_database_error',
+                'message', 'internal server error'
             )
         );
         RETURN v_result;
@@ -435,15 +439,15 @@ $$;
 -- SECURITY DEFINER functions keep EXECUTE for PUBLIC by default.
 -- Revoke from PUBLIC/anon/authenticated and grant only to service_role.
 REVOKE ALL ON FUNCTION public.commit_turn(
-    text, uuid, bigint, text, text, jsonb, jsonb, text, jsonb, jsonb, text, text
+    text, uuid, bigint, text, text, jsonb, jsonb, text, text, jsonb, jsonb, text
 ) FROM PUBLIC, anon, authenticated;
 GRANT EXECUTE ON FUNCTION public.commit_turn(
-    text, uuid, bigint, text, text, jsonb, jsonb, text, jsonb, jsonb, text, text
+    text, uuid, bigint, text, text, jsonb, jsonb, text, text, jsonb, jsonb, text
 ) TO service_role;
 
 -- =================================================================
 -- 3. Documentation comment
 -- =================================================================
 COMMENT ON FUNCTION public.commit_turn(
-    text, uuid, bigint, text, text, jsonb, jsonb, text, jsonb, jsonb, text, text
+    text, uuid, bigint, text, text, jsonb, jsonb, text, text, jsonb, jsonb, text
 ) IS 'Atomic turn commit RPC (#271). Executes complete turn as a single transaction: profile CAS, message inserts, snapshot update, turn_request completion, outbox events. Fail-closed: any error rolls back everything.';

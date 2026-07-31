@@ -356,9 +356,9 @@ def build_commit_turn_rpc_payload(
         p_emotional_state jsonb,
         p_relationship_state jsonb,
         p_public_response text,
+        p_payload_hash_sha256 text,
         p_outbox_events jsonb,  -- array of event objects
         p_replay_payload jsonb,
-        p_payload_hash_sha256 text,
         p_lease_owner text DEFAULT NULL
     ) RETURNS jsonb
     ```
