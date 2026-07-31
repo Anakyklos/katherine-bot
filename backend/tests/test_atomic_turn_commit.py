@@ -104,9 +104,10 @@ _BLOCKED_PREFIXES = ("backend.engine", "backend.memory", "backend.trusted_contex
                     "tests.", "backend.tests.")
 
 class _BlockImport:
-    def find_module(self, name, path=None):
-        if name in _BLOCKED or name.startswith(_BLOCKED_PREFIXES):
-            raise ImportError(f"blocked: {name}")
+    @classmethod
+    def find_spec(cls, fullname, path, target=None):
+        if fullname in _BLOCKED or fullname.startswith(_BLOCKED_PREFIXES):
+            raise ImportError(f"blocked: {fullname}")
         return None
 
 sys.meta_path.insert(0, _BlockImport())
