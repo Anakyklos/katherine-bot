@@ -693,13 +693,17 @@ SELECT throws_ok(
 
 -- Value contract: references/identifiers are scalar, sanitized and bounded.
 -- Raw content must never fit under an allowed key.
+-- NOTE: jsonb_build_object is used (not text concatenation with a trailing
+-- ::jsonb cast) so the long ref reaches the payload CHECK. A cast applied
+-- to the final fragment of a concatenation would raise 22P02 at the parser
+-- stage, before the INSERT ever exercises outbox_events_payload_check.
 SELECT throws_ok(
   $$INSERT INTO public.outbox_events (
        event_type, contract_version, user_id, turn_request_id, payload,
        status, attempts, next_attempt_at, idempotency_key
      ) VALUES (
        'memory_indexed', 1, 'pgtap_tr_user', NULL,
-       '{"ref": "' || repeat('x', 129) || '"}'::jsonb,
+       jsonb_build_object('ref', repeat('x', 129)),
        'pending', 0, now(), 'pgtap-idem-reflong'
      )$$,
   '23514', NULL, 'outbox ref over 128 chars is rejected'
