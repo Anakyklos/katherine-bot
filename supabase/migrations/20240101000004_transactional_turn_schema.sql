@@ -6,13 +6,18 @@
 -- of the ConversationEngine is wired to these objects yet.
 --
 -- Design and rationale: docs/architecture/transactional-turn-schema.md
+--
+-- Audit revisions (PR review #305):
+--  * Composite FKs (user_id, message_id) / (user_id, turn_request_id) so a
+--    request/event can never reference rows of another user.
+--  * Recursive payload validation with an explicit allowlist, so prompts,
+--    messages and internal fields are rejected even when nested.
+--  * Exact, mutually exclusive outbox states.
+--  * Sanitized identifier bounds for lease_owner / idempotency_key.
 
 -- =================================================================
 -- 0. PREFLIGHT: fail closed on unexpected schema drift
 -- =================================================================
--- If any of the objects already exist, the database has drifted from the
--- expected migration sequence. Fail loudly instead of silently re-creating
--- or altering objects that a later migration owns.
 DO $$
 BEGIN
     IF EXISTS (
@@ -35,6 +40,32 @@ BEGIN
         RAISE EXCEPTION 'Cannot apply transactional schema: internal tables already exist (unexpected drift)'
             USING ERRCODE = '23514';
     END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM pg_proc p
+        JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = 'public'
+          AND p.proname IN (
+              'jsonb_has_forbidden_key',
+              'jsonb_keys_subset_of',
+              'turn_requests_null_message_refs'
+          )
+    ) THEN
+        RAISE EXCEPTION 'Cannot apply transactional schema: helper functions already exist (unexpected drift)'
+            USING ERRCODE = '23514';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM pg_trigger t
+        JOIN pg_class c ON c.oid = t.tgrelid
+        WHERE c.relname = 'chat_logs'
+          AND t.tgname = 'turn_requests_message_refs_null_trigger'
+    ) THEN
+        RAISE EXCEPTION 'Cannot apply transactional schema: chat_logs trigger already exists (unexpected drift)'
+            USING ERRCODE = '23514';
+    END IF;
 END $$;
 
 -- =================================================================
@@ -55,7 +86,81 @@ ALTER TABLE public.profiles
     CHECK (revision >= 0);
 
 -- =================================================================
--- 2. turn_requests
+-- 2. Payload validation helpers (pure, immutable, no data access)
+-- =================================================================
+-- Used by the payload CHECK constraints below. Validation is fail-closed:
+--  * jsonb_keys_subset_of()  — top-level keys must be within an explicit
+--    allowlist (the minimal public contract for the stored document).
+--  * jsonb_has_forbidden_key() — forbidden keys are rejected at ANY depth
+--    (objects and arrays), so prompts / messages / internal fields can
+--    never hide inside nested structures.
+CREATE FUNCTION public.jsonb_has_forbidden_key(
+    payload jsonb,
+    forbidden text[]
+) RETURNS boolean
+LANGUAGE plpgsql
+IMMUTABLE
+AS $$
+DECLARE
+    v_key text;
+    v_value jsonb;
+    v_elem jsonb;
+BEGIN
+    IF payload IS NULL OR jsonb_typeof(payload) NOT IN ('object', 'array') THEN
+        RETURN FALSE;
+    END IF;
+
+    IF jsonb_typeof(payload) = 'array' THEN
+        FOR v_elem IN SELECT * FROM jsonb_array_elements(payload) LOOP
+            IF public.jsonb_has_forbidden_key(v_elem, forbidden) THEN
+                RETURN TRUE;
+            END IF;
+        END LOOP;
+        RETURN FALSE;
+    END IF;
+
+    FOR v_key, v_value IN SELECT * FROM jsonb_each(payload) LOOP
+        IF v_key = ANY(forbidden)
+           OR public.jsonb_has_forbidden_key(v_value, forbidden) THEN
+            RETURN TRUE;
+        END IF;
+    END LOOP;
+    RETURN FALSE;
+END;
+$$;
+
+CREATE FUNCTION public.jsonb_keys_subset_of(
+    payload jsonb,
+    allowed text[]
+) RETURNS boolean
+LANGUAGE plpgsql
+IMMUTABLE
+AS $$
+DECLARE
+    v_key text;
+BEGIN
+    IF payload IS NULL OR jsonb_typeof(payload) <> 'object' THEN
+        RETURN FALSE;
+    END IF;
+
+    FOR v_key IN SELECT * FROM jsonb_object_keys(payload) LOOP
+        IF NOT (v_key = ANY(allowed)) THEN
+            RETURN FALSE;
+        END IF;
+    END LOOP;
+    RETURN TRUE;
+END;
+$$;
+
+-- Fail-closed grant posture for the helpers (they expose no data, but
+-- clients must not be able to call server-owned internals).
+REVOKE ALL ON FUNCTION public.jsonb_has_forbidden_key(jsonb, text[]) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.jsonb_keys_subset_of(jsonb, text[]) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.jsonb_has_forbidden_key(jsonb, text[]) TO service_role;
+GRANT EXECUTE ON FUNCTION public.jsonb_keys_subset_of(jsonb, text[]) TO service_role;
+
+-- =================================================================
+-- 3. turn_requests
 -- =================================================================
 -- Server-owned request ledger. One row per (user, request_id) claim that
 -- the future atomic commit flow (issue #271) will use for idempotent,
@@ -80,14 +185,26 @@ CREATE TABLE public.turn_requests (
 
     CONSTRAINT turn_requests_user_id_request_id_key
         UNIQUE (user_id, request_id),
+    -- Candidate key (user_id, id): enables the outbox composite FK so an
+    -- event can only reference a request of the SAME user.
+    CONSTRAINT turn_requests_user_id_id_key
+        UNIQUE (user_id, id),
     CONSTRAINT turn_requests_user_id_fkey
         FOREIGN KEY (user_id) REFERENCES public.profiles(user_id)
         ON DELETE CASCADE,
+    -- Composite FKs enforce per-user isolation: a request can only point
+    -- at messages of the same user. The baseline chat_logs already has
+    -- UNIQUE (user_id, id) — see migration 20240101000000.
+    -- ON DELETE SET NULL on a composite key would NULL user_id (NOT NULL),
+    -- so a BEFORE DELETE trigger nulls ONLY the message references first;
+    -- the SET NULL action then has nothing left to null.
     CONSTRAINT turn_requests_user_message_chat_log_id_fkey
-        FOREIGN KEY (user_message_chat_log_id) REFERENCES public.chat_logs(id)
+        FOREIGN KEY (user_id, user_message_chat_log_id)
+        REFERENCES public.chat_logs(user_id, id)
         ON DELETE SET NULL,
     CONSTRAINT turn_requests_assistant_message_chat_log_id_fkey
-        FOREIGN KEY (assistant_message_chat_log_id) REFERENCES public.chat_logs(id)
+        FOREIGN KEY (user_id, assistant_message_chat_log_id)
+        REFERENCES public.chat_logs(user_id, id)
         ON DELETE SET NULL,
 
     CONSTRAINT turn_requests_payload_hash_sha256_check
@@ -100,6 +217,9 @@ CREATE TABLE public.turn_requests (
         CHECK (committed_revision IS NULL OR committed_revision >= 0),
     CONSTRAINT turn_requests_error_code_check
         CHECK (error_code IS NULL OR error_code ~ '^[a-z0-9_]{1,64}$'),
+    -- Sanitized worker identifier, max 64 chars (ADR section 3).
+    CONSTRAINT turn_requests_lease_owner_check
+        CHECK (lease_owner IS NULL OR lease_owner ~ '^[A-Za-z0-9_.:-]{1,64}$'),
     CONSTRAINT turn_requests_lease_pair_check
         CHECK (
             (lease_owner IS NULL AND lease_expires_at IS NULL)
@@ -124,25 +244,59 @@ CREATE TABLE public.turn_requests (
                 AND lease_owner IS NULL AND lease_expires_at IS NULL
                 AND error_code IS NOT NULL)
         ),
-    -- Replay payload stores ONLY the minimal public result needed to replay
-    -- a response after connection loss. Prompts, system instructions and
-    -- metacognition are forbidden inside the stored document.
+    -- Replay payload: minimal PUBLIC result only. Explicit allowlist of
+    -- top-level keys (public contract) plus a recursive forbidden-key check,
+    -- so prompts / messages / internal instructions can never be stored,
+    -- not even nested.
     CONSTRAINT turn_requests_replay_payload_check
         CHECK (
             replay_payload IS NULL
             OR (
                 jsonb_typeof(replay_payload) = 'object'
                 AND octet_length(replay_payload::text) <= 8192
-                AND NOT (replay_payload ? 'prompt')
-                AND NOT (replay_payload ? 'system_prompt')
-                AND NOT (replay_payload ? 'meta_cognition')
-                AND NOT (replay_payload ? 'internal_instructions')
+                AND public.jsonb_keys_subset_of(
+                    replay_payload,
+                    ARRAY['response', 'emotion_state', 'message_id',
+                          'request_id', 'duration_ms']
+                )
+                AND NOT public.jsonb_has_forbidden_key(
+                    replay_payload,
+                    ARRAY['prompt', 'system_prompt', 'meta_cognition',
+                          'internal_instructions', 'message',
+                          'user_message', 'assistant_message', 'content']
+                )
             )
         )
 );
 
+-- BEFORE DELETE trigger on chat_logs: preserves the documented SET NULL
+-- semantics for the composite message FKs. Runs as SECURITY DEFINER so it
+-- can null references on the FORCE-RLS server-owned table even when the
+-- deletion is performed by service_role.
+CREATE FUNCTION public.turn_requests_null_message_refs() RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+BEGIN
+    UPDATE public.turn_requests
+       SET user_message_chat_log_id = NULL
+     WHERE user_message_chat_log_id = OLD.id;
+    UPDATE public.turn_requests
+       SET assistant_message_chat_log_id = NULL
+     WHERE assistant_message_chat_log_id = OLD.id;
+    RETURN OLD;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS turn_requests_message_refs_null_trigger ON public.chat_logs;
+CREATE TRIGGER turn_requests_message_refs_null_trigger
+    BEFORE DELETE ON public.chat_logs
+    FOR EACH ROW
+    EXECUTE FUNCTION public.turn_requests_null_message_refs();
+
 -- =================================================================
--- 3. outbox_events
+-- 4. outbox_events
 -- =================================================================
 -- Durable outbox for future atomic publication. Events are enqueued in the
 -- same transaction as the turn commit; a future worker claims and delivers
@@ -174,8 +328,11 @@ CREATE TABLE public.outbox_events (
     CONSTRAINT outbox_events_user_id_fkey
         FOREIGN KEY (user_id) REFERENCES public.profiles(user_id)
         ON DELETE CASCADE,
+    -- Composite FK: an event can only reference a request of the SAME user
+    -- (candidate key turn_requests.user_id_id_key above).
     CONSTRAINT outbox_events_turn_request_id_fkey
-        FOREIGN KEY (turn_request_id) REFERENCES public.turn_requests(id)
+        FOREIGN KEY (user_id, turn_request_id)
+        REFERENCES public.turn_requests(user_id, id)
         ON DELETE CASCADE,
 
     CONSTRAINT outbox_events_event_type_check
@@ -188,52 +345,81 @@ CREATE TABLE public.outbox_events (
         CHECK (attempts >= 0 AND attempts <= 10),
     CONSTRAINT outbox_events_error_code_check
         CHECK (error_code IS NULL OR error_code ~ '^[a-z0-9_]{1,64}$'),
+    CONSTRAINT outbox_events_lease_owner_check
+        CHECK (lease_owner IS NULL OR lease_owner ~ '^[A-Za-z0-9_.:-]{1,64}$'),
+    -- Bounded idempotency key: prevents unbounded index/storage growth.
+    CONSTRAINT outbox_events_idempotency_key_check
+        CHECK (idempotency_key ~ '^[A-Za-z0-9_.:-]{1,128}$'),
     CONSTRAINT outbox_events_lease_pair_check
         CHECK (
             (lease_owner IS NULL AND lease_expires_at IS NULL)
             OR (lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL)
         ),
     -- Status / lease / attempts / completion coherence. Fail-closed: each
-    -- status has an exact, fully determined shape.
+    -- status has an exact, mutually exclusive shape — no field of another
+    -- state can leak in (no next_attempt_at/dead_letter fields on
+    -- completed, no missing error/retention on dead_letter, no failure
+    -- fields on processing).
     CONSTRAINT outbox_events_status_coherence_check
         CHECK (
             (status = 'pending' AND processed_at IS NULL
+                AND dead_lettered_at IS NULL AND retention_until IS NULL
                 AND lease_owner IS NULL AND lease_expires_at IS NULL
                 AND next_attempt_at IS NOT NULL AND attempts = 0
                 AND error_code IS NULL)
             OR
             (status = 'processing' AND processed_at IS NULL
+                AND dead_lettered_at IS NULL AND retention_until IS NULL
                 AND lease_owner IS NOT NULL AND lease_expires_at IS NOT NULL
-                AND attempts >= 1)
+                AND attempts BETWEEN 1 AND 10
+                AND error_code IS NULL)
             OR
             (status = 'completed' AND processed_at IS NOT NULL
+                AND dead_lettered_at IS NULL
                 AND lease_owner IS NULL AND lease_expires_at IS NULL
-                AND attempts >= 1 AND error_code IS NULL)
+                AND next_attempt_at IS NULL
+                AND attempts BETWEEN 1 AND 10
+                AND error_code IS NULL
+                AND retention_until IS NOT NULL)
             OR
             (status = 'failed' AND processed_at IS NULL
+                AND dead_lettered_at IS NULL AND retention_until IS NULL
                 AND lease_owner IS NULL AND lease_expires_at IS NULL
                 AND next_attempt_at IS NOT NULL
-                AND attempts BETWEEN 1 AND 9 AND error_code IS NOT NULL)
+                AND attempts BETWEEN 1 AND 9
+                AND error_code IS NOT NULL)
             OR
             (status = 'dead_letter' AND processed_at IS NULL
                 AND lease_owner IS NULL AND lease_expires_at IS NULL
-                AND dead_lettered_at IS NOT NULL AND attempts = 10)
+                AND next_attempt_at IS NULL
+                AND attempts = 10 AND error_code IS NOT NULL
+                AND dead_lettered_at IS NOT NULL
+                AND retention_until IS NOT NULL)
         ),
-    -- Outbox payload is a minimal, non-duplicating event document. Messages,
-    -- prompts, system instructions and metacognition must never be persisted.
+    -- Outbox payload is a minimal, non-duplicating event document with an
+    -- explicit allowlist and recursive forbidden-key validation. Messages,
+    -- prompts, system instructions and metacognition can never be stored,
+    -- not even nested.
     CONSTRAINT outbox_events_payload_check
         CHECK (
             jsonb_typeof(payload) = 'object'
             AND octet_length(payload::text) <= 8192
-            AND NOT (payload ? 'prompt')
-            AND NOT (payload ? 'system_prompt')
-            AND NOT (payload ? 'meta_cognition')
-            AND NOT (payload ? 'internal_instructions')
+            AND public.jsonb_keys_subset_of(
+                payload,
+                ARRAY['ref', 'request_id', 'turn_id', 'message_id',
+                      'entity_id', 'kind', 'version']
+            )
+            AND NOT public.jsonb_has_forbidden_key(
+                payload,
+                ARRAY['prompt', 'system_prompt', 'meta_cognition',
+                      'internal_instructions', 'message',
+                      'user_message', 'assistant_message', 'content']
+            )
         )
 );
 
 -- =================================================================
--- 4. Indexes
+-- 5. Indexes
 -- =================================================================
 -- turn_requests: uniqueness + replay + claim of expired leases + revision
 CREATE INDEX turn_requests_user_id_created_at_idx
@@ -252,7 +438,7 @@ CREATE INDEX outbox_events_turn_request_id_idx
     ON public.outbox_events (turn_request_id);
 
 -- =================================================================
--- 5. RLS and grants (server-owned internal tables)
+-- 6. RLS and grants (server-owned internal tables)
 -- =================================================================
 -- Both tables are internal, server-owned infrastructure. Authenticated
 -- clients must never reach them. RLS + FORCE RLS with no policies, and no

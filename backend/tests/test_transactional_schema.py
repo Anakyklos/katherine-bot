@@ -10,15 +10,17 @@ Covers:
  5. Canonical hash: differs for different payloads
  6. Canonical hash: rejects non-mapping input
  7. Canonical hash: rejects non-serializable values without leaking them
+ 7b. Canonical hash: rejects NaN / Infinity / -Infinity (non-JSON values)
  8. TurnRequestRecord: to_db_row omits None server-owned columns
  9. TurnRequestRecord: to_insert_row drops server-owned None columns
 10. TurnRequestRecord: from_db_row round-trips
-11. TurnRequestRecord: immutable after construction
+11. TurnRequestRecord: immutable after construction (incl. deep payload)
 12. OutboxEventRecord: to_db_row omits None
 13. OutboxEventRecord: to_insert_row drops server-owned None columns
 14. OutboxEventRecord: from_db_row round-trips
-15. OutboxEventRecord: immutable after construction
+15. OutboxEventRecord: immutable after construction (incl. deep payload)
 16. No shared mutable state / no module-level user state
+17. Allowlist constants mirror the SQL allowlists (no overlap with forbidden)
 """
 
 import subprocess
@@ -30,6 +32,8 @@ from dataclasses import FrozenInstanceError
 
 from backend.transactional_schema import (
     FORBIDDEN_PAYLOAD_KEYS,
+    REPLAY_PAYLOAD_ALLOWED_KEYS,
+    OUTBOX_PAYLOAD_ALLOWED_KEYS,
     TurnRequestRecord,
     OutboxEventRecord,
     canonical_payload_hash,
@@ -107,6 +111,8 @@ sys.meta_path.insert(0, _BlockImport())
 sys.path.insert(0, ".")
 from backend.transactional_schema import (
     FORBIDDEN_PAYLOAD_KEYS,
+    REPLAY_PAYLOAD_ALLOWED_KEYS,
+    OUTBOX_PAYLOAD_ALLOWED_KEYS,
     TurnRequestRecord,
     OutboxEventRecord,
     canonical_payload_hash,
@@ -114,7 +120,12 @@ from backend.transactional_schema import (
 
 assert canonical_payload_hash({"a": 1}) == canonical_payload_hash({"a": 1})
 assert len(canonical_payload_hash({"b": 2})) == 64
-assert FORBIDDEN_PAYLOAD_KEYS == {"prompt", "system_prompt", "meta_cognition", "internal_instructions"}
+assert FORBIDDEN_PAYLOAD_KEYS == {
+    "prompt", "system_prompt", "meta_cognition", "internal_instructions",
+    "message", "user_message", "assistant_message", "content",
+}
+assert REPLAY_PAYLOAD_ALLOWED_KEYS.isdisjoint(FORBIDDEN_PAYLOAD_KEYS)
+assert OUTBOX_PAYLOAD_ALLOWED_KEYS.isdisjoint(FORBIDDEN_PAYLOAD_KEYS)
 rec = TurnRequestRecord(user_id="u", request_id="r", payload_hash_sha256="a" * 64, status="pending")
 assert rec.to_db_row()["user_id"] == "u"
 outbox = OutboxEventRecord(event_type="memory_indexed", user_id="u", payload={}, status="pending", idempotency_key="k")
@@ -186,6 +197,17 @@ class TestCanonicalPayloadHash:
         assert "SECRET_INTERNAL_MARKER" not in str(excinfo.value)
         assert "SECRET_INTERNAL_MARKER" not in repr(excinfo.value)
 
+    def test_rejects_non_finite_floats(self):
+        """NaN / Infinity / -Infinity are not interoperable JSON and must
+        never be hashed (the database jsonb type refuses them too)."""
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with pytest.raises(TypeError):
+                canonical_payload_hash({"x": value})
+
+    def test_rejects_nested_non_finite_floats(self):
+        with pytest.raises(TypeError):
+            canonical_payload_hash({"outer": {"x": float("nan")}})
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # 8–11. TurnRequestRecord
@@ -239,6 +261,33 @@ class TestTurnRequestRecord:
         with pytest.raises(FrozenInstanceError):
             record.status = "completed"  # type: ignore[assignment]
 
+    def test_replay_payload_deeply_immutable(self):
+        """The stored replay_payload is a frozen copy: mutating the source
+        dict after construction must not affect the record, and mutating
+        the stored payload must raise."""
+        source = {"response": "ok", "emotion_state": {"name": "calm"}}
+        record = TurnRequestRecord(
+            user_id="u-1",
+            request_id="11111111-1111-4111-8111-111111111111",
+            payload_hash_sha256="a" * 64,
+            status="completed",
+            committed_revision=1,
+            replay_payload=source,
+        )
+        # Mutating the caller's dict afterwards must not leak into the record.
+        source["response"] = "mutated"
+        source["emotion_state"]["name"] = "mutated"
+        assert record.replay_payload["response"] == "ok"
+        assert record.replay_payload["emotion_state"]["name"] == "calm"
+        # The stored payload itself is immutable.
+        with pytest.raises(TypeError):
+            record.replay_payload["response"] = "x"  # type: ignore[index]
+        with pytest.raises(TypeError):
+            record.replay_payload["emotion_state"]["name"] = "x"  # type: ignore[index]
+        # Serialization yields plain, JSON-serializable structures.
+        import json
+        json.dumps(record.to_db_row()["replay_payload"])
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # 12–15. OutboxEventRecord
@@ -289,6 +338,29 @@ class TestOutboxEventRecord:
         with pytest.raises(FrozenInstanceError):
             record.status = "completed"  # type: ignore[assignment]
 
+    def test_payload_deeply_immutable(self):
+        """The stored outbox payload is a frozen copy: mutating the source
+        dict after construction must not affect the record, and mutating
+        the stored payload must raise."""
+        source = {"ref": "turn-1", "meta": {"n": 1}}
+        record = OutboxEventRecord(
+            event_type="memory_indexed",
+            user_id="u-1",
+            payload=source,
+            status="pending",
+            idempotency_key="idem-1",
+        )
+        source["ref"] = "mutated"
+        source["meta"]["n"] = 2
+        assert record.payload["ref"] == "turn-1"
+        assert record.payload["meta"]["n"] == 1
+        with pytest.raises(TypeError):
+            record.payload["ref"] = "x"  # type: ignore[index]
+        with pytest.raises(TypeError):
+            record.payload["meta"]["n"] = 3  # type: ignore[index]
+        import json
+        json.dumps(record.to_db_row()["payload"])
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # 16. No shared mutable state
@@ -296,12 +368,38 @@ class TestOutboxEventRecord:
 
 class TestNoSharedState:
     def test_forbidden_keys_frozen_set(self):
-        assert FORBIDDEN_PAYLOAD_KEYS == {
+        assert FORBIDDEN_PAYLOAD_KEYS == frozenset({
             "prompt",
             "system_prompt",
             "meta_cognition",
             "internal_instructions",
-        }
+            "message",
+            "user_message",
+            "assistant_message",
+            "content",
+        })
+
+    def test_allowlists_are_disjoint_from_forbidden(self):
+        """Allowlist constants must mirror the SQL allowlists and never
+        overlap with the forbidden keys."""
+        assert REPLAY_PAYLOAD_ALLOWED_KEYS == frozenset({
+            "response",
+            "emotion_state",
+            "message_id",
+            "request_id",
+            "duration_ms",
+        })
+        assert OUTBOX_PAYLOAD_ALLOWED_KEYS == frozenset({
+            "ref",
+            "request_id",
+            "turn_id",
+            "message_id",
+            "entity_id",
+            "kind",
+            "version",
+        })
+        assert REPLAY_PAYLOAD_ALLOWED_KEYS.isdisjoint(FORBIDDEN_PAYLOAD_KEYS)
+        assert OUTBOX_PAYLOAD_ALLOWED_KEYS.isdisjoint(FORBIDDEN_PAYLOAD_KEYS)
 
     def test_records_are_independent(self):
         r1 = TurnRequestRecord(user_id="u", request_id="r", payload_hash_sha256="a" * 64, status="pending")

@@ -42,7 +42,7 @@ SELECT ok(
 INSERT INTO public.profiles (user_id) VALUES ('pgtap_tr_user');
 SELECT is(
   (SELECT revision FROM public.profiles WHERE user_id = 'pgtap_tr_user'),
-  0,
+  0::bigint,
   'new profile starts at revision 0'
 );
 
@@ -94,14 +94,33 @@ SELECT is(
   'UNIQUE (user_id, request_id)',
   'turn_requests unique constraint is (user_id, request_id)'
 );
+SELECT is(
+  (SELECT pg_get_constraintdef(oid) FROM pg_constraint
+   WHERE conname = 'turn_requests_user_id_id_key'),
+  'UNIQUE (user_id, id)',
+  'turn_requests has candidate key (user_id, id)'
+);
 SELECT ok(EXISTS(SELECT 1 FROM pg_constraint WHERE conname = 'turn_requests_status_check'), 'turn_requests has status check');
 SELECT ok(EXISTS(SELECT 1 FROM pg_constraint WHERE conname = 'turn_requests_status_coherence_check'), 'turn_requests has status coherence check');
 SELECT ok(EXISTS(SELECT 1 FROM pg_constraint WHERE conname = 'turn_requests_lease_pair_check'), 'turn_requests has lease pair check');
+SELECT ok(EXISTS(SELECT 1 FROM pg_constraint WHERE conname = 'turn_requests_lease_owner_check'), 'turn_requests has lease owner check');
 SELECT ok(EXISTS(SELECT 1 FROM pg_constraint WHERE conname = 'turn_requests_payload_hash_sha256_check'), 'turn_requests has payload hash check');
 SELECT ok(EXISTS(SELECT 1 FROM pg_constraint WHERE conname = 'turn_requests_expected_revision_check'), 'turn_requests has expected revision check');
 SELECT ok(EXISTS(SELECT 1 FROM pg_constraint WHERE conname = 'turn_requests_committed_revision_check'), 'turn_requests has committed revision check');
 SELECT ok(EXISTS(SELECT 1 FROM pg_constraint WHERE conname = 'turn_requests_replay_payload_check'), 'turn_requests has replay payload check');
 SELECT ok(EXISTS(SELECT 1 FROM pg_constraint WHERE conname = 'turn_requests_error_code_check'), 'turn_requests has error code check');
+
+-- Composite message FKs enforce per-user isolation
+SELECT is(
+  (SELECT confdeltype FROM pg_constraint WHERE conname = 'turn_requests_user_message_chat_log_id_fkey'),
+  'n'::"char",
+  'user message FK has ON DELETE SET NULL'
+);
+SELECT is(
+  (SELECT confdeltype FROM pg_constraint WHERE conname = 'turn_requests_assistant_message_chat_log_id_fkey'),
+  'n'::"char",
+  'assistant message FK has ON DELETE SET NULL'
+);
 
 -- =================================================================
 -- 4. turn_requests behavior
@@ -181,7 +200,7 @@ SELECT throws_ok(
   $$INSERT INTO public.turn_requests (
        user_id, request_id, payload_hash_sha256, status
      ) VALUES (
-       'pgtap_tr_user', gen_random_uuid(), repeat('g', 64), 'expired'
+       'pgtap_tr_user', gen_random_uuid(), repeat('1', 64), 'expired'
      )$$,
   '23514', NULL, 'expired without error code is rejected'
 );
@@ -189,7 +208,7 @@ SELECT throws_ok(
   $$INSERT INTO public.turn_requests (
        user_id, request_id, payload_hash_sha256, status, lease_owner
      ) VALUES (
-       'pgtap_tr_user', gen_random_uuid(), repeat('h', 64), 'pending', 'worker-h'
+       'pgtap_tr_user', gen_random_uuid(), repeat('2', 64), 'pending', 'worker-h'
      )$$,
   '23514', NULL, 'lease owner without expiry is rejected'
 );
@@ -197,7 +216,7 @@ SELECT throws_ok(
   $$INSERT INTO public.turn_requests (
        user_id, request_id, payload_hash_sha256, status, error_code
      ) VALUES (
-       'pgtap_tr_user', gen_random_uuid(), repeat('m', 64), 'expired', 'Bad Error!'
+       'pgtap_tr_user', gen_random_uuid(), repeat('7', 64), 'expired', 'Bad Error!'
      )$$,
   '23514', NULL, 'unsanitized error code is rejected'
 );
@@ -208,7 +227,7 @@ SELECT throws_ok(
        user_id, request_id, payload_hash_sha256, status,
        lease_owner, lease_expires_at, user_message_chat_log_id
      ) VALUES (
-       'pgtap_tr_user', gen_random_uuid(), repeat('i', 64), 'pending',
+       'pgtap_tr_user', gen_random_uuid(), repeat('3', 64), 'pending',
        'worker-i', now() + interval '5 minutes', 999999
      )$$,
   '23503', NULL, 'FK rejects nonexistent chat_log reference'
@@ -218,10 +237,39 @@ SELECT throws_ok(
        user_id, request_id, payload_hash_sha256, status,
        lease_owner, lease_expires_at
      ) VALUES (
-       'pgtap_no_such_user', gen_random_uuid(), repeat('j', 64), 'pending',
+       'pgtap_no_such_user', gen_random_uuid(), repeat('4', 64), 'pending',
        'worker-j', now() + interval '5 minutes'
      )$$,
   '23503', NULL, 'FK rejects nonexistent user reference'
+);
+
+-- Cross-user message reference is rejected (composite FK on (user_id, message_id))
+INSERT INTO public.chat_logs (id, user_id, role, content)
+VALUES (500002, 'pgtap_tr_user', 'user', 'cross-user isolation message');
+SELECT throws_ok(
+  $$INSERT INTO public.turn_requests (
+       user_id, request_id, payload_hash_sha256, status,
+       lease_owner, lease_expires_at, user_message_chat_log_id
+     ) VALUES (
+       'pgtap_tr_user_2', gen_random_uuid(), repeat('b', 64), 'pending',
+       'worker-v', now() + interval '5 minutes', 500002
+     )$$,
+  '23503', NULL, 'cross-user message reference is rejected'
+);
+
+-- Valid completed request with a public replay contract is accepted
+INSERT INTO public.turn_requests (
+  user_id, request_id, payload_hash_sha256, status,
+  completed_at, committed_revision, replay_payload
+) VALUES (
+  'pgtap_tr_user', '44444444-4444-4444-8444-444444444444', repeat('c', 64), 'completed',
+  now(), 1, '{"response": "ok", "emotion_state": {"schema_version": 1}}'::jsonb
+);
+SELECT is(
+  (SELECT count(*)::integer FROM public.turn_requests
+   WHERE user_id = 'pgtap_tr_user' AND request_id = '44444444-4444-4444-8444-444444444444'),
+  1,
+  'valid completed request with public replay payload is inserted'
 );
 
 -- =================================================================
@@ -234,7 +282,7 @@ INSERT INTO public.turn_requests (
   user_id, request_id, payload_hash_sha256, status,
   lease_owner, lease_expires_at, user_message_chat_log_id
 ) VALUES (
-  'pgtap_tr_user', '22222222-2222-4222-8222-222222222222', repeat('k', 64), 'pending',
+  'pgtap_tr_user', '22222222-2222-4222-8222-222222222222', repeat('5', 64), 'pending',
   'worker-k', now() + interval '5 minutes', 500001
 );
 DELETE FROM public.chat_logs WHERE id = 500001;
@@ -301,8 +349,17 @@ SELECT ok(EXISTS(SELECT 1 FROM pg_constraint WHERE conname = 'outbox_events_stat
 SELECT ok(EXISTS(SELECT 1 FROM pg_constraint WHERE conname = 'outbox_events_status_coherence_check'), 'outbox has status coherence check');
 SELECT ok(EXISTS(SELECT 1 FROM pg_constraint WHERE conname = 'outbox_events_attempts_check'), 'outbox has attempts check');
 SELECT ok(EXISTS(SELECT 1 FROM pg_constraint WHERE conname = 'outbox_events_lease_pair_check'), 'outbox has lease pair check');
+SELECT ok(EXISTS(SELECT 1 FROM pg_constraint WHERE conname = 'outbox_events_lease_owner_check'), 'outbox has lease owner check');
+SELECT ok(EXISTS(SELECT 1 FROM pg_constraint WHERE conname = 'outbox_events_idempotency_key_check'), 'outbox has idempotency key check');
 SELECT ok(EXISTS(SELECT 1 FROM pg_constraint WHERE conname = 'outbox_events_payload_check'), 'outbox has payload check');
 SELECT ok(EXISTS(SELECT 1 FROM pg_constraint WHERE conname = 'outbox_events_error_code_check'), 'outbox has error code check');
+
+-- Composite FK enforces per-user isolation for the request reference
+SELECT is(
+  (SELECT confdeltype FROM pg_constraint WHERE conname = 'outbox_events_turn_request_id_fkey'),
+  'c'::"char",
+  'outbox turn_request FK has ON DELETE CASCADE'
+);
 
 -- =================================================================
 -- 8. outbox_events behavior
@@ -424,8 +481,130 @@ SELECT throws_ok(
   '23514', NULL, 'dead_letter event without dead_lettered_at is rejected'
 );
 
+-- Exact state shapes: no field of another state can leak in
+SELECT throws_ok(
+  $$INSERT INTO public.outbox_events (
+       event_type, contract_version, user_id, turn_request_id, payload,
+       status, attempts, next_attempt_at, processed_at, retention_until,
+       idempotency_key
+     ) VALUES (
+       'memory_indexed', 1, 'pgtap_tr_user', NULL, '{"ref":"x"}'::jsonb,
+       'completed', 1, now(), now(), now() + interval '30 days',
+       'pgtap-idem-cpl-na'
+     )$$,
+  '23514', NULL, 'completed event with next_attempt_at is rejected'
+);
+SELECT throws_ok(
+  $$INSERT INTO public.outbox_events (
+       event_type, contract_version, user_id, turn_request_id, payload,
+       status, attempts, next_attempt_at, processed_at, dead_lettered_at,
+       retention_until, idempotency_key
+     ) VALUES (
+       'memory_indexed', 1, 'pgtap_tr_user', NULL, '{"ref":"x"}'::jsonb,
+       'completed', 1, NULL, now(), now(),
+       now() + interval '30 days', 'pgtap-idem-cpl-dl'
+     )$$,
+  '23514', NULL, 'completed event with dead_lettered_at is rejected'
+);
+SELECT throws_ok(
+  $$INSERT INTO public.outbox_events (
+       event_type, contract_version, user_id, turn_request_id, payload,
+       status, attempts, next_attempt_at, dead_lettered_at, retention_until,
+       error_code, idempotency_key
+     ) VALUES (
+       'memory_indexed', 1, 'pgtap_tr_user', NULL, '{"ref":"x"}'::jsonb,
+       'dead_letter', 10, NULL, now(), now() + interval '30 days',
+       NULL, 'pgtap-idem-dl-noerr'
+     )$$,
+  '23514', NULL, 'dead_letter event without error_code is rejected'
+);
+SELECT throws_ok(
+  $$INSERT INTO public.outbox_events (
+       event_type, contract_version, user_id, turn_request_id, payload,
+       status, attempts, next_attempt_at, dead_lettered_at, retention_until,
+       error_code, idempotency_key
+     ) VALUES (
+       'memory_indexed', 1, 'pgtap_tr_user', NULL, '{"ref":"x"}'::jsonb,
+       'dead_letter', 10, now(), now(), now() + interval '30 days',
+       'exhausted', 'pgtap-idem-dl-na'
+     )$$,
+  '23514', NULL, 'dead_letter event with next_attempt_at is rejected'
+);
+SELECT throws_ok(
+  $$INSERT INTO public.outbox_events (
+       event_type, contract_version, user_id, turn_request_id, payload,
+       status, attempts, next_attempt_at, dead_lettered_at,
+       error_code, idempotency_key
+     ) VALUES (
+       'memory_indexed', 1, 'pgtap_tr_user', NULL, '{"ref":"x"}'::jsonb,
+       'dead_letter', 10, NULL, now(),
+       'exhausted', 'pgtap-idem-dl-noreten'
+     )$$,
+  '23514', NULL, 'dead_letter event without retention_until is rejected'
+);
+SELECT throws_ok(
+  $$INSERT INTO public.outbox_events (
+       event_type, contract_version, user_id, turn_request_id, payload,
+       status, attempts, next_attempt_at, lease_owner, lease_expires_at,
+       error_code, idempotency_key
+     ) VALUES (
+       'memory_indexed', 1, 'pgtap_tr_user', NULL, '{"ref":"x"}'::jsonb,
+       'processing', 1, NULL, 'worker-y', now() + interval '5 minutes',
+       'boom', 'pgtap-idem-proc-err'
+     )$$,
+  '23514', NULL, 'processing event with error_code is rejected'
+);
+
+-- Valid dead_letter event with a full exact shape is accepted
+INSERT INTO public.outbox_events (
+  event_type, contract_version, user_id, turn_request_id, payload,
+  status, attempts, next_attempt_at, dead_lettered_at, retention_until,
+  error_code, idempotency_key
+) VALUES (
+  'memory_indexed', 1, 'pgtap_tr_user', NULL, '{"ref":"turn-1"}'::jsonb,
+  'dead_letter', 10, NULL, now(), now() + interval '30 days',
+  'exhausted', 'pgtap-idem-dl-valid'
+);
+SELECT is(
+  (SELECT count(*)::integer FROM public.outbox_events WHERE idempotency_key = 'pgtap-idem-dl-valid'),
+  1,
+  'valid dead_letter event is inserted'
+);
+
+-- Identifier bounds are enforced (fail-closed)
+SELECT throws_ok(
+  $$INSERT INTO public.turn_requests (
+       user_id, request_id, payload_hash_sha256, status,
+       lease_owner, lease_expires_at
+     ) VALUES (
+       'pgtap_tr_user', gen_random_uuid(), repeat('8', 64), 'pending',
+       repeat('x', 65), now() + interval '5 minutes'
+     )$$,
+  '23514', NULL, 'turn_requests lease_owner over 64 chars is rejected'
+);
+SELECT throws_ok(
+  $$INSERT INTO public.outbox_events (
+       event_type, contract_version, user_id, turn_request_id, payload,
+       status, attempts, next_attempt_at, idempotency_key
+     ) VALUES (
+       'memory_indexed', 1, 'pgtap_tr_user', NULL, '{}'::jsonb,
+       'pending', 0, now(), repeat('k', 129)
+     )$$,
+  '23514', NULL, 'outbox idempotency_key over 128 chars is rejected'
+);
+SELECT throws_ok(
+  $$INSERT INTO public.outbox_events (
+       event_type, contract_version, user_id, turn_request_id, payload,
+       status, attempts, next_attempt_at, idempotency_key
+     ) VALUES (
+       'memory_indexed', 1, 'pgtap_tr_user', NULL, '{}'::jsonb,
+       'pending', 0, now(), 'bad key with space'
+     )$$,
+  '23514', NULL, 'outbox idempotency_key with invalid characters is rejected'
+);
+
 -- =================================================================
--- 9. Forbidden payload keys (prompt / internal fields) are rejected
+-- 9. Forbidden payload keys (prompt / internal fields) — top level and nested
 -- =================================================================
 SELECT throws_ok(
   $$INSERT INTO public.outbox_events (
@@ -447,17 +626,73 @@ SELECT throws_ok(
      )$$,
   '23514', NULL, 'outbox payload with metacognition is rejected'
 );
+-- Nested forbidden keys are rejected at any depth
+SELECT throws_ok(
+  $$INSERT INTO public.outbox_events (
+       event_type, contract_version, user_id, turn_request_id, payload,
+       status, attempts, next_attempt_at, idempotency_key
+     ) VALUES (
+       'memory_indexed', 1, 'pgtap_tr_user', NULL,
+       '{"ref": {"system_prompt": "hidden"}}'::jsonb,
+       'pending', 0, now(), 'pgtap-idem-nested'
+     )$$,
+  '23514', NULL, 'nested system_prompt in outbox payload is rejected'
+);
+-- Message content can never be stored in the outbox
+SELECT throws_ok(
+  $$INSERT INTO public.outbox_events (
+       event_type, contract_version, user_id, turn_request_id, payload,
+       status, attempts, next_attempt_at, idempotency_key
+     ) VALUES (
+       'memory_indexed', 1, 'pgtap_tr_user', NULL,
+       '{"ref": "turn-1", "message": "conteudo sensivel"}'::jsonb,
+       'pending', 0, now(), 'pgtap-idem-msg'
+     )$$,
+  '23514', NULL, 'outbox payload with message content is rejected'
+);
+-- Unknown top-level keys are rejected by the allowlist
+SELECT throws_ok(
+  $$INSERT INTO public.outbox_events (
+       event_type, contract_version, user_id, turn_request_id, payload,
+       status, attempts, next_attempt_at, idempotency_key
+     ) VALUES (
+       'memory_indexed', 1, 'pgtap_tr_user', NULL,
+       '{"ref": "turn-1", "unknown_key": 1}'::jsonb,
+       'pending', 0, now(), 'pgtap-idem-unknown'
+     )$$,
+  '23514', NULL, 'outbox payload with unknown top-level key is rejected'
+);
 
--- turn_requests replay_payload forbids internal fields too
+-- turn_requests replay_payload forbids internal fields too (top level + nested)
 SELECT throws_ok(
   $$INSERT INTO public.turn_requests (
        user_id, request_id, payload_hash_sha256, status,
        completed_at, committed_revision, replay_payload, error_code
      ) VALUES (
-       'pgtap_tr_user', gen_random_uuid(), repeat('l', 64), 'completed',
+       'pgtap_tr_user', gen_random_uuid(), repeat('6', 64), 'completed',
        now(), 1, '{"system_prompt": "hidden"}'::jsonb, NULL
      )$$,
   '23514', NULL, 'replay payload with system_prompt is rejected'
+);
+SELECT throws_ok(
+  $$INSERT INTO public.turn_requests (
+       user_id, request_id, payload_hash_sha256, status,
+       completed_at, committed_revision, replay_payload, error_code
+     ) VALUES (
+       'pgtap_tr_user', gen_random_uuid(), repeat('0', 64), 'completed',
+       now(), 1, '{"response": {"system_prompt": "hidden"}}'::jsonb, NULL
+     )$$,
+  '23514', NULL, 'nested system_prompt in replay payload is rejected'
+);
+SELECT throws_ok(
+  $$INSERT INTO public.turn_requests (
+       user_id, request_id, payload_hash_sha256, status,
+       completed_at, committed_revision, replay_payload, error_code
+     ) VALUES (
+       'pgtap_tr_user', gen_random_uuid(), repeat('a', 64), 'completed',
+       now(), 1, '{"response": "ok", "prompt": "hidden"}'::jsonb, NULL
+     )$$,
+  '23514', NULL, 'replay payload with prompt key is rejected'
 );
 
 -- FK: outbox turn_request_id rejects nonexistent reference
@@ -470,6 +705,27 @@ SELECT throws_ok(
        'pending', 0, now(), 'pgtap-idem-fk'
      )$$,
   '23503', NULL, 'FK rejects nonexistent turn_request reference'
+);
+
+-- Cross-user turn_request reference is rejected (composite FK)
+INSERT INTO public.turn_requests (
+  user_id, request_id, payload_hash_sha256, status,
+  lease_owner, lease_expires_at
+) VALUES (
+  'pgtap_tr_user', '55555555-5555-4555-8555-555555555555', repeat('d', 64), 'pending',
+  'worker-y', now() + interval '5 minutes'
+);
+SELECT throws_ok(
+  $$INSERT INTO public.outbox_events (
+       event_type, contract_version, user_id, turn_request_id, payload,
+       status, attempts, next_attempt_at, idempotency_key
+     ) VALUES (
+       'memory_indexed', 1, 'pgtap_tr_user_3',
+       (SELECT id FROM public.turn_requests WHERE request_id = '55555555-5555-4555-8555-555555555555'),
+       '{"ref":"turn-1"}'::jsonb,
+       'pending', 0, now(), 'pgtap-idem-xuser'
+     )$$,
+  '23503', NULL, 'cross-user turn_request reference is rejected'
 );
 
 -- =================================================================
@@ -502,10 +758,36 @@ SELECT ok(
   'PUBLIC has no privileges on outbox_events'
 );
 
+-- Payload helpers are server-only (anon cannot execute)
+SELECT ok(
+  NOT has_function_privilege('anon', 'public.jsonb_has_forbidden_key(jsonb, text[])', 'EXECUTE'),
+  'anon cannot execute jsonb_has_forbidden_key'
+);
+SELECT ok(
+  NOT has_function_privilege('anon', 'public.jsonb_keys_subset_of(jsonb, text[])', 'EXECUTE'),
+  'anon cannot execute jsonb_keys_subset_of'
+);
+SELECT ok(
+  has_function_privilege('service_role', 'public.jsonb_has_forbidden_key(jsonb, text[])', 'EXECUTE'),
+  'service_role can execute jsonb_has_forbidden_key'
+);
+
 -- =================================================================
 -- 11. Indexes (exact definitions — equivalent verification for the
 --     critical replay/claim queries)
 -- =================================================================
+SELECT has_index('public', 'turn_requests', 'turn_requests_user_id_request_id_key', 'turn_requests unique (user_id, request_id) index exists');
+SELECT is(
+  pg_get_indexdef('public.turn_requests_user_id_request_id_key'::regclass),
+  'CREATE UNIQUE INDEX turn_requests_user_id_request_id_key ON public.turn_requests USING btree (user_id, request_id)',
+  'unique (user_id, request_id) index has exact definition'
+);
+SELECT has_index('public', 'turn_requests', 'turn_requests_user_id_id_key', 'turn_requests unique (user_id, id) index exists');
+SELECT is(
+  pg_get_indexdef('public.turn_requests_user_id_id_key'::regclass),
+  'CREATE UNIQUE INDEX turn_requests_user_id_id_key ON public.turn_requests USING btree (user_id, id)',
+  'unique (user_id, id) index has exact definition'
+);
 SELECT has_index('public', 'turn_requests', 'turn_requests_user_id_created_at_idx', 'turn_requests user-created index exists');
 SELECT is(
   pg_get_indexdef('public.turn_requests_user_id_created_at_idx'::regclass),
@@ -524,13 +806,13 @@ SELECT is(
   'CREATE INDEX turn_requests_user_committed_revision_idx ON public.turn_requests USING btree (user_id, committed_revision)',
   'revision index has exact definition'
 );
-SELECT has_index('public', 'turn_requests', 'turn_requests_user_id_request_id_key', 'turn_requests unique (user_id, request_id) index exists');
-SELECT is(
-  pg_get_indexdef('public.turn_requests_user_id_request_id_key'::regclass),
-  'CREATE UNIQUE INDEX turn_requests_user_id_request_id_key ON public.turn_requests USING btree (user_id, request_id)',
-  'unique (user_id, request_id) index has exact definition'
-);
 
+SELECT has_index('public', 'outbox_events', 'outbox_events_user_id_idempotency_key_key', 'outbox unique (user_id, idempotency_key) index exists');
+SELECT is(
+  pg_get_indexdef('public.outbox_events_user_id_idempotency_key_key'::regclass),
+  'CREATE UNIQUE INDEX outbox_events_user_id_idempotency_key_key ON public.outbox_events USING btree (user_id, idempotency_key)',
+  'unique (user_id, idempotency_key) index has exact definition'
+);
 SELECT has_index('public', 'outbox_events', 'outbox_events_status_next_attempt_idx', 'outbox status-next_attempt index exists');
 SELECT is(
   pg_get_indexdef('public.outbox_events_status_next_attempt_idx'::regclass),
@@ -549,12 +831,6 @@ SELECT is(
   'CREATE INDEX outbox_events_turn_request_id_idx ON public.outbox_events USING btree (turn_request_id)',
   'turn_request index has exact definition'
 );
-SELECT has_index('public', 'outbox_events', 'outbox_events_user_id_idempotency_key_key', 'outbox unique (user_id, idempotency_key) index exists');
-SELECT is(
-  pg_get_indexdef('public.outbox_events_user_id_idempotency_key_key'::regclass),
-  'CREATE UNIQUE INDEX outbox_events_user_id_idempotency_key_key ON public.outbox_events USING btree (user_id, idempotency_key)',
-  'unique (user_id, idempotency_key) index has exact definition'
-);
 
 -- =================================================================
 -- 12. ON DELETE policy for every FK
@@ -565,24 +841,9 @@ SELECT is(
   'turn_requests.user_id FK has ON DELETE CASCADE'
 );
 SELECT is(
-  (SELECT confdeltype FROM pg_constraint WHERE conname = 'turn_requests_user_message_chat_log_id_fkey'),
-  'n'::"char",
-  'turn_requests user-message FK has ON DELETE SET NULL'
-);
-SELECT is(
-  (SELECT confdeltype FROM pg_constraint WHERE conname = 'turn_requests_assistant_message_chat_log_id_fkey'),
-  'n'::"char",
-  'turn_requests assistant-message FK has ON DELETE SET NULL'
-);
-SELECT is(
   (SELECT confdeltype FROM pg_constraint WHERE conname = 'outbox_events_user_id_fkey'),
   'c'::"char",
   'outbox_events.user_id FK has ON DELETE CASCADE'
-);
-SELECT is(
-  (SELECT confdeltype FROM pg_constraint WHERE conname = 'outbox_events_turn_request_id_fkey'),
-  'c'::"char",
-  'outbox_events.turn_request_id FK has ON DELETE CASCADE'
 );
 
 -- =================================================================
@@ -602,6 +863,11 @@ SELECT throws_ok(
   $$CREATE TABLE public.outbox_events (id uuid)$$,
   '42P07', NULL, 're-creating outbox_events fails (drift)'
 );
+SELECT throws_ok(
+  $$CREATE FUNCTION public.jsonb_has_forbidden_key(jsonb, text[]) RETURNS boolean
+    LANGUAGE sql IMMUTABLE AS 'SELECT true'$$,
+  '42723', NULL, 're-creating jsonb_has_forbidden_key fails (drift)'
+);
 
 -- =================================================================
 -- 13. User deletion leaves no incompatible orphan data
@@ -611,8 +877,8 @@ INSERT INTO public.turn_requests (
   user_id, request_id, payload_hash_sha256, status,
   lease_owner, lease_expires_at
 ) VALUES (
-  'pgtap_orphan_user', '33333333-3333-4333-8333-333333333333', repeat('n', 64), 'pending',
-  'worker-n', now() + interval '5 minutes'
+  'pgtap_orphan_user', '33333333-3333-4333-8333-333333333333', repeat('9', 64), 'pending',
+  'worker-o', now() + interval '5 minutes'
 );
 INSERT INTO public.outbox_events (
   event_type, contract_version, user_id, turn_request_id, payload,

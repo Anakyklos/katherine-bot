@@ -275,10 +275,18 @@ def test_operational_rollback(supabase_service_client):
     ), "profiles.revision missing before rollback"
 
     # Execute the documented operational rollback (additive-only migration).
+    # Trigger and helpers are dropped in dependency order: the trigger first
+    # (it references the function), then the tables (their CHECK constraints
+    # reference the payload helpers), then the helpers and the column.
     _run_psql(
+        "DROP TRIGGER IF EXISTS turn_requests_message_refs_null_trigger "
+        "ON public.chat_logs;\n"
+        "DROP FUNCTION IF EXISTS public.turn_requests_null_message_refs();\n"
         "DROP TABLE IF EXISTS public.outbox_events;\n"
         "DROP TABLE IF EXISTS public.turn_requests;\n"
         "ALTER TABLE public.profiles DROP COLUMN IF EXISTS revision;\n"
+        "DROP FUNCTION IF EXISTS public.jsonb_has_forbidden_key(jsonb, text[]);\n"
+        "DROP FUNCTION IF EXISTS public.jsonb_keys_subset_of(jsonb, text[]);\n"
     )
 
     # Objects are gone after rollback.
@@ -296,6 +304,22 @@ def test_operational_rollback(supabase_service_client):
         ") AS result",
         "result",
     ), "profiles.revision still exists after rollback"
+    assert not _query_scalar_bool(
+        "SELECT EXISTS("
+        "SELECT 1 FROM pg_trigger WHERE tgname = 'turn_requests_message_refs_null_trigger'"
+        ") AS result",
+        "result",
+    ), "chat_logs trigger still exists after rollback"
+    assert not _query_scalar_bool(
+        "SELECT EXISTS("
+        "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+        "WHERE n.nspname = 'public' "
+        "AND p.proname IN ("
+        "  'jsonb_has_forbidden_key', 'jsonb_keys_subset_of', "
+        "  'turn_requests_null_message_refs')"
+        ") AS result",
+        "result",
+    ), "payload helper functions still exist after rollback"
 
     # Pre-existing data survived the rollback.
     svc = supabase_service_client

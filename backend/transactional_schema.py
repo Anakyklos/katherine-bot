@@ -27,17 +27,44 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Mapping, Optional
 
 # ---------------------------------------------------------------------------
 # Canonical payload hash
 # ---------------------------------------------------------------------------
 
-#: Columns that may never be serialized into a stored payload. Mirrors the
-#: forbidden-key CHECK constraints in the migration; kept here so the
-#: serialization contract is testable without a database.
+#: Keys that may never appear inside a stored payload document. Mirrors the
+#: forbidden-key lists enforced recursively by the migration CHECK
+#: constraints; kept here so the serialization contract is testable without
+#: a database. ``message`` / ``user_message`` / ``assistant_message`` /
+#: ``content`` are forbidden because the outbox must never duplicate
+#: messages or prompts.
 FORBIDDEN_PAYLOAD_KEYS = frozenset(
-    {"prompt", "system_prompt", "meta_cognition", "internal_instructions"}
+    {
+        "prompt",
+        "system_prompt",
+        "meta_cognition",
+        "internal_instructions",
+        "message",
+        "user_message",
+        "assistant_message",
+        "content",
+    }
+)
+
+#: Explicit allowlist of top-level keys for ``turn_requests.replay_payload``.
+#: Mirrors the SQL CHECK ``jsonb_keys_subset_of`` allowlist. Only public
+#: result fields are permitted — never prompts or internal state.
+REPLAY_PAYLOAD_ALLOWED_KEYS = frozenset(
+    {"response", "emotion_state", "message_id", "request_id", "duration_ms"}
+)
+
+#: Explicit allowlist of top-level keys for ``outbox_events.payload``.
+#: Mirrors the SQL CHECK ``jsonb_keys_subset_of`` allowlist. Event payloads
+#: carry only stable references and public event metadata.
+OUTBOX_PAYLOAD_ALLOWED_KEYS = frozenset(
+    {"ref", "request_id", "turn_id", "message_id", "entity_id", "kind", "version"}
 )
 
 
@@ -49,26 +76,60 @@ def canonical_payload_hash(payload: Mapping[str, Any]) -> str:
     ``ensure_ascii=False`` — the same canonical JSON convention used by
     ``backend/trusted_context.py`` and ``backend/memory.py``.
 
+    ``allow_nan=False``: ``NaN``/``Infinity``/``-Infinity`` are rejected
+    because they are not interoperable JSON and ``jsonb`` refuses them;
+    hashing them would break idempotency for values the database would
+    reject.
+
     Returns a lowercase 64-character hexadecimal digest that satisfies the
     database CHECK ``payload_hash_sha256 ~ '^[0-9a-f]{64}$'``.
 
     Raises:
         TypeError: If *payload* is not a mapping or contains values that
-            cannot be JSON-serialized. The offending value is never included
-            in the exception message.
+            cannot be JSON-serialized (including non-finite floats). The
+            offending value is never included in the exception message.
     """
     if not isinstance(payload, Mapping):
         raise TypeError("payload must be a mapping")
     try:
         canonical = json.dumps(
-            payload,
+            dict(payload),
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=False,
+            allow_nan=False,
         )
     except (TypeError, ValueError) as exc:
         raise TypeError("payload is not JSON-serializable") from exc
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Deep immutability helpers
+# ---------------------------------------------------------------------------
+# The dataclasses are frozen, but a frozen dataclass only prevents attribute
+# reassignment. To make ``payload`` / ``replay_payload`` truly immutable we
+# deep-freeze them on construction (MappingProxyType for mappings, tuples
+# for sequences) and deep-unfreeze them back to JSON-serializable plain
+# structures in ``to_db_row``. Two records built from the same source dict
+# therefore never share mutable state, and callers can never mutate a
+# record's payload after the fact.
+
+
+def _deep_freeze(value: Any) -> Any:
+    if isinstance(value, dict):
+        return MappingProxyType({k: _deep_freeze(v) for k, v in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_deep_freeze(v) for v in value)
+    return value
+
+
+def _deep_unfreeze(value: Any) -> Any:
+    if isinstance(value, MappingProxyType):
+        return {k: _deep_unfreeze(v) for k, v in value.items()}
+    if isinstance(value, tuple):
+        return [_deep_unfreeze(v) for v in value]
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +164,10 @@ class TurnRequestRecord:
     updated_at: Optional[str] = None
     completed_at: Optional[str] = None
 
+    def __post_init__(self) -> None:
+        if self.replay_payload is not None:
+            object.__setattr__(self, "replay_payload", _deep_freeze(self.replay_payload))
+
     def to_db_row(self) -> dict[str, Any]:
         """Serialize to a database row, omitting ``None`` fields.
 
@@ -121,7 +186,11 @@ class TurnRequestRecord:
             "committed_revision": self.committed_revision,
             "user_message_chat_log_id": self.user_message_chat_log_id,
             "assistant_message_chat_log_id": self.assistant_message_chat_log_id,
-            "replay_payload": self.replay_payload,
+            "replay_payload": (
+                _deep_unfreeze(self.replay_payload)
+                if self.replay_payload is not None
+                else None
+            ),
             "error_code": self.error_code,
             "id": self.id,
             "created_at": self.created_at,
@@ -198,12 +267,15 @@ class OutboxEventRecord:
     dead_lettered_at: Optional[str] = None
     retention_until: Optional[str] = None
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "payload", _deep_freeze(self.payload))
+
     def to_db_row(self) -> dict[str, Any]:
         """Serialize to a database row, omitting ``None`` fields."""
         return {
             "event_type": self.event_type,
             "user_id": self.user_id,
-            "payload": self.payload,
+            "payload": _deep_unfreeze(self.payload),
             "status": self.status,
             "idempotency_key": self.idempotency_key,
             "contract_version": self.contract_version,

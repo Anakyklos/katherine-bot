@@ -80,7 +80,8 @@ fail-closed guarantee that prevents "stuck" requests.
 ## 3. Lease semantics and expiration
 
 - A `pending` request carries `lease_owner` (sanitized worker identifier,
-  max 64 chars) and `lease_expires_at`.
+  max 64 chars, `^[A-Za-z0-9_.:-]+$` — enforced by CHECK on both
+  `turn_requests` and `outbox_events`) and `lease_expires_at`.
 - The **lease pair check** enforces both-or-neither: a lease can never be
   half-written.
 - Expiration is **time-based only** — no background timer. The future worker
@@ -100,9 +101,12 @@ to detect duplicate/conflicting requests.
 
 - Computed by the application as SHA-256 over the **canonical JSON
   serialization** of the payload: `json.dumps(payload, sort_keys=True,
-  separators=(",", ":"), ensure_ascii=False)` — same canonical JSON
-  convention already used by `backend/trusted_context.py` and
-  `backend/memory.py`.
+  separators=(",", ":"), ensure_ascii=False, allow_nan=False)` — same
+  canonical JSON convention already used by `backend/trusted_context.py`
+  and `backend/memory.py`.
+- `allow_nan=False` is mandatory: `NaN`/`Infinity`/`-Infinity` are not
+  interoperable JSON and `jsonb` rejects them. Hashing them would produce
+  digests for values the database refuses, silently breaking idempotency.
 - The database validates **format only** (`~ '^[0-9a-f]{64}$'`); it never
   recomputes the hash, keeping SQL and Python from diverging on semantics.
 - `backend/transactional_schema.py::canonical_payload_hash()` is the single
@@ -118,41 +122,51 @@ to detect duplicate/conflicting requests.
 `turn_requests.replay_payload` stores **only the minimal public result**
 needed to reproduce a response after connection loss:
 
-- Public response contract fields (response text + public emotion state)
-- Hard size cap (8 KB serialized)
-- **Forbidden keys enforced by CHECK**: `prompt`, `system_prompt`,
-  `meta_cognition`, `internal_instructions` can never be stored.
+- **Explicit top-level allowlist** (public contract): `response`,
+  `emotion_state`, `message_id`, `request_id`, `duration_ms`. Any other
+  top-level key is rejected by the `jsonb_keys_subset_of` CHECK.
+- **Recursive forbidden-key validation**: `prompt`, `system_prompt`,
+  `meta_cognition`, `internal_instructions`, `message`, `user_message`,
+  `assistant_message`, `content` are rejected at **any depth** (objects and
+  arrays) by the `jsonb_has_forbidden_key` CHECK — a forbidden key can
+  never hide inside a nested structure.
+- Hard size cap (8 KB serialized).
 
 Message IDs (`user_message_chat_log_id`, `assistant_message_chat_log_id`)
-are stable references to `chat_logs` rows; they are `SET NULL` on message
-deletion, and replay must never depend on their presence — the
-`replay_payload` is authoritative for replay.
+are stable references to `chat_logs` rows. The message FKs are **composite
+`(user_id, message_id)`** (baseline `chat_logs` already has
+`UNIQUE (user_id, id)`) so a request can never reference another user's
+messages; they are nulled on message deletion and replay must never depend
+on their presence — the `replay_payload` is authoritative for replay.
 
 ---
 
 ## 6. Outbox states
 
-| Status | Meaning | Required shape |
+| Status | Meaning | Required shape (exact, mutually exclusive) |
 |---|---|---|
-| `pending` | Available for claim | no lease; `next_attempt_at` set; `attempts = 0`; no error |
-| `processing` | Leased by a worker | lease set; `attempts >= 1`; not processed |
-| `completed` | Delivered successfully | `processed_at` set; no lease; `attempts >= 1`; no error |
-| `failed` | Retryable failure | no lease; `next_attempt_at` set; `attempts` 1..9; error set |
-| `dead_letter` | Exhausted retries | `dead_lettered_at` set; `attempts = 10`; no lease |
+| `pending` | Available for claim | `processed_at`/`dead_lettered_at`/`retention_until` NULL; no lease; `next_attempt_at` set; `attempts = 0`; no error |
+| `processing` | Leased by a worker | `processed_at`/`dead_lettered_at`/`retention_until` NULL; lease set; `attempts` 1..10; no error |
+| `completed` | Delivered successfully | `processed_at` set; `dead_lettered_at` NULL; `next_attempt_at` NULL; no lease; `attempts` 1..10; no error; `retention_until` set |
+| `failed` | Retryable failure | `processed_at`/`dead_lettered_at`/`retention_until` NULL; no lease; `next_attempt_at` set; `attempts` 1..9; error set |
+| `dead_letter` | Exhausted retries | `dead_lettered_at` set; `retention_until` set; `next_attempt_at` NULL; no lease; `attempts = 10`; error set |
 
-The `outbox_events_status_coherence_check` gives every status an exact shape,
-fail-closed.
+The `outbox_events_status_coherence_check` gives every status an exact,
+mutually exclusive shape — no field of another state can leak in
+(`completed` cannot carry `next_attempt_at` or dead-letter fields;
+`dead_letter` requires error + retention; `processing` cannot carry failure
+fields), fail-closed.
 
 ---
 
 ## 7. Outbox idempotency key
 
-- `idempotency_key` is `NOT NULL` and unique per **`(user_id,
-  idempotency_key)`**.
+- `idempotency_key` is `NOT NULL`, bounded (1..128 chars,
+  `^[A-Za-z0-9_.:-]+$`), and unique per **`(user_id, idempotency_key)`**.
 - The same key for different users is allowed (user-scoped idempotency).
 - A duplicate key within the same user is rejected by the unique constraint,
   making repeated publication attempts idempotent without a worker-side
-  lock.
+  lock. The bound prevents unbounded index/storage growth.
 
 ---
 
@@ -195,10 +209,15 @@ fail-closed.
 | FK | Target | ON DELETE | Rationale |
 |---|---|---|---|
 | `turn_requests.user_id` | `profiles(user_id)` | `CASCADE` | User deletion removes their request ledger; no orphans |
-| `turn_requests.user_message_chat_log_id` | `chat_logs(id)` | `SET NULL` | Message pruning must not block; replay uses `replay_payload` |
-| `turn_requests.assistant_message_chat_log_id` | `chat_logs(id)` | `SET NULL` | Same as above |
+| `turn_requests.(user_id, user_message_chat_log_id)` | `chat_logs(user_id, id)` | `SET NULL` | **Composite FK** — a request can only reference messages of the same user; message pruning must not block; replay uses `replay_payload` |
+| `turn_requests.(user_id, assistant_message_chat_log_id)` | `chat_logs(user_id, id)` | `SET NULL` | Same as above |
 | `outbox_events.user_id` | `profiles(user_id)` | `CASCADE` | User deletion removes their events |
-| `outbox_events.turn_request_id` | `turn_requests(id)` | `CASCADE` | Event belongs to a request; deleting the request deletes its events |
+| `outbox_events.(user_id, turn_request_id)` | `turn_requests(user_id, id)` | `CASCADE` | **Composite FK** — an event can only reference a request of the same user (candidate key `turn_requests_user_id_id_key`); deleting the request deletes its events |
+
+Because a composite `ON DELETE SET NULL` would also NULL the `NOT NULL`
+`user_id`, a `BEFORE DELETE` trigger on `chat_logs`
+(`turn_requests_message_refs_null_trigger`, SECURITY DEFINER) nulls **only**
+the message references first; the FK action then has nothing left to null.
 
 Note: `chat_logs.user_id → profiles(user_id)` remains **NO ACTION** (from
 baseline). Operational user deletion therefore follows the existing order:
@@ -214,6 +233,8 @@ tested by the pgTAP orphan tests.
 
 - `turn_requests_user_id_request_id_key` — UNIQUE, covers replay lookup by
   `(user_id, request_id)`.
+- `turn_requests_user_id_id_key` — UNIQUE candidate key `(user_id, id)`,
+  referenced by the outbox composite FK.
 - `turn_requests_user_id_created_at_idx` — recent requests per user.
 - `turn_requests_status_lease_expiry_idx` — claim of expired leases.
 - `turn_requests_user_committed_revision_idx` — per-user revision queries.
@@ -240,9 +261,15 @@ makes a real, non-destructive rollback possible today:
 
 ```sql
 -- Operational rollback (only valid while nothing has written real data):
+-- Dependency order: trigger first, then tables (their CHECKs reference the
+-- payload helpers), then the helpers and the column.
+DROP TRIGGER IF EXISTS turn_requests_message_refs_null_trigger ON public.chat_logs;
+DROP FUNCTION IF EXISTS public.turn_requests_null_message_refs();
 DROP TABLE IF EXISTS public.outbox_events;
 DROP TABLE IF EXISTS public.turn_requests;
 ALTER TABLE public.profiles DROP COLUMN IF EXISTS revision;
+DROP FUNCTION IF EXISTS public.jsonb_has_forbidden_key(jsonb, text[]);
+DROP FUNCTION IF EXISTS public.jsonb_keys_subset_of(jsonb, text[]);
 ```
 
 This is exercised by `test_transactional_schema_legacy.py` and is safe only
@@ -267,6 +294,11 @@ Both new tables are **server-owned internal infrastructure**:
 No client-authenticated role can reach `turn_requests` or `outbox_events`,
 directly or through the PostgREST API. The pgTAP suite asserts the exact
 grant matrix.
+
+The payload validation helpers (`jsonb_has_forbidden_key`,
+`jsonb_keys_subset_of`) are server-only too: EXECUTE is revoked from
+`PUBLIC`, `anon` and `authenticated`, and granted only to `service_role`
+(asserted by pgTAP).
 
 ---
 

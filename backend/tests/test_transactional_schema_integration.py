@@ -384,6 +384,112 @@ def test_outbox_payload_forbids_prompt(service_client):
         service_client.table("profiles").delete().eq("user_id", user_id).execute()
 
 
+def test_outbox_payload_forbids_nested_internal(service_client):
+    """Forbidden keys must be rejected at any depth, not only top level."""
+    user_id = _uid("on")
+    service_client.table("profiles").upsert({"user_id": user_id}).execute()
+    try:
+        payload = _valid_outbox_payload(user_id, f"idem_{user_id}")
+        payload["payload"] = {"ref": {"system_prompt": "hidden"}}
+        with pytest.raises(APIError) as exc:
+            service_client.table("outbox_events").insert(payload).execute()
+        assert getattr(exc.value, "code", None) == "23514"
+    finally:
+        service_client.table("outbox_events").delete().eq("user_id", user_id).execute()
+        service_client.table("profiles").delete().eq("user_id", user_id).execute()
+
+
+def test_outbox_payload_forbids_message_content(service_client):
+    """The outbox must never store message content, even under an allowed key."""
+    user_id = _uid("om")
+    service_client.table("profiles").upsert({"user_id": user_id}).execute()
+    try:
+        payload = _valid_outbox_payload(user_id, f"idem_{user_id}")
+        payload["payload"] = {"ref": "turn-1", "message": "conteudo sensivel"}
+        with pytest.raises(APIError) as exc:
+            service_client.table("outbox_events").insert(payload).execute()
+        assert getattr(exc.value, "code", None) == "23514"
+    finally:
+        service_client.table("outbox_events").delete().eq("user_id", user_id).execute()
+        service_client.table("profiles").delete().eq("user_id", user_id).execute()
+
+
+def test_outbox_payload_forbids_unknown_top_level_key(service_client):
+    """The explicit allowlist rejects unknown top-level keys."""
+    user_id = _uid("ou")
+    service_client.table("profiles").upsert({"user_id": user_id}).execute()
+    try:
+        payload = _valid_outbox_payload(user_id, f"idem_{user_id}")
+        payload["payload"] = {"ref": "turn-1", "unknown_key": 1}
+        with pytest.raises(APIError) as exc:
+            service_client.table("outbox_events").insert(payload).execute()
+        assert getattr(exc.value, "code", None) == "23514"
+    finally:
+        service_client.table("outbox_events").delete().eq("user_id", user_id).execute()
+        service_client.table("profiles").delete().eq("user_id", user_id).execute()
+
+
+# ---------------------------------------------------------------------------
+# Cross-user isolation (composite FKs)
+# ---------------------------------------------------------------------------
+
+
+def test_cross_user_message_reference_rejected(service_client):
+    """A request for user A must not be able to reference a chat_logs
+    message owned by user B (composite FK on (user_id, message_id))."""
+    user_a = _uid("msg_a")
+    user_b = _uid("msg_b")
+    service_client.table("profiles").upsert([
+        {"user_id": user_a},
+        {"user_id": user_b},
+    ]).execute()
+    try:
+        chat = service_client.table("chat_logs").insert({
+            "user_id": user_a,
+            "role": "user",
+            "content": "message owned by user A",
+        }).execute()
+        message_id = chat.data[0]["id"]
+
+        payload = _valid_turn_request_payload(user_b, str(uuid.uuid4()))
+        payload["user_message_chat_log_id"] = message_id
+        with pytest.raises(APIError) as exc:
+            service_client.table("turn_requests").insert(payload).execute()
+        assert getattr(exc.value, "code", None) == "23503"
+    finally:
+        service_client.table("chat_logs").delete().eq("user_id", user_a).execute()
+        for uid in (user_a, user_b):
+            service_client.table("turn_requests").delete().eq("user_id", uid).execute()
+            service_client.table("profiles").delete().eq("user_id", uid).execute()
+
+
+def test_cross_user_turn_request_reference_rejected(service_client):
+    """An outbox event for user B must not be able to reference a
+    turn_request owned by user A (composite FK on (user_id, turn_request_id))."""
+    user_a = _uid("req_a")
+    user_b = _uid("req_b")
+    service_client.table("profiles").upsert([
+        {"user_id": user_a},
+        {"user_id": user_b},
+    ]).execute()
+    try:
+        req = service_client.table("turn_requests").insert(
+            _valid_turn_request_payload(user_a, str(uuid.uuid4()))
+        ).execute()
+        request_id = req.data[0]["id"]
+
+        payload = _valid_outbox_payload(user_b, f"idem_{user_b}")
+        payload["turn_request_id"] = request_id
+        with pytest.raises(APIError) as exc:
+            service_client.table("outbox_events").insert(payload).execute()
+        assert getattr(exc.value, "code", None) == "23503"
+    finally:
+        for uid in (user_a, user_b):
+            service_client.table("turn_requests").delete().eq("user_id", uid).execute()
+            service_client.table("outbox_events").delete().eq("user_id", uid).execute()
+            service_client.table("profiles").delete().eq("user_id", uid).execute()
+
+
 # ---------------------------------------------------------------------------
 # Cascade: user deletion leaves no orphans
 # ---------------------------------------------------------------------------
