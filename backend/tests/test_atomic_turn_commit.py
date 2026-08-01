@@ -636,6 +636,38 @@ class TestValidateAtomicCommitInput:
         valid_inputs["outbox_events"] = []
         validate_atomic_commit_input(**valid_inputs)
 
+    @pytest.mark.parametrize("event_type", ["a" * 64, "a" * 65, "A", "a-b"])
+    def test_event_type_sql_regex_boundaries(self, valid_inputs, event_type):
+        valid_inputs["outbox_events"] = [(event_type, {}, "key")]
+        if event_type == "a" * 64:
+            validate_atomic_commit_input(**valid_inputs)
+        else:
+            with pytest.raises(ValidationError) as exc:
+                validate_atomic_commit_input(**valid_inputs)
+            assert exc.value.code == "invalid_outbox_events"
+
+    @pytest.mark.parametrize("key", ["a" * 128, "a" * 129, "a", "a b"])
+    def test_outbox_idempotency_key_sql_regex_boundaries(self, valid_inputs, key):
+        valid_inputs["outbox_events"] = [("turn_completed", {}, key)]
+        if key in {"a" * 128, "a"}:
+            validate_atomic_commit_input(**valid_inputs)
+        else:
+            with pytest.raises(ValidationError) as exc:
+                validate_atomic_commit_input(**valid_inputs)
+            assert exc.value.code == "invalid_idempotency_key"
+
+    def test_replay_payload_byte_limit(self, valid_inputs):
+        valid_inputs["replay_payload"] = _valid_replay_payload("x" * 8200)
+        valid_inputs["public_response"] = valid_inputs["replay_payload"]["response"]
+        with pytest.raises(ValidationError) as exc:
+            validate_atomic_commit_input(**valid_inputs)
+        assert exc.value.code == "invalid_replay_payload"
+
+    def test_outbox_payload_byte_limit(self, valid_inputs):
+        valid_inputs["outbox_events"] = [("turn_completed", {"ref": "x" * 8200}, "key")]
+        with pytest.raises(ValidationError) as exc:
+            validate_atomic_commit_input(**valid_inputs)
+        assert exc.value.code == "invalid_outbox_events"
 
 # ═══════════════════════════════════════════════════════════════════════
 # 4. RPC payload building

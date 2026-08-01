@@ -1344,6 +1344,50 @@ def test_new_profile_rejects_null_snapshots(service_client: Client):
         _cleanup_user(service_client, user_id)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("p_payload_hash_sha256", "a" * 63),
+        ("p_payload_hash_sha256", "a" * 65),
+        ("p_payload_hash_sha256", "A" * 64),
+        ("p_lease_owner", "w" * 65),
+    ],
+)
+def test_sql_scalar_regex_boundaries_rejected(service_client: Client, field: str, value: str):
+    user_id = _uid("sql_scalar_boundary")
+    params = _commit_params(user_id, str(uuid.uuid4()), payload_hash=_hash_a())
+    params[field] = value
+    try:
+        result = _call_commit(service_client, params)
+        assert result["error"]["code"] == "validation_failed"
+        assert _count("profiles", user_id) == 0
+        assert _count("turn_requests", user_id) == 0
+    finally:
+        _cleanup_user(service_client, user_id)
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"event_type": "a" * 65, "payload": {}, "idempotency_key": "k"},
+        {"event_type": "turn_completed", "payload": {"ref": "x"}, "idempotency_key": "k" * 129},
+        {"event_type": "turn_completed", "payload": {"ref": "x" * 129}, "idempotency_key": "k"},
+    ],
+)
+def test_sql_outbox_boundaries_rejected(service_client: Client, event: dict):
+    user_id = _uid("sql_outbox_boundary")
+    params = _commit_params(
+        user_id, str(uuid.uuid4()), payload_hash=_hash_a(), outbox_events=[event]
+    )
+    try:
+        result = _call_commit(service_client, params)
+        assert result["error"]["code"] == "validation_failed"
+        assert _count("profiles", user_id) == 0
+        assert _count("turn_requests", user_id) == 0
+    finally:
+        _cleanup_user(service_client, user_id)
+
+
 def test_backend_adapter_rejects_nonfinite_snapshot_before_rpc(service_client: Client):
     """JSON has no non-finite number, so reject it before the real client serializes it."""
     user_id = _uid("snapshot_nonfinite")
