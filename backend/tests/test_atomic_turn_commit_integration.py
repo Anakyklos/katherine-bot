@@ -59,6 +59,8 @@ from postgrest.exceptions import APIError
 from supabase import Client, create_client
 
 from backend.atomic_turn_commit import ConflictError, ValidationError, commit_turn
+from backend.emotional_domain import EmotionalStateV1
+from backend.relationship import RelationshipStateV1
 
 
 _SUPABASE_CLI = ["supabase"] if shutil.which("supabase") else ["npx", "supabase"]
@@ -188,18 +190,46 @@ def _hash_b() -> str:
 
 
 def _emotional_state() -> dict:
-    return {
-        "schema_version": 1, "pleasure": 0.1, "arousal": 0.2, "dominance": 0.3,
-        "libido": 0.2, "aggression": 0.1, "connection": 0.6, "energy": 0.7,
-        "tension": 0.2, "coping_mode": "HEALTHY", "timestamp": 1700000000.0,
-    }
+    return EmotionalStateV1.neutral(timestamp=1700000000.0).to_dict()
 
 
 def _relationship_state() -> dict:
-    return {
-        "schema_version": 1, "trust": 0.5, "affection": 0.6, "tension": 0.1,
-        "triggers": [], "timestamp": 1700000000.0,
-    }
+    return RelationshipStateV1.neutral(timestamp=1700000000.0).to_dict()
+
+
+def _domain_state_payloads() -> tuple[dict, dict]:
+    """Return non-neutral snapshots through the canonical domain serializers."""
+    emotional = EmotionalStateV1.create(
+        pleasure=0.25,
+        arousal=-0.5,
+        dominance=0.75,
+        libido=0.1,
+        aggression=0.2,
+        connection=0.9,
+        energy=0.8,
+        tension=0.35,
+        coping_mode="DEFENSIVE",
+        timestamp=1700000000.25,
+    ).to_dict()
+    relationship = RelationshipStateV1.create(
+        trust=0.8,
+        affection=0.65,
+        tension=0.3,
+        triggers=["  abandonment  ", "conflict", "abandonment"],
+        timestamp=1700000000.25,
+    ).to_dict()
+    return emotional, relationship
+
+
+def _commit_params_with_states(user_id: str, request_id: str, *, payload_hash: str) -> dict:
+    emotional, relationship = _domain_state_payloads()
+    return _commit_params(
+        user_id,
+        request_id,
+        payload_hash=payload_hash,
+        emotional_state=emotional,
+        relationship_state=relationship,
+    )
 
 
 def _replay_payload(response: str = "Hi there!") -> dict:
@@ -449,6 +479,31 @@ def test_happy_path_writes_messages_snapshots_request_outbox(service_client: Cli
         assert rows[0]["revision"] == 1
         assert rows[0]["emotional_state"]["schema_version"] == 1
         assert rows[0]["relationship_state"]["schema_version"] == 1
+    finally:
+        _cleanup_user(service_client, user_id)
+
+
+def test_domain_serializers_round_trip_through_real_commit(service_client: Client):
+    """The real RPC must persist the exact v1 domain serializer output."""
+    user_id = _uid("domain_serializers")
+    request_id = str(uuid.uuid4())
+    params = _commit_params_with_states(user_id, request_id, payload_hash=_hash_a())
+    try:
+        result = _call_commit(service_client, params)
+        assert "error" not in result
+        rows = _run_sql(
+            "SELECT emotional_state, relationship_state FROM public.profiles "
+            f"WHERE user_id = '{user_id}'"
+        )
+        assert rows == [{
+            "emotional_state": params["p_emotional_state"],
+            "relationship_state": params["p_relationship_state"],
+        }]
+        assert params["p_emotional_state"]["coping_mode"] == "DEFENSIVE"
+        assert params["p_emotional_state"]["timestamp"] == 1700000000.25
+        assert params["p_relationship_state"]["timestamp"] == 1700000000.25
+        assert params["p_relationship_state"]["triggers"] == ["abandonment", "conflict"]
+        assert "bond_label" not in params["p_relationship_state"]
     finally:
         _cleanup_user(service_client, user_id)
 

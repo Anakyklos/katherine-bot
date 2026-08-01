@@ -23,6 +23,8 @@ import os
 
 import pytest
 from dataclasses import FrozenInstanceError
+from backend.emotional_domain import EmotionalStateV1
+from backend.relationship import RelationshipStateV1
 from typing import Mapping, Any, Optional
 
 # Import under test
@@ -426,6 +428,38 @@ class TestValidateSnapshotPayload:
                 "relationship_state",
             )
         assert "missing fundamental fields" in str(exc.value)
+
+    @pytest.mark.parametrize("coping_mode", ["UNKNOWN", "", None])
+    def test_domain_serializer_rejects_invalid_coping_mode(self, coping_mode):
+        with pytest.raises(ValueError):
+            EmotionalStateV1.create(
+                pleasure=0.0, arousal=0.0, dominance=0.0,
+                libido=0.0, aggression=0.0, connection=0.5,
+                energy=0.8, tension=0.0, coping_mode=coping_mode,
+                timestamp=1.0,
+            )
+
+    @pytest.mark.parametrize("timestamp", [0, -1, float("nan"), float("inf")])
+    def test_domain_serializers_reject_invalid_timestamps(self, timestamp):
+        with pytest.raises(ValueError):
+            EmotionalStateV1.neutral(timestamp=timestamp)
+        with pytest.raises(ValueError):
+            RelationshipStateV1.neutral(timestamp=timestamp)
+
+    @pytest.mark.parametrize("triggers", [[""], ["x" * 129], [f"t{i}" for i in range(33)]])
+    def test_domain_serializer_rejects_invalid_triggers(self, triggers):
+        with pytest.raises(ValueError):
+            RelationshipStateV1.create(
+                trust=0.5, affection=0.3, tension=0.0,
+                triggers=triggers, timestamp=1.0,
+            )
+
+    def test_domain_serializer_normalizes_duplicate_triggers(self):
+        state = RelationshipStateV1.create(
+            trust=0.5, affection=0.3, tension=0.0,
+            triggers=["duplicate", "duplicate"], timestamp=1.0,
+        )
+        assert state.to_dict()["triggers"] == ["duplicate"]
 
 
 # ═══════════════════════════════════════════════════════════════════════
