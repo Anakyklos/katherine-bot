@@ -17,7 +17,30 @@ jobs:
           version: '2.109.1'
 
       - name: Start Supabase
-        run: supabase start
+        shell: bash
+        run: |
+          set -uo pipefail
+          log_file="$(mktemp)"
+          trap 'rm -f "$log_file"' EXIT
+          if supabase start >"$log_file" 2>&1; then
+            echo "Supabase local stack started"
+          else
+            echo "::error::Supabase local stack failed to start"
+            # Sanitized diagnostic: never print lines that may carry keys,
+            # JWTs, passwords, or credentialed connection strings.
+            grep -vEi \
+              -e 'publishable' \
+              -e 'secret' \
+              -e 'anon' \
+              -e 'service_role' \
+              -e 'jwt' \
+              -e 'password' \
+              -e 'access.?key' \
+              -e 'postgres(ql)?://' \
+              -e '://[^/@[:space:]]+@' \
+              "$log_file" || true
+            exit 1
+          fi
 
       - name: Verify Supabase is running (no secrets in logs)
         run: |

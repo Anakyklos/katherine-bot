@@ -92,14 +92,56 @@ def service_role_key() -> str:
     return _required_env("SUPABASE_SERVICE_ROLE_KEY")
 
 
+def _close_http_transports(client: Client) -> None:
+    """Close the lazily-created postgrest/storage/functions transports.
+
+    Each lazily-created sub-client owns an httpx session; in the pinned
+    versions storage3 and supabase-functions expose no ``close()``/``aclose()``
+    of their own, so close the underlying httpx session directly.
+    """
+    if client is None:
+        return
+    for attr, session_attr in (
+        ("_postgrest", "session"),
+        ("_storage", "session"),
+        ("_functions", "_client"),
+    ):
+        transport = getattr(client, attr, None)
+        if transport is None:
+            continue
+        session = getattr(transport, session_attr, None)
+        if session is not None and hasattr(session, "close"):
+            session.close()
+
+
+def _close_client(client: Client) -> None:
+    """Close every HTTP transport a Supabase sync client may hold.
+
+    supabase-py 2.31.0 does not expose a public close(); the auth transport is
+    created eagerly and postgrest/storage/functions lazily. Close only the
+    transports that were actually created so no unclosed-socket
+    ``ResourceWarning`` is reported while ``filterwarnings = error`` is active.
+    """
+    if client is None:
+        return
+    _close_http_transports(client)
+    auth = getattr(client, "auth", None)
+    if auth is not None and hasattr(auth, "close"):
+        auth.close()
+
+
 @pytest.fixture(scope="module")
 def service_client(supabase_url: str, service_role_key: str) -> Client:
-    return create_client(supabase_url, service_role_key)
+    client = create_client(supabase_url, service_role_key)
+    yield client
+    _close_client(client)
 
 
 @pytest.fixture(scope="module")
 def anon_client(supabase_url: str, anon_key: str) -> Client:
-    return create_client(supabase_url, anon_key)
+    client = create_client(supabase_url, anon_key)
+    yield client
+    _close_client(client)
 
 
 @pytest.fixture(scope="module")
@@ -119,10 +161,16 @@ def auth_client(supabase_url: str, anon_key: str, service_client: Client) -> tup
     assert response.session is not None and response.session.access_token is not None
     yield client, response.user.id
 
+    # Close the lazily-created transports BEFORE sign_out(): sign_out() fires
+    # an auth state change event that resets client._postgrest (and the other
+    # lazy transports) to None without closing their httpx sessions, which
+    # would leak sockets until GC and fail under filterwarnings=error.
+    _close_http_transports(client)
     client.auth.sign_out()
     for user in service_client.auth.admin.list_users():
         if user.email == email:
             service_client.auth.admin.delete_user(user.id)
+    _close_client(client)
 
 
 # ---------------------------------------------------------------------------
@@ -368,17 +416,20 @@ def _run_concurrent(
 
     def _one(call: _ConcurrentCommit) -> dict:
         client = create_client(url, key)
-        barrier.wait(timeout=timeout)
-        return _call_commit(
-            client,
-            _commit_params(
-                call.user_id,
-                call.request_id,
-                payload_hash=call.payload_hash,
-                lease_owner=call.lease_owner,
-                expected_revision=call.expected_revision,
-            ),
-        )
+        try:
+            barrier.wait(timeout=timeout)
+            return _call_commit(
+                client,
+                _commit_params(
+                    call.user_id,
+                    call.request_id,
+                    payload_hash=call.payload_hash,
+                    lease_owner=call.lease_owner,
+                    expected_revision=call.expected_revision,
+                ),
+            )
+        finally:
+            _close_client(client)
 
     with ThreadPoolExecutor(max_workers=len(calls)) as pool:
         futures = [pool.submit(_one, call) for call in calls]
@@ -672,7 +723,11 @@ def test_two_transactions_same_revision_only_one_commits(supabase_url, service_r
         rows = _run_sql(f"SELECT revision FROM public.profiles WHERE user_id = '{user_id}'")
         assert rows[0]["revision"] == 1
     finally:
-        _cleanup_user(create_client(supabase_url, service_role_key), user_id)
+        cleanup = create_client(supabase_url, service_role_key)
+        try:
+            _cleanup_user(cleanup, user_id)
+        finally:
+            _close_client(cleanup)
 
 
 # ---------------------------------------------------------------------------
@@ -692,8 +747,11 @@ def test_different_users_progress_in_parallel(supabase_url, service_role_key):
         assert all("error" not in r for r in results)
         assert [r["committed_revision"] for r in results] == [1, 1]
     finally:
-        for call in calls:
-            _cleanup_user(client, call.user_id)
+        try:
+            for call in calls:
+                _cleanup_user(client, call.user_id)
+        finally:
+            _close_client(client)
 
 
 # ---------------------------------------------------------------------------
@@ -721,7 +779,10 @@ def test_missing_profile_created_once_under_concurrency(supabase_url, service_ro
         rows = _run_sql(f"SELECT revision FROM public.profiles WHERE user_id = '{user_id}'")
         assert rows[0]["revision"] == 1
     finally:
-        _cleanup_user(client, user_id)
+        try:
+            _cleanup_user(client, user_id)
+        finally:
+            _close_client(client)
 
 
 # ---------------------------------------------------------------------------
@@ -1080,7 +1141,10 @@ def test_simultaneous_reclaims_do_not_both_win(supabase_url, service_role_key):
         rows = _run_sql(f"SELECT revision FROM public.profiles WHERE user_id = '{user_id}'")
         assert rows[0]["revision"] == 1
     finally:
-        _cleanup_user(client, user_id)
+        try:
+            _cleanup_user(client, user_id)
+        finally:
+            _close_client(client)
 
 
 def test_reclaim_miss_rolls_back_profile_and_messages(service_client: Client):

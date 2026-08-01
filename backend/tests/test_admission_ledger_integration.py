@@ -49,14 +49,56 @@ def service_role_key() -> str:
     return _required_env("SUPABASE_SERVICE_ROLE_KEY")
 
 
+def _close_http_transports(client: Client) -> None:
+    """Close the lazily-created postgrest/storage/functions transports.
+
+    Each lazily-created sub-client owns an httpx session; in the pinned
+    versions storage3 and supabase-functions expose no ``close()``/``aclose()``
+    of their own, so close the underlying httpx session directly.
+    """
+    if client is None:
+        return
+    for attr, session_attr in (
+        ("_postgrest", "session"),
+        ("_storage", "session"),
+        ("_functions", "_client"),
+    ):
+        transport = getattr(client, attr, None)
+        if transport is None:
+            continue
+        session = getattr(transport, session_attr, None)
+        if session is not None and hasattr(session, "close"):
+            session.close()
+
+
+def _close_client(client: Client) -> None:
+    """Close every HTTP transport a Supabase sync client may hold.
+
+    supabase-py 2.31.0 does not expose a public close(); the auth transport is
+    created eagerly and postgrest/storage/functions lazily. Close only the
+    transports that were actually created so no unclosed-socket
+    ``ResourceWarning`` is reported while ``filterwarnings = error`` is active.
+    """
+    if client is None:
+        return
+    _close_http_transports(client)
+    auth = getattr(client, "auth", None)
+    if auth is not None and hasattr(auth, "close"):
+        auth.close()
+
+
 @pytest.fixture(scope="module")
 def service_client(supabase_url: str, service_role_key: str) -> Client:
-    return create_client(supabase_url, service_role_key)
+    client = create_client(supabase_url, service_role_key)
+    yield client
+    _close_client(client)
 
 
 @pytest.fixture(scope="module")
 def anon_client(supabase_url: str, anon_key: str) -> Client:
-    return create_client(supabase_url, anon_key)
+    client = create_client(supabase_url, anon_key)
+    yield client
+    _close_client(client)
 
 
 def _run_sql(sql: str) -> list[dict]:
@@ -158,10 +200,16 @@ def authenticated_client(
     _assert_valid_session(response, client, "authenticated_client")
     yield client
 
+    # Close the lazily-created transports BEFORE sign_out(): sign_out() fires
+    # an auth state change event that resets client._postgrest (and the other
+    # lazy transports) to None without closing their httpx sessions, which
+    # would leak sockets until GC and fail under filterwarnings=error.
+    _close_http_transports(client)
     client.auth.sign_out()
     for user in service_client.auth.admin.list_users():
         if user.email == email:
             service_client.auth.admin.delete_user(user.id)
+    _close_client(client)
 
 
 @pytest.fixture(autouse=True)
@@ -252,14 +300,17 @@ def _concurrent_reserve(
     call: ConcurrentCall,
 ) -> dict:
     client = _new_service_client(url, key)
-    barrier.wait(timeout=10)
-    return _reserve(
-        client,
-        user_id=call.user_id,
-        request_id=call.request_id,
-        message_hmac=call.message_hmac,
-        network_hmac=call.network_hmac,
-    )
+    try:
+        barrier.wait(timeout=10)
+        return _reserve(
+            client,
+            user_id=call.user_id,
+            request_id=call.request_id,
+            message_hmac=call.message_hmac,
+            network_hmac=call.network_hmac,
+        )
+    finally:
+        _close_client(client)
 
 
 def test_concurrent_exact_replays_insert_once(
