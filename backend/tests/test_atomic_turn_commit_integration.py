@@ -508,6 +508,55 @@ def test_domain_serializers_round_trip_through_real_commit(service_client: Clien
         _cleanup_user(service_client, user_id)
 
 
+@pytest.mark.parametrize(
+    ("snapshot", "mutate"),
+    [
+        ("emotional", lambda state: state.update({"coping_mode": "INVALID"})),
+        ("emotional", lambda state: state.update({"timestamp": 0.0})),
+        ("relationship", lambda state: state.update({"timestamp": 0.0})),
+        ("relationship", lambda state: state.update({"triggers": "not-a-list"})),
+        ("relationship", lambda state: state.update({"triggers": ["x" * 129]})),
+        ("relationship", lambda state: state.update({"triggers": [f"trigger-{i}" for i in range(33)]})),
+        ("relationship", lambda state: state.update({"triggers": ["duplicate", "duplicate"]})),
+    ],
+    ids=[
+        "invalid-emotional-coping-mode",
+        "invalid-emotional-timestamp",
+        "invalid-relationship-timestamp",
+        "relationship-triggers-not-list",
+        "relationship-trigger-too-large",
+        "relationship-too-many-triggers",
+        "relationship-duplicate-triggers",
+    ],
+)
+def test_forged_raw_snapshot_mappings_are_rejected_atomically(
+    service_client: Client, snapshot: str, mutate
+):
+    """The RPC rejects forged mutations of canonical serializer snapshots."""
+    user_id = _uid("raw_snapshot_rejection")
+    request_id = str(uuid.uuid4())
+    emotional = _emotional_state()
+    relationship = _relationship_state()
+    mutate(emotional if snapshot == "emotional" else relationship)
+
+    try:
+        result = _call_commit(
+            service_client,
+            _commit_params(
+                user_id,
+                request_id,
+                payload_hash=_hash_a(),
+                emotional_state=emotional,
+                relationship_state=relationship,
+            ),
+        )
+        assert result["error"]["code"] == "validation_failed"
+        for table in ("profiles", "chat_logs", "turn_requests", "outbox_events"):
+            assert _count(table, user_id) == 0
+    finally:
+        _cleanup_user(service_client, user_id)
+
+
 # ---------------------------------------------------------------------------
 # 2. Rollback after first message
 # ---------------------------------------------------------------------------

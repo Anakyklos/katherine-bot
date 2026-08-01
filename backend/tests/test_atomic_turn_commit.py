@@ -20,6 +20,7 @@ import json
 import subprocess
 import sys
 import os
+from copy import deepcopy
 
 import pytest
 from dataclasses import FrozenInstanceError
@@ -1336,6 +1337,58 @@ class TestAsyncCommitTurn:
         with pytest.raises(ValidationError):
             await commit_turn(rpc_client=recording_rpc_client, **valid_inputs)
         assert len(recording_rpc_client.calls) == 0
+
+    @pytest.mark.parametrize(
+        "snapshot_name, field_name, invalid_value, expected_code",
+        [
+            ("emotional_state", "coping_mode", "UNKNOWN", "invalid_emotional_state"),
+            ("emotional_state", "coping_mode", "", "invalid_emotional_state"),
+            ("emotional_state", "coping_mode", None, "invalid_emotional_state"),
+            ("emotional_state", "timestamp", 0, "invalid_emotional_state"),
+            ("emotional_state", "timestamp", -1, "invalid_emotional_state"),
+            ("emotional_state", "timestamp", "1700000000", "invalid_emotional_state"),
+            ("emotional_state", "timestamp", None, "invalid_emotional_state"),
+            ("relationship_state", "timestamp", 0, "invalid_relationship_state"),
+            ("relationship_state", "timestamp", -1, "invalid_relationship_state"),
+            ("relationship_state", "timestamp", "1700000000", "invalid_relationship_state"),
+            ("relationship_state", "timestamp", None, "invalid_relationship_state"),
+            ("relationship_state", "triggers", "not-a-list", "invalid_relationship_state"),
+            ("relationship_state", "triggers", [""], "invalid_relationship_state"),
+            ("relationship_state", "triggers", ["x" * 129], "invalid_relationship_state"),
+            (
+                "relationship_state",
+                "triggers",
+                [f"trigger-{index}" for index in range(33)],
+                "invalid_relationship_state",
+            ),
+            (
+                "relationship_state",
+                "triggers",
+                ["duplicate", "duplicate"],
+                "invalid_relationship_state",
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_invalid_raw_snapshot_rejected_before_rpc(
+        self,
+        valid_inputs,
+        recording_rpc_client,
+        snapshot_name,
+        field_name,
+        invalid_value,
+        expected_code,
+    ):
+        inputs = deepcopy(valid_inputs)
+        snapshot = deepcopy(inputs[snapshot_name])
+        snapshot[field_name] = deepcopy(invalid_value)
+        inputs[snapshot_name] = snapshot
+
+        with pytest.raises(ValidationError) as exc:
+            await commit_turn(rpc_client=recording_rpc_client, **inputs)
+
+        assert exc.value.code == expected_code
+        assert recording_rpc_client.calls == []
 
     @pytest.mark.asyncio
     async def test_invalid_lease_owner_rejected_before_rpc(self, valid_inputs, recording_rpc_client):
