@@ -61,11 +61,18 @@ def _valid_replay_payload(response: str = "Hi there!") -> dict:
 
 
 def _valid_emotional_state() -> dict:
-    return {"schema_version": 1, "pleasure": 0.4, "arousal": 0.3, "dominance": 0.2}
+    return {
+        "schema_version": 1, "pleasure": 0.4, "arousal": 0.3, "dominance": 0.2,
+        "libido": 0.2, "aggression": 0.1, "connection": 0.7, "energy": 0.8,
+        "tension": 0.1, "coping_mode": "HEALTHY", "timestamp": 1700000000.0,
+    }
 
 
 def _valid_relationship_state() -> dict:
-    return {"schema_version": 1, "trust": 0.8, "affection": 0.6, "tension": 0.1}
+    return {
+        "schema_version": 1, "trust": 0.8, "affection": 0.6, "tension": 0.1,
+        "triggers": [], "timestamp": 1700000000.0,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════════

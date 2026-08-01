@@ -180,11 +180,18 @@ def _hash_b() -> str:
 
 
 def _emotional_state() -> dict:
-    return {"schema_version": 1, "pleasure": 0.1, "arousal": 0.2, "dominance": 0.3}
+    return {
+        "schema_version": 1, "pleasure": 0.1, "arousal": 0.2, "dominance": 0.3,
+        "libido": 0.2, "aggression": 0.1, "connection": 0.6, "energy": 0.7,
+        "tension": 0.2, "coping_mode": "HEALTHY", "timestamp": 1700000000.0,
+    }
 
 
 def _relationship_state() -> dict:
-    return {"schema_version": 1, "trust": 0.5, "affection": 0.6, "tension": 0.1}
+    return {
+        "schema_version": 1, "trust": 0.5, "affection": 0.6, "tension": 0.1,
+        "triggers": [], "timestamp": 1700000000.0,
+    }
 
 
 def _replay_payload(response: str = "Hi there!") -> dict:

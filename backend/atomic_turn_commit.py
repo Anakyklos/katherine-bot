@@ -49,6 +49,7 @@ Security notes:
 from __future__ import annotations
 
 import json
+import math
 import re
 
 from dataclasses import dataclass
@@ -79,11 +80,13 @@ _MAX_OUTBOX_PAYLOAD_BYTES = 8192
 # any depth (mirrors SQL jsonb_snapshot_contract).
 SNAPSHOT_FORBIDDEN_KEYS = FORBIDDEN_PAYLOAD_KEYS | frozenset({"user_id", "bond_label"})
 
-# Minimal fundamental structure per snapshot kind (mirrors SQL
-# jsonb_snapshot_contract). The full domain validation lives in the domain
-# layer; this only checks that the envelope is structurally coherent.
-EMOTIONAL_FUNDAMENTAL_KEYS = frozenset({"pleasure", "arousal", "dominance"})
-RELATIONSHIP_FUNDAMENTAL_KEYS = frozenset({"trust", "affection", "tension"})
+EMOTIONAL_SNAPSHOT_FIELDS = frozenset({
+    "schema_version", "pleasure", "arousal", "dominance", "libido",
+    "aggression", "connection", "energy", "tension", "coping_mode", "timestamp",
+})
+RELATIONSHIP_SNAPSHOT_FIELDS = frozenset({
+    "schema_version", "trust", "affection", "tension", "triggers", "timestamp",
+})
 
 # Explicit ASCII regexes mirroring the SQL CHECK constraints. str.isalnum()
 # accepts Unicode characters that the database rejects, so plain isalnum()
@@ -306,17 +309,68 @@ def _validate_snapshot_payload(payload: Optional[Mapping[str, Any]], field_name:
             "contains forbidden keys (identity or internal fields)",
         )
 
-    fundamental = (
-        EMOTIONAL_FUNDAMENTAL_KEYS
+    expected = (
+        EMOTIONAL_SNAPSHOT_FIELDS
         if field_name == "emotional_state"
-        else RELATIONSHIP_FUNDAMENTAL_KEYS
+        else RELATIONSHIP_SNAPSHOT_FIELDS
     )
-    missing = fundamental - set(payload.keys())
-    if missing:
+    if set(payload) != expected:
+        missing = sorted(expected - set(payload))
+        detail = f"; missing fundamental fields: {', '.join(missing)}" if missing else ""
         raise ValidationError(
             f"invalid_{field_name}",
-            f"missing fundamental fields: {', '.join(sorted(missing))}",
+            f"must contain exactly the v1 snapshot fields{detail}",
         )
+
+    def bounded(name: str, low: float, high: float) -> None:
+        value = payload[name]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValidationError(f"invalid_{field_name}", f"{name} must be numeric")
+        try:
+            finite = math.isfinite(float(value))
+        except (OverflowError, ValueError):
+            finite = False
+        if not finite or value < low or value > high:
+            raise ValidationError(f"invalid_{field_name}", f"{name} is out of range")
+
+    if field_name == "emotional_state":
+        for name in ("pleasure", "arousal", "dominance"):
+            bounded(name, -1.0, 1.0)
+        for name in ("libido", "aggression", "connection", "energy", "tension"):
+            bounded(name, 0.0, 1.0)
+        if (
+            not isinstance(payload["coping_mode"], str)
+            or payload["coping_mode"] not in {"HEALTHY", "DEFENSIVE", "DISSOCIATED", "MANIC"}
+        ):
+            raise ValidationError(f"invalid_{field_name}", "coping_mode is invalid")
+    else:
+        for name in ("trust", "affection", "tension"):
+            bounded(name, 0.0, 1.0)
+        triggers = payload["triggers"]
+        if not isinstance(triggers, (list, tuple)) or len(triggers) > 32:
+            raise ValidationError(
+                f"invalid_{field_name}", "triggers must contain at most 32 strings"
+            )
+        for trigger in triggers:
+            if (
+                not isinstance(trigger, str)
+                or trigger != trigger.strip()
+                or not trigger
+                or len(trigger) > 128
+            ):
+                raise ValidationError(f"invalid_{field_name}", "triggers contain an invalid value")
+        normalized = [trigger.strip() for trigger in triggers]
+        if len(normalized) != len(set(normalized)):
+            raise ValidationError(f"invalid_{field_name}", "triggers must be deduplicated")
+
+    timestamp = payload["timestamp"]
+    try:
+        timestamp_finite = math.isfinite(float(timestamp))
+    except (OverflowError, ValueError, TypeError):
+        timestamp_finite = False
+    if (isinstance(timestamp, bool) or not isinstance(timestamp, (int, float))
+            or not timestamp_finite or timestamp <= 0):
+        raise ValidationError(f"invalid_{field_name}", "timestamp must be positive")
 
     try:
         serialized = json.dumps(payload, ensure_ascii=False, allow_nan=False)

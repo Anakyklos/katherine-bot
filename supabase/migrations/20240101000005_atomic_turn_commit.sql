@@ -146,6 +146,8 @@ IMMUTABLE
 AS $$
 DECLARE
     v_schema_version jsonb;
+    v_key text;
+    v_value jsonb;
 BEGIN
     IF payload IS NULL THEN
         RETURN TRUE;
@@ -187,17 +189,69 @@ BEGIN
         RETURN FALSE;
     END IF;
 
-    -- Minimal fundamental structure per snapshot kind.
+    -- Exact v1 domain shape and scalar ranges. This intentionally mirrors
+    -- EmotionalStateV1.to_dict() and RelationshipStateV1.to_dict().
     IF p_snapshot_kind = 'emotional' THEN
-        IF NOT (payload ? 'pleasure')
-           OR NOT (payload ? 'arousal')
-           OR NOT (payload ? 'dominance') THEN
+        IF NOT public.jsonb_keys_subset_of(payload, ARRAY[
+            'schema_version', 'pleasure', 'arousal', 'dominance', 'libido',
+            'aggression', 'connection', 'energy', 'tension', 'coping_mode',
+            'timestamp'
+        ]) OR (SELECT count(*) FROM jsonb_object_keys(payload)) <> 11 THEN
+            RETURN FALSE;
+        END IF;
+        FOREACH v_key IN ARRAY ARRAY['pleasure','arousal','dominance'] LOOP
+            v_value := payload->v_key;
+            IF jsonb_typeof(v_value) <> 'number'
+               OR (v_value::text)::double precision < -1
+               OR (v_value::text)::double precision > 1 THEN
+                RETURN FALSE;
+            END IF;
+        END LOOP;
+        FOREACH v_key IN ARRAY ARRAY['libido','aggression','connection','energy','tension'] LOOP
+            v_value := payload->v_key;
+            IF jsonb_typeof(v_value) <> 'number'
+               OR (v_value::text)::double precision < 0
+               OR (v_value::text)::double precision > 1 THEN
+                RETURN FALSE;
+            END IF;
+        END LOOP;
+        IF jsonb_typeof(payload->'coping_mode') <> 'string'
+           OR payload->>'coping_mode' NOT IN ('HEALTHY','DEFENSIVE','DISSOCIATED','MANIC')
+           OR jsonb_typeof(payload->'timestamp') <> 'number'
+           OR (payload->>'timestamp')::double precision <= 0 THEN
             RETURN FALSE;
         END IF;
     ELSIF p_snapshot_kind = 'relationship' THEN
-        IF NOT (payload ? 'trust')
-           OR NOT (payload ? 'affection')
-           OR NOT (payload ? 'tension') THEN
+        IF NOT public.jsonb_keys_subset_of(payload, ARRAY[
+            'schema_version', 'trust', 'affection', 'tension', 'triggers', 'timestamp'
+        ]) OR (SELECT count(*) FROM jsonb_object_keys(payload)) <> 6 THEN
+            RETURN FALSE;
+        END IF;
+        FOREACH v_key IN ARRAY ARRAY['trust','affection','tension'] LOOP
+            v_value := payload->v_key;
+            IF jsonb_typeof(v_value) <> 'number'
+               OR (v_value::text)::double precision < 0
+               OR (v_value::text)::double precision > 1 THEN
+                RETURN FALSE;
+            END IF;
+        END LOOP;
+        IF jsonb_typeof(payload->'triggers') <> 'array'
+           OR jsonb_array_length(payload->'triggers') > 32
+           OR EXISTS (
+                SELECT 1 FROM jsonb_array_elements(payload->'triggers') AS t(value)
+                WHERE jsonb_typeof(t.value) <> 'string'
+                   OR length(trim(t.value #>> '{}')) = 0
+                   OR length(t.value #>> '{}') > 128
+                   OR (t.value #>> '{}') <> trim(t.value #>> '{}')
+           )
+           OR EXISTS (
+                SELECT 1
+                FROM jsonb_array_elements_text(payload->'triggers') AS t(value)
+                GROUP BY trim(t.value)
+                HAVING count(*) > 1
+           )
+           OR jsonb_typeof(payload->'timestamp') <> 'number'
+           OR (payload->>'timestamp')::double precision <= 0 THEN
             RETURN FALSE;
         END IF;
     END IF;
@@ -217,6 +271,47 @@ GRANT EXECUTE ON FUNCTION public.jsonb_snapshot_contract(jsonb, text) TO service
 -- initial response and every retry are assembled by exactly the same code.
 -- Never reads chat_logs: message identifiers come from request_id and
 -- replay_payload.message_id, both of which survive message pruning.
+ALTER TABLE public.turn_requests
+    ADD COLUMN IF NOT EXISTS replay_outbox_refs jsonb NOT NULL DEFAULT '[]'::jsonb;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'turn_requests_replay_outbox_refs_check'
+    ) THEN
+        ALTER TABLE public.turn_requests
+            ADD CONSTRAINT turn_requests_replay_outbox_refs_check
+            CHECK (jsonb_typeof(replay_outbox_refs) = 'array');
+    END IF;
+END $$;
+
+-- Preserve replay stability for completed rows created before this column was
+-- introduced. This is a one-time migration snapshot; future replays never
+-- consult live outbox state.
+UPDATE public.turn_requests tr
+SET replay_outbox_refs = refs.outbox_refs
+FROM (
+    SELECT
+        tr0.id,
+        COALESCE(
+            jsonb_agg(
+                jsonb_build_object(
+                    'id', e.id::text,
+                    'event_type', e.event_type,
+                    'idempotency_key', e.idempotency_key,
+                    'turn_request_id', e.turn_request_id::text,
+                    'contract_version', e.contract_version
+                ) ORDER BY e.id
+            ) FILTER (WHERE e.id IS NOT NULL), '[]'::jsonb
+        ) AS outbox_refs
+    FROM public.turn_requests tr0
+    LEFT JOIN public.outbox_events e
+      ON e.user_id = tr0.user_id AND e.turn_request_id = tr0.id
+    WHERE tr0.status = 'completed'
+    GROUP BY tr0.id
+) refs
+WHERE tr.id = refs.id;
+
 CREATE OR REPLACE FUNCTION public.commit_turn_build_result(
     p_user_id text,
     p_request_id uuid
@@ -227,7 +322,6 @@ SET search_path = public
 AS $$
 DECLARE
     v_row public.turn_requests%ROWTYPE;
-    v_outbox jsonb;
 BEGIN
     SELECT * INTO v_row
     FROM public.turn_requests
@@ -237,23 +331,6 @@ BEGIN
         RAISE EXCEPTION 'persistence error' USING ERRCODE = 'P0001';
     END IF;
 
-    -- Stable, deterministic outbox references (ORDER BY id).
-    SELECT COALESCE(
-        jsonb_agg(
-            jsonb_build_object(
-                'id', e.id::text,
-                'event_type', e.event_type,
-                'idempotency_key', e.idempotency_key,
-                'turn_request_id', e.turn_request_id::text,
-                'contract_version', e.contract_version
-            ) ORDER BY e.id
-        ),
-        '[]'::jsonb
-    )
-    INTO v_outbox
-    FROM public.outbox_events e
-    WHERE e.user_id = p_user_id AND e.turn_request_id = v_row.id;
-
     RETURN jsonb_build_object(
         'user_id', v_row.user_id,
         'request_id', v_row.request_id::text,
@@ -261,7 +338,7 @@ BEGIN
         'user_message_id', v_row.request_id::text,
         'assistant_message_id', v_row.replay_payload->>'message_id',
         'replay_payload', COALESCE(v_row.replay_payload, '{}'::jsonb),
-        'outbox_events', v_outbox,
+        'outbox_events', COALESCE(v_row.replay_outbox_refs, '[]'::jsonb),
         'created_at', v_row.created_at::text,
         'completed_at', COALESCE(v_row.completed_at::text, v_row.created_at::text)
     );
@@ -503,6 +580,15 @@ BEGIN
         );
     END IF;
 
+    IF p_outbox_events IS NULL OR jsonb_typeof(p_outbox_events) <> 'array' THEN
+        RETURN jsonb_build_object(
+            'error', jsonb_build_object(
+                'code', 'validation_failed',
+                'message', 'outbox_events must be a JSON array'
+            )
+        );
+    END IF;
+
     -- Lease owner, when provided, must satisfy the sanitized identifier regex.
     IF p_lease_owner IS NOT NULL
        AND NOT (p_lease_owner ~ '^[A-Za-z0-9_.:-]{1,64}$') THEN
@@ -728,13 +814,21 @@ BEGIN
             updated_at = v_now
         WHERE user_id = p_authenticated_user_id;
     ELSE
+        IF p_emotional_state IS NULL OR p_relationship_state IS NULL THEN
+            RETURN jsonb_build_object(
+                'error', jsonb_build_object(
+                    'code', 'validation_failed',
+                    'message', 'new profiles require complete v1 snapshots'
+                )
+            );
+        END IF;
         INSERT INTO public.profiles (
             user_id, persona_config, user_profile, relationship_state, emotional_state,
             revision, updated_at
         ) VALUES (
             p_authenticated_user_id, NULL, NULL,
-            COALESCE(p_relationship_state, '{}'::jsonb),
-            COALESCE(p_emotional_state, '{}'::jsonb),
+            p_relationship_state,
+            p_emotional_state,
             v_new_revision, v_now
         );
     END IF;
@@ -795,14 +889,7 @@ BEGIN
         IF v_reclaim_updated IS NULL THEN
             -- The row changed between the SELECT and the UPDATE (or the lease
             -- was re-taken): controlled conflict, never a payload rewrite.
-            RETURN jsonb_build_object(
-                'error', jsonb_build_object(
-                    'code', 'lease_conflict',
-                    'message', 'Request state changed; reclaim failed',
-                    'expected_revision', p_expected_revision,
-                    'request_id', p_request_id::text
-                )
-            );
+            RAISE EXCEPTION 'lease conflict' USING ERRCODE = 'P0002';
         END IF;
     ELSE
         INSERT INTO public.turn_requests (
@@ -842,6 +929,24 @@ BEGIN
         );
     END LOOP;
 
+    SELECT COALESCE(
+        jsonb_agg(
+            jsonb_build_object(
+                'id', e.id::text,
+                'event_type', e.event_type,
+                'idempotency_key', e.idempotency_key,
+                'turn_request_id', e.turn_request_id::text,
+                'contract_version', e.contract_version
+            ) ORDER BY e.id
+        ), '[]'::jsonb
+    ) INTO v_result
+    FROM public.outbox_events e
+    WHERE e.user_id = p_authenticated_user_id AND e.turn_request_id = v_turn_request_id;
+
+    UPDATE public.turn_requests
+    SET replay_outbox_refs = v_result
+    WHERE id = v_turn_request_id;
+
     -- =============================================================
     -- Step 10: Build and return the public result from PERSISTED rows
     -- (identical to the replay path).
@@ -849,6 +954,15 @@ BEGIN
     RETURN public.commit_turn_build_result(p_authenticated_user_id, p_request_id);
 
 EXCEPTION
+    WHEN SQLSTATE 'P0002' THEN
+        RETURN jsonb_build_object(
+            'error', jsonb_build_object(
+                'code', 'lease_conflict',
+                'message', 'Request state changed; reclaim failed',
+                'expected_revision', p_expected_revision,
+                'request_id', p_request_id::text
+            )
+        );
     WHEN OTHERS THEN
         -- Unexpected PostgreSQL failure. Never expose SQLERRM, SQLSTATE,
         -- constraint names or payload; propagate a constant sanitized message
