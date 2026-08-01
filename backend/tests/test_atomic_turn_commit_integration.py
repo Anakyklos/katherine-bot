@@ -43,8 +43,11 @@ database (never public RPC failpoints).
 
 from __future__ import annotations
 
+import asyncio
 import json
+import math
 import os
+import shutil
 import subprocess
 import threading
 import uuid
@@ -54,6 +57,11 @@ from dataclasses import dataclass
 import pytest
 from postgrest.exceptions import APIError
 from supabase import Client, create_client
+
+from backend.atomic_turn_commit import ConflictError, ValidationError, commit_turn
+
+
+_SUPABASE_CLI = ["supabase"] if shutil.which("supabase") else ["npx", "supabase"]
 
 
 # ---------------------------------------------------------------------------
@@ -132,7 +140,7 @@ def _run_sql(sql: str) -> list[dict]:
     child_env["SUPABASE_ANALYTICS_ENABLED"] = "false"
     result = subprocess.run(
         [
-            "supabase",
+            *_SUPABASE_CLI,
             "db",
             "query",
             "--agent=no",
@@ -370,6 +378,28 @@ def _install_trigger(name: str, target: str, condition: str | None, message: str
 def _drop_trigger(name: str, target: str) -> None:
     _run_sql(f"DROP TRIGGER IF EXISTS atc_{name}_trg ON public.{target}")
     _run_sql(f"DROP FUNCTION IF EXISTS public.atc_{name}_fn()")
+
+
+def _install_reclaim_miss_trigger() -> None:
+    """Make the final reclaim UPDATE miss after message writes begin."""
+    _run_sql(
+        "CREATE OR REPLACE FUNCTION public.atc_reclaim_miss_fn() RETURNS trigger "
+        "LANGUAGE plpgsql AS $$ BEGIN "
+        "UPDATE public.turn_requests SET lease_owner='other-worker', "
+        "lease_expires_at=now() + INTERVAL '1 hour' "
+        "WHERE user_id=NEW.user_id AND status IN ('pending','expired'); "
+        "RETURN NEW; END $$;"
+    )
+    _run_sql(
+        "CREATE TRIGGER atc_reclaim_miss_trg AFTER INSERT ON public.chat_logs "
+        "FOR EACH ROW WHEN (NEW.role = 'assistant') "
+        "EXECUTE FUNCTION public.atc_reclaim_miss_fn()"
+    )
+
+
+def _drop_reclaim_miss_trigger() -> None:
+    _run_sql("DROP TRIGGER IF EXISTS atc_reclaim_miss_trg ON public.chat_logs")
+    _run_sql("DROP FUNCTION IF EXISTS public.atc_reclaim_miss_fn()")
 
 
 # ---------------------------------------------------------------------------
@@ -949,6 +979,37 @@ def test_simultaneous_reclaims_do_not_both_win(supabase_url, service_role_key):
         _cleanup_user(client, user_id)
 
 
+def test_reclaim_miss_rolls_back_profile_and_messages(service_client: Client):
+    user_id = _uid("reclaim_rollback")
+    request_id = str(uuid.uuid4())
+    try:
+        _create_profile(service_client, user_id)
+        _insert_pending_request(
+            user_id, request_id, _hash_a(), "worker-dead", "2000-01-01T00:00:00Z"
+        )
+        _install_reclaim_miss_trigger()
+        result = _call_commit(
+            service_client,
+            _commit_params(
+                user_id, request_id, payload_hash=_hash_a(), lease_owner="worker-1"
+            ),
+        )
+        assert result["error"]["code"] == "lease_conflict"
+        assert _count("chat_logs", user_id) == 0
+        rows = _run_sql(
+            f"SELECT revision FROM public.profiles WHERE user_id = '{user_id}'"
+        )
+        assert rows[0]["revision"] == 0
+        request_rows = _run_sql(
+            "SELECT status, lease_owner FROM public.turn_requests "
+            f"WHERE user_id = '{user_id}' AND request_id = '{request_id}'"
+        )
+        assert request_rows == [{"status": "pending", "lease_owner": "worker-dead"}]
+    finally:
+        _drop_reclaim_miss_trigger()
+        _cleanup_user(service_client, user_id)
+
+
 # ---------------------------------------------------------------------------
 # 21. Pruning messages does not break replay
 # ---------------------------------------------------------------------------
@@ -1014,6 +1075,32 @@ def test_outbox_status_change_does_not_change_replay(service_client: Client):
         _cleanup_user(service_client, user_id)
 
 
+def test_outbox_deletion_and_stable_field_mutation_do_not_change_replay(service_client: Client):
+    user_id = _uid("outbox_immutable")
+    request_id = str(uuid.uuid4())
+    events = [
+        {"event_type": "memory_indexed", "payload": {"ref": "m1"}, "idempotency_key": "k1"},
+    ]
+    try:
+        first = _call_commit(
+            service_client,
+            _commit_params(user_id, request_id, payload_hash=_hash_a(), outbox_events=events),
+        )
+        ref = first["outbox_events"][0]
+        _run_sql(
+            "UPDATE public.outbox_events SET event_type='turn_completed', "
+            f"idempotency_key='mutated-key' WHERE id = '{ref['id']}'"
+        )
+        _run_sql(f"DELETE FROM public.outbox_events WHERE id = '{ref['id']}'")
+        replay = _call_commit(
+            service_client,
+            _commit_params(user_id, request_id, payload_hash=_hash_a(), outbox_events=events),
+        )
+        assert replay["outbox_events"] == first["outbox_events"]
+    finally:
+        _cleanup_user(service_client, user_id)
+
+
 # ---------------------------------------------------------------------------
 # 23. Outbox reference order is deterministic
 # ---------------------------------------------------------------------------
@@ -1070,6 +1157,70 @@ def test_divergent_public_response_rejected(service_client: Client):
         _cleanup_user(service_client, user_id)
 
 
+@pytest.mark.parametrize("bad_response", [123, True, {"nested": "object"}])
+def test_replay_response_must_be_string(service_client: Client, bad_response):
+    user_id = _uid("replay_response_type")
+    try:
+        replay = _replay_payload()
+        replay["response"] = bad_response
+        result = _call_commit(
+            service_client,
+            _commit_params(
+                user_id,
+                str(uuid.uuid4()),
+                payload_hash=_hash_a(),
+                response=str(bad_response),
+                replay_payload=replay,
+            ),
+        )
+        assert result["error"]["code"] == "validation_failed"
+        assert _count("chat_logs", user_id) == 0
+    finally:
+        _cleanup_user(service_client, user_id)
+
+
+def test_replay_request_id_must_match_outer_request(service_client: Client):
+    user_id = _uid("replay_request_id")
+    request_id = str(uuid.uuid4())
+    replay = _replay_payload()
+    replay["request_id"] = str(uuid.uuid4())
+    try:
+        result = _call_commit(
+            service_client,
+            _commit_params(
+                user_id,
+                request_id,
+                payload_hash=_hash_a(),
+                replay_payload=replay,
+            ),
+        )
+        assert result["error"]["code"] == "validation_failed"
+        assert _count("chat_logs", user_id) == 0
+    finally:
+        _cleanup_user(service_client, user_id)
+
+
+def test_replay_request_id_must_be_lowercase_canonical(service_client: Client):
+    user_id = _uid("replay_request_id_case")
+    request_id = str(uuid.uuid4())
+    replay = _replay_payload()
+    replay["request_id"] = request_id.upper()
+    try:
+        result = _call_commit(
+            service_client,
+            _commit_params(
+                user_id,
+                request_id,
+                payload_hash=_hash_a(),
+                replay_payload=replay,
+            ),
+        )
+        assert result["error"]["code"] == "validation_failed"
+        assert _count("chat_logs", user_id) == 0
+    finally:
+        _cleanup_user(service_client, user_id)
+
+
 # ---------------------------------------------------------------------------
 # 25. schema_version textual/boolean/incompatible rejected
 # ---------------------------------------------------------------------------
@@ -1093,6 +1244,116 @@ def test_bad_schema_version_rejected(service_client: Client, bad_schema_version)
         result = _call_commit(service_client, params)
         assert result["error"]["code"] == "validation_failed"
         assert _count("chat_logs", user_id) == 0
+    finally:
+        _cleanup_user(service_client, user_id)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda state: state.pop("energy"),
+        lambda state: state.update({"unexpected": 1}),
+        lambda state: state.update({"pleasure": 2.0}),
+    ],
+)
+def test_invalid_snapshot_shape_or_number_rejected(service_client: Client, mutate):
+    user_id = _uid("snapshot_shape")
+    emotional = _emotional_state()
+    mutate(emotional)
+    try:
+        result = _call_commit(
+            service_client,
+            _commit_params(
+                user_id,
+                str(uuid.uuid4()),
+                payload_hash=_hash_a(),
+                emotional_state=emotional,
+            ),
+        )
+        assert result["error"]["code"] == "validation_failed"
+        assert _count("profiles", user_id) == 0
+    finally:
+        _cleanup_user(service_client, user_id)
+
+
+def test_new_profile_rejects_null_snapshots(service_client: Client):
+    user_id = _uid("null_snapshot")
+    params = _commit_params(user_id, str(uuid.uuid4()), payload_hash=_hash_a())
+    params["p_emotional_state"] = None
+    params["p_relationship_state"] = None
+    try:
+        result = _call_commit(service_client, params)
+        assert result["error"]["code"] == "validation_failed"
+        assert _count("profiles", user_id) == 0
+    finally:
+        _cleanup_user(service_client, user_id)
+
+
+def test_backend_adapter_rejects_nonfinite_snapshot_before_rpc(service_client: Client):
+    """JSON has no non-finite number, so reject it before the real client serializes it."""
+    user_id = _uid("snapshot_nonfinite")
+    request_id = str(uuid.uuid4())
+    emotional = _emotional_state()
+    emotional["pleasure"] = math.nan
+    replay = _replay_payload()
+    replay["request_id"] = request_id
+
+    async def rpc_client(name: str, params: dict) -> dict:
+        return _call_commit(service_client, params)
+
+    with pytest.raises(ValidationError) as exc:
+        asyncio.run(
+            commit_turn(
+                rpc_client=rpc_client,
+                authenticated_user_id=user_id,
+                request_id=request_id,
+                expected_revision=0,
+                user_message="Hello",
+                assistant_message="Hi there!",
+                emotional_state=emotional,
+                relationship_state=_relationship_state(),
+                public_response="Hi there!",
+                outbox_events=[],
+                replay_payload=replay,
+            )
+        )
+    assert exc.value.code == "invalid_emotional_state"
+    assert _count("profiles", user_id) == 0
+
+
+def test_backend_commit_turn_real_client_replays_and_conflicts(service_client: Client):
+    user_id = _uid("backend_adapter")
+    request_id = str(uuid.uuid4())
+    replay = _replay_payload("Adapter response")
+    replay["request_id"] = request_id
+    outbox_events = [("turn_completed", {"ref": "adapter"}, "adapter-key")]
+
+    async def rpc_client(name: str, params: dict) -> dict:
+        return _call_commit(service_client, params)
+
+    async def invoke(assistant_message: str):
+        return await commit_turn(
+            rpc_client=rpc_client,
+            authenticated_user_id=user_id,
+            request_id=request_id,
+            expected_revision=0,
+            user_message="Hello",
+            assistant_message=assistant_message,
+            emotional_state=_emotional_state(),
+            relationship_state=_relationship_state(),
+            public_response="Adapter response",
+            outbox_events=outbox_events,
+            replay_payload=replay,
+        )
+
+    try:
+        first = asyncio.run(invoke("Adapter response"))
+        replayed = asyncio.run(invoke("Adapter response"))
+        assert replayed.to_db_row() == first.to_db_row()
+
+        with pytest.raises(ConflictError) as exc:
+            asyncio.run(invoke("Changed hashed assistant message"))
+        assert exc.value.code == "request_payload_conflict"
     finally:
         _cleanup_user(service_client, user_id)
 

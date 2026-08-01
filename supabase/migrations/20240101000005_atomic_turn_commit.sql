@@ -521,11 +521,26 @@ BEGIN
         );
     END IF;
 
-    IF (p_replay_payload->>'response') IS NULL THEN
+    IF jsonb_typeof(p_replay_payload->'response') <> 'string'
+       OR (p_replay_payload->>'response') IS NULL THEN
         RETURN jsonb_build_object(
             'error', jsonb_build_object(
                 'code', 'validation_failed',
                 'message', 'replay_payload must contain response'
+            )
+        );
+    END IF;
+
+    IF p_replay_payload ? 'request_id'
+       AND (
+           jsonb_typeof(p_replay_payload->'request_id') <> 'string'
+           OR (p_replay_payload->>'request_id') !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+           OR (p_replay_payload->>'request_id') <> p_request_id::text
+       ) THEN
+        RETURN jsonb_build_object(
+            'error', jsonb_build_object(
+                'code', 'validation_failed',
+                'message', 'replay_payload.request_id must equal request_id'
             )
         );
     END IF;

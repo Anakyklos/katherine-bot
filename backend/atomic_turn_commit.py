@@ -474,7 +474,7 @@ def _validate_outbox_event_payload(payload: Mapping[str, Any], event_index: int)
                 )
 
 
-def _validate_replay_payload(payload: Mapping[str, Any]) -> None:
+def _validate_replay_payload(payload: Mapping[str, Any], expected_request_id: str | None = None) -> None:
     """Validate replay payload against the allowlist, forbidden keys and the
     required public fields (response and message_id)."""
     if not isinstance(payload, Mapping):
@@ -506,6 +506,16 @@ def _validate_replay_payload(payload: Mapping[str, Any]) -> None:
             "invalid_replay_payload",
             "must contain a valid UUID message_id field",
         )
+
+    if "request_id" in payload:
+        request_id = payload["request_id"]
+        if not _is_valid_uuid(request_id) or (
+            expected_request_id is not None and request_id != expected_request_id
+        ):
+            raise ValidationError(
+                "invalid_replay_payload",
+                "request_id must equal the enclosing request_id",
+            )
 
     try:
         serialized = json.dumps(payload, ensure_ascii=False, allow_nan=False)
@@ -593,7 +603,7 @@ def validate_atomic_commit_input(
         _validate_outbox_event_payload(payload, i)
         _validate_idempotency_key(idempotency_key)
 
-    _validate_replay_payload(replay_payload)
+    _validate_replay_payload(replay_payload, request_id)
 
     # Single authoritative source for the public response: replay_payload.response
     # must equal public_response (mirrors the SQL constraint).
@@ -786,7 +796,7 @@ def parse_commit_turn_result(result: Mapping[str, Any]) -> CommittedTurn:
 
     if not isinstance(replay_payload, Mapping):
         raise ValidationError("invalid_replay_payload", "replay_payload must be a mapping")
-    _validate_replay_payload(replay_payload)
+    _validate_replay_payload(replay_payload, request_id)
     if replay_payload.get("message_id") != assistant_message_id:
         raise ValidationError(
             "invalid_assistant_message_id",

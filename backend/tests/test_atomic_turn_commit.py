@@ -317,6 +317,21 @@ class TestValidateReplayPayload:
             _validate_replay_payload("not a mapping")
         assert "invalid_replay_payload" in str(exc.value)
 
+    def test_response_must_be_string(self):
+        with pytest.raises(ValidationError):
+            _validate_replay_payload({"response": 123, "message_id": VALID_MESSAGE_ID})
+
+    def test_request_id_must_match_enclosing_request(self):
+        with pytest.raises(ValidationError):
+            _validate_replay_payload(
+                {
+                    "response": "Hi",
+                    "message_id": VALID_MESSAGE_ID,
+                    "request_id": VALID_REQUEST_ID,
+                },
+                "00000000-0000-0000-0000-000000000000",
+            )
+
 
 class TestValidateSnapshotPayload:
     def test_none_ok(self):
@@ -716,6 +731,15 @@ class TestParseCommitTurnResult:
         assert not hasattr(result.outbox_events[0], "status")
         assert not hasattr(result.outbox_events[0], "attempts")
         assert not hasattr(result.outbox_events[0], "lease_owner")
+
+    def test_parse_replay_request_id_must_match_result_request_id(self):
+        result = _success_result()
+        result["replay_payload"]["request_id"] = "00000000-0000-0000-0000-000000000000"
+
+        with pytest.raises(ValidationError) as exc:
+            parse_commit_turn_result(result)
+
+        assert exc.value.code == "invalid_replay_payload"
 
     def test_parse_error_result_conflict(self):
         error_result = {
