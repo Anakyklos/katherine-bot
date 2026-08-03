@@ -47,14 +47,56 @@ def anon_key():
 # Clients
 # ---------------------------------------------------------------------------
 
+def _close_http_transports(client) -> None:
+    """Close the lazily-created postgrest/storage/functions transports.
+
+    Each lazily-created sub-client owns an httpx session; in the pinned
+    versions storage3 and supabase-functions expose no ``close()``/``aclose()``
+    of their own, so close the underlying httpx session directly.
+    """
+    if client is None:
+        return
+    for attr, session_attr in (
+        ("_postgrest", "session"),
+        ("_storage", "session"),
+        ("_functions", "_client"),
+    ):
+        transport = getattr(client, attr, None)
+        if transport is None:
+            continue
+        session = getattr(transport, session_attr, None)
+        if session is not None and hasattr(session, "close"):
+            session.close()
+
+
+def _close_client(client) -> None:
+    """Close every HTTP transport a Supabase sync client may hold.
+
+    supabase-py 2.31.0 does not expose a public close(); the auth transport is
+    created eagerly and postgrest/storage/functions lazily. Close only the
+    transports that were actually created so no unclosed-socket
+    ``ResourceWarning`` is reported while ``filterwarnings = error`` is active.
+    """
+    if client is None:
+        return
+    _close_http_transports(client)
+    auth = getattr(client, "auth", None)
+    if auth is not None and hasattr(auth, "close"):
+        auth.close()
+
+
 @pytest.fixture(scope="module")
 def service_client(supabase_url, service_role_key):
-    return create_client(supabase_url, service_role_key)
+    client = create_client(supabase_url, service_role_key)
+    yield client
+    _close_client(client)
 
 
 @pytest.fixture(scope="module")
 def anon_client(supabase_url, anon_key):
-    return create_client(supabase_url, anon_key)
+    client = create_client(supabase_url, anon_key)
+    yield client
+    _close_client(client)
 
 
 @pytest.fixture(scope="module")
@@ -77,7 +119,8 @@ def auth_client_a(supabase_url, anon_key, service_client):
     user = client.auth.get_user()
     assert user is not None, "get_user() returned None for A"
     assert user.user.id == res.user.id, "get_user() id mismatch for A"
-    return client, res.user.id
+    yield client, res.user.id
+    _close_client(client)
 
 
 @pytest.fixture(scope="module")
@@ -100,7 +143,8 @@ def auth_client_b(supabase_url, anon_key, service_client):
     user = client.auth.get_user()
     assert user is not None, "get_user() returned None for B"
     assert user.user.id == res.user.id, "get_user() id mismatch for B"
-    return client, res.user.id
+    yield client, res.user.id
+    _close_client(client)
 
 
 def _assert_valid_session(res, label: str):

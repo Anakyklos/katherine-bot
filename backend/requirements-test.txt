@@ -31,7 +31,10 @@ pluggy==1.6.0
 pytest==8.2.1
     # via
     #   -r backend/requirements-test.in
+    #   pytest-asyncio
     #   pytest-cov
+pytest-asyncio==0.23.8
+    # via -r backend/requirements-test.in
 pytest-cov==5.0.0
     # via -r backend/requirements-test.in
 sniffio==1.3.1
