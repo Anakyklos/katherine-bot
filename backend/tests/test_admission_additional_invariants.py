@@ -5,7 +5,7 @@ import threading
 from types import SimpleNamespace
 
 import pytest
-from fastapi import BackgroundTasks, Request
+from fastapi import Request
 
 import backend.main as main
 from backend.admission import (
@@ -106,7 +106,6 @@ def test_endpoint_cancellation_drains_reservation_and_never_calls_engine(monkeyp
             main.chat_endpoint(
                 main.ChatInput(request_id=UUID, message="hello"),
                 request,
-                BackgroundTasks(),
                 current_user=SimpleNamespace(id="user-a"),
             )
         )

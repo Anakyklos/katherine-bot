@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -20,7 +21,9 @@ from backend.admission import (
     AdmissionRuntimeConfig,
     AdmissionUnavailable,
 )
+from backend.atomic_turn_commit import ConflictError
 from backend.emotion_presentation import EmotionStateResponse
+from backend.process_turn import ProcessTurnResult, TurnMode
 from backend.turn_execution import TurnBudget
 
 UUID = "550e8400-e29b-41d4-a716-446655440000"
@@ -36,28 +39,33 @@ def emotion_response() -> EmotionStateResponse:
     )
 
 
+def _turn_result(mode: str = "normal") -> ProcessTurnResult:
+    return ProcessTurnResult(
+        committed=object(),
+        response="response text",
+        emotion_state=emotion_response(),
+    )
+
+
 class FakeEngine:
     def __init__(self):
         self.memory_manager = SimpleNamespace(supabase=object())
         self.calls = []
+        self.error = None
 
-    async def process_turn(
-        self,
-        user_id,
-        message,
-        background_tasks=None,
-        *,
-        budget=None,
-    ):
+    async def process_turn(self, user_id, message, request_id, *, budget=None, mode=None):
         self.calls.append(
             {
                 "user_id": user_id,
                 "message": message,
-                "background_tasks": background_tasks,
+                "request_id": request_id,
                 "budget": budget,
+                "mode": mode,
             }
         )
-        return "response", emotion_response()
+        if self.error is not None:
+            raise self.error
+        return _turn_result()
 
 
 @pytest.fixture
@@ -98,7 +106,7 @@ def endpoint(monkeypatch):
         main.app.dependency_overrides.clear()
 
 
-def test_admitted_normalises_uuid_and_shares_one_budget(endpoint, monkeypatch):
+def test_admitted_runs_process_turn_normal_with_request_id_and_one_budget(endpoint, monkeypatch):
     client, fake_engine, captured = endpoint
     rpc_calls = []
 
@@ -115,21 +123,70 @@ def test_admitted_normalises_uuid_and_shares_one_budget(endpoint, monkeypatch):
 
     assert response.status_code == 200
     assert set(response.json()) == {"response", "emotion_state"}
+    assert response.json()["response"] == "response text"
     assert len(rpc_calls) == 1
     request = rpc_calls[0]
     assert request.user_id == "user-a"
     assert request.request_id == UUID
     assert request.estimated_units == len("Olá".encode("utf-8"))
     assert len(fake_engine.calls) == 1
-    assert fake_engine.calls[0]["budget"] is captured["budget"]
+    call = fake_engine.calls[0]
+    # request_id is forwarded to the ProcessTurn-backed engine and the SAME
+    # budget flows from admission through the engine call.
+    assert call["request_id"] == UUID
+    assert call["mode"] is TurnMode.normal
+    assert call["budget"] is captured["budget"]
     assert captured["stage_label"] == "reserve_admission"
     assert captured["allowlist_exceptions"] == (AdmissionUnavailable,)
+
+
+def test_replay_unavailable_runs_process_turn_replay_mode(endpoint, monkeypatch):
+    client, fake_engine, _captured = endpoint
+    monkeypatch.setattr(
+        main,
+        "reserve_admission_sync",
+        lambda _client, _request: AdmissionResult(REQUEST_REPLAY_UNAVAILABLE, 0),
+    )
+
+    response = client.post(
+        "/chat",
+        json={"request_id": UUID, "message": "hello"},
+    )
+
+    assert response.status_code == 200
+    assert len(fake_engine.calls) == 1
+    call = fake_engine.calls[0]
+    assert call["request_id"] == UUID
+    assert call["mode"] is TurnMode.replay_attempt
+
+
+def test_replay_unavailable_without_confirmed_result_returns_409(endpoint, monkeypatch):
+    client, fake_engine, _captured = endpoint
+    monkeypatch.setattr(
+        main,
+        "reserve_admission_sync",
+        lambda _client, _request: AdmissionResult(REQUEST_REPLAY_UNAVAILABLE, 0),
+    )
+    fake_engine.error = ConflictError(
+        code="request_replay_unavailable",
+        message="Request replay is unavailable.",
+        expected_revision=0,
+    )
+
+    response = client.post(
+        "/chat",
+        json={"request_id": UUID, "message": "hello"},
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "request_replay_unavailable"
+    assert UUID not in response.text
+    assert fake_engine.calls[0]["mode"] is TurnMode.replay_attempt
 
 
 @pytest.mark.parametrize(
     ("decision", "retry", "status", "header"),
     [
-        (REQUEST_REPLAY_UNAVAILABLE, 0, 409, None),
         (REQUEST_ID_CONFLICT, 0, 409, None),
         (USER_RATE_LIMITED, 60, 429, "60"),
         (NETWORK_RATE_LIMITED, 60, 429, "60"),
@@ -163,6 +220,68 @@ def test_rejections_map_exactly_without_calling_engine(
     assert response.json()["detail"]["code"] == decision
     assert response.headers.get("Retry-After") == header
     assert fake_engine.calls == []
+
+
+@pytest.mark.parametrize(
+    ("code", "status", "public_code"),
+    [
+        ("revision_mismatch", 409, "revision_conflict"),
+        ("request_payload_conflict", 409, "request_id_conflict"),
+        ("request_in_progress", 409, "request_in_progress"),
+        ("lease_conflict", 409, "lease_conflict"),
+        ("request_replay_unavailable", 409, "request_replay_unavailable"),
+    ],
+)
+def test_process_turn_conflicts_map_without_leaking_request_id(
+    endpoint, monkeypatch, code, status, public_code
+):
+    client, fake_engine, _captured = endpoint
+    monkeypatch.setattr(
+        main,
+        "reserve_admission_sync",
+        lambda _client, _request: AdmissionResult(ADMITTED, 0),
+    )
+    fake_engine.error = ConflictError(
+        code=code,
+        message="internal details that must never be exposed",
+        expected_revision=7,
+        actual_revision=8,
+        request_id=UUID,
+    )
+
+    response = client.post(
+        "/chat",
+        json={"request_id": UUID, "message": "hello"},
+    )
+
+    assert response.status_code == status
+    detail = response.json()["detail"]
+    assert detail["code"] == public_code
+    # ConflictError text, revisions and request_id never reach the client.
+    assert "internal details" not in response.text
+    assert UUID not in response.text
+    assert "expected_revision" not in response.text
+    assert "actual_revision" not in response.text
+
+
+def test_persistence_error_maps_to_503(endpoint, monkeypatch):
+    from backend.atomic_turn_commit import PersistenceError
+
+    client, fake_engine, _captured = endpoint
+    monkeypatch.setattr(
+        main,
+        "reserve_admission_sync",
+        lambda _client, _request: AdmissionResult(ADMITTED, 0),
+    )
+    fake_engine.error = PersistenceError("database_error", "persistence error")
+
+    response = client.post(
+        "/chat",
+        json={"request_id": UUID, "message": "hello"},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "persistence_unavailable"
 
 
 def test_store_unavailable_fails_closed_without_engine(endpoint, monkeypatch):
@@ -306,3 +425,50 @@ def test_expired_budget_returns_timeout_before_rpc(endpoint, monkeypatch):
     assert response.json()["detail"]["code"] == "turn_timeout"
     assert called is False
     assert fake_engine.calls == []
+
+
+def test_cancellation_is_propagated_not_converted_to_500(monkeypatch):
+    """The endpoint must re-raise CancelledError, never map it to HTTP 500."""
+    fake_engine = FakeEngine()
+    monkeypatch.setattr(main, "engine", fake_engine)
+    monkeypatch.setattr(
+        main,
+        "_admission_config",
+        AdmissionRuntimeConfig.from_values("s" * 32),
+    )
+    monkeypatch.setattr(
+        main,
+        "reserve_admission_sync",
+        lambda _client, _request: AdmissionResult(ADMITTED, 0),
+    )
+
+    async def fake_run_blocking_write(*_args, **_kwargs):
+        return AdmissionResult(ADMITTED, 0)
+
+    monkeypatch.setattr(main, "run_blocking_write", fake_run_blocking_write)
+
+    async def boom(*_args, **_kwargs):
+        raise asyncio.CancelledError()
+
+    fake_engine.process_turn = boom
+
+    input_data = main.ChatInput(request_id=UUID, message="hello")
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/chat",
+        "headers": [],
+        "client": ("127.0.0.1", 1234),
+        "server": ("test", 80),
+    }
+    request = main.Request(scope)
+
+    async def run():
+        with pytest.raises(asyncio.CancelledError):
+            await main.chat_endpoint(
+                input_data=input_data,
+                request=request,
+                current_user=SimpleNamespace(id="user-a"),
+            )
+
+    asyncio.run(run())

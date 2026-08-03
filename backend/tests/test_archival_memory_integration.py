@@ -395,10 +395,17 @@ def test_chat_response_format(client_app, mock_supabase, monkeypatch):
         ],
         timestamp=1700000000.0,
     )
+    from backend.process_turn import ProcessTurnResult
     monkeypatch.setattr(
         engine,
         "process_turn",
-        AsyncMock(return_value=("My response text", mock_emotion)),
+        AsyncMock(
+            return_value=ProcessTurnResult(
+                committed=object(),
+                response="My response text",
+                emotion_state=mock_emotion,
+            )
+        ),
     )
     
     response = client_app.post(
