@@ -6,6 +6,8 @@ services:
     ports:
       - "8000:8000"
     restart: unless-stopped
+    # Liveness only: proves the process accepts connections. It does not
+    # assert readiness against Supabase/auth/provider.
     healthcheck:
       test:
         [
@@ -22,13 +24,12 @@ services:
   frontend:
     build:
       context: ./frontend
+      # Required build-time configuration; the Dockerfile fails the build
+      # when any of these is missing or malformed.
       args:
-        VITE_API_URL: ${VITE_API_URL:-http://localhost:8000}
-        VITE_SUPABASE_URL: ${VITE_SUPABASE_URL:-}
-        VITE_SUPABASE_ANON_KEY: ${VITE_SUPABASE_ANON_KEY:-}
+        VITE_API_URL: ${VITE_API_URL}
+        VITE_SUPABASE_URL: ${VITE_SUPABASE_URL}
+        VITE_SUPABASE_ANON_KEY: ${VITE_SUPABASE_ANON_KEY}
     ports:
       - "80:80"
     restart: unless-stopped
-    depends_on:
-      backend:
-        condition: service_healthy

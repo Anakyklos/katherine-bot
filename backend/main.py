@@ -54,11 +54,14 @@ app = FastAPI(title="SoulMate API", description="Backend for the Emotional Compa
 
 # Comma-separated origins allowed by CORS. Default preserves the historical
 # development origin; production sets its own public frontend origin(s).
-cors_allowed_origins = [
-    origin.strip()
-    for origin in os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:3000").split(",")
-    if origin.strip()
-]
+# Invalid configuration (empty or wildcard) fails fast at startup without
+# logging the raw value.
+from .cors_policy import parse_cors_allowed_origins  # noqa: E402
+
+try:
+    cors_allowed_origins = list(parse_cors_allowed_origins(os.getenv("CORS_ALLOWED_ORIGINS")))
+except ValueError:
+    raise RuntimeError("Invalid CORS_ALLOWED_ORIGINS configuration") from None
 
 app.add_middleware(
     CORSMiddleware,

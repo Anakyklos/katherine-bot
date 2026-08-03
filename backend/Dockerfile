@@ -1,4 +1,7 @@
-FROM python:3.12-slim
+# Immutable base image pinned by digest (python:3.12-slim, snapshot 2026-08-03).
+# Update procedure: pick a new digest at https://hub.docker.com/_/python,
+# replace the @sha256 reference, and verify the backend suite in CI.
+FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -16,6 +19,8 @@ USER appuser
 
 EXPOSE 8000
 
+# Liveness only: proves the process accepts connections. It does not assert
+# readiness against Supabase/auth/provider, which stay out of scope here.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
     CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
 
