@@ -21,6 +21,32 @@ from backend.supabase_cli import run_supabase_op
 logger = logging.getLogger(__name__)
 
 
+def _close_client(client) -> None:
+    """Close every HTTP transport a Supabase sync client may hold.
+
+    supabase-py 2.31.0 does not expose a public close(); the auth transport is
+    created eagerly and postgrest/storage/functions lazily. Close only the
+    transports that were actually created so no unclosed-socket
+    ``ResourceWarning`` is reported while ``filterwarnings = error`` is active.
+    """
+    if client is None:
+        return
+    for attr, session_attr in (
+        ("_postgrest", "session"),
+        ("_storage", "session"),
+        ("_functions", "_client"),
+    ):
+        transport = getattr(client, attr, None)
+        if transport is None:
+            continue
+        session = getattr(transport, session_attr, None)
+        if session is not None and hasattr(session, "close"):
+            session.close()
+    auth = getattr(client, "auth", None)
+    if auth is not None and hasattr(auth, "close"):
+        auth.close()
+
+
 @pytest.fixture(scope="module")
 def supabase_service_client():
     """Create a Supabase service-role client for querying state after upgrade."""
@@ -42,7 +68,9 @@ def supabase_service_client():
                 break
         if not key:
             pytest.skip("SERVICE_ROLE_KEY not found")
-    return create_client(url, key)
+    client = create_client(url, key)
+    yield client
+    _close_client(client)
 
 
 def _run_supabase(op_id: str, args: list[str], check: bool = True):
