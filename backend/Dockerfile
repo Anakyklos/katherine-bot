@@ -1,0 +1,29 @@
+# Immutable base image pinned by digest (python:3.12-slim, snapshot 2026-08-03).
+# Update procedure: pick a new digest at https://hub.docker.com/_/python,
+# replace the @sha256 reference, and verify the backend suite in CI.
+FROM python:3.12-slim@sha256:57cd7c3a7a273101a6485ba99423ee568157882804b1124b4dd04266317710de
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+COPY . /app/backend
+
+RUN useradd --create-home --uid 10001 appuser
+USER appuser
+
+EXPOSE 8000
+
+# Liveness only: proves the process accepts connections on the port. It
+# does not call any HTTP endpoint and does not assert readiness against
+# Supabase/auth/provider, which stay out of scope here.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
+    CMD ["python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8000), timeout=3).close()"]
+
+# Single-worker production entrypoint (runtime containment enforces workers=1).
+CMD ["python", "-m", "backend.serve", "--host", "0.0.0.0", "--port", "8000"]

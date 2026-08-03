@@ -294,3 +294,94 @@ jobs:
       - name: Build
         working-directory: ./frontend
         run: npm run build
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create sanitized test environment
+        run: |
+          cat > .env <<'EOF'
+          ADMISSION_HMAC_SECRET=ci-test-secret-0123456789abcdef0123456789abcdef
+          TRUSTED_PROXY_CIDRS=
+          CORS_ALLOWED_ORIGINS=http://allowed.example
+          SUPABASE_URL=http://127.0.0.1:1
+          SUPABASE_SERVICE_ROLE_KEY=ci-test-key
+          GROQ_API_KEY=ci-test-key
+          GROQ_API_KEY_2=ci-test-key
+          ARCHIVAL_EXTRACTION_ENABLED=false
+          HF_HUB_OFFLINE=1
+          TRANSFORMERS_OFFLINE=1
+          VITE_API_URL=http://localhost:8000
+          VITE_SUPABASE_URL=http://127.0.0.1:1
+          VITE_SUPABASE_ANON_KEY=ci-test-key.ci-test-key.ci-test-key
+          EOF
+
+      - name: Validate compose configuration
+        run: docker compose config --quiet
+
+      - name: Frontend build fails when required configuration is missing
+        run: |
+          set +e
+          docker build -f frontend/Dockerfile frontend > /tmp/frontend-invalid-build.log 2>&1
+          exit_code=$?
+          set -e
+          if [ "$exit_code" -eq 0 ]; then
+            echo "frontend build succeeded without required VITE_* args" >&2
+            exit 1
+          fi
+          grep -Fq "Missing required VITE_* build argument" /tmp/frontend-invalid-build.log
+          echo "frontend build correctly failed with the VITE_* validation message"
+
+      - name: Build backend and frontend images without cache
+        run: docker compose build --no-cache
+
+      - name: Start the stack
+        run: docker compose up -d
+
+      - name: Backend liveness (TCP healthcheck on port 8000)
+        run: |
+          for i in $(seq 1 60); do
+            cid="$(docker compose ps -q backend)"
+            if [ -n "$cid" ]; then
+              status="$(docker inspect -f '{{.State.Health.Status}}' "$cid" 2>/dev/null || true)"
+              if [ "$status" = "healthy" ]; then
+                exit 0
+              fi
+            fi
+            sleep 2
+          done
+          echo "backend container did not become healthy" >&2
+          exit 1
+
+      - name: Frontend serves index, asset and SPA fallback
+        run: |
+          curl -fsS http://127.0.0.1/ | grep -q "SoulMate"
+          asset="$(curl -fsS http://127.0.0.1/ | grep -oE '/assets/[^"]+\.js' | head -n1)"
+          test -n "$asset"
+          curl -fsS -o /dev/null "http://127.0.0.1$asset"
+          code="$(curl -fsS -o /dev/null -w '%{http_code}' http://127.0.0.1/qualquer/rota/spa)"
+          test "$code" = "200"
+
+      - name: Allowed CORS origin is reflected
+        run: |
+          curl -fsS -D- -o /dev/null \
+            -H "Origin: http://allowed.example" \
+            http://127.0.0.1:8000/health \
+            | grep -i "^access-control-allow-origin: http://allowed.example"
+
+      - name: Disallowed CORS origin is not allowed
+        run: |
+          headers="$(curl -fsS -D- -o /dev/null \
+            -H "Origin: http://denied.example" \
+            http://127.0.0.1:8000/health)"
+          if echo "$headers" | grep -qi "^access-control-allow-origin:"; then
+            echo "unexpected access-control-allow-origin for disallowed origin" >&2
+            exit 1
+          fi
+
+      - name: Stop and remove containers and volumes
+        if: always()
+        run: docker compose down -v
