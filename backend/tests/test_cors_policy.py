@@ -1,11 +1,17 @@
-"""Tests for the CORS origin allowlist parsing and middleware behavior."""
+"""Tests for the CORS origin allowlist parsing and middleware behavior.
+
+The middleware behavior is exercised against a minimal in-test FastAPI app
+so no global state is mutated: ``backend.main`` (engine, managers,
+Supabase/SentenceTransformer) is never imported here. The real wiring of
+``backend.main`` through the parser is covered by the CI docker job against
+the actual stack.
+"""
 
 from __future__ import annotations
 
-import os
-import sys
-
 import pytest
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.testclient import TestClient
 
 from backend.cors_policy import DEFAULT_ALLOWED_ORIGINS, parse_cors_allowed_origins
@@ -51,41 +57,56 @@ class TestParseCorsAllowedOrigins:
             parse_cors_allowed_origins("http://a.example,*")
 
 
-@pytest.fixture(scope="module")
-def cors_client():
-    """TestClient with a fresh backend.main import under a test CORS env."""
-    _original_modules = dict(sys.modules)
-    _original_env = dict(os.environ)
-    os.environ.update(
-        {
-            "GROQ_API_KEY": "mock_groq_key_placeholder",
-            "GROQ_API_KEY_2": "mock_groq_key_2_placeholder",
-            "ADMISSION_HMAC_SECRET": "test-admission-secret-that-is-at-least-32-bytes",
-            "TRUSTED_PROXY_CIDRS": "",
-            "CORS_ALLOWED_ORIGINS": "http://allowed.example, http://allowed.example",
-        }
+def _client_with_origins(raw: str | None) -> TestClient:
+    """Minimal app wired exactly like backend.main: parser -> middleware."""
+    app = FastAPI()
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(parse_cors_allowed_origins(raw)),
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
-    sys.modules.pop("backend.main", None)
 
-    from backend.main import app
+    @app.get("/health")
+    def health():
+        return {"status": "alive"}
 
-    yield TestClient(app)
+    return TestClient(app)
 
-    os.environ.clear()
-    os.environ.update(_original_env)
-    if "backend.main" in _original_modules and _original_modules["backend.main"] is not None:
-        sys.modules["backend.main"] = _original_modules["backend.main"]
-    else:
-        sys.modules.pop("backend.main", None)
+
+ALLOWED = "http://allowed.example"
+DENIED = "http://denied.example"
 
 
 class TestCorsMiddlewareBehavior:
-    def test_allowed_origin_is_reflected(self, cors_client: TestClient):
-        response = cors_client.get("/health", headers={"Origin": "http://allowed.example"})
+    def test_allowed_origin_is_reflected(self):
+        response = _client_with_origins(ALLOWED).get(
+            "/health", headers={"Origin": ALLOWED}
+        )
         assert response.status_code == 200
-        assert response.headers["access-control-allow-origin"] == "http://allowed.example"
+        assert response.headers["access-control-allow-origin"] == ALLOWED
 
-    def test_disallowed_origin_is_not_allowed(self, cors_client: TestClient):
-        response = cors_client.get("/health", headers={"Origin": "http://denied.example"})
+    def test_disallowed_origin_is_not_allowed(self):
+        response = _client_with_origins(ALLOWED).get(
+            "/health", headers={"Origin": DENIED}
+        )
         assert response.status_code == 200
+        assert "access-control-allow-origin" not in response.headers
+
+    def test_allowed_preflight_succeeds(self):
+        response = _client_with_origins(ALLOWED).options(
+            "/health",
+            headers={"Origin": ALLOWED, "Access-Control-Request-Method": "POST"},
+        )
+        assert response.status_code == 200
+        assert response.headers["access-control-allow-origin"] == ALLOWED
+        assert response.headers["access-control-allow-methods"]
+
+    def test_disallowed_preflight_is_denied(self):
+        response = _client_with_origins(ALLOWED).options(
+            "/health",
+            headers={"Origin": DENIED, "Access-Control-Request-Method": "POST"},
+        )
+        assert response.status_code == 400
         assert "access-control-allow-origin" not in response.headers

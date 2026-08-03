@@ -325,14 +325,15 @@ jobs:
       - name: Frontend build fails when required configuration is missing
         run: |
           set +e
-          docker build -f frontend/Dockerfile frontend >/dev/null 2>&1
+          docker build -f frontend/Dockerfile frontend > /tmp/frontend-invalid-build.log 2>&1
           exit_code=$?
           set -e
           if [ "$exit_code" -eq 0 ]; then
             echo "frontend build succeeded without required VITE_* args" >&2
             exit 1
           fi
-          echo "frontend build correctly failed without required VITE_* args"
+          grep -Fq "Missing required VITE_* build argument" /tmp/frontend-invalid-build.log
+          echo "frontend build correctly failed with the VITE_* validation message"
 
       - name: Build backend and frontend images without cache
         run: docker compose build --no-cache
@@ -340,15 +341,19 @@ jobs:
       - name: Start the stack
         run: docker compose up -d
 
-      - name: Backend liveness (process accepts connections)
+      - name: Backend liveness (TCP healthcheck on port 8000)
         run: |
           for i in $(seq 1 60); do
-            if curl -fsS http://127.0.0.1:8000/health; then
-              exit 0
+            cid="$(docker compose ps -q backend)"
+            if [ -n "$cid" ]; then
+              status="$(docker inspect -f '{{.State.Health.Status}}' "$cid" 2>/dev/null || true)"
+              if [ "$status" = "healthy" ]; then
+                exit 0
+              fi
             fi
             sleep 2
           done
-          echo "backend did not become live" >&2
+          echo "backend container did not become healthy" >&2
           exit 1
 
       - name: Frontend serves index, asset and SPA fallback

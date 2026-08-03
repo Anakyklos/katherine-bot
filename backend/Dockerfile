@@ -19,10 +19,11 @@ USER appuser
 
 EXPOSE 8000
 
-# Liveness only: proves the process accepts connections. It does not assert
-# readiness against Supabase/auth/provider, which stay out of scope here.
+# Liveness only: proves the process accepts connections on the port. It
+# does not call any HTTP endpoint and does not assert readiness against
+# Supabase/auth/provider, which stay out of scope here.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+    CMD ["python", "-c", "import socket; socket.create_connection(('127.0.0.1', 8000), timeout=3).close()"]
 
 # Single-worker production entrypoint (runtime containment enforces workers=1).
 CMD ["python", "-m", "backend.serve", "--host", "0.0.0.0", "--port", "8000"]

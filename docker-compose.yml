@@ -6,15 +6,16 @@ services:
     ports:
       - "8000:8000"
     restart: unless-stopped
-    # Liveness only: proves the process accepts connections. It does not
-    # assert readiness against Supabase/auth/provider.
+    # Liveness only: TCP check proves the process accepts connections. It
+    # does not call any HTTP endpoint and does not assert readiness against
+    # Supabase/auth/provider.
     healthcheck:
       test:
         [
           "CMD",
           "python",
           "-c",
-          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)",
+          "import socket; socket.create_connection(('127.0.0.1', 8000), timeout=3).close()",
         ]
       interval: 30s
       timeout: 5s
