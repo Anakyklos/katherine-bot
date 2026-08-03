@@ -52,9 +52,17 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="SoulMate API", description="Backend for the Emotional Companion Bot")
 
+# Comma-separated origins allowed by CORS. Default preserves the historical
+# development origin; production sets its own public frontend origin(s).
+cors_allowed_origins = [
+    origin.strip()
+    for origin in os.getenv("CORS_ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+    if origin.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=cors_allowed_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
