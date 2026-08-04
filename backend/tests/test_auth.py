@@ -78,6 +78,7 @@ def mock_supabase():
 def mock_engine_process():
     from backend.main import engine
     from backend.emotion_presentation import EmotionStateResponse, PublicPAD
+    from backend.process_turn import ProcessTurnResult
     fake_emotion = EmotionStateResponse(
         schema_version=1,
         mood_label="NEUTRA",
@@ -85,7 +86,12 @@ def mock_engine_process():
         dominant_emotions=[],
         timestamp=1_700_000_000.0,
     )
-    with patch.object(engine, 'process_turn', return_value=("Mock response", fake_emotion)) as mock_process:
+    fake_result = ProcessTurnResult(
+        committed=object(),
+        response="Mock response",
+        emotion_state=fake_emotion,
+    )
+    with patch.object(engine, 'process_turn', return_value=fake_result) as mock_process:
         yield mock_process
 
 
@@ -181,7 +187,9 @@ def test_valid_token(client_app, mock_supabase, mock_engine_process):
 
     assert response.status_code == 200
     assert response.json()["response"] == "Mock response"
-    mock_engine_process.assert_called_once_with("user123", "Hello", ANY, budget=ANY)
+    mock_engine_process.assert_called_once_with(
+        "user123", "Hello", REQUEST_ID, budget=ANY, mode=ANY, correlation=ANY
+    )
 
 
 def test_spoofing_user_id_in_chat(client_app, mock_supabase, mock_engine_process):
@@ -404,7 +412,9 @@ def test_chat_message_exactly_at_limit(client_app, mock_supabase, mock_engine_pr
 
     assert response.status_code == 200
     assert response.json()["response"] == "Mock response"
-    mock_engine_process.assert_called_once_with("user123", message, ANY, budget=ANY)
+    mock_engine_process.assert_called_once_with(
+        "user123", message, REQUEST_ID, budget=ANY, mode=ANY, correlation=ANY
+    )
 
 
 def test_chat_message_exceeds_limit(client_app, mock_supabase, mock_engine_process):

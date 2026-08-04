@@ -227,6 +227,29 @@ class ConversationEngine:
     def _project_emotion_state(state: EmotionalStateV1, appraisal: AppraisalV1) -> EmotionStateResponse:
         return project_public_emotion(state, appraisal)
 
+    # ─── ProcessTurn provider port (#272) ──────────────────────────────────────
+    # Public surface used by the ProcessTurn use case so provider calls stay
+    # outside the transaction while keeping the domain logic unchanged.
+
+    async def appraise(self, message: str, budget: TurnBudget) -> AppraisalV1:
+        """Public appraisal port for the ProcessTurn use case."""
+        return await self._appraise(message, budget)
+
+    async def generate(self, messages: list, budget: TurnBudget) -> str:
+        """Public generation port for the ProcessTurn use case."""
+        return await self._generate_with_messages(messages, budget)
+
+    def build_trusted_policy(
+        self,
+        emotional_state: EmotionalStateV1,
+        relationship: RelationshipStateV1,
+        adaptation_strategy: str = "",
+    ) -> str:
+        """Public trusted-policy builder for the ProcessTurn use case."""
+        return self._build_trusted_policy(
+            emotional_state, relationship, adaptation_strategy
+        )
+
     @staticmethod
     def _classify_commit_error(
         exc: BaseException,

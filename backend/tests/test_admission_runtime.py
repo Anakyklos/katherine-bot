@@ -21,6 +21,7 @@ from backend.admission import (
     NETWORK_RATE_LIMITED,
     REQUEST_ID_CONFLICT,
     REQUEST_REPLAY_UNAVAILABLE,
+    TURN_CORRELATION_DOMAIN,
     UNKNOWN_NETWORK_IDENTITY,
     USER_DAILY_REQUEST_QUOTA_EXCEEDED,
     USER_DAILY_UNIT_QUOTA_EXCEEDED,
@@ -32,6 +33,7 @@ from backend.admission import (
     AdmissionUnavailable,
     build_admission_request,
     compute_hmac_sha256,
+    compute_turn_correlation,
     parse_admission_result,
     reserve_admission_sync,
     resolve_network_identity,
@@ -91,6 +93,65 @@ def test_hmac_is_exact_utf8_and_domain_separated():
     assert message_digest != network_digest
     assert len(message_digest) == 64
     assert message_digest == message_digest.lower()
+
+
+class TestTurnCorrelation:
+    def test_correlation_is_exact_hmac_with_domain_separation(self):
+        config = AdmissionRuntimeConfig.from_values(SECRET)
+        request_id = RequestIdentity(UUID).request_id
+        expected = hmac.new(
+            SECRET.encode("utf-8"),
+            TURN_CORRELATION_DOMAIN + b"\x00" + request_id.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        assert compute_turn_correlation(config, UUID) == expected
+        assert len(expected) == 64
+        assert expected == expected.lower()
+
+    def test_same_request_same_correlation_across_calls(self):
+        config = AdmissionRuntimeConfig.from_values(SECRET)
+        assert compute_turn_correlation(config, UUID.upper()) == compute_turn_correlation(
+            config, UUID.lower()
+        )
+
+    def test_different_requests_produce_different_correlations(self):
+        config = AdmissionRuntimeConfig.from_values(SECRET)
+        other = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        assert compute_turn_correlation(config, UUID) != compute_turn_correlation(
+            config, other
+        )
+
+    def test_correlation_is_not_a_truncated_uuid_and_not_reversible(self):
+        config = AdmissionRuntimeConfig.from_values(SECRET)
+        correlation = compute_turn_correlation(config, UUID)
+        # never the raw request id, never a truncated UUID
+        assert correlation != UUID
+        assert UUID not in correlation
+        assert "550e8400" not in correlation
+        # domain separation: differs from the message HMAC of the same value
+        message_digest = compute_hmac_sha256(
+            SECRET.encode("utf-8"), MESSAGE_HMAC_DOMAIN, UUID
+        )
+        assert correlation != message_digest
+
+    def test_secret_never_appears_in_repr_or_exception(self):
+        config = AdmissionRuntimeConfig.from_values(SECRET)
+        correlation = compute_turn_correlation(config, UUID)
+        assert SECRET not in correlation
+        assert SECRET not in repr(config)
+        assert SECRET not in repr(correlation)
+
+    @pytest.mark.parametrize(
+        "request_id", ["not-a-uuid", "", None, 123, "x" * 128]
+    )
+    def test_invalid_request_id_fails_closed(self, request_id):
+        config = AdmissionRuntimeConfig.from_values(SECRET)
+        with pytest.raises(AdmissionUnavailable):
+            compute_turn_correlation(config, request_id)
+
+    def test_invalid_config_fails_closed(self):
+        with pytest.raises(AdmissionUnavailable):
+            compute_turn_correlation(object(), UUID)
 
 
 def test_untrusted_peer_ignores_forwarded_header():

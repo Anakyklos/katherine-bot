@@ -197,6 +197,21 @@ jobs:
           set -euo pipefail
           python -m pytest -q -ra backend/tests/test_atomic_turn_commit_integration.py
 
+      - name: Reset database for process turn integration tests
+        run: |
+          set -euo pipefail
+          supabase db reset
+
+      - name: Run Process Turn Integration Tests (replay RPC + multi-worker)
+        env:
+          SUPABASE_URL: "http://127.0.0.1:54321"
+          SUPABASE_ANON_KEY: "${{ env.SUPABASE_ANON_KEY }}"
+          SUPABASE_SERVICE_ROLE_KEY: "${{ env.SUPABASE_SERVICE_ROLE_KEY }}"
+          PYTHONPATH: "."
+        run: |
+          set -euo pipefail
+          python -m pytest -q -ra backend/tests/test_process_turn_integration.py
+
       - name: Stop Supabase
         if: always()
         run: supabase stop
@@ -248,6 +263,7 @@ jobs:
               --ignore=backend/tests/test_transactional_schema_legacy.py \
               --ignore=backend/tests/test_transactional_schema_integration.py \
               --ignore=backend/tests/test_atomic_turn_commit_integration.py \
+              --ignore=backend/tests/test_process_turn_integration.py \
               -ra
 
   frontend:

@@ -1,5 +1,5 @@
 import asyncio
-from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -29,13 +29,16 @@ from .admission import (
     AdmissionRuntimeConfig,
     AdmissionUnavailable,
     build_admission_request,
+    compute_turn_correlation,
     reserve_admission_sync,
     resolve_network_identity,
 )
 from .admission_contracts import AdmissionError, RequestIdentity, validate_new_message
+from .atomic_turn_commit import ConflictError, PersistenceError
 from .chat_engine import ChatConversationEngine
 from .memory import StatePersistenceError
 from .emotion_presentation import EmotionStateResponse
+from .process_turn import TurnMode
 from .turn_execution import (
     TurnExecutionConfig,
     TurnExecutionError,
@@ -268,11 +271,53 @@ def _map_turn_error(exc: Exception) -> HTTPException:
             detail={"code": TurnErrorCode.persistence_unavailable.value, "message": "Persistence service unavailable."},
         )
 
+    if isinstance(exc, PersistenceError):
+        # Unexpected persistence failure: sanitized, never PostgreSQL messages.
+        return HTTPException(
+            status_code=503,
+            detail={"code": TurnErrorCode.persistence_unavailable.value, "message": "Persistence service unavailable."},
+        )
+
     # Unknown/unexpected — sanitize to generic 500
     return HTTPException(
         status_code=500,
         detail={"code": TurnErrorCode.internal_error.value, "message": "Internal server error."},
     )
+
+
+# Stable conflict mapping for the ProcessTurn use case (#272). One single
+# documented policy per code; messages are public constants, never raw
+# PostgreSQL/Supabase text. request_id / message / revisions are never echoed.
+_PROCESS_TURN_CONFLICT_HTTP = {
+    "revision_mismatch": (
+        409,
+        {"code": "revision_conflict", "message": "Request conflicts with a concurrent update."},
+    ),
+    "request_payload_conflict": (
+        409,
+        {"code": "request_id_conflict", "message": "Request identifier conflicts with a different message."},
+    ),
+    "request_in_progress": (
+        409,
+        {"code": "request_in_progress", "message": "Request is already being processed."},
+    ),
+    "lease_conflict": (
+        409,
+        {"code": "lease_conflict", "message": "Request lease conflict."},
+    ),
+    "request_replay_unavailable": (
+        409,
+        {"code": "request_replay_unavailable", "message": "Request was already received but its response is unavailable."},
+    ),
+}
+
+
+def _map_process_turn_conflict(exc: ConflictError) -> HTTPException:
+    status_code, detail = _PROCESS_TURN_CONFLICT_HTTP.get(
+        exc.code,
+        (409, {"code": "request_conflict", "message": "Request conflict."}),
+    )
+    return HTTPException(status_code=status_code, detail=detail)
 
 
 _ADMISSION_HTTP = {
@@ -308,7 +353,6 @@ def _admission_unavailable_error() -> HTTPException:
 async def chat_endpoint(
     input_data: ChatInput,
     request: Request,
-    background_tasks: BackgroundTasks,
     current_user = Depends(get_current_user)
 ):
     try:
@@ -337,15 +381,34 @@ async def chat_endpoint(
             admission_request,
             allowlist_exceptions=(AdmissionUnavailable,),
         )
-        if admission_result.decision != ADMITTED:
+        # Sanitized correlation reference for observability: HMAC-SHA256 of
+        # the canonical request id under the dedicated turn-correlation domain
+        # (never the raw request id, user id, message or any secret).
+        correlation = compute_turn_correlation(_admission_config, identity.request_id)
+        if admission_result.decision == ADMITTED:
+            mode = TurnMode.normal
+            logger.info("event=admission_admitted correlation=%s", correlation)
+        elif admission_result.decision == REQUEST_REPLAY_UNAVAILABLE:
+            # The ledger detected a repeated (user, request_id): try the
+            # persisted transactional result BEFORE any provider call. A
+            # replay is a distinct observable event from a fresh admission.
+            mode = TurnMode.replay_attempt
+            logger.info("event=admission_replay correlation=%s", correlation)
+        else:
             logger.info("event=admission_rejected code=%s", admission_result.decision)
             raise _map_admission_rejection(admission_result)
 
-        logger.info("event=admission_admitted")
-        response_text, current_emotion = await engine.process_turn(
-            user_id, input_data.message, background_tasks, budget=budget
+        result = await engine.process_turn(
+            user_id,
+            input_data.message,
+            identity.request_id,
+            budget=budget,
+            mode=mode,
+            correlation=correlation,
         )
-        return ChatResponse(response=response_text, emotion_state=current_emotion)
+        # The public DTO exposes exactly response + emotion_state; revisions,
+        # outbox refs, internal IDs and CommittedTurn are never exposed.
+        return ChatResponse(response=result.response, emotion_state=result.emotion_state)
     except asyncio.CancelledError:
         # CancelledError must NOT be converted to HTTP 500 — propagate
         raise
@@ -354,8 +417,10 @@ async def chat_endpoint(
     except AdmissionUnavailable:
         logger.error("event=admission_unavailable")
         raise _admission_unavailable_error()
+    except ConflictError as exc:
+        raise _map_process_turn_conflict(exc)
     except (DeadlineExceeded, TurnExecutionError, GroqPoolExhaustedError,
-            GroqRequestError, StatePersistenceError) as exc:
+            GroqRequestError, StatePersistenceError, PersistenceError) as exc:
         raise _map_turn_error(exc)
     except Exception:
         # Sanitize logging: avoid logging raw exceptions that might contain secrets or tracebacks

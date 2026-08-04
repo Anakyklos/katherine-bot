@@ -869,6 +869,42 @@ def parse_commit_turn_result(result: Mapping[str, Any]) -> CommittedTurn:
     )
 
 
+def build_canonical_commit_payload(
+    authenticated_user_id: str,
+    request_id: str,
+    expected_revision: int,
+    user_message: str,
+    assistant_message: str,
+    emotional_state: Optional[Mapping[str, Any]],
+    relationship_state: Optional[Mapping[str, Any]],
+    public_response: str,
+    replay_payload: Mapping[str, Any],
+    outbox_events: list[tuple[str, Mapping[str, Any], str]],
+) -> dict[str, Any]:
+    """Build the canonical payload hashed for the ``payload_hash_sha256``.
+
+    The canonical payload covers every input that determines the turn's
+    identity, content and side effects (outbox + replay). Single source of
+    truth shared by the async ``commit_turn`` entry point and the synchronous
+    repository adapter used by the ProcessTurn use case (#272).
+    """
+    return {
+        "authenticated_user_id": authenticated_user_id,
+        "request_id": request_id,
+        "expected_revision": expected_revision,
+        "user_message": user_message,
+        "assistant_message": assistant_message,
+        "emotional_state": emotional_state,
+        "relationship_state": relationship_state,
+        "public_response": public_response,
+        "replay_payload": replay_payload,
+        "outbox_events": [
+            {"event_type": et, "payload": pl, "idempotency_key": ik}
+            for et, pl, ik in outbox_events
+        ],
+    }
+
+
 # Type alias for the RPC function callable
 # The actual implementation depends on the database client being used
 RpcCallable = Any
@@ -925,21 +961,18 @@ async def commit_turn(
 
     # The canonical payload hash covers every input that determines the turn's
     # identity, content and side effects (outbox + replay).
-    canonical_payload = {
-        "authenticated_user_id": authenticated_user_id,
-        "request_id": request_id,
-        "expected_revision": expected_revision,
-        "user_message": user_message,
-        "assistant_message": assistant_message,
-        "emotional_state": emotional_state,
-        "relationship_state": relationship_state,
-        "public_response": public_response,
-        "replay_payload": replay_payload,
-        "outbox_events": [
-            {"event_type": et, "payload": pl, "idempotency_key": ik}
-            for et, pl, ik in outbox_events
-        ],
-    }
+    canonical_payload = build_canonical_commit_payload(
+        authenticated_user_id=authenticated_user_id,
+        request_id=request_id,
+        expected_revision=expected_revision,
+        user_message=user_message,
+        assistant_message=assistant_message,
+        emotional_state=emotional_state,
+        relationship_state=relationship_state,
+        public_response=public_response,
+        replay_payload=replay_payload,
+        outbox_events=outbox_events,
+    )
     payload_hash_sha256 = canonical_payload_hash(canonical_payload)
 
     rpc_payload = build_commit_turn_rpc_payload(
