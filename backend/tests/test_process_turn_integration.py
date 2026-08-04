@@ -460,10 +460,14 @@ def test_same_request_different_message_conflicts(service_client: Client):
 
 # Each worker instantiates the REAL repositories and the REAL ProcessTurn use
 # case over an INDEPENDENT Supabase client, with a deterministic fake provider
-# and fake context loader (no network). The state repository is wrapped by a
-# deterministic file barrier: both workers load the same revision and only
-# then race their commits. The loser receives revision_mismatch, reloads
-# state/context and runs its second generation; the bounded retry lives inside
+# and fake context loader (no network). Coordination happens ONLY in the
+# commit path: the commit repository is wrapped by a file rendezvous on the
+# FIRST commit attempt (expected_revision == 0), so both workers must have
+# loaded revision 0 and entered their first commit before either commit
+# proceeds. The rendezvous runs inside run_blocking_write(), which never
+# abandons the operation, so the artificial wait does NOT consume the turn
+# budget. The loser receives revision_mismatch, reloads state/context and
+# runs its second generation; the bounded retry lives inside
 # ProcessTurn.execute() — the worker never reimplements the retry loop.
 _WORKER_SCRIPT = r"""
 import asyncio
@@ -493,6 +497,7 @@ from backend.turn_execution import (
     create_budget,
 )
 from backend.turn_repositories import (
+    PersistenceError,
     TurnCommitRepository,
     TurnReplayRepository,
     UserStateRepository,
@@ -502,18 +507,33 @@ url = os.environ["SUPABASE_URL"]
 key = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 user_id = os.environ["WORKER_USER"]
 request_id = os.environ["WORKER_REQUEST"]
-ready_file = os.environ["WORKER_READY"]
-peer_file = os.environ["WORKER_PEER"]
+commit_ready_file = os.environ["WORKER_COMMIT_READY"]
+commit_peer_file = os.environ["WORKER_COMMIT_PEER"]
 start_ready_file = os.environ["WORKER_START_READY"]
 start_peer_file = os.environ["WORKER_START_PEER"]
 correlation = os.environ["WORKER_CORRELATION"]
+trace_file = os.environ["WORKER_TRACE"]
 
 
-class BarrierStateRepository:
-    '''Real UserStateRepository + deterministic barrier AFTER the first load.
+def trace(event, **fields):
+    with open(trace_file, "a") as f:
+        f.write(
+            json.dumps(
+                {"event": event, "ts": round(time.time(), 3), "pid": os.getpid(), **fields}
+            )
+            + "\n"
+        )
 
-    Both workers signal after loading the same revision and wait for each
-    other before any commit can start. Retries (reloads) never re-sync.
+
+class CommitBarrierRepository:
+    '''Real TurnCommitRepository + deterministic rendezvous on the FIRST
+    commit attempt (expected_revision == 0).
+
+    Both workers signal that they have loaded revision 0 and entered their
+    first commit, then wait for each other before any commit proceeds. The
+    wait runs inside run_blocking_write(), which never abandons the write,
+    so it does NOT consume the turn budget (the pre-commit budget check has
+    already passed). Retry commits (expected_revision > 0) never re-sync.
     '''
 
     def __init__(self, inner, ready_file, peer_file, timeout=60.0):
@@ -521,34 +541,43 @@ class BarrierStateRepository:
         self._ready_file = ready_file
         self._peer_file = peer_file
         self._timeout = timeout
-        self._synced = False
 
-    def load(self, *args, **kwargs):
-        state = self._inner.load(*args, **kwargs)
-        if not self._synced:
-            self._synced = True
+    def commit(self, *args, **kwargs):
+        expected = kwargs.get("expected_revision")
+        trace("commit_enter", expected=expected)
+        if expected == 0:
+            trace("barrier_wait_start")
             open(self._ready_file, "w").close()
             deadline = time.monotonic() + self._timeout
             while not os.path.exists(self._peer_file):
                 if time.monotonic() > deadline:
-                    raise RuntimeError("barrier_timeout")
+                    # Surfaces distinctly in the worker failure reason
+                    # (allowlisted: propagates as-is, never wrapped).
+                    raise PersistenceError(
+                        "database_error", "commit rendezvous timed out"
+                    )
                 time.sleep(0.02)
-        return state
+            trace("barrier_wait_end")
+        result = self._inner.commit(*args, **kwargs)
+        trace("commit_done", revision=result.committed_revision)
+        return result
 
 
 def wait_for_start_peer():
     '''Absorb subprocess startup skew OUTSIDE the turn budget.
 
     Both workers signal once imports and the client are ready, then wait for
-    each other. The post-load barrier inside BarrierStateRepository then
-    resolves within milliseconds instead of racing against startup.
+    each other. The commit rendezvous then resolves within milliseconds
+    instead of racing against startup.
     '''
+    trace("start_ready")
     open(start_ready_file, "w").close()
     deadline = time.monotonic() + 60.0
     while not os.path.exists(start_peer_file):
         if time.monotonic() > deadline:
             raise RuntimeError("start_sync_timeout")
         time.sleep(0.02)
+    trace("start_peer_seen")
 
 
 class FakeProvider:
@@ -600,27 +629,38 @@ def main():
         wait_for_start_peer()
         asyncio.run(run(client))
     except Exception as exc:  # noqa: BLE001 - worker reports structured failure
+        trace("error", error=type(exc).__name__ + ": " + str(exc))
         fail(type(exc).__name__ + ": " + str(exc))
     finally:
-        for f in (ready_file, start_ready_file):
-            try:
-                os.unlink(f)
-            except OSError:
-                pass
+        # Marker files (start/commit rendezvous) are removed by the harness
+        # after BOTH workers exit: a slow peer must never lose the peer marker
+        # mid-flight.
         close_client(client)
 
 
 async def run(client):
     try:
         client_provider = lambda: client
-        state_repo = UserStateRepository(client_provider)
-        commit_repo = TurnCommitRepository(client_provider)
+
+        class TracingStateRepository:
+            def __init__(self, inner):
+                self._inner = inner
+
+            def load(self, *args, **kwargs):
+                state = self._inner.load(*args, **kwargs)
+                trace("state_loaded", revision=state.revision)
+                return state
+
+        state_repo = TracingStateRepository(UserStateRepository(client_provider))
+        commit_repo = CommitBarrierRepository(
+            TurnCommitRepository(client_provider), commit_ready_file, commit_peer_file
+        )
         replay_repo = TurnReplayRepository(client_provider)
         context_loader = lambda uid, message, user_state: LoadedContextData()
         provider = FakeProvider()
         config = TurnExecutionConfig.defaults()
         use_case = ProcessTurn(
-            state_repository=BarrierStateRepository(state_repo, ready_file, peer_file),
+            state_repository=state_repo,
             commit_repository=commit_repo,
             replay_repository=replay_repo,
             context_loader=context_loader,
@@ -628,7 +668,10 @@ async def run(client):
             transition_config=TransitionConfig.defaults(),
             relationship_config=RelationshipTransitionConfig.defaults(),
             clock=time.time,
-            supabase_timeout=90.0,
+            # Coherent with the same config that drives the budget; the
+            # rendezvous never counts against it (write path is never
+            # abandoned).
+            supabase_timeout=config.supabase_timeout,
             archival_extraction_enabled=False,
             # Per-instance lease owner: this worker NEVER shares an owner.
             lease_owner=new_lease_owner(),
@@ -663,28 +706,52 @@ main()
 """
 
 
-def _run_worker_pair(url: str, key: str, user_a: str, user_b: str) -> list[dict]:
-    """Run two independent subprocess workers synchronized by a file barrier."""
+def _read_trace_events(path: str) -> list[dict]:
+    """Parse a worker trace file (one JSON event per line) into a list."""
+    events: list[dict] = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                events.append(json.loads(line))
+    return events
+
+
+def _trace_field_values(events: list[dict], event: str, field: str) -> list:
+    return [ev[field] for ev in events if ev["event"] == event]
+
+
+def _run_worker_pair(
+    url: str, key: str, user_a: str, user_b: str
+) -> tuple[list[dict], tuple[list[dict], list[dict]]]:
+    """Run two independent subprocess workers synchronized by a file barrier.
+
+    Returns ``(results, traces)`` where ``results`` is the parsed stdout of
+    each worker and ``traces`` the parsed structured trace events of each
+    worker (captured before the rendezvous directory is removed).
+    """
     ready_dir = f"/tmp/opencode/pt_workers_{uuid.uuid4().hex}"
     os.makedirs(ready_dir, exist_ok=True)
     admission_config = AdmissionRuntimeConfig.from_values("s" * 32)
 
-    def spawn(user: str, index: int) -> tuple[subprocess.Popen, str, str, str]:
+    def spawn(user: str, index: int) -> tuple[subprocess.Popen, str, str, str, str]:
         request_id = str(uuid.uuid4())
-        ready = os.path.join(ready_dir, f"ready_{index}")
-        peer = os.path.join(ready_dir, f"ready_{1 - index}")
+        commit_ready = os.path.join(ready_dir, f"commit_ready_{index}")
+        commit_peer = os.path.join(ready_dir, f"commit_ready_{1 - index}")
         start_ready = os.path.join(ready_dir, f"start_ready_{index}")
         start_peer = os.path.join(ready_dir, f"start_ready_{1 - index}")
+        trace_file = os.path.join(ready_dir, f"trace_{index}.jsonl")
         env = dict(os.environ)
         env.update(
             SUPABASE_URL=url,
             SUPABASE_SERVICE_ROLE_KEY=key,
             WORKER_USER=user,
             WORKER_REQUEST=request_id,
-            WORKER_READY=ready,
-            WORKER_PEER=peer,
+            WORKER_COMMIT_READY=commit_ready,
+            WORKER_COMMIT_PEER=commit_peer,
             WORKER_START_READY=start_ready,
             WORKER_START_PEER=start_peer,
+            WORKER_TRACE=trace_file,
             WORKER_CORRELATION=compute_turn_correlation(admission_config, request_id),
         )
         proc = subprocess.Popen(
@@ -694,14 +761,27 @@ def _run_worker_pair(url: str, key: str, user_a: str, user_b: str) -> list[dict]
             stderr=subprocess.PIPE,
             text=True,
         )
-        return proc, ready, request_id, user
+        return proc, commit_ready, request_id, user, trace_file
 
-    proc_a, ready_a, request_a, user_a_final = spawn(user_a, 0)
-    proc_b, ready_b, request_b, _ = spawn(user_b, 1)
+    # Profiles pre-exist at revision 0 with valid neutral snapshots BEFORE
+    # either worker spawns: both deterministically load revision 0 and enter
+    # their first commit with expected_revision == 0. (Concurrent
+    # first-profile creation is covered by a dedicated test.)
+    _run_sql(
+        "INSERT INTO public.profiles (user_id, revision, emotional_state, relationship_state) VALUES "
+        f"('{user_a}', 0, '{json.dumps(_emotional_state())}'::jsonb, '{json.dumps(_relationship_state())}'::jsonb), "
+        f"('{user_b}', 0, '{json.dumps(_emotional_state())}'::jsonb, '{json.dumps(_relationship_state())}'::jsonb) "
+        "ON CONFLICT (user_id) DO NOTHING"
+    )
+    proc_a, ready_a, request_a, user_a_final, trace_a = spawn(user_a, 0)
+    proc_b, ready_b, request_b, _, trace_b = spawn(user_b, 1)
     assert ready_a != ready_b
     try:
         out_a, err_a = proc_a.communicate(timeout=90)
         out_b, err_b = proc_b.communicate(timeout=90)
+        # Capture trace contents BEFORE the rendezvous directory is removed.
+        events_a = _read_trace_events(trace_a)
+        events_b = _read_trace_events(trace_b)
     finally:
         proc_a.kill()
         proc_b.kill()
@@ -719,12 +799,19 @@ def _run_worker_pair(url: str, key: str, user_a: str, user_b: str) -> list[dict]
             os.rmdir(ready_dir)
         except OSError:
             pass
+    if proc_a.returncode != 0 or proc_b.returncode != 0:
+        for label, trace_path in (("A", trace_a), ("B", trace_b)):
+            try:
+                print(f"--- worker {label} trace ---")
+                print(open(trace_path).read())
+            except OSError:
+                print(f"--- worker {label} trace: missing ---")
     assert proc_a.returncode == 0, f"worker A failed: {err_a} | out: {out_a}"
     assert proc_b.returncode == 0, f"worker B failed: {err_b} | out: {out_b}"
     return [
         json.loads(out_a),
         json.loads(out_b),
-    ]
+    ], (events_a, events_b)
 
 
 def test_multi_worker_same_user_cas_consistency(
@@ -736,7 +823,9 @@ def test_multi_worker_same_user_cas_consistency(
     user_id = _uid("mw_same")
     client = create_client(supabase_url, service_role_key)
     try:
-        results = _run_worker_pair(supabase_url, service_role_key, user_id, user_id)
+        results, (events_a, events_b) = _run_worker_pair(
+            supabase_url, service_role_key, user_id, user_id
+        )
         assert [r["ok"] for r in results] == [True, True]
         # exactly one worker needed a second generation; the other won on the
         # first attempt (order between workers is nondeterministic)
@@ -747,6 +836,29 @@ def test_multi_worker_same_user_cas_consistency(
             assert result["response"].startswith("worker response ")
             assert result["user_message_id"] == result["request_id"]
             assert len(result["assistant_message_id"]) == 36
+        # trace proof: both workers loaded revision 0 and entered their first
+        # commit with expected_revision == 0 (the rendezvous); the loser then
+        # reloaded revision 1 and committed expected_revision == 1 exactly
+        # once. No third attempt exists: commit_enter count == generations.
+        initial_revisions = sorted(
+            _trace_field_values(events, "state_loaded", "revision")[0]
+            for events in (events_a, events_b)
+        )
+        assert initial_revisions == [0, 0]
+        first_commits = sorted(
+            _trace_field_values(events, "commit_enter", "expected")[0]
+            for events in (events_a, events_b)
+        )
+        assert first_commits == [0, 0]
+        commit_sequences = sorted(
+            _trace_field_values(events, "commit_enter", "expected")
+            for events in (events_a, events_b)
+        )
+        assert commit_sequences == [[0], [0, 1]]
+        for events, result in zip((events_a, events_b), results):
+            assert len(_trace_field_values(events, "commit_enter", "expected")) == (
+                result["generations"]
+            )
         # the revision increased exactly twice (one per committed request)
         rows = _run_sql(
             f"SELECT revision FROM public.profiles WHERE user_id = '{user_id}'"
@@ -773,11 +885,19 @@ def test_multi_worker_different_users_progress_independently(
     user_b = _uid("mw_b")
     client = create_client(supabase_url, service_role_key)
     try:
-        results = _run_worker_pair(supabase_url, service_role_key, user_a, user_b)
+        results, (events_a, events_b) = _run_worker_pair(
+            supabase_url, service_role_key, user_a, user_b
+        )
         assert [r["ok"] for r in results] == [True, True]
         # no conflicts across users: each commits on its first attempt,
         # proving there is no global lock between workers
         assert [r["generations"] for r in results] == [1, 1]
+        # trace proof: each worker loaded revision 0 and entered exactly one
+        # commit with expected_revision == 0, committing revision 0 -> 1
+        for events in (events_a, events_b):
+            assert _trace_field_values(events, "state_loaded", "revision") == [0]
+            assert _trace_field_values(events, "commit_enter", "expected") == [0]
+            assert _trace_field_values(events, "commit_done", "revision") == [1]
         for user in (user_a, user_b):
             rows = _run_sql(
                 f"SELECT revision FROM public.profiles WHERE user_id = '{user}'"

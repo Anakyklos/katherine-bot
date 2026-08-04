@@ -181,10 +181,14 @@ revisão). Ele nunca é tratado como garantia multi-worker.
 - Provado por `test_process_turn_integration.py` com **processos
   independentes**, cada um instanciando o `ProcessTurn` real com repositórios
   e clientes Supabase separados (provider e context loader determinísticos,
-  barrier determinística por arquivo, timeouts locais, sem sleeps longos). O
-  worker que perde o CAS recebe `revision_mismatch`, recarrega estado/contexto
-  e executa a segunda geração — o loop de retry vive dentro de
-  `ProcessTurn.execute()`, nunca reimplementado no teste.
+  sem sleeps longos). A coordenação artificial é um rendezvous por arquivo no
+  **commit** (primeira tentativa, `expected_revision == 0`), executado dentro
+  de `run_blocking_write()` — que nunca abandona a escrita — então a espera
+  não consome o orçamento pré-commit; ambos os workers carregam a revisão 0 e
+  entram no primeiro commit antes de qualquer commit prosseguir. O worker que
+  perde o CAS recebe `revision_mismatch`, recarrega estado/contexto e executa
+  a segunda geração — o loop de retry vive dentro de `ProcessTurn.execute()`,
+  nunca reimplementado no teste.
 
 ## Outbox em vez de BackgroundTasks
 
