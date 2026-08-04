@@ -56,6 +56,7 @@ class ChatConversationEngine(ConversationEngine):
         *,
         budget: Optional[TurnBudget] = None,
         mode: TurnMode = TurnMode.normal,
+        correlation: str,
     ):
         active_budget = (
             budget
@@ -70,9 +71,10 @@ class ChatConversationEngine(ConversationEngine):
             request_id,
             active_budget,
             mode,
+            correlation,
         )
 
-    async def _run_turn_locked(self, user_id, user_message, request_id, budget, mode):
+    async def _run_turn_locked(self, user_id, user_message, request_id, budget, mode, correlation):
         # Only the lock acquisition is bounded by remaining_before_reserve.
         # Once acquired, the turn runs under budget checks (each stage
         # checks remaining_before_reserve).  This prevents the outer timeout
@@ -91,6 +93,7 @@ class ChatConversationEngine(ConversationEngine):
                 request_id=request_id,
                 user_message=user_message,
                 budget=budget,
+                correlation=correlation,
                 mode=mode,
             )
             return await self._process_turn.execute(inp)

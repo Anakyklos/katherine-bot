@@ -27,6 +27,7 @@ pre-commit variables.
 from __future__ import annotations
 
 import logging
+import re as _re
 import time as _time
 import uuid as _uuid
 from dataclasses import dataclass
@@ -68,12 +69,28 @@ from .turn_execution import (
 
 logger = logging.getLogger(__name__)
 
-#: Stable lease owner used when commit_turn needs to claim/reclaim a
-#: pending/expired request row with the same payload hash.
-LEASE_OWNER = "process-turn-v1"
+#: Stable prefix for per-instance lease owners. Every ProcessTurn instance
+#: generates its OWN owner (``process-turn-v1:<uuidhex>``) so workers never
+#: share an effective lease owner; the value is stable for the instance life,
+#: sanitized for the database CHECK (^[A-Za-z0-9_.:-]{1,64}$) and injectable
+#: for tests.
+LEASE_OWNER_PREFIX = "process-turn-v1"
 
 #: Maximum total commit attempts (initial + exactly one revision retry).
 MAX_COMMIT_ATTEMPTS = 2
+
+#: Correlation reference contract: exact lowercase 64-char HMAC-SHA256 hex.
+_CORRELATION_RE = _re.compile(r"^[0-9a-f]{64}$")
+
+
+def new_lease_owner() -> str:
+    """Generate a unique, sanitized lease owner for one ProcessTurn instance.
+
+    Not derived from user id, request id, message, raw PID or any secret:
+    a fresh random UUID hex under the stable prefix. Format stays within the
+    database limit (``process-turn-v1:`` + 32 hex chars = 47 chars <= 64).
+    """
+    return f"{LEASE_OWNER_PREFIX}:{_uuid.uuid4().hex}"
 
 #: Outbox event for archival extraction (references only, no content).
 ARCHIVAL_EVENT_TYPE = "archival_extraction_requested"
@@ -92,13 +109,25 @@ class TurnMode(str, Enum):
 
 @dataclass(frozen=True)
 class ProcessTurnInput:
-    """Immutable input for one ProcessTurn execution."""
+    """Immutable input for one ProcessTurn execution.
+
+    ``correlation`` is the sanitized HMAC correlation reference computed by
+    the admission runtime for the canonical request id (exact lowercase
+    64-char hex). It is the only request-derived value ProcessTurn logs.
+    """
 
     authenticated_user_id: str
     request_id: str
     user_message: str
     budget: TurnBudget
+    correlation: str
     mode: TurnMode = TurnMode.normal
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.correlation, str) or not _CORRELATION_RE.fullmatch(
+            self.correlation
+        ):
+            raise ValueError("correlation must be a 64-char lowercase hex HMAC")
 
 
 @dataclass(frozen=True)
@@ -170,7 +199,11 @@ def build_archival_outbox_event(request_id: str) -> tuple[str, Mapping[str, Any]
 
 
 def build_process_turn(engine: Any) -> "ProcessTurn":
-    """Wire a ``ProcessTurn`` around a ``ConversationEngine`` instance."""
+    """Wire a ``ProcessTurn`` around a ``ConversationEngine`` instance.
+
+    Each call creates a fresh per-instance lease owner so distinct engine
+    instances (and processes) never share an effective lease owner.
+    """
     from .turn_repositories import (
         TurnCommitRepository,
         TurnReplayRepository,
@@ -189,7 +222,7 @@ def build_process_turn(engine: Any) -> "ProcessTurn":
         clock=engine._clock,
         supabase_timeout=engine._turn_config.supabase_timeout,
         archival_extraction_enabled=engine.archival_extraction_enabled,
-        lease_owner=LEASE_OWNER,
+        lease_owner=new_lease_owner(),
     )
 
 
@@ -209,7 +242,7 @@ class ProcessTurn:
         clock: Callable[[], float] = _time.time,
         supabase_timeout: float = 5.0,
         archival_extraction_enabled: bool = False,
-        lease_owner: str = LEASE_OWNER,
+        lease_owner: Optional[str] = None,
     ) -> None:
         self._state_repository = state_repository
         self._commit_repository = commit_repository
@@ -221,7 +254,9 @@ class ProcessTurn:
         self._clock = clock
         self._supabase_timeout = supabase_timeout
         self._archival_extraction_enabled = archival_extraction_enabled
-        self._lease_owner = lease_owner
+        # Per-instance lease owner: stable for the instance life, unique across
+        # instances, never shared, injectable for tests.
+        self._lease_owner = lease_owner if lease_owner is not None else new_lease_owner()
 
     # ─── Entry point ───────────────────────────────────────────────────────────
 
@@ -237,7 +272,10 @@ class ProcessTurn:
     # ─── Replay path (before the provider) ─────────────────────────────────────
 
     async def _replay(self, inp: ProcessTurnInput) -> CommittedTurn:
-        logger.info("event=process_turn_attempt attempt=1 mode=replay")
+        logger.info(
+            "event=process_turn_attempt correlation=%s attempt=1 mode=replay",
+            inp.correlation,
+        )
         outcome = await run_blocking_read(
             "replay_turn",
             inp.budget,
@@ -248,14 +286,20 @@ class ProcessTurn:
             allowlist_exceptions=_REPOSITORY_ERRORS,
         )
         if outcome.status == "completed":
-            logger.info("event=process_turn_replay")
+            logger.info("event=process_turn_replay correlation=%s", inp.correlation)
             return outcome.committed
         if outcome.status == "request_in_progress":
+            # Active lease of another worker: the request IS being processed;
+            # never recompute and never fall back to the normal path (no
+            # replay<->normal loop).
             raise ConflictError(
                 code="request_in_progress",
                 message="Request is already in progress.",
                 expected_revision=0,
             )
+        # request_replay_unavailable: no confirmed turn exists and this version
+        # performs NO automatic reclaim. Stale pending (expired lease) and
+        # expired reservations require a new request id or operational action.
         raise ConflictError(
             code="request_replay_unavailable",
             message="Request replay is unavailable.",
@@ -267,16 +311,26 @@ class ProcessTurn:
     async def _execute_normal(self, inp: ProcessTurnInput) -> CommittedTurn:
         attempt = 1
         while True:
-            logger.info("event=process_turn_attempt attempt=%s", attempt)
+            logger.info(
+                "event=process_turn_attempt correlation=%s attempt=%s",
+                inp.correlation,
+                attempt,
+            )
             result = await self._run_once(inp, attempt)
             if isinstance(result, CommittedTurn):
-                logger.info("event=process_turn_commit_completed attempt=%s", attempt)
+                logger.info(
+                    "event=process_turn_commit_completed correlation=%s attempt=%s",
+                    inp.correlation,
+                    attempt,
+                )
                 return result
 
             # revision_mismatch: bounded retry (initial + exactly one retry).
             if attempt >= MAX_COMMIT_ATTEMPTS:
                 logger.info(
-                    "event=process_turn_conflict_exhausted attempt=%s", attempt
+                    "event=process_turn_conflict_exhausted correlation=%s attempt=%s",
+                    inp.correlation,
+                    attempt,
                 )
                 raise ConflictError(
                     code="revision_mismatch",
@@ -285,7 +339,11 @@ class ProcessTurn:
                     actual_revision=result.actual_revision,
                 )
 
-            logger.info("event=process_turn_revision_conflict attempt=%s", attempt)
+            logger.info(
+                "event=process_turn_revision_conflict correlation=%s attempt=%s",
+                inp.correlation,
+                attempt,
+            )
             # Verify budget before retrying: an exhausted deadline never retries.
             if inp.budget.remaining_before_reserve <= 0.0:
                 raise DeadlineExceeded()

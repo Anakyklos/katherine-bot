@@ -25,8 +25,10 @@ from backend.atomic_turn_commit import ConflictError
 from backend.emotion_presentation import EmotionStateResponse
 from backend.process_turn import ProcessTurnResult, TurnMode
 from backend.turn_execution import TurnBudget
+from backend.admission import compute_turn_correlation
 
 UUID = "550e8400-e29b-41d4-a716-446655440000"
+SECRET = "s" * 32
 
 
 def emotion_response() -> EmotionStateResponse:
@@ -53,7 +55,9 @@ class FakeEngine:
         self.calls = []
         self.error = None
 
-    async def process_turn(self, user_id, message, request_id, *, budget=None, mode=None):
+    async def process_turn(
+        self, user_id, message, request_id, *, budget=None, mode=None, correlation=None
+    ):
         self.calls.append(
             {
                 "user_id": user_id,
@@ -61,6 +65,7 @@ class FakeEngine:
                 "request_id": request_id,
                 "budget": budget,
                 "mode": mode,
+                "correlation": correlation,
             }
         )
         if self.error is not None:
@@ -472,3 +477,135 @@ def test_cancellation_is_propagated_not_converted_to_500(monkeypatch):
             )
 
     asyncio.run(run())
+
+
+class TestCorrelationFlow:
+    def _expected(self) -> str:
+        return compute_turn_correlation(
+            AdmissionRuntimeConfig.from_values(SECRET), UUID
+        )
+
+    def test_same_request_same_correlation_between_endpoint_and_engine(
+        self, endpoint, monkeypatch
+    ):
+        client, fake_engine, _captured = endpoint
+        monkeypatch.setattr(
+            main,
+            "reserve_admission_sync",
+            lambda _client, _request: AdmissionResult(ADMITTED, 0),
+        )
+
+        response = client.post(
+            "/chat",
+            json={"request_id": UUID, "message": "hello"},
+        )
+
+        assert response.status_code == 200
+        expected = self._expected()
+        assert len(expected) == 64
+        assert fake_engine.calls[0]["correlation"] == expected
+        # the raw request id is never forwarded as the correlation
+        assert fake_engine.calls[0]["correlation"] != UUID
+
+    def test_different_requests_produce_different_correlations(self, endpoint, monkeypatch):
+        client, fake_engine, _captured = endpoint
+        monkeypatch.setattr(
+            main,
+            "reserve_admission_sync",
+            lambda _client, _request: AdmissionResult(ADMITTED, 0),
+        )
+
+        client.post("/chat", json={"request_id": UUID, "message": "hello"})
+        client.post(
+            "/chat",
+            json={"request_id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "message": "hi"},
+        )
+
+        correlations = {call["correlation"] for call in fake_engine.calls}
+        assert len(correlations) == 2
+
+    def test_replay_attempt_receives_same_correlation(self, endpoint, monkeypatch):
+        client, fake_engine, _captured = endpoint
+        monkeypatch.setattr(
+            main,
+            "reserve_admission_sync",
+            lambda _client, _request: AdmissionResult(REQUEST_REPLAY_UNAVAILABLE, 0),
+        )
+
+        response = client.post(
+            "/chat",
+            json={"request_id": UUID, "message": "hello"},
+        )
+
+        assert response.status_code == 200
+        assert fake_engine.calls[0]["mode"] is TurnMode.replay_attempt
+        assert fake_engine.calls[0]["correlation"] == self._expected()
+
+    def test_admission_events_are_distinct_and_correlated(self, endpoint, monkeypatch, caplog):
+        import logging
+
+        client, fake_engine, _captured = endpoint
+        monkeypatch.setattr(
+            main,
+            "reserve_admission_sync",
+            lambda _client, _request: AdmissionResult(REQUEST_REPLAY_UNAVAILABLE, 0),
+        )
+
+        with caplog.at_level(logging.INFO, logger="backend.main"):
+            client.post(
+                "/chat",
+                json={"request_id": UUID, "message": "hello"},
+            )
+
+        expected = self._expected()
+        messages = [r.getMessage() for r in caplog.records]
+        assert f"event=admission_replay correlation={expected}" in messages
+        # a replay is NEVER logged as a normal admission
+        assert not any("event=admission_admitted" in m for m in messages)
+
+    def test_admitted_event_logged_only_for_fresh_admission(
+        self, endpoint, monkeypatch, caplog
+    ):
+        import logging
+
+        client, fake_engine, _captured = endpoint
+        monkeypatch.setattr(
+            main,
+            "reserve_admission_sync",
+            lambda _client, _request: AdmissionResult(ADMITTED, 0),
+        )
+
+        with caplog.at_level(logging.INFO, logger="backend.main"):
+            client.post(
+                "/chat",
+                json={"request_id": UUID, "message": "hello"},
+            )
+
+        expected = self._expected()
+        messages = [r.getMessage() for r in caplog.records]
+        assert f"event=admission_admitted correlation={expected}" in messages
+        assert not any("event=admission_replay" in m for m in messages)
+
+    def test_no_raw_uuid_and_no_secret_in_http_or_logs(
+        self, endpoint, monkeypatch, caplog
+    ):
+        import logging
+
+        client, fake_engine, _captured = endpoint
+        monkeypatch.setattr(
+            main,
+            "reserve_admission_sync",
+            lambda _client, _request: AdmissionResult(ADMITTED, 0),
+        )
+
+        with caplog.at_level(logging.INFO, logger="backend.main"):
+            response = client.post(
+                "/chat",
+                json={"request_id": UUID, "message": "hello"},
+            )
+
+        assert response.status_code == 200
+        assert UUID not in response.text
+        assert SECRET not in response.text
+        assert UUID not in caplog.text
+        assert SECRET not in caplog.text

@@ -188,7 +188,7 @@ def test_valid_token(client_app, mock_supabase, mock_engine_process):
     assert response.status_code == 200
     assert response.json()["response"] == "Mock response"
     mock_engine_process.assert_called_once_with(
-        "user123", "Hello", REQUEST_ID, budget=ANY, mode=ANY
+        "user123", "Hello", REQUEST_ID, budget=ANY, mode=ANY, correlation=ANY
     )
 
 
@@ -413,7 +413,7 @@ def test_chat_message_exactly_at_limit(client_app, mock_supabase, mock_engine_pr
     assert response.status_code == 200
     assert response.json()["response"] == "Mock response"
     mock_engine_process.assert_called_once_with(
-        "user123", message, REQUEST_ID, budget=ANY, mode=ANY
+        "user123", message, REQUEST_ID, budget=ANY, mode=ANY, correlation=ANY
     )
 
 

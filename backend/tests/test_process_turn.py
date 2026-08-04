@@ -12,21 +12,34 @@ context loader — no database, no network, no provider. Coverage:
  4. Result comes from the persisted CommittedTurn, not pre-commit variables
  5. Replay returns the persisted result without the provider
  6. Replay does not run transitions / appraisal / context loading
- 7. Same-ID conflicts never retry the provider
- 8. revision_mismatch retries exactly once, reloads state + context and
+ 7. Replay semantics: pending with ACTIVE lease -> request_in_progress;
+    pending with EXPIRED lease and expired -> request_replay_unavailable;
+    no provider when the policy does not authorize recomputation; replay
+    outcomes are terminal (no replay<->normal loop)
+ 8. Same-ID conflicts never retry the provider
+ 9. revision_mismatch retries exactly once, reloads state + context and
     recomputes a fresh response; a third attempt never occurs
- 9. Provider failure produces no committed turn
-10. Deadline prevents retry
-11. Cancellation before commit writes nothing; cancellation after commit
-    allows replay
-12. Outbox event is idempotent and sanitized (no content / identity)
-13. Logs and errors never contain sensitive markers
+10. Provider failure produces no committed turn
+11. Deadline prevents retry
+12. Lease owner is unique per instance, stable for the instance, sanitized
+    and never shared / never logged
+13. Cancellation before commit writes nothing; cancellation DURING commit
+    drains a stateful write to completion before propagating the original
+    CancelledError; replay recovers exactly the written result; a worker
+    failing after cancellation never leaves an unretrieved task exception
+14. Outbox event is idempotent and sanitized (no content / identity)
+15. Correlation is the sanitized HMAC of the canonical request id, present
+    in every ProcessTurn event, consistent across attempts and never the
+    raw request id; replay and commit events are semantically distinct
+16. Logs and errors never contain sensitive markers
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import re as _re
+import threading
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Mapping, Optional
@@ -46,12 +59,14 @@ from backend.emotional_domain import (
     TransitionConfig,
 )
 from backend.process_turn import (
+    LEASE_OWNER_PREFIX,
     MAX_COMMIT_ATTEMPTS,
     ProcessTurn,
     ProcessTurnInput,
     ProcessTurnResult,
     TurnMode,
     build_archival_outbox_event,
+    new_lease_owner,
     parse_public_result,
 )
 from backend.relationship import (
@@ -76,6 +91,9 @@ from backend.trusted_context import LoadedContextData
 
 UUID = "550e8400-e29b-41d4-a716-446655440000"
 MESSAGE_ID = "87654321-4321-4321-4321-cba987654321"
+CORRELATION = "c" * 64
+
+_LEASE_OWNER_RE = _re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 
 
 def _budget() -> TurnBudget:
@@ -217,7 +235,7 @@ def _use_case(**kwargs: Any) -> ProcessTurn:
         "clock": lambda: 1000.0,
         "supabase_timeout": 5.0,
         "archival_extraction_enabled": False,
-        "lease_owner": "process-turn-v1",
+        # lease_owner omitted: every instance generates its OWN owner.
     }
     params.update(kwargs)
     return ProcessTurn(**params)
@@ -229,6 +247,7 @@ def _input(mode: TurnMode = TurnMode.normal) -> ProcessTurnInput:
         request_id=UUID,
         user_message="hello",
         budget=_budget(),
+        correlation=CORRELATION,
         mode=mode,
     )
 
@@ -258,7 +277,11 @@ class TestNominalPath:
         assert commit["request_id"] == UUID
         assert commit["authenticated_user_id"] == "user-a"
         assert commit["user_message"] == "hello"
-        assert commit["lease_owner"] == "process-turn-v1"
+        # the instance owns a unique, sanitized, per-instance lease owner
+        owner = commit["lease_owner"]
+        assert owner.startswith(LEASE_OWNER_PREFIX + ":")
+        assert _LEASE_OWNER_RE.fullmatch(owner)
+        assert len(owner) <= 64
         # the assistant message id is generated before commit (valid UUID)
         assert len(commit["replay_payload"]["message_id"]) == 36
 
@@ -340,11 +363,13 @@ class TestReplayPath:
         provider = FakeProvider()
         state_repo = FakeStateRepository()
         context_loader = FakeContextLoader()
+        commit_repo = FakeCommitRepository()
         use_case = _use_case(
             replay_repository=replay_repo,
             provider=provider,
             state_repository=state_repo,
             context_loader=context_loader,
+            commit_repository=commit_repo,
         )
 
         result = await _execute(use_case, _input(mode=TurnMode.replay_attempt))
@@ -356,6 +381,7 @@ class TestReplayPath:
         assert provider.appraisals == 0
         assert provider.generations == 0
         assert len(state_repo.loads) == 0
+        assert len(commit_repo.calls) == 0
 
     @pytest.mark.asyncio
     async def test_replay_in_progress_raises_structured_conflict(self):
@@ -378,6 +404,122 @@ class TestReplayPath:
         with pytest.raises(ConflictError) as exc:
             await _execute(use_case, _input(mode=TurnMode.replay_attempt))
         assert exc.value.code == "request_replay_unavailable"
+
+
+class TestReplaySemantics:
+    """Stale/pending/reclaim policy (#308 review).
+
+    Policy chosen: NO automatic reclaim through the endpoint in this version.
+    A replay outcome is always terminal:
+      * completed -> persisted result, never recomputes;
+      * pending with ACTIVE lease -> request_in_progress (it IS being
+        processed; retry the same request id later);
+      * pending with EXPIRED lease / expired / missing -> the reservation can
+        never complete on its own; the client needs a NEW request id (or
+        operational cleanup).
+    The provider is never called for any non-completed outcome and there is
+    never a transition from replay back to the normal (commit) path.
+    """
+
+    @pytest.mark.asyncio
+    async def test_pending_active_lease_is_request_in_progress_no_provider(self):
+        provider = FakeProvider()
+        commit_repo = FakeCommitRepository()
+        use_case = _use_case(
+            replay_repository=FakeReplayRepository(
+                outcome=ReplayOutcome(status=REPLAY_STATUS_IN_PROGRESS)
+            ),
+            provider=provider,
+            commit_repository=commit_repo,
+        )
+        with pytest.raises(ConflictError) as exc:
+            await _execute(use_case, _input(mode=TurnMode.replay_attempt))
+        assert exc.value.code == "request_in_progress"
+        # The policy does not authorize recomputation: no provider, no commit.
+        assert provider.appraisals == 0
+        assert provider.generations == 0
+        assert len(commit_repo.calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_pending_expired_lease_is_replay_unavailable_no_provider(self):
+        provider = FakeProvider()
+        commit_repo = FakeCommitRepository()
+        use_case = _use_case(
+            replay_repository=FakeReplayRepository(
+                outcome=ReplayOutcome(status=REPLAY_STATUS_UNAVAILABLE)
+            ),
+            provider=provider,
+            commit_repository=commit_repo,
+        )
+        with pytest.raises(ConflictError) as exc:
+            await _execute(use_case, _input(mode=TurnMode.replay_attempt))
+        assert exc.value.code == "request_replay_unavailable"
+        assert provider.appraisals == 0
+        assert provider.generations == 0
+        assert len(commit_repo.calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_expired_status_is_replay_unavailable_no_provider(self):
+        provider = FakeProvider()
+        use_case = _use_case(
+            replay_repository=FakeReplayRepository(
+                outcome=ReplayOutcome(status=REPLAY_STATUS_UNAVAILABLE)
+            ),
+            provider=provider,
+        )
+        with pytest.raises(ConflictError) as exc:
+            await _execute(use_case, _input(mode=TurnMode.replay_attempt))
+        assert exc.value.code == "request_replay_unavailable"
+        assert provider.appraisals == 0
+        assert provider.generations == 0
+
+    @pytest.mark.asyncio
+    async def test_no_loop_between_replay_and_normal(self):
+        """A failed replay never falls back to the normal commit path."""
+        replay_repo = FakeReplayRepository(
+            outcome=ReplayOutcome(status=REPLAY_STATUS_UNAVAILABLE)
+        )
+        state_repo = FakeStateRepository()
+        commit_repo = FakeCommitRepository()
+        context_loader = FakeContextLoader()
+        provider = FakeProvider()
+        use_case = _use_case(
+            replay_repository=replay_repo,
+            state_repository=state_repo,
+            commit_repository=commit_repo,
+            context_loader=context_loader,
+            provider=provider,
+        )
+
+        with pytest.raises(ConflictError) as exc:
+            await _execute(use_case, _input(mode=TurnMode.replay_attempt))
+
+        assert exc.value.code == "request_replay_unavailable"
+        # Terminal outcome: no state load, no context, no provider, no commit.
+        assert len(state_repo.loads) == 0
+        assert context_loader.calls == 0
+        assert provider.appraisals == 0
+        assert provider.generations == 0
+        assert len(commit_repo.calls) == 0
+        # The same request re-sent as NORMAL is a distinct admission; only a
+        # repeated admission can enter replay mode. A single execution never
+        # cycles replay -> normal.
+        assert len(replay_repo.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_replay_does_not_claim_any_request(self):
+        """Replay performs reads only: no commit_turn call is ever made."""
+        replay_repo = FakeReplayRepository(
+            outcome=ReplayOutcome(status="completed", committed=_committed())
+        )
+        commit_repo = FakeCommitRepository()
+        use_case = _use_case(
+            replay_repository=replay_repo, commit_repository=commit_repo
+        )
+
+        await _execute(use_case, _input(mode=TurnMode.replay_attempt))
+
+        assert len(commit_repo.calls) == 0
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -500,6 +642,7 @@ class TestRevisionRetry:
             request_id=UUID,
             user_message="hello",
             budget=budget,
+            correlation=CORRELATION,
             mode=TurnMode.normal,
         )
 
@@ -553,21 +696,73 @@ class TestCancellation:
         # Cancellation before the commit started: nothing written.
         assert len(commit_repo.calls) == 0
 
+
+class StatefulWriteRepository:
+    """commit() that really writes to a shared store, gated by threading
+    events so the test can cancel the caller while the worker is active.
+
+    Contract mirrors the real repository inside `run_blocking_write`: the
+    write starts, blocks until released, writes the result to the shared
+    store and only then returns. A configured ``error`` is raised instead.
+    """
+
+    def __init__(
+        self,
+        store: dict,
+        started: threading.Event,
+        release: threading.Event,
+        finished: threading.Event,
+        error: Optional[BaseException] = None,
+        result: Optional[CommittedTurn] = None,
+    ) -> None:
+        self.store = store
+        self.started = started
+        self.release = release
+        self.finished = finished
+        self.error = error
+        self.result = result
+
+    def commit(self, **kwargs: Any) -> CommittedTurn:
+        self.started.set()
+        released = self.release.wait(timeout=10.0)
+        assert released, "worker release timed out"
+        if self.error is not None:
+            raise self.error
+        committed = self.result if self.result is not None else _committed()
+        self.store["committed"] = committed
+        self.finished.set()
+        return committed
+
+
+class StoreBackedReplayRepository:
+    """Replay repository that reads exactly what the stateful write wrote."""
+
+    def __init__(self, store: dict) -> None:
+        self.store = store
+        self.calls = 0
+
+    def replay(self, authenticated_user_id: str, request_id: str) -> ReplayOutcome:
+        self.calls += 1
+        committed = self.store.get("committed")
+        if committed is None:
+            return ReplayOutcome(status=REPLAY_STATUS_UNAVAILABLE)
+        return ReplayOutcome(status="completed", committed=committed)
+
+
+class TestCancelDrainsStatefulWrite:
     @pytest.mark.asyncio
-    async def test_cancel_after_commit_allows_replay(self):
-        # The write helper re-raises the original CancelledError after the
-        # underlying write has been drained (commit actually succeeded).
-        committed = _committed()
-
-        class CommitThenCancel(FakeCommitRepository):
-            def commit(self, **kwargs):
-                self.calls.append(kwargs)
-                raise asyncio.CancelledError()
-
-        commit_repo = CommitThenCancel()
-        replay_repo = FakeReplayRepository(
-            outcome=ReplayOutcome(status="completed", committed=committed)
-        )
+    async def test_cancel_during_commit_drains_then_replay_reads_written_result(self):
+        """The write starts, the caller is cancelled while the worker is
+        active, the worker writes the result and only then is released;
+        run_blocking_write waits for the worker and only then propagates the
+        original CancelledError; replay reads exactly the written result and
+        the provider is not called again."""
+        store: dict = {}
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        commit_repo = StatefulWriteRepository(store, started, release, finished)
+        replay_repo = StoreBackedReplayRepository(store)
         provider = FakeProvider()
         use_case = _use_case(
             commit_repository=commit_repo,
@@ -575,13 +770,115 @@ class TestCancellation:
             provider=provider,
         )
 
+        task = asyncio.create_task(_execute(use_case, _input()))
+        # 1. The write started inside run_blocking_write (worker active).
+        started_ok = await asyncio.to_thread(started.wait, 5.0)
+        assert started_ok, "commit write did not start"
+        # 2. Cancel the calling task while the worker is still active.
+        task.cancel()
+        await asyncio.sleep(0.05)
+        assert not task.done(), "task must still be draining the write"
+        # 3. The worker writes the result and only then is released.
+        release.set()
         with pytest.raises(asyncio.CancelledError):
-            await _execute(use_case, _input())
-
-        # The retried delivery recovers the persisted replay without provider.
+            await task
+        assert finished.wait(5.0), "worker never finished"
+        # 4. The write really completed before the cancellation propagated.
+        assert "committed" in store
+        # 5. Replay recovers exactly the written result, without provider.
         result = await _execute(use_case, _input(mode=TurnMode.replay_attempt))
         assert result.response == "persisted response"
-        assert provider.generations == 1  # only the first (cancelled) attempt
+        assert result.committed is store["committed"]
+        assert provider.generations == 1
+        assert provider.appraisals == 1
+
+    @pytest.mark.asyncio
+    async def test_worker_failure_after_cancel_is_recovered_without_asyncio_warning(
+        self, caplog
+    ):
+        """If the worker fails after the cancellation, the original
+        CancelledError propagates and the worker's exception is retrieved:
+        asyncio must never log 'Task exception was never retrieved'."""
+        store: dict = {}
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        commit_repo = StatefulWriteRepository(
+            store,
+            started,
+            release,
+            finished,
+            error=RuntimeError("worker exploded after cancel"),
+        )
+        use_case = _use_case(commit_repository=commit_repo)
+
+        task = asyncio.create_task(_execute(use_case, _input()))
+        started_ok = await asyncio.to_thread(started.wait, 5.0)
+        assert started_ok, "commit write did not start"
+        task.cancel()
+        await asyncio.sleep(0.05)
+        release.set()
+
+        with caplog.at_level(logging.ERROR, logger="asyncio"):
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        # run_blocking_write only propagates after the worker task is done:
+        # the CancelledError above is itself the proof the drain finished.
+        assert "Task exception was never retrieved" not in caplog.text
+        assert "worker exploded" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_run_blocking_write_regression_consumes_worker_outcome_on_cancel(
+        self, caplog
+    ):
+        """Regression for the helper race that could exit the drain loop
+        without consuming ``worker_task.result()`` after a cancellation:
+        the worker completes while the caller is cancelled and the outcome
+        (success or failure) is always retrieved."""
+        from backend.turn_execution import run_blocking_write
+
+        store: dict = {}
+        started = threading.Event()
+        release = threading.Event()
+        finished = threading.Event()
+        commit_repo = StatefulWriteRepository(store, started, release, finished)
+        replay_repo = StoreBackedReplayRepository(store)
+
+        async def run():
+            return await run_blocking_write(
+                "commit_turn",
+                _budget(),
+                5.0,
+                commit_repo.commit,
+                authenticated_user_id="user-a",
+                request_id=UUID,
+                expected_revision=0,
+                user_message="hello",
+                assistant_message="ok",
+                emotional_state=None,
+                relationship_state=None,
+                public_response="ok",
+                outbox_events=[],
+                replay_payload={},
+                lease_owner=new_lease_owner(),
+                allowlist_exceptions=(ConflictError, ValidationError, PersistenceError),
+            )
+
+        task = asyncio.create_task(run())
+        started_ok = await asyncio.to_thread(started.wait, 5.0)
+        assert started_ok, "commit write did not start"
+        task.cancel()
+        await asyncio.sleep(0.05)
+        release.set()
+        with caplog.at_level(logging.ERROR, logger="asyncio"):
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        # The worker's successful result was consumed; the write landed.
+        assert finished.wait(5.0)
+        assert "committed" in store
+        assert "Task exception was never retrieved" not in caplog.text
+        # The replay store is authoritative for what was drained.
+        assert replay_repo.store["committed"] is store["committed"]
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -653,10 +950,158 @@ class TestObservability:
             await _execute(use_case, _input())
 
         messages = [r.getMessage() for r in caplog.records]
-        assert "event=process_turn_attempt attempt=1" in messages
-        assert "event=process_turn_revision_conflict attempt=1" in messages
-        assert "event=process_turn_attempt attempt=2" in messages
-        assert "event=process_turn_commit_completed attempt=2" in messages
+        assert f"event=process_turn_attempt correlation={CORRELATION} attempt=1" in messages
+        assert f"event=process_turn_revision_conflict correlation={CORRELATION} attempt=1" in messages
+        assert f"event=process_turn_attempt correlation={CORRELATION} attempt=2" in messages
+        assert f"event=process_turn_commit_completed correlation={CORRELATION} attempt=2" in messages
+
+    @pytest.mark.asyncio
+    async def test_lease_owner_never_appears_in_logs(self, caplog):
+        commit_repo = FakeCommitRepository()
+        use_case = _use_case(commit_repository=commit_repo)
+
+        with caplog.at_level(logging.INFO, logger="backend.process_turn"):
+            await _execute(use_case, _input())
+
+        assert use_case._lease_owner not in caplog.text
+
+
+class TestLeaseOwner:
+    def test_two_instances_receive_different_owners(self):
+        first = _use_case()
+        second = _use_case()
+        assert first._lease_owner != second._lease_owner
+
+    def test_same_instance_reuses_the_same_owner(self):
+        use_case = _use_case()
+        owner = use_case._lease_owner
+        assert use_case._lease_owner == owner
+        assert _LEASE_OWNER_RE.fullmatch(owner)
+        assert owner.startswith(LEASE_OWNER_PREFIX + ":")
+        assert len(owner) <= 64
+
+    def test_injected_owner_is_respected(self):
+        use_case = _use_case(lease_owner="custom-owner-1")
+        assert use_case._lease_owner == "custom-owner-1"
+
+    def test_new_lease_owner_is_always_sanitized_and_unique(self):
+        owners = {new_lease_owner() for _ in range(100)}
+        assert len(owners) == 100
+        for owner in owners:
+            assert _LEASE_OWNER_RE.fullmatch(owner)
+            assert owner.startswith(LEASE_OWNER_PREFIX + ":")
+            assert len(owner) <= 64
+
+    @pytest.mark.asyncio
+    async def test_active_lease_of_another_instance_is_request_in_progress(self):
+        """An active lease held by a DIFFERENT instance must surface as
+        request_in_progress, never as a continuation of the same worker."""
+        other_instance_owner = new_lease_owner()
+        commit_repo = FakeCommitRepository(
+            error=ConflictError(
+                code="request_in_progress",
+                message="Request is already in progress by another worker",
+                expected_revision=0,
+                request_id=UUID,
+            )
+        )
+        use_case = _use_case(commit_repository=commit_repo)
+
+        with pytest.raises(ConflictError) as exc:
+            await _execute(use_case, _input())
+
+        assert exc.value.code == "request_in_progress"
+        # The instance must not have claimed the other worker's lease.
+        assert use_case._lease_owner != other_instance_owner
+        assert commit_repo.calls[0]["lease_owner"] != other_instance_owner
+
+    @pytest.mark.asyncio
+    async def test_owner_is_injectable_per_instance_for_tests(self):
+        commit_repo = FakeCommitRepository()
+        first = _use_case(commit_repository=commit_repo, lease_owner="worker-A")
+        second = _use_case(commit_repository=commit_repo, lease_owner="worker-B")
+
+        await _execute(first, _input())
+        await _execute(second, _input())
+
+        assert [c["lease_owner"] for c in commit_repo.calls] == [
+            "worker-A",
+            "worker-B",
+        ]
+
+
+class TestCorrelationObservability:
+    def test_invalid_correlation_fails_closed(self):
+        with pytest.raises(ValueError):
+            ProcessTurnInput(
+                authenticated_user_id="user-a",
+                request_id=UUID,
+                user_message="hello",
+                budget=_budget(),
+                correlation="not-a-hex-hmac",
+            )
+        with pytest.raises(ValueError):
+            ProcessTurnInput(
+                authenticated_user_id="user-a",
+                request_id=UUID,
+                user_message="hello",
+                budget=_budget(),
+                correlation=UUID,  # raw request id is never a valid correlation
+            )
+
+    @pytest.mark.asyncio
+    async def test_replay_and_commit_events_are_semantically_distinct(self, caplog):
+        replay_repo = FakeReplayRepository(
+            outcome=ReplayOutcome(status="completed", committed=_committed())
+        )
+        use_case = _use_case(replay_repository=replay_repo)
+
+        with caplog.at_level(logging.INFO, logger="backend.process_turn"):
+            await _execute(use_case, _input(mode=TurnMode.replay_attempt))
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert f"event=process_turn_attempt correlation={CORRELATION} attempt=1 mode=replay" in messages
+        assert f"event=process_turn_replay correlation={CORRELATION}" in messages
+        # A replay is NEVER logged as a commit completion.
+        assert not any(
+            "event=process_turn_commit_completed" in message for message in messages
+        )
+
+    @pytest.mark.asyncio
+    async def test_correlation_is_consistent_across_retry_attempts(self, caplog):
+        commit_repo = FakeCommitRepository(results=[_mismatch(0, 1), _committed()])
+        use_case = _use_case(commit_repository=commit_repo)
+
+        with caplog.at_level(logging.INFO, logger="backend.process_turn"):
+            await _execute(use_case, _input())
+
+        messages = [r.getMessage() for r in caplog.records]
+        for message in messages:
+            assert f"correlation={CORRELATION}" in message
+        # the raw request id never appears in any event
+        assert all(UUID not in message for message in messages)
+
+    @pytest.mark.asyncio
+    async def test_different_correlations_produce_distinct_events(self, caplog):
+        other = "d" * 64
+        commit_repo = FakeCommitRepository()
+        use_case = _use_case(commit_repository=commit_repo)
+        first_inp = _input()
+        second_inp = ProcessTurnInput(
+            authenticated_user_id="user-a",
+            request_id=UUID,
+            user_message="hello",
+            budget=_budget(),
+            correlation=other,
+        )
+
+        with caplog.at_level(logging.INFO, logger="backend.process_turn"):
+            await _execute(use_case, first_inp)
+            await _execute(use_case, second_inp)
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert f"event=process_turn_commit_completed correlation={CORRELATION} attempt=1" in messages
+        assert f"event=process_turn_commit_completed correlation={other} attempt=1" in messages
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -831,13 +1276,19 @@ class TestEngineDelegation:
         engine._turn_config = SimpleNamespace()
 
         result = await engine.process_turn(
-            "user-a", "hello", UUID, budget=_budget(), mode=TurnMode.normal
+            "user-a",
+            "hello",
+            UUID,
+            budget=_budget(),
+            mode=TurnMode.normal,
+            correlation=CORRELATION,
         )
         assert result == "ok"
         assert captured["inp"].authenticated_user_id == "user-a"
         assert captured["inp"].request_id == UUID
         assert captured["inp"].user_message == "hello"
         assert captured["inp"].mode is TurnMode.normal
+        assert captured["inp"].correlation == CORRELATION
         assert captured["inp"].budget is not None
 
 
@@ -877,6 +1328,8 @@ class TestActivePathNeverCallsLegacyWriters:
         engine._monotonic = lambda: 0.0
         engine._turn_config = SimpleNamespace()
 
-        result = await engine.process_turn("user-a", "hello", UUID, budget=_budget())
+        result = await engine.process_turn(
+            "user-a", "hello", UUID, budget=_budget(), correlation=CORRELATION
+        )
         assert result == "ok"
         assert captured["mode"] is TurnMode.normal

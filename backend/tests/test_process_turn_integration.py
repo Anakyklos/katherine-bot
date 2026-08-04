@@ -30,6 +30,7 @@ import pytest
 from postgrest.exceptions import APIError
 from supabase import Client, create_client
 
+from backend.admission import AdmissionRuntimeConfig, compute_turn_correlation
 from backend.emotional_domain import EmotionalStateV1
 from backend.relationship import RelationshipStateV1
 
@@ -310,6 +311,29 @@ def test_pending_request_is_not_treated_as_completed(service_client: Client):
         _cleanup_user(service_client, user_id)
 
 
+def test_pending_request_with_expired_lease_is_stale(service_client: Client):
+    """A pending reservation whose lease expired can never complete on its
+    own: v1 performs NO automatic reclaim through the endpoint, so replay is
+    unavailable and the client needs a new request id."""
+    user_id = _uid("pending_stale")
+    request_id = str(uuid.uuid4())
+    try:
+        _run_sql(
+            "INSERT INTO public.profiles (user_id) VALUES "
+            f"('{user_id}')"
+        )
+        _run_sql(
+            "INSERT INTO public.turn_requests "
+            "(user_id, request_id, payload_hash_sha256, status, lease_owner, lease_expires_at) "
+            f"VALUES ('{user_id}', '{request_id}', '{'d' * 64}', 'pending', "
+            "'worker-x', timezone('utc'::text, now()) - INTERVAL '1 hour')"
+        )
+        replay = _call_replay(service_client, user_id, request_id)
+        assert replay == {"status": "request_replay_unavailable"}
+    finally:
+        _cleanup_user(service_client, user_id)
+
+
 def test_expired_request_is_not_treated_as_completed(service_client: Client):
     user_id = _uid("expired")
     request_id = str(uuid.uuid4())
@@ -431,13 +455,18 @@ def test_same_request_different_message_conflicts(service_client: Client):
 
 
 # ---------------------------------------------------------------------------
-# 4. Multi-worker consistency (independent subprocesses, separate clients)
+# 4. Multi-worker consistency (independent subprocesses, real ProcessTurn)
 # ---------------------------------------------------------------------------
 
-# Each worker: loads the profile revision, synchronizes on a file barrier,
-# then runs the ProcessTurn commit loop (bounded retry on revision_mismatch).
-# It reports its attempts and the revision it committed at.
+# Each worker instantiates the REAL repositories and the REAL ProcessTurn use
+# case over an INDEPENDENT Supabase client, with a deterministic fake provider
+# and fake context loader (no network). The state repository is wrapped by a
+# deterministic file barrier: both workers load the same revision and only
+# then race their commits. The loser receives revision_mismatch, reloads
+# state/context and runs its second generation; the bounded retry lives inside
+# ProcessTurn.execute() — the worker never reimplements the retry loop.
 _WORKER_SCRIPT = r"""
+import asyncio
 import json
 import os
 import sys
@@ -446,61 +475,118 @@ import uuid
 
 from supabase import create_client
 
+from backend.admission import (
+    AdmissionRuntimeConfig,
+    compute_turn_correlation,
+)
+from backend.emotional_domain import AppraisalV1, TransitionConfig
+from backend.process_turn import (
+    ProcessTurn,
+    ProcessTurnInput,
+    TurnMode,
+    new_lease_owner,
+)
+from backend.relationship import RelationshipTransitionConfig
+from backend.trusted_context import LoadedContextData
+from backend.turn_execution import (
+    TurnExecutionConfig,
+    create_budget,
+)
+from backend.turn_repositories import (
+    TurnCommitRepository,
+    TurnReplayRepository,
+    UserStateRepository,
+)
+
 url = os.environ["SUPABASE_URL"]
 key = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 user_id = os.environ["WORKER_USER"]
 request_id = os.environ["WORKER_REQUEST"]
 ready_file = os.environ["WORKER_READY"]
 peer_file = os.environ["WORKER_PEER"]
-
-client = create_client(url, key)
-
-
-def load_revision():
-    rows = (
-        client.table("profiles")
-        .select("revision")
-        .eq("user_id", user_id)
-        .execute()
-        .data
-    )
-    return rows[0]["revision"] if rows else 0
+start_ready_file = os.environ["WORKER_START_READY"]
+start_peer_file = os.environ["WORKER_START_PEER"]
+correlation = os.environ["WORKER_CORRELATION"]
 
 
-def commit(expected_revision, attempt):
-    emotional = {
-        "schema_version": 1, "pleasure": 0.1, "arousal": 0.1, "dominance": 0.1,
-        "libido": 0.1, "aggression": 0.1, "connection": 0.5, "energy": 0.5,
-        "tension": 0.1, "coping_mode": "HEALTHY", "timestamp": 1700000000.0,
-    }
-    relationship = {
-        "schema_version": 1, "trust": 0.5, "affection": 0.3, "tension": 0.1,
-        "triggers": [], "timestamp": 1700000000.0,
-    }
-    replay = {
-        "response": "Hi from worker " + request_id[:8],
-        "message_id": str(uuid.uuid4()),
-        "duration_ms": 7,
-    }
-    params = {
-        "p_authenticated_user_id": user_id,
-        "p_request_id": request_id,
-        "p_expected_revision": expected_revision,
-        "p_user_message": "Hello",
-        "p_assistant_message": replay["response"],
-        "p_payload_hash_sha256": ("a" + str(attempt)) * 32,
-        "p_emotional_state": emotional,
-        "p_relationship_state": relationship,
-        "p_public_response": replay["response"],
-        "p_replay_payload": replay,
-        "p_outbox_events": [],
-        "p_lease_owner": "worker-" + str(attempt),
-    }
-    response = client.rpc("commit_turn", params).execute()
-    data = response.data
-    if isinstance(data, list):
-        data = data[0]
-    return data
+class BarrierStateRepository:
+    '''Real UserStateRepository + deterministic barrier AFTER the first load.
+
+    Both workers signal after loading the same revision and wait for each
+    other before any commit can start. Retries (reloads) never re-sync.
+    '''
+
+    def __init__(self, inner, ready_file, peer_file, timeout=60.0):
+        self._inner = inner
+        self._ready_file = ready_file
+        self._peer_file = peer_file
+        self._timeout = timeout
+        self._synced = False
+
+    def load(self, *args, **kwargs):
+        state = self._inner.load(*args, **kwargs)
+        if not self._synced:
+            self._synced = True
+            open(self._ready_file, "w").close()
+            deadline = time.monotonic() + self._timeout
+            while not os.path.exists(self._peer_file):
+                if time.monotonic() > deadline:
+                    raise RuntimeError("barrier_timeout")
+                time.sleep(0.02)
+        return state
+
+
+def wait_for_start_peer():
+    '''Absorb subprocess startup skew OUTSIDE the turn budget.
+
+    Both workers signal once imports and the client are ready, then wait for
+    each other. The post-load barrier inside BarrierStateRepository then
+    resolves within milliseconds instead of racing against startup.
+    '''
+    open(start_ready_file, "w").close()
+    deadline = time.monotonic() + 60.0
+    while not os.path.exists(start_peer_file):
+        if time.monotonic() > deadline:
+            raise RuntimeError("start_sync_timeout")
+        time.sleep(0.02)
+
+
+class FakeProvider:
+    '''Deterministic provider: no network, counts provider generations.'''
+
+    def __init__(self):
+        self.generations = 0
+        self.appraisals = 0
+
+    async def appraise(self, message, budget):
+        self.appraisals += 1
+        return AppraisalV1.neutral()
+
+    async def generate(self, messages, budget):
+        self.generations += 1
+        return f"worker response {self.generations}"
+
+    def build_trusted_policy(self, emotional_state, relationship, adaptation_strategy=""):
+        return "policy"
+
+
+def close_client(client):
+    if client is None:
+        return
+    for attr, session_attr in (
+        ("_postgrest", "session"),
+        ("_storage", "session"),
+        ("_functions", "_client"),
+    ):
+        transport = getattr(client, attr, None)
+        if transport is None:
+            continue
+        session = getattr(transport, session_attr, None)
+        if session is not None and hasattr(session, "close"):
+            session.close()
+    auth = getattr(client, "auth", None)
+    if auth is not None and hasattr(auth, "close"):
+        auth.close()
 
 
 def fail(reason):
@@ -508,36 +594,72 @@ def fail(reason):
     sys.exit(1)
 
 
-# Load revision BEFORE the barrier so both workers race the same revision.
-revision = load_revision()
-open(ready_file, "w").close()
-deadline = time.monotonic() + 30
-while not os.path.exists(peer_file):
-    if time.monotonic() > deadline:
-        fail("barrier_timeout")
-    time.sleep(0.02)
+def main():
+    client = create_client(url, key)
+    try:
+        wait_for_start_peer()
+        asyncio.run(run(client))
+    except Exception as exc:  # noqa: BLE001 - worker reports structured failure
+        fail(type(exc).__name__ + ": " + str(exc))
+    finally:
+        for f in (ready_file, start_ready_file):
+            try:
+                os.unlink(f)
+            except OSError:
+                pass
+        close_client(client)
 
-attempts = 0
-for attempt in (1, 2):
-    if attempt == 2:
-        revision = load_revision()
-    data = commit(revision, attempt)
-    attempts = attempt
-    if "error" not in data:
+
+async def run(client):
+    try:
+        client_provider = lambda: client
+        state_repo = UserStateRepository(client_provider)
+        commit_repo = TurnCommitRepository(client_provider)
+        replay_repo = TurnReplayRepository(client_provider)
+        context_loader = lambda uid, message, user_state: LoadedContextData()
+        provider = FakeProvider()
+        config = TurnExecutionConfig.defaults()
+        use_case = ProcessTurn(
+            state_repository=BarrierStateRepository(state_repo, ready_file, peer_file),
+            commit_repository=commit_repo,
+            replay_repository=replay_repo,
+            context_loader=context_loader,
+            provider=provider,
+            transition_config=TransitionConfig.defaults(),
+            relationship_config=RelationshipTransitionConfig.defaults(),
+            clock=time.time,
+            supabase_timeout=90.0,
+            archival_extraction_enabled=False,
+            # Per-instance lease owner: this worker NEVER shares an owner.
+            lease_owner=new_lease_owner(),
+        )
+        inp = ProcessTurnInput(
+            authenticated_user_id=user_id,
+            request_id=request_id,
+            user_message="Hello",
+            budget=create_budget(config),
+            correlation=correlation,
+            mode=TurnMode.normal,
+        )
+        result = await use_case.execute(inp)
         print(
             json.dumps(
                 {
                     "ok": True,
-                    "attempts": attempts,
-                    "revision": data["committed_revision"],
-                    "request_id": data["request_id"],
+                    "generations": provider.generations,
+                    "committed_revision": result.committed.committed_revision,
+                    "response": result.response,
+                    "request_id": result.committed.request_id,
+                    "user_message_id": result.committed.user_message_id,
+                    "assistant_message_id": result.committed.assistant_message_id,
                 }
             )
         )
-        sys.exit(0)
-    if data["error"]["code"] != "revision_mismatch":
-        fail(data["error"]["code"])
-fail("exhausted")
+    except Exception as exc:  # noqa: BLE001 - worker reports structured failure
+        fail(type(exc).__name__ + ": " + str(exc))
+
+
+main()
 """
 
 
@@ -545,11 +667,14 @@ def _run_worker_pair(url: str, key: str, user_a: str, user_b: str) -> list[dict]
     """Run two independent subprocess workers synchronized by a file barrier."""
     ready_dir = f"/tmp/opencode/pt_workers_{uuid.uuid4().hex}"
     os.makedirs(ready_dir, exist_ok=True)
+    admission_config = AdmissionRuntimeConfig.from_values("s" * 32)
 
     def spawn(user: str, index: int) -> tuple[subprocess.Popen, str, str, str]:
         request_id = str(uuid.uuid4())
         ready = os.path.join(ready_dir, f"ready_{index}")
         peer = os.path.join(ready_dir, f"ready_{1 - index}")
+        start_ready = os.path.join(ready_dir, f"start_ready_{index}")
+        start_peer = os.path.join(ready_dir, f"start_ready_{1 - index}")
         env = dict(os.environ)
         env.update(
             SUPABASE_URL=url,
@@ -558,6 +683,9 @@ def _run_worker_pair(url: str, key: str, user_a: str, user_b: str) -> list[dict]
             WORKER_REQUEST=request_id,
             WORKER_READY=ready,
             WORKER_PEER=peer,
+            WORKER_START_READY=start_ready,
+            WORKER_START_PEER=start_peer,
+            WORKER_CORRELATION=compute_turn_correlation(admission_config, request_id),
         )
         proc = subprocess.Popen(
             [sys.executable, "-c", _WORKER_SCRIPT],
@@ -572,12 +700,17 @@ def _run_worker_pair(url: str, key: str, user_a: str, user_b: str) -> list[dict]
     proc_b, ready_b, request_b, _ = spawn(user_b, 1)
     assert ready_a != ready_b
     try:
-        out_a, err_a = proc_a.communicate(timeout=60)
-        out_b, err_b = proc_b.communicate(timeout=60)
+        out_a, err_a = proc_a.communicate(timeout=90)
+        out_b, err_b = proc_b.communicate(timeout=90)
     finally:
         proc_a.kill()
         proc_b.kill()
-        for f in (ready_a, ready_b):
+        for f in (
+            ready_a,
+            ready_b,
+            os.path.join(ready_dir, "start_ready_0"),
+            os.path.join(ready_dir, "start_ready_1"),
+        ):
             try:
                 os.unlink(f)
             except OSError:
@@ -586,25 +719,34 @@ def _run_worker_pair(url: str, key: str, user_a: str, user_b: str) -> list[dict]
             os.rmdir(ready_dir)
         except OSError:
             pass
-    assert proc_a.returncode == 0, f"worker A failed: {err_a}"
-    assert proc_b.returncode == 0, f"worker B failed: {err_b}"
+    assert proc_a.returncode == 0, f"worker A failed: {err_a} | out: {out_a}"
+    assert proc_b.returncode == 0, f"worker B failed: {err_b} | out: {out_b}"
     return [
         json.loads(out_a),
         json.loads(out_b),
     ]
 
 
-def test_multi_worker_same_user_cas_consistency(supabase_url, service_role_key):
-    """Two independent workers race the same revision: one wins, the other
-    receives revision_mismatch, reloads and commits on the next revision."""
+def test_multi_worker_same_user_cas_consistency(
+    supabase_url, service_role_key, service_client
+):
+    """Two independent ProcessTurn workers race the same revision: exactly one
+    commit wins the first attempt, the loser receives revision_mismatch,
+    reloads state/context and runs its second generation."""
     user_id = _uid("mw_same")
     client = create_client(supabase_url, service_role_key)
     try:
         results = _run_worker_pair(supabase_url, service_role_key, user_id, user_id)
         assert [r["ok"] for r in results] == [True, True]
-        attempts = sorted(r["attempts"] for r in results)
-        # exactly one worker retried once; the other committed on the first try
-        assert attempts == [1, 2]
+        # exactly one worker needed a second generation; the other won on the
+        # first attempt (order between workers is nondeterministic)
+        assert sorted(r["generations"] for r in results) == [1, 2]
+        assert sorted(r["committed_revision"] for r in results) == [1, 2]
+        # each worker returned the CommittedTurn the database persisted
+        for result in results:
+            assert result["response"].startswith("worker response ")
+            assert result["user_message_id"] == result["request_id"]
+            assert len(result["assistant_message_id"]) == 36
         # the revision increased exactly twice (one per committed request)
         rows = _run_sql(
             f"SELECT revision FROM public.profiles WHERE user_id = '{user_id}'"
@@ -614,6 +756,11 @@ def test_multi_worker_same_user_cas_consistency(supabase_url, service_role_key):
         assert _count("chat_logs", user_id) == 4
         assert _count("profiles", user_id) == 1
         assert _count("outbox_events", user_id) == 0
+        # persisted results are exactly what the workers returned: replay of
+        # each committed request returns the same response
+        for result in results:
+            replay = _call_replay(service_client, user_id, result["request_id"])
+            assert replay["replay_payload"]["response"] == result["response"]
     finally:
         _cleanup_user(client, user_id)
         _close_client(client)
@@ -628,8 +775,9 @@ def test_multi_worker_different_users_progress_independently(
     try:
         results = _run_worker_pair(supabase_url, service_role_key, user_a, user_b)
         assert [r["ok"] for r in results] == [True, True]
-        # no conflicts across users: each commits on its first attempt
-        assert [r["attempts"] for r in results] == [1, 1]
+        # no conflicts across users: each commits on its first attempt,
+        # proving there is no global lock between workers
+        assert [r["generations"] for r in results] == [1, 1]
         for user in (user_a, user_b):
             rows = _run_sql(
                 f"SELECT revision FROM public.profiles WHERE user_id = '{user}'"

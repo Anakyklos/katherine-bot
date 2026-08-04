@@ -255,9 +255,13 @@ async def run_blocking_write(
             worker_exc = exc
             break
 
-    # Phase 2: If the worker finished but we didn't retrieve the result
-    # above (e.g. it completed between iterations), retrieve it now.
-    if worker_task.done() and worker_exc is None and original_cancel is None:
+    # Phase 2: If the worker finished but we didn't retrieve the outcome
+    # above (e.g. it completed between iterations, or it completed during the
+    # cancellation drain loop), retrieve it now. This runs even when a
+    # cancellation was recorded, so the worker's result/exception is ALWAYS
+    # consumed: an unretrieved task exception would make asyncio log "Task
+    # exception was never retrieved" and the write would still have finished.
+    if worker_task.done() and worker_exc is None:
         try:
             worker_result = worker_task.result()
         except BaseException as exc:

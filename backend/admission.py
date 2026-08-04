@@ -22,6 +22,7 @@ from .admission_contracts import (
 
 MESSAGE_HMAC_DOMAIN = b"message"
 NETWORK_HMAC_DOMAIN = b"network"
+TURN_CORRELATION_DOMAIN = b"turn-correlation"
 UNKNOWN_NETWORK_IDENTITY = "unknown"
 
 ADMITTED = "admitted"
@@ -235,6 +236,35 @@ def compute_hmac_sha256(secret_bytes: bytes, domain: bytes, payload: str) -> str
     return hmac.new(
         validated_secret,
         domain + b"\x00" + payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def compute_turn_correlation(
+    config: AdmissionRuntimeConfig,
+    request_id: object,
+) -> str:
+    """Compute the sanitized, non-reversible correlation reference for a turn.
+
+    The correlation is an HMAC-SHA256 of the canonical request id under the
+    dedicated ``turn-correlation`` domain, using the already-validated
+    admission secret. It is stable across the endpoint and the ProcessTurn
+    use case for the same request, never reversible (no truncated UUID or
+    unauthenticated hash), never echoed in HTTP responses, and can be logged
+    without exposing the raw request id, user id, message or any secret.
+
+    Returns the exact lowercase 64-character hex HMAC.
+    """
+    if not isinstance(config, AdmissionRuntimeConfig):
+        raise AdmissionUnavailable()
+    try:
+        canonical_request_id = RequestIdentity(request_id).request_id
+    except AdmissionError:
+        raise AdmissionUnavailable() from None
+    validated_secret = _validate_secret_bytes(config.secret_bytes)
+    return hmac.new(
+        validated_secret,
+        TURN_CORRELATION_DOMAIN + b"\x00" + canonical_request_id.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
 

@@ -1,7 +1,7 @@
 BEGIN;
 
 CREATE EXTENSION IF NOT EXISTS pgtap;
-SELECT plan(25);
+SELECT plan(26);
 
 -- =================================================================
 -- 1. replay_committed_turn function shape and security posture
@@ -215,7 +215,27 @@ SELECT is(
     'pending request returns request_in_progress'
 );
 
--- 4f. Expired request is not treated as completed
+-- 4f. Pending request with EXPIRED lease is stale: replay unavailable
+-- (v1 has NO automatic reclaim through the endpoint; the reservation can
+-- never complete on its own).
+INSERT INTO public.turn_requests (
+    user_id, request_id, payload_hash_sha256, status,
+    lease_owner, lease_expires_at
+) VALUES (
+    'replay_tap_user', 'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid,
+    'd'::text || repeat('0', 63), 'pending',
+    'worker-x', timezone('utc'::text, now()) - INTERVAL '1 hour'
+);
+
+SELECT is(
+    (SELECT public.replay_committed_turn(
+        'replay_tap_user', 'ffffffff-ffff-ffff-ffff-ffffffffffff'::uuid
+    )->>'status'),
+    'request_replay_unavailable',
+    'pending request with EXPIRED lease returns request_replay_unavailable'
+);
+
+-- 4g. Expired request is not treated as completed
 INSERT INTO public.turn_requests (
     user_id, request_id, payload_hash_sha256, status, error_code
 ) VALUES (

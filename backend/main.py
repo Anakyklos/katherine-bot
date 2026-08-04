@@ -29,6 +29,7 @@ from .admission import (
     AdmissionRuntimeConfig,
     AdmissionUnavailable,
     build_admission_request,
+    compute_turn_correlation,
     reserve_admission_sync,
     resolve_network_identity,
 )
@@ -380,19 +381,30 @@ async def chat_endpoint(
             admission_request,
             allowlist_exceptions=(AdmissionUnavailable,),
         )
+        # Sanitized correlation reference for observability: HMAC-SHA256 of
+        # the canonical request id under the dedicated turn-correlation domain
+        # (never the raw request id, user id, message or any secret).
+        correlation = compute_turn_correlation(_admission_config, identity.request_id)
         if admission_result.decision == ADMITTED:
             mode = TurnMode.normal
+            logger.info("event=admission_admitted correlation=%s", correlation)
         elif admission_result.decision == REQUEST_REPLAY_UNAVAILABLE:
             # The ledger detected a repeated (user, request_id): try the
-            # persisted transactional result BEFORE any provider call.
+            # persisted transactional result BEFORE any provider call. A
+            # replay is a distinct observable event from a fresh admission.
             mode = TurnMode.replay_attempt
+            logger.info("event=admission_replay correlation=%s", correlation)
         else:
             logger.info("event=admission_rejected code=%s", admission_result.decision)
             raise _map_admission_rejection(admission_result)
 
-        logger.info("event=admission_admitted")
         result = await engine.process_turn(
-            user_id, input_data.message, identity.request_id, budget=budget, mode=mode
+            user_id,
+            input_data.message,
+            identity.request_id,
+            budget=budget,
+            mode=mode,
+            correlation=correlation,
         )
         # The public DTO exposes exactly response + emotion_state; revisions,
         # outbox refs, internal IDs and CommittedTurn are never exposed.

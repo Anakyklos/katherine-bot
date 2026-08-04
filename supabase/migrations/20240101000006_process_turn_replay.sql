@@ -10,12 +10,21 @@
 --
 -- Result contract (structured, never raw):
 --   * completed row -> canonical CommittedTurn envelope (same as commit_turn)
---   * pending row    -> {"status": "request_in_progress"}
+--   * pending row with ACTIVE lease -> {"status": "request_in_progress"}
+--   * pending row with EXPIRED lease (stale worker, will never complete) ->
+--     {"status": "request_replay_unavailable"}
 --   * no row (only an admission reservation exists) -> {"status": "request_replay_unavailable"}
---   * expired row    -> {"status": "request_replay_unavailable"}
+--   * expired row -> {"status": "request_replay_unavailable"}
 --   * invalid input or corrupt persisted contract -> sanitized error envelope
 --     (validation_failed) or a raised constant sanitized error (P0001), never
 --     SQLSTATE, constraint names, payload or raw error text.
+--
+-- Reclaim policy (v1): there is NO automatic reclaim through this RPC or the
+-- /chat endpoint. A stale pending row (expired lease) and an expired row never
+-- complete on their own; clients must use a NEW request id or an operator must
+-- clear the reservation. commit_turn keeps its same-hash lease reclaim ONLY
+-- for exact byte-identical retries (never reachable from the endpoint, which
+-- always recomputes a different payload).
 --
 -- Security posture (mirrors commit_turn):
 --   * SECURITY DEFINER with fixed search_path = public, fully qualified objects
@@ -112,7 +121,16 @@ BEGIN
 
     -- pending: another worker is (or was) actively processing this request.
     IF v_row.status = 'pending' THEN
-        RETURN jsonb_build_object('status', 'request_in_progress');
+        -- Active lease: the request is really being processed right now.
+        IF v_row.lease_expires_at IS NOT NULL
+           AND v_row.lease_expires_at > now() THEN
+            RETURN jsonb_build_object('status', 'request_in_progress');
+        END IF;
+        -- Expired lease: the worker is gone and the reservation can never
+        -- complete. This version performs NO automatic reclaim through the
+        -- endpoint; the client needs a new request id (or operational
+        -- cleanup), so replay is unavailable.
+        RETURN jsonb_build_object('status', 'request_replay_unavailable');
     END IF;
 
     -- expired: reservation exists but the turn was never confirmed.
@@ -139,4 +157,4 @@ GRANT EXECUTE ON FUNCTION public.replay_committed_turn(text, uuid)
 -- 3. Documentation comment
 -- =================================================================
 COMMENT ON FUNCTION public.replay_committed_turn(text, uuid) IS
-'Idempotent replay RPC (#272). Returns the canonical public result of a previously committed turn without any writes, context loading, appraisal, provider call or transitions. Completed -> canonical CommittedTurn envelope; pending -> request_in_progress; missing/expired -> request_replay_unavailable. SECURITY DEFINER, service_role only, fixed search_path, sanitized failures.';
+'Idempotent replay RPC (#272). Returns the canonical public result of a previously committed turn without any writes, context loading, appraisal, provider call or transitions. Completed -> canonical CommittedTurn envelope; pending with ACTIVE lease -> request_in_progress; pending with EXPIRED lease / missing / expired -> request_replay_unavailable (no automatic reclaim in v1). SECURITY DEFINER, service_role only, fixed search_path, sanitized failures.';

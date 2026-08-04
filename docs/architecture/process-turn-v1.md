@@ -41,8 +41,8 @@ Módulos:
 
 - `backend/process_turn.py` — caso de uso `ProcessTurn`, entrada imutável
   `ProcessTurnInput` (user id autenticado, request id canônico, mensagem
-  validada, `TurnBudget`, modo `normal`/`replay_attempt`), resultado
-  `ProcessTurnResult` construído **somente** a partir de
+  validada, `TurnBudget`, `correlation`, modo `normal`/`replay_attempt`),
+  resultado `ProcessTurnResult` construído **somente** a partir de
   `CommittedTurn.replay_payload`. Não possui estado por usuário em globais.
 - `backend/turn_repositories.py` — fronteiras mínimas de repositório:
   - `UserStateRepository` — carrega snapshots + `revision` sem criar perfil;
@@ -56,6 +56,36 @@ Módulos:
   para testes/rollback, isolado do `/chat`.
 - `supabase/migrations/20240101000006_process_turn_replay.sql` — RPC
   `replay_committed_turn`.
+
+## Lease de reserva por instância
+
+Cada instância do ProcessTurn recebe um `lease_owner` próprio
+(`process-turn-v1:<uuidhex>` gerado por `new_lease_owner()`). O dono do lease:
+
+- nunca é compartilhado entre instâncias/processos/workers (cada
+  `ProcessTurn.execute()` usa um dono novo);
+- identifica a reserva da linha `pending` criada por `commit_turn`, permitindo
+  diagnosticar qual worker detém a reserva;
+- não é usado para "dono único" global — a consistência continua vinda do CAS
+  de revisão sob o lock de usuário no banco.
+
+## Correlação sanitizada por turno
+
+O `/chat` calcula `correlation` = HMAC-SHA256 do request id canônico sob o
+segredo de admissão com domínio dedicado (`TURN_CORRELATION_DOMAIN`), em
+`backend/admission.py` (`compute_turn_correlation`). O valor é exatamente 64
+chars hex minúsculos e é o **único** valor derivado do request que o
+ProcessTurn registra em logs/eventos.
+
+A correlação:
+
+- é estável entre a admissão, o endpoint e o ProcessTurn;
+- nunca expõe o request id, user id, mensagem, segredo ou truncamento do UUID
+  (é não reversível);
+- aparece em todos os eventos do ProcessTurn
+  (`process_turn_started`, `process_turn_commit_completed`,
+  `process_turn_commit_conflict`, cancelamento, etc.) e no log de admissão
+  (`event=admission_admitted` / `event=admission_replay`).
 
 ## Carregamento de estado com revisão
 
@@ -87,8 +117,9 @@ Resultados estruturados da RPC (nunca SQLSTATE/constraint/payload bruto):
 | Estado                        | Resultado                        | HTTP |
 |-------------------------------|----------------------------------|------|
 | turno concluído               | envelope canônico `CommittedTurn`| 200  |
-| linha pendente                | `request_in_progress`            | 409  |
-| reserva sem turno confirmado  | `request_replay_unavailable`     | 409  |
+| linha pendente com lease ativo| `request_in_progress`            | 409  |
+| reserva pendente com lease expirado | `request_replay_unavailable`| 409  |
+| request expirado/falho        | `request_replay_unavailable`     | 409  |
 | identidade divergente/inválida| erro sanitizado                  | 500/409 |
 
 O builder canônico `commit_turn_build_result` é o único formato de replay —
@@ -148,8 +179,12 @@ revisão). Ele nunca é tratado como garantia multi-worker.
 - Replay do mesmo request id após commit não gera nova transição, mensagem
   ou outbox e não chama provider.
 - Provado por `test_process_turn_integration.py` com **processos
-  independentes** e clientes Supabase separados (barrier determinística por
-  arquivo, timeouts locais, sem sleeps longos).
+  independentes**, cada um instanciando o `ProcessTurn` real com repositórios
+  e clientes Supabase separados (provider e context loader determinísticos,
+  barrier determinística por arquivo, timeouts locais, sem sleeps longos). O
+  worker que perde o CAS recebe `revision_mismatch`, recarrega estado/contexto
+  e executa a segunda geração — o loop de retry vive dentro de
+  `ProcessTurn.execute()`, nunca reimplementado no teste.
 
 ## Outbox em vez de BackgroundTasks
 
@@ -191,8 +226,12 @@ idempotency_key: archival:<request_id>:v1
 
 - `revision_mismatch` após as 2 tentativas → 409 para o cliente; o usuário
   pode repetir a requisição (novo request id).
-- Replay de turno `pending` (worker morto) → 409 até o lease expirar; depois,
-  `commit_turn` com o mesmo request id pode reclamar o turno.
+- Reserva `pending` de worker morto → 409 (`request_in_progress`) enquanto o
+  lease estiver ativo; após a expiração do lease, o replay retorna
+  `request_replay_unavailable`. O v1 **não** faz reclaim automático via
+  endpoint: um request id abandonado exige um novo request id (ou ação
+  operacional) para prosseguir. O dono do lease (`process-turn-v1:<uuidhex>`)
+  permite diagnosticar qual instância abandonou a reserva.
 - A extração arquivística fica pendente até o worker da outbox existir
   (fora de escopo).
 - O lock local não protege entre processos; qualquer uso futuro deve

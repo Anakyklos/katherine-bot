@@ -30,25 +30,46 @@ banco nunca são devolvidos ao cliente.
 | Sintoma | Causa provável | Ação |
 |---|---|---|
 | 409 `revision_conflict` | dois turnos simultâneos do mesmo usuário | cliente reenvia com novo request id; sem ação manual |
-| 409 `request_in_progress` | worker anterior morreu com lease ativo | aguardar expiração do lease; o próximo commit reclaima |
-| 409 `request_replay_unavailable` | request id repetido sem turno confirmado | cliente usa novo request id |
+| 409 `request_in_progress` | worker anterior morreu com lease ativo | aguardar expiração do lease; enquanto ativo, replay responde 409 |
+| 409 `request_replay_unavailable` | request id repetido sem turno confirmado, ou reserva pendente com lease expirado | cliente usa novo request id; v1 não faz reclaim automático via endpoint |
 | 503 `persistence_unavailable` | banco/PostgREST indisponível | verificar conectividade; retry com novo request id |
 | 504 `turn_timeout` | orçamento de 16.000 unidades / deadline | reduzir mensagem; retry |
 | evento `process_turn_conflict_exhausted` | 2 tentativas de CAS falharam | sinal de contenção alta; monitorar `event=process_turn_revision_conflict` |
 
+## Reservas abandonadas (lease)
+
+Quando um worker morre após criar a linha `pending`, o replay responde:
+
+- `request_in_progress` enquanto o lease estiver ativo;
+- `request_replay_unavailable` após a expiração do lease (a reserva nunca
+  completa sozinha; o v1 **não** implementa reclaim automático via endpoint).
+
+O dono da reserva (`lease_owner = process-turn-v1:<uuidhex>`) é per-instância
+e nunca compartilhado entre workers; ele serve para diagnosticar qual
+instância abandonou o turno. Para liberar o usuário, o cliente deve enviar um
+novo request id.
+
 ## Logs úteis (baixa cardinalidade)
 
 ```
-event=process_turn_attempt attempt=1
-event=process_turn_revision_conflict attempt=1
-event=process_turn_replay
-event=process_turn_commit_completed attempt=N
-event=process_turn_conflict_exhausted attempt=N
+event=admission_admitted correlation=<hex64>
+event=admission_replay correlation=<hex64>
+event=process_turn_started correlation=<hex64>
+event=process_turn_attempt attempt=1 correlation=<hex64>
+event=process_turn_revision_conflict attempt=1 correlation=<hex64>
+event=process_turn_replay correlation=<hex64>
+event=process_turn_commit_completed attempt=N correlation=<hex64>
+event=process_turn_conflict_exhausted attempt=N correlation=<hex64>
 ```
+
+A `correlation` é um HMAC-SHA256 (64 hex minúsculos) do request id canônico,
+calculado com o segredo de admissão sob domínio dedicado. Ela permite
+correlacionar admissão → endpoint → ProcessTurn nos logs sem expor dados
+sensíveis.
 
 Nunca aparecem em logs: mensagem, resposta, prompt, contexto, memória,
 user id, request id bruto, message id bruto, snapshots, exceções upstream,
-tokens ou payloads de RPC.
+tokens, payloads de RPC ou a própria `correlation` de outro turno.
 
 ## Rollback operacional
 
