@@ -102,11 +102,15 @@ security = HTTPBearer(auto_error=False)
 def get_dependencies(request: Request) -> ApplicationDependencies:
     """Resolve the application dependency container from ``app.state``.
 
-    Returns 503 when the lifespan has not completed startup, so no endpoint
-    can run against a partially initialized application.
+    Returns 503 when the lifespan has not completed startup OR is no longer
+    active, so no endpoint can run against a partially initialized
+    application or a composition whose owned resources were already closed
+    (injected dependencies remain in ``app.state`` after shutdown, but routes
+    still refuse to operate outside the lifespan).
     """
     deps = getattr(request.app.state, "dependencies", None)
-    if deps is None:
+    lifespan_started = bool(getattr(request.app.state, "lifespan_started", False))
+    if deps is None or not lifespan_started:
         raise HTTPException(
             status_code=503,
             detail={"code": "service_unavailable", "message": "Service unavailable."},
@@ -470,10 +474,14 @@ def _admission_unavailable_error() -> HTTPException:
 async def _lifespan(app: FastAPI):
     """Start and stop application resources.
 
-    Startup: build owned resources when none were injected, store the
-    completed container, and only then mark startup as complete.
-    Shutdown: close owned resources, keep going past individual failures,
-    and record shutdown completion (idempotent).
+    Startup: build a fresh owned composition when none is present (injected
+    dependencies keep their ownership with the caller), store the completed
+    container, and only then mark startup as complete.
+    Shutdown: close owned resources, keep going past individual failures, and
+    drop the owned composition so a second lifespan cycle builds fresh
+    resources instead of reusing already-closed ones. Injected dependencies
+    are never closed and are left in ``app.state`` for the caller, but routes
+    refuse to operate once the lifespan is no longer active.
     """
     if app.state.dependencies is None:
         try:
@@ -488,6 +496,7 @@ async def _lifespan(app: FastAPI):
             raise
         app.state.dependencies = dependencies
         app.state.owned_resources = owned
+        app.state.dependencies_owned = True
     app.state.lifespan_started = True
     try:
         yield
@@ -495,6 +504,12 @@ async def _lifespan(app: FastAPI):
         app.state.lifespan_started = False
         await shutdown_dependencies(app.state.owned_resources)
         app.state.owned_resources = ()
+        if app.state.dependencies_owned:
+            # The owned composition is finished; drop it so the next lifespan
+            # cycle builds a new one with fresh resources. Injected
+            # dependencies (dependencies_owned False) stay with the caller.
+            app.state.dependencies = None
+            app.state.dependencies_owned = False
         app.state.shutdown_completed = True
 
 
@@ -536,6 +551,9 @@ def create_app(
 
     app.state.settings = settings
     app.state.dependencies = dependencies
+    # Only the lifespan marks a composition it builds as owned; injected
+    # dependencies belong to the caller and are never closed.
+    app.state.dependencies_owned = False
     app.state.lifespan_started = dependencies is not None
     app.state.owned_resources = ()
     app.state.shutdown_completed = False

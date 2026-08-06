@@ -109,28 +109,50 @@ class ApplicationDependencies:
 ## Ordem de shutdown (lifespan)
 
 ```text
-1. Marcar lifespan como não iniciado (impede readiness durante shutdown).
+1. Marcar lifespan como não iniciado (impede readiness durante shutdown e
+   faz get_dependencies() recusar novas requisições).
 2. Fechar cada recurso owned:
    a. contrato: aclose() → close() (o primeiro disponível)
    b. falha em um recurso não interrompe os demais
    c. apenas `event=app_shutdown_failed` é registrado (código sanitizado)
-3. Limpar app.state.owned_resources → shutdown idempotente
-4. Recursos injetados externamente NUNCA são fechados pela aplicação
+3. Limpar app.state.owned_resources.
+4. Se a composição era owned (construída pela aplicação), limpar
+   app.state.dependencies: o próximo ciclo de lifespan constrói uma
+   composição nova com recursos novos, nunca reutiliza recursos já fechados.
+5. Recursos injetados externamente NUNCA são fechados pela aplicação e
+   permanecem em app.state para o chamador; as rotas ainda recusam operar
+   fora do lifespan (get_dependencies() exige lifespan_started).
 ```
+
+## Ciclos de lifespan
+
+- Composição **owned**: cada entrada no lifespan executa
+  `build_default_dependencies()`; o shutdown fecha e descarta a composição.
+  Um segundo ciclo constrói recursos novos (testado com fakes e com o builder
+  padrão).
+- Composição **injetada**: o chamador mantém ownership; o shutdown não fecha
+  nem descarta, mas as rotas continuam recusando operar fora do lifespan.
 
 ## Ownership
 
 | Recurso | Criado por | Fechado por |
 | --- | --- | --- |
-| Engine/managers (default) | `build_default_dependencies` | aplicação (shutdown) |
+| Engine/managers (default) | `build_default_dependencies` | aplicação (shutdown; hoje sem contrato close/aclose no grafo) |
+| Registry de readiness (checks + executor do probe) | `build_default_dependencies` | aplicação (shutdown e startup parcial) |
+| Cliente de probe do banco | `build_default_dependencies` | aplicação (quando o SDK expuser close/aclose) |
 | Cliente Supabase (default) | `build_default_dependencies` via factory dos settings | aplicação (se expuser close/aclose) |
 | Container injetado | chamador (teste/deploy) | chamador |
 | Clientes Groq por request | `GroqClientManager` | request-scoped (fechados por call) |
 
-A versão atual do SDK Supabase pinado não expõe `close()`/`aclose()` no
-cliente, e os clientes Groq são request-scoped; portanto o mecanismo de
-shutdown existe e é testado com recursos falsos, mas a lista owned do builder
-padrão é vazia hoje.
+O builder padrão retorna `owned = (health_checks, probe_client)`: o registry
+fecha cada check fechável (o executor dedicado do probe de banco, com
+`wait=False`, sem abandonar um probe em voo — o transporte alinhado o
+encerra) e o cliente de probe é fechado quando o SDK expuser contrato
+compatível. A versão atual do SDK Supabase pinado não expõe
+`close()`/`aclose()`, e os clientes Groq são request-scoped, então o grafo do
+engine não entra na tupla owned hoje. Em falha parcial de startup, os
+recursos já criados (engine, probe client, registry) são fechados antes da
+exceção propagar.
 
 ## Importabilidade
 

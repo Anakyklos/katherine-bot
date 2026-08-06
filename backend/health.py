@@ -78,6 +78,10 @@ class HealthRegistry:
     Order is deterministic: insertion order, which the default builder
     fixes as ``configuration``, ``database``, ``provider``, then
     ``embeddings`` (only when the retrieval feature is enabled).
+
+    The registry is closable: ``close()`` delegates to every registered check
+    that exposes a ``close`` contract (e.g. the database probe executor), so
+    the application can own the whole registry as one lifecycle resource.
     """
 
     checks: Mapping[str, ReadinessCheck] = field(default_factory=dict)
@@ -88,6 +92,27 @@ class HealthRegistry:
     def add(self, check: ReadinessCheck) -> None:
         """Register one check (idempotent by name)."""
         self.checks[check.name] = check
+
+    def close(self) -> None:
+        """Close every closable check without aborting on individual failures.
+
+        Never abandons an active probe: each check's ``close`` shuts down its
+        own executor with ``wait=False`` so the in-flight probe self-terminates
+        through its aligned transport timeout and no new work is queued.
+        """
+        for check in self.checks.values():
+            closer = getattr(check, "close", None)
+            if closer is None:
+                continue
+            try:
+                closer()
+            except Exception:
+                emit_event(
+                    logger,
+                    EVENT_READINESS_CHECK_FAILED,
+                    level=logging.ERROR,
+                    component=check.name,
+                )
 
     async def run_all(self) -> list[CheckResult]:
         """Run every check in order with its own explicit timeout.
@@ -176,9 +201,22 @@ class DatabaseCheck:
             thread_name_prefix="readiness-db",
         )
         self._probe_future: Optional[concurrent.futures.Future] = None
+        self._closed = False
+
+    def close(self) -> None:
+        """Stop accepting new probes without abandoning the active one.
+
+        Shuts the executor down with ``wait=False``: the in-flight probe (if
+        any) keeps running and self-terminates through its aligned transport
+        timeout, and no new work can be queued. Non-daemon executor threads
+        finish on their own once the probe completes, so the process is never
+        blocked by an abandoned future.
+        """
+        self._closed = True
+        self._executor.shutdown(wait=False)
 
     async def run(self) -> None:
-        if self._client is None:
+        if self._client is None or self._closed:
             raise CheckFailure()
         if self._probe_future is not None and not self._probe_future.done():
             # A previous probe is still in flight. Its aligned transport
@@ -197,7 +235,13 @@ class DatabaseCheck:
         except Exception:
             raise CheckFailure() from None
         finally:
-            if future.done():
+            # Guarded clear: only drop the reference this call owns. A
+            # concurrent poll may have already replaced the reference with a
+            # newer probe future before this finally runs; clearing it would
+            # let a third poll submit extra work and break the single-probe
+            # invariant. The comparison is atomic in the event loop because
+            # no await happens between reading and clearing.
+            if self._probe_future is future and future.done():
                 self._probe_future = None
         if response is None:
             raise CheckFailure()

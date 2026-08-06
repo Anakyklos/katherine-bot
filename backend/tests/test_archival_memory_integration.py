@@ -514,6 +514,94 @@ def test_archival_extraction_explicit_false(backend):
     assert engine.archival_extraction_enabled is False
 
 
+# ─── Retrieval honesty in enabled mode (review blocker 3) ───────────────────
+
+
+def _mm_with_embeddings(enabled, supabase=None, model=None):
+    """Bare MemoryManager with controlled retrieval dependencies."""
+    from backend.memory import MemoryManager
+
+    mm = MemoryManager.__new__(MemoryManager)
+    mm.embeddings_enabled = enabled
+    mm.supabase = supabase
+    mm.embedding_model = model
+    return mm
+
+
+def test_embeddings_disabled_mode_returns_empty_without_embeddings():
+    """Disabled mode returns [] and never touches embeddings or the store."""
+    from backend.memory import MemoryManager
+
+    mm = _mm_with_embeddings(enabled=False, supabase=None, model=None)
+    assert mm._retrieve_relevant_entries("u", "q") == []
+
+
+def test_embeddings_enabled_mode_encode_failure_fails_honestly():
+    """Enabled mode: an encode failure raises a sanitized ContextLoadError
+    instead of silently returning [] (review blocker 3)."""
+    from unittest.mock import MagicMock
+
+    from backend.memory import ContextLoadError
+
+    model = MagicMock()
+    model.encode.side_effect = RuntimeError("embedding backend down")
+    mm = _mm_with_embeddings(enabled=True, supabase=MagicMock(), model=model)
+    with pytest.raises(ContextLoadError):
+        mm._retrieve_relevant_entries("u", "q")
+
+
+def test_embeddings_enabled_mode_rpc_failure_fails_honestly():
+    """Enabled mode: a transport/RPC failure raises ContextLoadError (blocker 3)."""
+    from unittest.mock import MagicMock
+
+    from backend.memory import ContextLoadError
+
+    model = MagicMock()
+    model.encode.return_value.tolist.return_value = [0.1, 0.2]
+    supabase = MagicMock()
+    supabase.rpc.return_value.execute.side_effect = RuntimeError("rpc down")
+    mm = _mm_with_embeddings(enabled=True, supabase=supabase, model=model)
+    with pytest.raises(ContextLoadError):
+        mm._retrieve_relevant_entries("u", "q")
+
+
+def test_embeddings_enabled_mode_invalid_response_fails_honestly():
+    """Enabled mode: a structurally invalid RPC response raises
+    ContextLoadError; only valid data=[] means no memories (review blocker 3)."""
+    from unittest.mock import MagicMock
+
+    from backend.memory import ContextLoadError
+
+    model = MagicMock()
+    model.encode.return_value.tolist.return_value = [0.1, 0.2]
+    supabase = MagicMock()
+    supabase.rpc.return_value.execute.return_value = None
+    mm = _mm_with_embeddings(enabled=True, supabase=supabase, model=model)
+    with pytest.raises(ContextLoadError):
+        mm._retrieve_relevant_entries("u", "q")
+
+    supabase.rpc.return_value.execute.return_value = MagicMock(data=None)
+    with pytest.raises(ContextLoadError):
+        mm._retrieve_relevant_entries("u", "q")
+
+    supabase.rpc.return_value.execute.return_value = MagicMock(data="not-a-list")
+    with pytest.raises(ContextLoadError):
+        mm._retrieve_relevant_entries("u", "q")
+
+
+def test_embeddings_enabled_mode_valid_empty_returns_no_memories():
+    """Enabled mode: a structurally valid response with data=[] is the real
+    absence of memories and returns [] (review blocker 3)."""
+    from unittest.mock import MagicMock
+
+    model = MagicMock()
+    model.encode.return_value.tolist.return_value = [0.1, 0.2]
+    supabase = MagicMock()
+    supabase.rpc.return_value.execute.return_value = MagicMock(data=[])
+    mm = _mm_with_embeddings(enabled=True, supabase=supabase, model=model)
+    assert mm._retrieve_relevant_entries("u", "q") == []
+
+
 def test_no_real_external_dependencies_proof():
     # Programmatic proof that real SentenceTransformer, Supabase or Groq are not used
     # in any test environment instantiation

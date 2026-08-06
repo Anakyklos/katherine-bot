@@ -347,6 +347,117 @@ def test_database_check_fails_while_probe_in_flight_and_recovers():
     executor.shutdown(wait=False)
 
 
+# ─── 31c. Probe guard race between concurrent requests (review blocker 4) ────
+
+
+def test_concurrent_polls_submit_single_probe():
+    """Concurrent /ready polls while a probe is in flight submit exactly one
+    probe; the rest fail fast (review blocker 4)."""
+    import asyncio
+    import concurrent.futures
+    import threading
+    import time as _time
+
+    release = threading.Event()
+    calls = []
+
+    class BlockingClient(_OkProbeClient):
+        def execute(self):
+            calls.append(1)
+            release.wait(timeout=1.0)
+            return _ProbeResult(data=[])
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    check = DatabaseCheck(BlockingClient(), timeout_seconds=0.1, probe_executor=executor)
+
+    async def run_check():
+        try:
+            await check.run()
+            return "ok"
+        except Exception:
+            return "unavailable"
+
+    async def hammer():
+        results = await asyncio.gather(*(run_check() for _ in range(12)))
+        return results
+
+    results = asyncio.run(hammer())
+    assert all(r == "unavailable" for r in results)
+    assert len(calls) == 1, "concurrent polls must submit a single probe"
+
+    release.set()
+    deadline = _time.monotonic() + 5.0
+    while _time.monotonic() < deadline:
+        if asyncio.run(run_check()) == "ok":
+            break
+        _time.sleep(0.01)
+    assert asyncio.run(run_check()) == "ok"
+    executor.shutdown(wait=False)
+
+
+def test_probe_guard_preserves_newer_future_on_owner_finish():
+    """The guarded clear only drops the future the calling poll owns.
+
+    Deterministically reproduces the race: poll A's probe completes; before
+    A's finally runs, poll B installs a newer probe future. A's finally must
+    NOT clear B's reference, otherwise a third poll could submit extra work
+    (review blocker 4).
+    """
+    import asyncio
+    import concurrent.futures
+
+    made = []
+
+    class FakeExecutor:
+        def submit(self, fn, *args, **kwargs):
+            fut = concurrent.futures.Future()
+            made.append(fut)
+            return fut
+
+        def shutdown(self, *args, **kwargs):
+            pass
+
+    check = DatabaseCheck(_OkProbeClient(), timeout_seconds=1.0, probe_executor=FakeExecutor())
+
+    async def run_check():
+        try:
+            await check.run()
+            return "ok"
+        except Exception:
+            return "unavailable"
+
+    async def scenario():
+        # Seed an already-completed future (as if a previous probe finished).
+        old = concurrent.futures.Future()
+        old.set_result(_ProbeResult(data=[]))
+        check._probe_future = old
+
+        # Poll A submits a PENDING future and awaits it.
+        task_a = asyncio.create_task(run_check())
+        await asyncio.sleep(0)
+        fut_a = check._probe_future
+        assert fut_a is not old and not fut_a.done()
+
+        # While A is still awaiting, poll B sees fut_a done? No: fut_a is
+        # pending, so B must fail fast (single-probe invariant holds).
+        assert await run_check() == "unavailable"
+        assert check._probe_future is fut_a
+
+        # Complete A's future; A's continuation is queued. Before A resumes,
+        # simulate B observing fut_a done and installing a newer future. The
+        # guard in A's finally must not clear this newer reference.
+        fut_a.set_result(_ProbeResult(data=[]))
+        fut_b = concurrent.futures.Future()
+        fut_b.set_result(_ProbeResult(data=[]))
+        check._probe_future = fut_b
+
+        await task_a  # A's finally runs the guarded clear here
+        assert check._probe_future is fut_b, "A must not clear B's newer future"
+        assert made == [fut_a]
+
+    asyncio.run(scenario())
+
+
 # ─── 32. Sensitive marker sanitization ──────────────────────────────────────
 
 

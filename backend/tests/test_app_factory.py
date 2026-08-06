@@ -130,20 +130,27 @@ def test_create_app_with_default_dependencies_builds_owned_resources_once(monkey
     monkeypatch.setattr(main_module, "build_default_dependencies", fake_builder)
     app = main_module.create_app(settings=settings)
     with TestClient(app):
-        pass
-    assert len(built) == 1
-    assert app.state.dependencies is not None
+        assert len(built) == 1
+        assert app.state.dependencies is not None
 
 
 # ─── 18/19. Lifespan ownership and close counts ─────────────────────────────
 
 
-def test_lifespan_closes_each_owned_resource_exactly_once(monkeypatch):
+def test_lifespan_second_cycle_builds_fresh_owned_composition(monkeypatch):
+    """A second lifespan cycle builds a NEW owned composition.
+
+    Shutdown closes and drops the owned composition; the next cycle must not
+    reuse already-closed resources (review blocker 2).
+    """
     settings = _settings()
-    owned_a = RecordingResource("a")
-    owned_b = RecordingResource("b")
+    cycles = []
 
     def fake_builder(settings_arg):
+        idx = len(cycles)
+        owned_a = RecordingResource(f"a-{idx}")
+        owned_b = RecordingResource(f"b-{idx}")
+        cycles.append((owned_a, owned_b))
         engine = FakeEngine(supabase=object())
         deps = main_module.ApplicationDependencies(
             conversation_engine=engine,
@@ -157,17 +164,20 @@ def test_lifespan_closes_each_owned_resource_exactly_once(monkeypatch):
 
     monkeypatch.setattr(main_module, "build_default_dependencies", fake_builder)
     app = main_module.create_app(settings=settings)
+
     with TestClient(app):
-        assert owned_a.close_calls == 0
-        assert owned_b.close_calls == 0
-    assert owned_a.close_calls == 1
-    assert owned_b.close_calls == 1
-    assert owned_a.closed and owned_b.closed
-    # Idempotent shutdown: a second lifespan run closes nothing again.
+        assert len(cycles) == 1
+    a1, b1 = cycles[0]
+    assert a1.close_calls == 1 and b1.close_calls == 1
+    assert app.state.dependencies is None, "owned composition must be dropped"
+
+    # Second lifespan cycle builds fresh resources and closes them again.
     with TestClient(app):
-        pass
-    assert owned_a.close_calls == 1
-    assert owned_b.close_calls == 1
+        assert len(cycles) == 2
+    a2, b2 = cycles[1]
+    assert a2 is not a1 and b2 is not b1
+    assert a2.close_calls == 1 and b2.close_calls == 1
+    assert app.state.dependencies is None
 
 
 def test_injected_dependencies_are_never_closed():
@@ -185,6 +195,127 @@ def test_injected_dependencies_are_never_closed():
     # The caller keeps ownership of injected resources.
     assert calls == []
     assert app.state.owned_resources == ()
+
+
+def test_owned_routes_refuse_after_shutdown(monkeypatch):
+    """After an owned lifespan shutdown, routes return 503 even though the
+    container was dropped (review blocker 2)."""
+    settings = _settings()
+
+    def fake_builder(settings_arg):
+        engine = FakeEngine(supabase=object())
+        deps = main_module.ApplicationDependencies(
+            conversation_engine=engine,
+            auth_client=object(),
+            admission_config=AdmissionRuntimeConfig.from_values(SECRET),
+            turn_config=TurnExecutionConfig.defaults(),
+            health_checks=HealthRegistry(),
+            clock=time.time,
+        )
+        return deps, ()
+
+    monkeypatch.setattr(main_module, "build_default_dependencies", fake_builder)
+    app = main_module.create_app(settings=settings)
+    with TestClient(app):
+        pass
+    assert app.state.dependencies is None
+    client = TestClient(app)
+    response = client.get("/history", headers={"Authorization": "Bearer x"})
+    assert response.status_code == 503
+
+
+def test_injected_routes_refuse_outside_lifespan():
+    """Injected dependencies stay with the caller after shutdown, but routes
+    still refuse to operate outside the lifespan (review blocker 2)."""
+    deps = _fake_dependencies()
+    app = main_module.create_app(settings=_settings(), dependencies=deps)
+    client = TestClient(app)
+    with client:
+        # During the lifespan the injected composition serves requests.
+        response = client.get("/history", headers={"Authorization": "Bearer x"})
+        assert response.status_code == 503  # no persistence client -> 503 body
+    # After the lifespan, routes refuse even though deps remain in app.state.
+    assert app.state.dependencies is deps
+    response = client.get("/history", headers={"Authorization": "Bearer x"})
+    assert response.status_code == 503
+
+
+# ─── Readiness resources enter the lifecycle (review blocker 1) ─────────────
+
+
+class _ProbeOkClient:
+    def table(self, name):
+        return self
+
+    def select(self, cols):
+        return self
+
+    def limit(self, n):
+        return self
+
+    def execute(self):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(data=[], error=None)
+
+
+def test_default_builder_shuts_down_readiness_executor(monkeypatch):
+    """The readiness registry is owned by the application: after leaving the
+    lifespan no readiness-db executor thread stays alive (review blocker 1)."""
+    import threading
+    import time as _time
+
+    import backend.dependencies as dependencies_module
+
+    monkeypatch.setattr(
+        dependencies_module,
+        "_build_readiness_probe_client",
+        lambda _settings: _ProbeOkClient(),
+    )
+    app = main_module.create_app(settings=_settings())
+
+    assert not [t for t in threading.enumerate() if t.name.startswith("readiness-db")]
+    with TestClient(app) as client:
+        # Running /ready submits a probe, which creates the executor thread.
+        response = client.get("/ready")
+        assert response.status_code == 200
+        # The owned tuple now includes the closable registry.
+        assert any(
+            hasattr(resource, "close") and type(resource).__name__ == "HealthRegistry"
+            for resource in app.state.owned_resources
+        )
+    # After shutdown the registry's close() shut the executor down; the
+    # (completed) probe thread terminates on its own.
+    deadline = _time.monotonic() + 5.0
+    while any(t.name.startswith("readiness-db") for t in threading.enumerate()):
+        assert _time.monotonic() < deadline, "readiness-db thread alive after shutdown"
+        _time.sleep(0.01)
+
+
+def test_default_builder_cleans_readiness_on_partial_startup(monkeypatch):
+    """Partial startup failure closes the probe client and registry created
+    before the failure (review blocker 1)."""
+    import backend.dependencies as dependencies_module
+
+    closed = []
+
+    class ClosableProbe:
+        def close(self):
+            closed.append(self)
+
+    monkeypatch.setattr(
+        dependencies_module,
+        "_build_readiness_probe_client",
+        lambda _settings: ClosableProbe(),
+    )
+
+    def boom(settings, engine, **kwargs):
+        raise RuntimeError("late readiness build failure")
+
+    monkeypatch.setattr(dependencies_module, "build_health_registry", boom)
+    with pytest.raises(RuntimeError):
+        dependencies_module.build_default_dependencies(_settings())
+    assert len(closed) == 1, "probe client must be closed on partial startup"
 
 
 def test_aclose_and_close_contracts_both_supported():
@@ -311,6 +442,7 @@ def test_no_per_user_state_in_app_state_or_container():
     assert state_keys <= {
         "settings",
         "dependencies",
+        "dependencies_owned",
         "lifespan_started",
         "owned_resources",
         "shutdown_completed",

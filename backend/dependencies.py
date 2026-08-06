@@ -178,11 +178,13 @@ def build_default_dependencies(
 
         supabase_client = engine.memory_manager.supabase
         probe_client = _build_readiness_probe_client(settings)
+        created.append(probe_client)
         health_checks = build_health_registry(
             settings,
             engine,
             database_probe_client=probe_client,
         )
+        created.append(health_checks)
 
         dependencies = ApplicationDependencies(
             conversation_engine=engine,
@@ -194,12 +196,17 @@ def build_default_dependencies(
             persistence_client=supabase_client,
         )
 
-        # Owned resources created by this builder. The current engine graph
-        # does not expose close()/aclose() contracts (Supabase clients in the
-        # pinned SDK version have no close method; Groq clients are
-        # request-scoped), so this tuple is empty today but the mechanism is
-        # exercised by tests with injectable owned resources.
-        owned: tuple[Any, ...] = ()
+        # Owned resources created by this builder, closed at shutdown and on
+        # partial startup:
+        # * ``health_checks`` closes every closable check, including the
+        #   database probe executor (no new probes are queued; an in-flight
+        #   probe self-terminates via its aligned transport timeout).
+        # * ``probe_client`` is closed when the SDK exposes a compatible
+        #   close/aclose contract (the pinned version does not).
+        # The engine graph itself does not expose close()/aclose() contracts
+        # today (Groq clients are request-scoped; the pinned Supabase SDK has
+        # no close), so it is not part of the owned tuple.
+        owned: tuple[Any, ...] = (health_checks, probe_client)
 
         return dependencies, owned
     except BaseException:

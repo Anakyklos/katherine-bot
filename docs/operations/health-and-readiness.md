@@ -72,13 +72,26 @@ Políticas:
   trabalho, e o timeout de transporte do cliente de probe (alinhado ao
   `READINESS_DATABASE_TIMEOUT_MS`) libera o worker. Polling repetido não
   acumula threads nem esgota o executor.
+- **O registry de readiness é owned pela aplicação.** O builder padrão inclui
+  `health_checks` (que fecha cada check fechável, incluindo o executor do
+  probe com `wait=False`, sem abandonar um probe em voo) e o cliente de probe
+  na tupla de `owned_resources`: são fechados no shutdown e em falha parcial
+  de startup, e nenhuma thread `readiness-db` permanece viva após sair do
+  lifespan.
+- **A guarda de probe é atômica no event loop.** O clear do estado só
+  acontece quando a future observada é a que o poll dono aguarda; uma future
+  mais nova instalada por um poll concorrente nunca é limpa por engano, então
+  no máximo um probe fica em voo (testado com concorrência determinística).
 - **Feature opcional desligada não bloqueia readiness** (`embeddings` só
   existe quando `EMBEDDINGS_RETRIEVAL_ENABLED=true`), e o modelo nunca é
   construído quando a feature está desligada.
 - **Feature obrigatória habilitada e indisponível bloqueia readiness.** Com
   a recuperação vetorial habilitada, um modelo ausente torna a instância
   `not_ready` (o caminho do turno também falha de forma honesta, nunca retorna
-  vazio silenciosamente).
+  vazio silenciosamente). No modo habilitado, falha de encode, transporte/RPC
+  ou resposta estruturalmente inválida produz `ContextLoadError` sanitizado;
+  somente uma resposta válida com `data=[]` representa ausência real de
+  memórias.
 - Check lento é interrompido pelo timeout aprovado (nunca fica pendurado).
 - Exceções com conteúdo sensível nunca aparecem na resposta nem nos logs:
   o registry emite apenas `event=readiness_check_failed component=<nome>`.
