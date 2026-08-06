@@ -1,0 +1,315 @@
+"""Readiness checks for the Katherine Bot backend.
+
+Semantics
+=========
+
+* ``/live`` (see ``backend.main``) proves only process/event-loop vitality and
+  never touches dependencies.
+* ``/ready`` aggregates small, typed checks over the critical dependencies an
+  instance needs to accept nominal traffic: valid configuration, minimal
+  database access, provider path availability, resources of the enabled
+  feature mode, and a completed lifespan.
+
+Check contract
+==============
+
+Each check implements :class:`ReadinessCheck` and is wrapped by
+:class:`HealthRegistry` with an explicit per-check timeout. Checks never
+execute a full generation, never include user content, and never return raw
+exception text. A failed or timed-out check produces a sanitized
+``unavailable`` result with no payload details.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Callable, Mapping, Protocol
+
+from .observability import (
+    EVENT_READINESS_CHECK_FAILED,
+    emit_event,
+)
+from .settings import Settings
+
+logger = logging.getLogger(__name__)
+
+#: Fallback timeout for checks that do not declare their own.
+DEFAULT_CHECK_TIMEOUT_SECONDS = 1.0
+
+
+class CheckStatus(str, Enum):
+    """Stable, sanitized readiness status values."""
+
+    ok = "ok"
+    unavailable = "unavailable"
+
+
+@dataclass(frozen=True)
+class CheckResult:
+    """Result of one readiness check (name + sanitized status only)."""
+
+    name: str
+    status: CheckStatus
+
+
+class CheckFailure(Exception):
+    """Internal signal that a check did not pass (never rendered raw)."""
+
+
+class ReadinessCheck(Protocol):
+    """A single, cheap readiness check."""
+
+    name: str
+    timeout_seconds: float
+
+    async def run(self) -> None:  # pragma: no cover - protocol
+        """Return ``None`` when healthy; raise ``CheckFailure`` otherwise."""
+        ...
+
+
+@dataclass
+class HealthRegistry:
+    """Ordered registry of readiness checks with per-check timeouts.
+
+    Order is deterministic: insertion order, which the default builder
+    fixes as ``configuration``, ``database``, ``provider``, then
+    ``embeddings`` (only when the archival feature is enabled).
+    """
+
+    checks: Mapping[str, ReadinessCheck] = field(default_factory=dict)
+
+    def names(self) -> tuple[str, ...]:
+        return tuple(self.checks)
+
+    def add(self, check: ReadinessCheck) -> None:
+        """Register one check (idempotent by name)."""
+        self.checks[check.name] = check
+
+    async def run_all(self) -> list[CheckResult]:
+        """Run every check in order with its own explicit timeout.
+
+        A check that raises, times out, or never completes becomes
+        ``unavailable``. Raw exception text is never propagated: callers only
+        see names and statuses. A ``readiness_check_failed`` event is emitted
+        per failing component with the sanitized component name.
+        """
+        results: list[CheckResult] = []
+        for name, check in self.checks.items():
+            timeout = getattr(check, "timeout_seconds", DEFAULT_CHECK_TIMEOUT_SECONDS)
+            try:
+                await asyncio.wait_for(check.run(), timeout=timeout)
+                results.append(CheckResult(name, CheckStatus.ok))
+            except asyncio.CancelledError:
+                # Cancellation of the ready request must propagate, but the
+                # check itself must not leak.
+                raise
+            except Exception:
+                emit_event(
+                    logger,
+                    EVENT_READINESS_CHECK_FAILED,
+                    level=logging.ERROR,
+                    component=name,
+                )
+                results.append(CheckResult(name, CheckStatus.unavailable))
+        return results
+
+
+# ─── Concrete checks ────────────────────────────────────────────────────────
+
+
+class ConfigurationCheck:
+    """Validates that the running settings are still valid (no I/O).
+
+    Settings are fully validated at construction; this check re-runs the
+    cheap cross-field validation and guards against a missing or mutated
+    settings reference.
+    """
+
+    name = "configuration"
+    timeout_seconds = DEFAULT_CHECK_TIMEOUT_SECONDS
+
+    def __init__(self, settings: Settings | None) -> None:
+        self._settings = settings
+
+    async def run(self) -> None:
+        if self._settings is None:
+            raise CheckFailure()
+        try:
+            self._settings.ensure_valid()
+        except Exception:
+            raise CheckFailure() from None
+
+
+class DatabaseCheck:
+    """Minimal database/Supabase access check.
+
+    The default implementation performs one cheap read (limit 1) against the
+    core ``profiles`` table using the application's own client, bounded by an
+    explicit timeout. It never touches user data: no rows are read into
+    memory beyond the transport-level response and no content is logged.
+    """
+
+    name = "database"
+
+    def __init__(self, client: Any, timeout_seconds: float) -> None:
+        self._client = client
+        self.timeout_seconds = timeout_seconds
+
+    async def run(self) -> None:
+        if self._client is None:
+            raise CheckFailure()
+        try:
+            response = await asyncio.to_thread(self._probe)
+        except Exception:
+            raise CheckFailure() from None
+        if response is None:
+            raise CheckFailure()
+
+    def _probe(self) -> Any:
+        result = self._client.table("profiles").select("user_id").limit(1).execute()
+        if result is None:
+            raise CheckFailure()
+        if getattr(result, "error", None):
+            raise CheckFailure()
+        return result
+
+
+class ProviderCheck:
+    """Provider path availability check (configuration-level, no generation).
+
+    Verifies that the Groq manager holds validated keys and is ready to build
+    clients. It deliberately never runs a completion, never sends a request,
+    and never loads models. Deployments that want a real network probe must
+    inject their own check with an explicit, documented timeout.
+    """
+
+    name = "provider"
+
+    def __init__(self, groq_manager: Any, timeout_seconds: float) -> None:
+        self._groq_manager = groq_manager
+        self.timeout_seconds = timeout_seconds
+
+    async def run(self) -> None:
+        if self._groq_manager is None:
+            raise CheckFailure()
+        try:
+            configured = await asyncio.to_thread(self._groq_manager.is_configured)
+        except Exception:
+            raise CheckFailure() from None
+        if not configured:
+            raise CheckFailure()
+
+
+class EmbeddingsCheck:
+    """Checks that embeddings are available when the feature mode requires them.
+
+    Only registered when ``archival_extraction_enabled`` is true. The model is
+    loaded once during startup; this check only verifies the loaded resource
+    exists and never loads a model by itself.
+    """
+
+    name = "embeddings"
+    timeout_seconds = DEFAULT_CHECK_TIMEOUT_SECONDS
+
+    def __init__(self, memory_manager: Any) -> None:
+        self._memory_manager = memory_manager
+
+    async def run(self) -> None:
+        if self._memory_manager is None:
+            raise CheckFailure()
+        if getattr(self._memory_manager, "embedding_model", None) is None:
+            raise CheckFailure()
+
+
+class LifespanCheck:
+    """Checks that the application lifespan has completed startup.
+
+    The provider is a callable returning the current ``lifespan_started``
+    flag from ``app.state``, so the check always observes the live state.
+    """
+
+    name = "lifespan"
+    timeout_seconds = DEFAULT_CHECK_TIMEOUT_SECONDS
+
+    def __init__(self, state_provider: Callable[[], bool]) -> None:
+        self._state_provider = state_provider
+
+    async def run(self) -> None:
+        try:
+            started = bool(self._state_provider())
+        except Exception:
+            raise CheckFailure() from None
+        if not started:
+            raise CheckFailure()
+
+
+# ─── Default registry builder ───────────────────────────────────────────────
+
+
+def build_health_registry(
+    settings: Settings,
+    engine: Any,
+    auth_client: Any,
+) -> HealthRegistry:
+    """Build the default ordered registry for the running configuration.
+
+    Components:
+    1. ``configuration`` — validated settings.
+    2. ``database`` — minimal Supabase read, bounded by
+       ``readiness_database_timeout_ms``.
+    3. ``provider`` — provider keys/client path, bounded by
+       ``readiness_provider_timeout_ms``.
+    4. ``embeddings`` — only when ``archival_extraction_enabled`` is true.
+
+    ``lifespan`` is appended by the application at request time because it
+    observes ``app.state``.
+    """
+    registry = HealthRegistry()
+    registry.add(
+        ConfigurationCheck(settings)
+    )
+    registry.add(
+        DatabaseCheck(
+            auth_client,
+            timeout_seconds=settings.readiness_database_timeout_ms / 1000.0,
+        )
+    )
+    registry.add(
+        ProviderCheck(
+            engine.groq_manager,
+            timeout_seconds=settings.readiness_provider_timeout_ms / 1000.0,
+        )
+    )
+    if settings.archival_extraction_enabled:
+        registry.add(EmbeddingsCheck(engine.memory_manager))
+    return registry
+
+
+def build_ready_response(
+    results: list[CheckResult],
+    lifespan_started: bool,
+) -> tuple[int, dict]:
+    """Aggregate check results into the deterministic readiness response.
+
+    Returns ``(http_status, body)``. The body schema is stable:
+
+    .. code-block:: json
+
+        {"status": "ready", "components": {"configuration": "ok", ...}}
+
+    Component order is deterministic. Only sanitized status values are
+    included; no URLs, keys, names, counts, or exception text.
+    """
+    components: dict[str, str] = {}
+    for result in results:
+        components[result.name] = result.status.value
+    components["lifespan"] = (
+        CheckStatus.ok.value if lifespan_started else CheckStatus.unavailable.value
+    )
+    ready = all(status == CheckStatus.ok.value for status in components.values())
+    if ready:
+        return 200, {"status": "ready", "components": components}
+    return 503, {"status": "not_ready", "components": components}

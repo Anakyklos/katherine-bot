@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 from .engine import ConversationEngine
 from .process_turn import (
@@ -40,11 +40,16 @@ class ChatConversationEngine(ConversationEngine):
         clock=time.time,
         archival_extraction_enabled: bool = False,
         turn_config: Optional[TurnExecutionConfig] = None,
+        *,
+        groq_keys: Optional[list] = None,
+        supabase_factory: Optional[Callable[[], Optional[object]]] = None,
     ):
         super().__init__(
             clock=clock,
             archival_extraction_enabled=archival_extraction_enabled,
             turn_config=turn_config,
+            groq_keys=groq_keys,
+            supabase_factory=supabase_factory,
         )
         self._process_turn = build_process_turn(self)
 

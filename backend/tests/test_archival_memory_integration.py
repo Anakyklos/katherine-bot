@@ -13,6 +13,8 @@ from unittest.mock import patch, AsyncMock
 from fastapi import BackgroundTasks
 from fastapi.testclient import TestClient
 
+import backend.main as main
+
 REQUEST_ID = "550e8400-e29b-41d4-a716-446655440000"
 
 
@@ -73,15 +75,43 @@ def backend(mock_external_dependencies):
     return h
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def client_app(mock_external_dependencies):
-    from backend.main import app
+    """Real engine composed through the application factory with mocked env."""
+    from backend.admission import AdmissionRuntimeConfig
+    from backend.chat_engine import ChatConversationEngine
+    from backend.dependencies import ApplicationDependencies
+    from backend.health import HealthRegistry
+    from backend.settings import AppEnvironment, Settings
+    from backend.turn_execution import TurnExecutionConfig
+
+    engine = ChatConversationEngine()
+    settings = Settings(
+        app_env=AppEnvironment.local,
+        groq_api_key="mock_key",
+        admission_hmac_secret="test-admission-secret-that-is-at-least-32-bytes",
+        cors_allowed_origins=("http://localhost:3000",),
+    )
+    deps = ApplicationDependencies(
+        conversation_engine=engine,
+        auth_client=engine.memory_manager.supabase,
+        admission_config=AdmissionRuntimeConfig.from_values(
+            "test-admission-secret-that-is-at-least-32-bytes"
+        ),
+        turn_config=TurnExecutionConfig.defaults(),
+        health_checks=HealthRegistry(),
+    )
+    app = main.create_app(settings=settings, dependencies=deps)
     return TestClient(app)
 
 
+def _app_engine(client_app):
+    return client_app.app.state.dependencies.conversation_engine
+
+
 @pytest.fixture
-def mock_supabase():
-    from backend.main import engine
+def mock_supabase(client_app):
+    engine = _app_engine(client_app)
     with patch.object(engine.memory_manager, 'supabase', MagicMock()) as mock_sb:
         mock_sb.rpc.return_value.execute.return_value.data = [
             {"decision": "admitted", "retry_after_seconds": 0}
@@ -371,7 +401,7 @@ async def test_run_archival_extraction_disabled_returns_early(backend):
 
 
 def test_chat_response_format(client_app, mock_supabase, monkeypatch):
-    from backend.main import engine
+    engine = _app_engine(client_app)
     from backend.relationship import RelationshipStateV1
     
     mock_user = MockUser(id="user123")

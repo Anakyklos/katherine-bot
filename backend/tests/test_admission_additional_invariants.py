@@ -77,12 +77,24 @@ def test_endpoint_cancellation_drains_reservation_and_never_calls_engine(monkeyp
             raise AssertionError("engine must not run after cancelled admission")
 
     fake_engine = FakeEngine()
-    monkeypatch.setattr(main, "engine", fake_engine)
-    monkeypatch.setattr(
-        main,
-        "_admission_config",
-        AdmissionRuntimeConfig.from_values("s" * 32),
+    from backend.health import HealthRegistry
+    from backend.settings import AppEnvironment, Settings
+    from backend.turn_execution import TurnExecutionConfig
+
+    settings = Settings(
+        app_env=AppEnvironment.local,
+        groq_api_key="k",
+        admission_hmac_secret="s" * 40,
+        cors_allowed_origins=("http://localhost:3000",),
     )
+    deps = main.ApplicationDependencies(
+        conversation_engine=fake_engine,
+        auth_client=object(),
+        admission_config=AdmissionRuntimeConfig.from_values("s" * 32),
+        turn_config=TurnExecutionConfig.defaults(),
+        health_checks=HealthRegistry(),
+    )
+    app = main.create_app(settings=settings, dependencies=deps)
 
     def blocking_reservation(_client, _request):
         started.set()
@@ -100,6 +112,7 @@ def test_endpoint_cancellation_drains_reservation_and_never_calls_engine(monkeyp
                 "path": "/chat",
                 "headers": [],
                 "client": ("203.0.113.8", 12345),
+                "app": app,
             }
         )
         task = asyncio.create_task(

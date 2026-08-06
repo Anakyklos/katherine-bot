@@ -1,0 +1,100 @@
+# Health and Readiness
+
+Status: implementado na issue #275.
+
+Este documento define a semântica de `/live`, `/ready` e `/health`, os checks
+críticos e opcionais, os timeouts e o procedimento de diagnóstico.
+
+## Diferença entre `/live`, `/ready` e `/health`
+
+| Endpoint | Semântica | Falha de dependência? | Uso |
+| --- | --- | --- | --- |
+| `GET /live` | Processo e event loop respondem | Ignorada | Liveness de orquestradores |
+| `GET /ready` | Instância apta a receber tráfego nominal | 503 | Readiness de orquestradores |
+| `GET /health` | Alias legado de processo vivo | Ignorada | Compatibilidade (consumidores antigos) |
+
+### `GET /live`
+
+Resposta fixa e estável:
+
+```json
+{"status": "live"}
+```
+
+Nunca chama provider, banco, embeddings ou checks. Não inclui versões,
+hostname, configuração ou detalhes internos. Retorna 200 enquanto o processo
+responder.
+
+### `GET /ready`
+
+Executa os checks críticos com timeout explícito por check. Resposta:
+
+```json
+{"status": "ready", "components": {"configuration": "ok", "database": "ok", "provider": "ok", "lifespan": "ok"}}
+```
+
+Quando qualquer componente crítico falha:
+
+```json
+{"status": "not_ready", "components": {"configuration": "ok", "database": "unavailable", "provider": "ok", "lifespan": "ok"}}
+```
+
+com HTTP 503. A resposta nunca inclui URLs, chaves, nomes de projeto, texto
+de exceção, contagens ou IDs de usuário. A ordem dos componentes é
+determinística.
+
+### `GET /health`
+
+Mantido por compatibilidade (consumidores legados e CI de deploy). Retorna
+exatamente `{"status": "alive"}` e **não afirma readiness**: nenhum check de
+banco/provider é executado. Consumidores novos devem usar `/live` e `/ready`.
+
+## Checks críticos e opcionais
+
+Ordem determinística registrada em `backend/health.py`:
+
+| Componente | Crítico | O que verifica | Timeout padrão |
+| --- | --- | --- | --- |
+| `configuration` | Sim | Settings ainda válidos (re-validação barata, sem I/O) | 1s |
+| `database` | Sim | Acesso mínimo ao Supabase: leitura `limit 1` em `profiles` com o cliente da aplicação | `READINESS_DATABASE_TIMEOUT_MS` (3000) |
+| `provider` | Sim | Caminho do provider configurado: `GroqClientManager.is_configured()` (chaves válidas, sem geração) | `READINESS_PROVIDER_TIMEOUT_MS` (1000) |
+| `embeddings` | Somente com `ARCHIVAL_EXTRACTION_ENABLED=true` | Modelo de embeddings carregado no startup (atributo, sem carregar modelo) | 1s |
+| `lifespan` | Sim | `app.state.lifespan_started` (startup concluído) | 1s |
+
+Políticas:
+
+- **O check de provider nunca executa geração real.** É barato, limitado e
+  verifica configuração do caminho. Deployments que quiserem um probe real de
+  rede devem injetar um check próprio com timeout documentado.
+- **Feature opcional desligada não bloqueia readiness** (`embeddings` só
+  existe quando habilitado).
+- **Feature obrigatória habilitada e indisponível bloqueia readiness.**
+- Check lento é interrompido pelo timeout aprovado (nunca fica pendurado).
+- Exceções com conteúdo sensível nunca aparecem na resposta nem nos logs:
+  o registry emite apenas `event=readiness_check_failed component=<nome>`.
+
+## Timeouts de readiness
+
+- `READINESS_DATABASE_TIMEOUT_MS`: faixa 100–30000, default 3000.
+- `READINESS_PROVIDER_TIMEOUT_MS`: faixa 100–30000, default 1000.
+- Checks internos (configuration, embeddings, lifespan): 1s fixo.
+- Valores inválidos são rejeitados pelos settings (falha cedo).
+
+## Diagnóstico quando `/ready` falhar
+
+1. **`lifespan` unavailable** — a aplicação não completou o startup: procure
+   `event=app_startup_failed` nos logs e valide a configuração (ver
+   `docs/operations/configuration.md`).
+2. **`configuration` unavailable** — settings inválidos em runtime (improvável,
+   pois falha cedo; verifique se o processo foi iniciado com configuração
+   válida).
+3. **`database` unavailable** — verifique conectividade com o Supabase
+   (URL, service role key, rede) e se a tabela `profiles` está acessível com
+   o role da aplicação. Timeout curto sugere rede/slow query.
+4. **`provider` unavailable** — chaves do provider ausentes ou inválidas na
+   configuração da instância.
+5. **`embeddings` unavailable** (só com archival habilitado) — o modelo não
+   carregou no startup (ex.: `HF_HUB_OFFLINE=1` sem cache local).
+
+Cada falha aparece nos logs como `event=readiness_check_failed
+component=<nome>`; nenhum detalhe de exceção é registrado.

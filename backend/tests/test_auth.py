@@ -4,6 +4,8 @@ import logging
 import pytest
 from unittest.mock import patch, MagicMock, ANY
 
+import backend.main as main
+
 REQUEST_ID = "550e8400-e29b-41d4-a716-446655440000"
 
 
@@ -57,16 +59,50 @@ def mock_external_dependencies():
     os.environ.update(_original_env)
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def client_app(mock_external_dependencies):
+    """Real engine composed through the application factory with mocked env.
+
+    The engine is built once per module (like the historical module-level
+    engine) and composed via ``create_app`` with the validated settings, so
+    the auth dependency runs through the real server-side path.
+    """
     from fastapi.testclient import TestClient
-    from backend.main import app
+    from backend.admission import AdmissionRuntimeConfig
+    from backend.chat_engine import ChatConversationEngine
+    from backend.dependencies import ApplicationDependencies
+    from backend.health import HealthRegistry
+    from backend.settings import AppEnvironment, Settings
+    from backend.turn_execution import TurnExecutionConfig
+
+    engine = ChatConversationEngine()
+    settings = Settings(
+        app_env=AppEnvironment.local,
+        groq_api_key="mock_key",
+        admission_hmac_secret="test-admission-secret-that-is-at-least-32-bytes",
+        cors_allowed_origins=("http://localhost:3000",),
+    )
+    deps = ApplicationDependencies(
+        conversation_engine=engine,
+        auth_client=engine.memory_manager.supabase,
+        admission_config=AdmissionRuntimeConfig.from_values(
+            "test-admission-secret-that-is-at-least-32-bytes"
+        ),
+        turn_config=TurnExecutionConfig.defaults(),
+        health_checks=HealthRegistry(),
+    )
+    app = main.create_app(settings=settings, dependencies=deps)
     return TestClient(app)
 
 
+def _app_engine(client_app):
+    """Resolve the composed engine from the test client's app state."""
+    return client_app.app.state.dependencies.conversation_engine
+
+
 @pytest.fixture
-def mock_supabase():
-    from backend.main import engine
+def mock_supabase(client_app):
+    engine = _app_engine(client_app)
     with patch.object(engine.memory_manager, 'supabase', MagicMock()) as mock_sb:
         mock_sb.rpc.return_value.execute.return_value.data = [
             {"decision": "admitted", "retry_after_seconds": 0}
@@ -75,8 +111,8 @@ def mock_supabase():
 
 
 @pytest.fixture
-def mock_engine_process():
-    from backend.main import engine
+def mock_engine_process(client_app):
+    engine = _app_engine(client_app)
     from backend.emotion_presentation import EmotionStateResponse, PublicPAD
     from backend.process_turn import ProcessTurnResult
     fake_emotion = EmotionStateResponse(
@@ -162,7 +198,7 @@ def test_user_is_none(client_app, mock_supabase, mock_engine_process):
 
 
 def test_service_unavailable(client_app, mock_supabase, mock_engine_process):
-    from backend.main import engine
+    engine = _app_engine(client_app)
     with patch.object(engine.memory_manager, 'supabase', None):
         response = client_app.post(
             "/chat",
@@ -331,7 +367,7 @@ def test_unexpected_error_503(client_app, mock_supabase, mock_engine_process, ca
 
 
 def test_http_chat_load_failure_sanitization(client_app, mock_supabase, caplog):
-    from backend.main import engine
+    engine = _app_engine(client_app)
     mock_supabase.auth.get_user.return_value = MockAuthResponse(user=MockUser("user123"))
 
     # Mock supabase select call to raise a sensitive exception
@@ -361,7 +397,7 @@ def test_http_chat_load_failure_sanitization(client_app, mock_supabase, caplog):
 
 
 def test_http_chat_persistence_failure_sanitization(client_app, mock_supabase, caplog):
-    from backend.main import engine
+    engine = _app_engine(client_app)
     from backend.emotional_core import EmotionalState
     from backend.relationship import RelationshipStateV1
     mock_supabase.auth.get_user.return_value = MockAuthResponse(user=MockUser("user123"))

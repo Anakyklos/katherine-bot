@@ -1,0 +1,153 @@
+# Application Lifecycle
+
+Status: implementado na issue #275.
+
+Este documento descreve como o backend é composto, iniciado e encerrado:
+settings validados, container de dependências, app factory, lifespan e
+ownership dos recursos.
+
+## Problema e causa raiz
+
+O backend anterior construía dependências no carregamento dos módulos:
+
+```text
+import backend.main
+→ cria engine (cliente Groq + MemoryManager + SentenceTransformer + Supabase)
+→ lê CORS, archival flag e timeouts de ambiente no import
+→ registra /health sem checar dependências
+```
+
+Consequências:
+
+- efeitos colaterais durante import (rede, modelos, clientes);
+- testes dependentes de monkeypatch em `sys.modules` e de globais de módulo;
+- impossibilidade de fechar clientes no shutdown;
+- configuração de produção baseada em defaults de desenvolvimento;
+- health check incapaz de distinguir processo vivo de instância apta;
+- baixa capacidade de injetar doubles nos testes.
+
+## Solução
+
+A composição foi separada da lógica de negócio em quatro camadas:
+
+1. `backend/settings.py` — configuração tipada e validada (ver
+   [Configuration](operations/configuration.md)).
+2. `backend/dependencies.py` — container explícito
+   `ApplicationDependencies` + builder padrão + ownership.
+3. `backend/main.py` — `create_app(settings, dependencies)` + lifespan.
+4. `backend/health.py` — checks de readiness (ver
+   [Health and Readiness](operations/health-and-readiness.md)).
+
+## Contrato da app factory
+
+```python
+def create_app(
+    settings: Settings | None = None,
+    dependencies: ApplicationDependencies | None = None,
+) -> FastAPI: ...
+```
+
+- `settings=None` → `Settings.from_env()` (validação estrita, falha cedo).
+- `dependencies=None` → o lifespan constrói a composição padrão
+  (`build_default_dependencies(settings)`) e a aplicação é dona dos recursos.
+- `dependencies=<container>` → o chamador mantém ownership; a aplicação não
+  constrói nada no startup e marca o ciclo como concluído imediatamente.
+- A factory **nunca** constrói cliente Groq, cliente Supabase, modelo de
+  embeddings, threads ou tarefas em background. Importar `backend.main` é
+  seguro e sem efeitos colaterais.
+- O container fica em `app.state.dependencies`; endpoints o recuperam por
+  dependency functions pequenas (`get_dependencies(request)`), nunca por
+  globais.
+
+## Container de dependências
+
+```python
+@dataclass
+class ApplicationDependencies:
+    conversation_engine: ConversationEngine  # ProcessTurn + provider + persistência
+    auth_client: object                      # superfície de auth (cliente Supabase)
+    admission_config: AdmissionRuntimeConfig # ledger de admissão + HMAC
+    turn_config: TurnExecutionConfig         # budget/deadline do turno
+    health_checks: HealthRegistry            # checks de readiness
+    clock: Callable[[], float]               # relógio de parede
+```
+
+- Nenhum estado por usuário vive no container ou em singleton: identidade
+  autenticada é resolvida por request (`get_current_user`), e snapshots
+  emocionais/relacionais permanecem no domínio/persistência.
+- `UserLockManager` permanece process-wide porque já é thread-safe por
+  construção e é um recurso de infraestrutura, não estado de usuário.
+- Para adicionar uma dependência nova, ver “Procedimento para adicionar uma
+  dependência” abaixo.
+
+## Ordem de startup (lifespan)
+
+```text
+1. Validar configuração final (Settings já validado; re-validação barata).
+2. Se não injetado: build_default_dependencies(settings)
+   a. engine (GroqClientManager + MemoryManager + lock manager)
+   b. admission_config a partir dos settings
+   c. health registry (configuration, database, provider[, embeddings])
+   d. container concluído
+3. Falha em qualquer passo:
+   a. recursos já criados pelo builder são fechados (cleanup parcial)
+   b. app.state.owned_resources é drenado
+   c. evento sanitizado `event=app_startup_failed`
+   d. a exceção propaga: a aplicação não começa a servir tráfego
+4. Somente após sucesso: `app.state.lifespan_started = True`
+```
+
+## Ordem de shutdown (lifespan)
+
+```text
+1. Marcar lifespan como não iniciado (impede readiness durante shutdown).
+2. Fechar cada recurso owned:
+   a. contrato: aclose() → close() (o primeiro disponível)
+   b. falha em um recurso não interrompe os demais
+   c. apenas `event=app_shutdown_failed` é registrado (código sanitizado)
+3. Limpar app.state.owned_resources → shutdown idempotente
+4. Recursos injetados externamente NUNCA são fechados pela aplicação
+```
+
+## Ownership
+
+| Recurso | Criado por | Fechado por |
+| --- | --- | --- |
+| Engine/managers (default) | `build_default_dependencies` | aplicação (shutdown) |
+| Cliente Supabase (default) | `build_default_dependencies` via factory dos settings | aplicação (se expuser close/aclose) |
+| Container injetado | chamador (teste/deploy) | chamador |
+| Clientes Groq por request | `GroqClientManager` | request-scoped (fechados por call) |
+
+A versão atual do SDK Supabase pinado não expõe `close()`/`aclose()` no
+cliente, e os clientes Groq são request-scoped; portanto o mecanismo de
+shutdown existe e é testado com recursos falsos, mas a lista owned do builder
+padrão é vazia hoje.
+
+## Importabilidade
+
+Importar `backend.main`, `backend.engine`, `backend.memory`,
+`backend.groq_manager`, `backend.dependencies`, `backend.settings`,
+`backend.health`, `backend.observability` e `backend.process_turn`:
+
+- não abre socket;
+- não constrói cliente Groq ou Supabase;
+- não instancia `SentenceTransformer`;
+- não inicia thread nem background task;
+- não lê arquivos de runtime nem executa migration;
+- não imprime nada.
+
+O único acesso a ambiente no import é `Settings.from_env()` na construção do
+app de módulo (`app = create_app()`), que é validação pura.
+
+## Procedimento para adicionar uma dependência nova
+
+1. Adicione o campo ao container `ApplicationDependencies` (sem estado por
+   usuário).
+2. Construa o recurso em `build_default_dependencies` e, se a aplicação deve
+   fechá-lo, inclua-o na tupla de `owned_resources` e implemente
+   `close()`/`aclose()`.
+3. Se for crítico para tráfego nominal, adicione um check em `health.py` com
+   timeout explícito e registre-o em `build_health_registry`.
+4. Se exigir configuração, adicione o campo em `Settings` com validação
+   estrita e documente a variável em `docs/operations/configuration.md`.
+5. Teste: factory com fakes injetados, lifespan, ownership, readiness.

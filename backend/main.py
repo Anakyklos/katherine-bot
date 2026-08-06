@@ -1,20 +1,45 @@
+"""HTTP application factory for the Katherine Bot backend.
+
+Lifecycle
+=========
+
+* Importing this module has no side effects beyond declaring the FastAPI
+  application (``app = create_app()``): no sockets, no Groq/Supabase clients,
+  no embedding models, no threads, no environment reads outside
+  ``Settings.from_env()``.
+* Heavy resources (engine, providers, persistence) are built inside the
+  lifespan by :func:`backend.dependencies.build_default_dependencies` and
+  owned by the application.
+* ``create_app(settings=..., dependencies=...)`` accepts injected doubles so
+  tests run without Groq, Supabase, embeddings, or network.
+
+Health semantics
+================
+
+* ``GET /live``  — process/event-loop vitality only; never touches providers.
+* ``GET /ready`` — real checks over critical dependencies with explicit
+  timeouts; 503 when any critical component is unavailable.
+* ``GET /health`` — legacy alias kept for compatibility; asserts only that
+  the process is alive, never readiness.
+"""
+
+from __future__ import annotations
+
 import asyncio
-from fastapi import FastAPI, HTTPException, Depends, Request
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-
 import logging
-from supabase_auth.errors import AuthApiError, AuthRetryableError
-logger = logging.getLogger(__name__)
+import time
+from contextlib import asynccontextmanager
+from typing import Optional
 
-
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, ConfigDict, StrictStr, field_validator
 from pydantic_core import PydanticCustomError
-from typing import Optional
-import uvicorn
-import os
-from dotenv import load_dotenv
+from supabase_auth.errors import AuthApiError, AuthRetryableError
+
 from .admission import (
     ADMITTED,
     APPLICATION_RATE_LIMITED,
@@ -26,7 +51,6 @@ from .admission import (
     USER_DAILY_UNIT_QUOTA_EXCEEDED,
     USER_RATE_LIMITED,
     AdmissionResult,
-    AdmissionRuntimeConfig,
     AdmissionUnavailable,
     build_admission_request,
     compute_turn_correlation,
@@ -35,103 +59,114 @@ from .admission import (
 )
 from .admission_contracts import AdmissionError, RequestIdentity, validate_new_message
 from .atomic_turn_commit import ConflictError, PersistenceError
-from .chat_engine import ChatConversationEngine
-from .memory import StatePersistenceError
+from .dependencies import (
+    ApplicationDependencies,
+    build_default_dependencies,
+    shutdown_dependencies,
+)
 from .emotion_presentation import EmotionStateResponse
+from .groq_manager import GroqPoolExhaustedError, GroqRequestError
+from .health import build_ready_response
+from .memory import StatePersistenceError
+from .observability import (
+    EVENT_APP_STARTUP_FAILED,
+    EVENT_AUTH_COMPLETED,
+    EVENT_AUTH_FAILED,
+    EVENT_HTTP_RESULT,
+    EVENT_REQUEST_CONFLICT,
+    EVENT_TURN_COMPLETED,
+    EVENT_TURN_FAILED,
+    emit_event,
+)
 from .process_turn import TurnMode
+from .runtime_containment import validate_worker_configuration
+from .settings import Settings, SettingsConfigurationError
 from .turn_execution import (
-    TurnExecutionConfig,
-    TurnExecutionError,
-    TurnErrorCode,
     DeadlineExceeded,
+    TurnErrorCode,
+    TurnExecutionError,
     create_budget,
     run_blocking_write,
 )
-from .groq_manager import GroqPoolExhaustedError, GroqRequestError
 
-load_dotenv()
-
-from fastapi.middleware.cors import CORSMiddleware
-
-app = FastAPI(title="SoulMate API", description="Backend for the Emotional Companion Bot")
-
-# Comma-separated origins allowed by CORS. Default preserves the historical
-# development origin; production sets its own public frontend origin(s).
-# Invalid configuration (empty or wildcard) fails fast at startup without
-# logging the raw value.
-from .cors_policy import parse_cors_allowed_origins  # noqa: E402
-
-try:
-    cors_allowed_origins = list(parse_cors_allowed_origins(os.getenv("CORS_ALLOWED_ORIGINS")))
-except ValueError:
-    raise RuntimeError("Invalid CORS_ALLOWED_ORIGINS configuration") from None
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=cors_allowed_origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Validate runtime containment before initialising the engine.
-# This runs at module load time, so multi-worker configurations fail early.
-from .runtime_containment import (
-    validate_worker_configuration,
-    parse_archival_extraction_flag,
-)
-
-validate_worker_configuration()
-
-# Parse archival extraction flag from environment (default: disabled)
-_archival_extraction_enabled = parse_archival_extraction_flag(
-    os.environ.get("ARCHIVAL_EXTRACTION_ENABLED")
-)
-
-# Parse turn execution and admission config from environment. Admission has no
-# fallback secret and fails closed during application initialisation.
-_turn_config = TurnExecutionConfig.from_env()
-_admission_config = AdmissionRuntimeConfig.from_env()
-
-# Initialize Engine with containment-aware configuration
-engine = ChatConversationEngine(
-    archival_extraction_enabled=_archival_extraction_enabled,
-    turn_config=_turn_config,
-)
-
+logger = logging.getLogger(__name__)
 
 security = HTTPBearer(auto_error=False)
 
-def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)):
-    if not credentials:
-        raise HTTPException(status_code=401, detail="Not authenticated", headers={"WWW-Authenticate": "Bearer"})
-    token = credentials.credentials
-    try:
-        if not engine.memory_manager.supabase:
-            raise HTTPException(status_code=503, detail="Authentication service unavailable")
 
-        auth_response = engine.memory_manager.supabase.auth.get_user(token)
+# ─── Dependency access from app.state ───────────────────────────────────────
+
+
+def get_dependencies(request: Request) -> ApplicationDependencies:
+    """Resolve the application dependency container from ``app.state``.
+
+    Returns 503 when the lifespan has not completed startup, so no endpoint
+    can run against a partially initialized application.
+    """
+    deps = getattr(request.app.state, "dependencies", None)
+    if deps is None:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "service_unavailable", "message": "Service unavailable."},
+        )
+    return deps
+
+
+def get_current_user(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+):
+    """Authenticate the bearer token against the server-side auth client.
+
+    The authenticated identity is resolved per request and never stored in
+    the container or any global. The auth surface is the engine's Supabase
+    client (shared with admission and persistence), and only sanitized codes
+    are logged.
+    """
+    if not credentials:
+        raise HTTPException(
+            status_code=401,
+            detail="Not authenticated",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token = credentials.credentials
+    deps = get_dependencies(request)
+    auth_client = deps.conversation_engine.memory_manager.supabase
+    try:
+        if not auth_client:
+            emit_event(logger, EVENT_AUTH_FAILED, code="service_unavailable")
+            raise HTTPException(status_code=503, detail="Authentication service unavailable")
+        auth_response = auth_client.auth.get_user(token)
         if not auth_response.user:
+            emit_event(logger, EVENT_AUTH_FAILED, code="invalid_token")
             raise HTTPException(
                 status_code=401,
                 detail="Authentication failed",
                 headers={"WWW-Authenticate": "Bearer"},
             )
+        emit_event(logger, EVENT_AUTH_COMPLETED, outcome="ok")
         return auth_response.user
     except HTTPException:
         raise
-    except AuthApiError as e:
-        # e.status is present in AuthApiError
-        if e.status in (400, 401, 403):
-            raise HTTPException(status_code=401, detail="Authentication failed", headers={"WWW-Authenticate": "Bearer"})
-        logger.error("Authentication service failure: Upstream AuthApiError")
+    except AuthApiError as exc:
+        if exc.status in (400, 401, 403):
+            raise HTTPException(
+                status_code=401,
+                detail="Authentication failed",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        emit_event(logger, EVENT_AUTH_FAILED, code="upstream_error")
         raise HTTPException(status_code=503, detail="Authentication service unavailable")
     except AuthRetryableError:
-        logger.error("Authentication service failure: Transport/Fetch error")
+        emit_event(logger, EVENT_AUTH_FAILED, code="transport_error")
         raise HTTPException(status_code=503, detail="Authentication service unavailable")
     except Exception:
-        logger.error("Authentication service failure: Unexpected error")
+        emit_event(logger, EVENT_AUTH_FAILED, code="unexpected")
         raise HTTPException(status_code=503, detail="Authentication service unavailable")
+
+
+# ─── Request/response contracts ─────────────────────────────────────────────
+
 
 class ChatInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -155,6 +190,7 @@ class ChatInput(BaseModel):
             raise PydanticCustomError(exc.code, exc.code)
         return value
 
+
 class ChatResponse(BaseModel):
     response: str
     emotion_state: EmotionStateResponse
@@ -168,28 +204,8 @@ _VALIDATION_MESSAGES = {
 }
 
 
-@app.exception_handler(RequestValidationError)
-async def _sanitise_request_validation_error(
-    _request: Request,
-    exc: RequestValidationError,
-) -> JSONResponse:
-    error_types = {item.get("type") for item in exc.errors()}
-    code = "invalid_request"
-    for candidate in (
-        "invalid_request_id",
-        "message_too_long",
-        "message_budget_exceeded",
-    ):
-        if candidate in error_types:
-            code = candidate
-            break
-    return JSONResponse(
-        status_code=422,
-        content={"detail": {"code": code, "message": _VALIDATION_MESSAGES[code]}},
-    )
+# ─── Error mapping (public contract preserved) ──────────────────────────────
 
-
-# ─── Error mapping ───────────────────────────────────────────────────────────
 
 def _turn_code_to_http(code: TurnErrorCode) -> int:
     """Map a ``TurnErrorCode`` to an HTTP status code.
@@ -248,8 +264,8 @@ def _map_turn_error(exc: Exception) -> HTTPException:
         )
 
     if isinstance(exc, GroqPoolExhaustedError):
-        # Map the failure code if available
         from .groq_manager import provider_failure_to_turn_code
+
         turn_code = (
             provider_failure_to_turn_code(exc.failure_code) if exc.failure_code
             else TurnErrorCode.provider_unavailable
@@ -262,23 +278,30 @@ def _map_turn_error(exc: Exception) -> HTTPException:
     if isinstance(exc, GroqRequestError):
         return HTTPException(
             status_code=503,
-            detail={"code": TurnErrorCode.provider_unavailable.value, "message": "Provider request failed."},
+            detail={
+                "code": TurnErrorCode.provider_unavailable.value,
+                "message": "Provider request failed.",
+            },
         )
 
     if isinstance(exc, StatePersistenceError):
         return HTTPException(
             status_code=503,
-            detail={"code": TurnErrorCode.persistence_unavailable.value, "message": "Persistence service unavailable."},
+            detail={
+                "code": TurnErrorCode.persistence_unavailable.value,
+                "message": "Persistence service unavailable.",
+            },
         )
 
     if isinstance(exc, PersistenceError):
-        # Unexpected persistence failure: sanitized, never PostgreSQL messages.
         return HTTPException(
             status_code=503,
-            detail={"code": TurnErrorCode.persistence_unavailable.value, "message": "Persistence service unavailable."},
+            detail={
+                "code": TurnErrorCode.persistence_unavailable.value,
+                "message": "Persistence service unavailable.",
+            },
         )
 
-    # Unknown/unexpected — sanitize to generic 500
     return HTTPException(
         status_code=500,
         detail={"code": TurnErrorCode.internal_error.value, "message": "Internal server error."},
@@ -349,33 +372,156 @@ def _admission_unavailable_error() -> HTTPException:
     )
 
 
-@app.post("/chat", response_model=ChatResponse)
+# ─── Lifespan ───────────────────────────────────────────────────────────────
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """Start and stop application resources.
+
+    Startup: build owned resources when none were injected, store the
+    completed container, and only then mark startup as complete.
+    Shutdown: close owned resources, keep going past individual failures,
+    and record shutdown completion (idempotent).
+    """
+    if app.state.dependencies is None:
+        try:
+            dependencies, owned = build_default_dependencies(app.state.settings)
+        except Exception:
+            # Partial startup: drain anything already recorded as owned, then
+            # fail. Resources created inside build_default_dependencies are
+            # cleaned by the builder itself.
+            await shutdown_dependencies(app.state.owned_resources)
+            app.state.owned_resources = ()
+            emit_event(logger, EVENT_APP_STARTUP_FAILED, level=logging.ERROR)
+            raise
+        app.state.dependencies = dependencies
+        app.state.owned_resources = owned
+    app.state.lifespan_started = True
+    try:
+        yield
+    finally:
+        app.state.lifespan_started = False
+        await shutdown_dependencies(app.state.owned_resources)
+        app.state.owned_resources = ()
+        app.state.shutdown_completed = True
+
+
+# ─── Application factory ────────────────────────────────────────────────────
+
+
+def create_app(
+    settings: Optional[Settings] = None,
+    dependencies: Optional[ApplicationDependencies] = None,
+) -> FastAPI:
+    """Build and configure the FastAPI application.
+
+    Args:
+        settings: Validated settings. Defaults to ``Settings.from_env()``.
+        dependencies: Fully composed container. When provided, the caller
+            keeps ownership of every resource inside it; the application
+            performs no startup construction and marks the lifespan as
+            already complete. When omitted, the lifespan builds the default
+            composition from settings (owned by the application).
+
+    The factory never constructs Groq/Supabase/embedding resources: heavy
+    construction happens only inside the lifespan.
+    """
+    if settings is None:
+        try:
+            settings = Settings.from_env()
+        except SettingsConfigurationError:
+            emit_event(logger, EVENT_APP_STARTUP_FAILED, reason="invalid_settings")
+            raise
+
+    # Single-worker containment (fail early for multi-worker configs).
+    validate_worker_configuration()
+
+    app = FastAPI(
+        title="SoulMate API",
+        description="Backend for the Emotional Companion Bot",
+        lifespan=_lifespan,
+    )
+
+    app.state.settings = settings
+    app.state.dependencies = dependencies
+    app.state.lifespan_started = dependencies is not None
+    app.state.owned_resources = ()
+    app.state.shutdown_completed = False
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=list(settings.cors_allowed_origins),
+        allow_credentials=settings.cors_allow_credentials,
+        allow_methods=["GET", "POST", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type"],
+    )
+
+    @app.exception_handler(RequestValidationError)
+    async def _sanitise_request_validation_error(
+        _request: Request,
+        exc: RequestValidationError,
+    ) -> JSONResponse:
+        error_types = {item.get("type") for item in exc.errors()}
+        code = "invalid_request"
+        for candidate in (
+            "invalid_request_id",
+            "message_too_long",
+            "message_budget_exceeded",
+        ):
+            if candidate in error_types:
+                code = candidate
+                break
+        return JSONResponse(
+            status_code=422,
+            content={"detail": {"code": code, "message": _VALIDATION_MESSAGES[code]}},
+        )
+
+    # ─── Routes (module-level handlers registered here) ───────────────────
+    app.post("/chat", response_model=ChatResponse)(chat_endpoint)
+    app.get("/history")(get_history)
+    app.get("/live")(live_endpoint)
+    app.get("/ready")(ready_endpoint)
+    app.get("/health")(health_endpoint)
+
+    return app
+
+
+# ─── Route handlers (module-level for injection and direct testing) ─────────
+
+
 async def chat_endpoint(
     input_data: ChatInput,
     request: Request,
-    current_user = Depends(get_current_user)
+    current_user=Depends(get_current_user),
 ):
+    deps = get_dependencies(request)
+    engine = deps.conversation_engine
+    turn_config = deps.turn_config
+    admission_config = deps.admission_config
+    started_at = time.monotonic()
+    correlation = None
     try:
-        budget = create_budget(_turn_config)
+        budget = create_budget(turn_config)
         user_id = getattr(current_user, "id", None)
         identity = RequestIdentity(input_data.request_id)
         peer_host = request.client.host if request.client is not None else None
         network_identity = resolve_network_identity(
             peer_host,
             request.headers.get("x-forwarded-for"),
-            _admission_config.trusted_proxy_networks,
+            admission_config.trusted_proxy_networks,
         )
         admission_request = build_admission_request(
             user_id=user_id,
             request_identity=identity,
             message=input_data.message,
             network_identity=network_identity,
-            config=_admission_config,
+            config=admission_config,
         )
         admission_result = await run_blocking_write(
             "reserve_admission",
             budget,
-            _turn_config.supabase_timeout,
+            turn_config.supabase_timeout,
             reserve_admission_sync,
             engine.memory_manager.supabase,
             admission_request,
@@ -384,7 +530,7 @@ async def chat_endpoint(
         # Sanitized correlation reference for observability: HMAC-SHA256 of
         # the canonical request id under the dedicated turn-correlation domain
         # (never the raw request id, user id, message or any secret).
-        correlation = compute_turn_correlation(_admission_config, identity.request_id)
+        correlation = compute_turn_correlation(admission_config, identity.request_id)
         if admission_result.decision == ADMITTED:
             mode = TurnMode.normal
             logger.info("event=admission_admitted correlation=%s", correlation)
@@ -396,7 +542,9 @@ async def chat_endpoint(
             logger.info("event=admission_replay correlation=%s", correlation)
         else:
             logger.info("event=admission_rejected code=%s", admission_result.decision)
-            raise _map_admission_rejection(admission_result)
+            http_exc = _map_admission_rejection(admission_result)
+            emit_event(logger, EVENT_HTTP_RESULT, code=http_exc.status_code)
+            raise http_exc
 
         result = await engine.process_turn(
             user_id,
@@ -406,6 +554,16 @@ async def chat_endpoint(
             mode=mode,
             correlation=correlation,
         )
+        duration_ms = (time.monotonic() - started_at) * 1000
+        emit_event(
+            logger,
+            EVENT_TURN_COMPLETED,
+            code="ok",
+            duration_ms=duration_ms,
+            mode=mode.value,
+            correlation=correlation,
+        )
+        emit_event(logger, EVENT_HTTP_RESULT, code=200)
         # The public DTO exposes exactly response + emotion_state; revisions,
         # outbox refs, internal IDs and CommittedTurn are never exposed.
         return ChatResponse(response=result.response, emotion_state=result.emotion_state)
@@ -415,44 +573,112 @@ async def chat_endpoint(
     except HTTPException:
         raise
     except AdmissionUnavailable:
-        logger.error("event=admission_unavailable")
+        emit_event(logger, EVENT_TURN_FAILED, code="admission_unavailable")
+        emit_event(logger, EVENT_HTTP_RESULT, code=503)
         raise _admission_unavailable_error()
     except ConflictError as exc:
-        raise _map_process_turn_conflict(exc)
+        emit_event(logger, EVENT_REQUEST_CONFLICT, code=exc.code, correlation=correlation)
+        http_exc = _map_process_turn_conflict(exc)
+        emit_event(logger, EVENT_HTTP_RESULT, code=http_exc.status_code)
+        raise http_exc
     except (DeadlineExceeded, TurnExecutionError, GroqPoolExhaustedError,
             GroqRequestError, StatePersistenceError, PersistenceError) as exc:
-        raise _map_turn_error(exc)
+        http_exc = _map_turn_error(exc)
+        detail = http_exc.detail
+        code = detail.get("code") if isinstance(detail, dict) else "internal_error"
+        emit_event(
+            logger,
+            EVENT_TURN_FAILED,
+            level=logging.ERROR,
+            code=code,
+            correlation=correlation,
+        )
+        emit_event(logger, EVENT_HTTP_RESULT, code=http_exc.status_code)
+        raise http_exc
     except Exception:
-        # Sanitize logging: avoid logging raw exceptions that might contain secrets or tracebacks
-        logger.error("Event: Chat Turn Failure")
+        # Sanitize logging: avoid logging raw exceptions that might contain
+        # secrets or tracebacks.
+        emit_event(
+            logger,
+            EVENT_TURN_FAILED,
+            level=logging.ERROR,
+            code=TurnErrorCode.internal_error.value,
+            correlation=correlation,
+        )
+        emit_event(logger, EVENT_HTTP_RESULT, code=500)
         raise HTTPException(
             status_code=500,
             detail={"code": TurnErrorCode.internal_error.value, "message": "Internal server error."},
         )
 
-@app.get("/health")
-def health_check():
-    return {"status": "alive", "engine_status": "ready"}
 
-@app.get("/history")
-def get_history(current_user = Depends(get_current_user)):
+def get_history(request: Request, current_user=Depends(get_current_user)):
+    deps = get_dependencies(request)
     user_id = current_user.id
     try:
-        if not engine.memory_manager.supabase:
+        supabase = deps.conversation_engine.memory_manager.supabase
+        if not supabase:
             return []
-            
-        response = engine.memory_manager.supabase.table("chat_logs")\
+
+        response = supabase.table("chat_logs")\
             .select("*")\
             .eq("user_id", user_id)\
             .order("created_at", desc=True)\
             .limit(50)\
             .execute()
-            
+
         return response.data[::-1] if response.data else []
     except Exception:
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
+
+async def live_endpoint():
+    """Liveness: proves the process and event loop can respond.
+
+    Never touches providers, database, embeddings, or readiness state.
+    """
+    return JSONResponse(status_code=200, content={"status": "live"})
+
+
+async def ready_endpoint(request: Request):
+    """Readiness: checks critical dependencies with explicit timeouts.
+
+    Returns 200 only when every critical component for the currently
+    enabled mode is available and the lifespan completed startup;
+    503 otherwise. The response never includes URLs, keys, project
+    names, exception text, counts, or user identifiers.
+    """
+    deps = getattr(request.app.state, "dependencies", None)
+    if deps is None:
+        return JSONResponse(
+            status_code=503,
+            content={"status": "not_ready", "components": {}},
+        )
+    results = await deps.health_checks.run_all()
+    lifespan_started = bool(getattr(request.app.state, "lifespan_started", False))
+    status_code, body = build_ready_response(results, lifespan_started)
+    return JSONResponse(status_code=status_code, content=body)
+
+
+def health_endpoint():
+    """Legacy compatibility endpoint.
+
+    Documented as a process-alive alias: it never asserts readiness
+    (no database/provider checks run here). New consumers must use
+    ``/live`` and ``/ready``.
+    """
+    return {"status": "alive"}
+
+
+# Module-level application for Uvicorn targets (``backend.main:app``).
+# Only configuration and routing are built here; resources are created by
+# the lifespan when the server actually starts.
+app = create_app()
+
+
 if __name__ == "__main__":
     # Development entrypoint — NOT for production use.
     # Use ``python -m backend.serve`` for production.
+    import uvicorn
+
     uvicorn.run("backend.main:app", host="0.0.0.0", port=8000, reload=True)
