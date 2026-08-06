@@ -55,10 +55,10 @@ Ordem determinística registrada em `backend/health.py`:
 
 | Componente | Crítico | O que verifica | Timeout padrão |
 | --- | --- | --- | --- |
-| `configuration` | Sim | Settings ainda válidos (re-validação barata, sem I/O) | 1s |
-| `database` | Sim | Acesso mínimo ao Supabase: leitura `limit 1` em `profiles` com o cliente da aplicação | `READINESS_DATABASE_TIMEOUT_MS` (3000) |
+| `configuration` | Sim | Settings ainda válidos (re-validação completa do modelo congelado, sem I/O) | 1s |
+| `database` | Sim | Acesso mínimo ao Supabase: leitura `limit 1` em `profiles` com um cliente de probe dedicado, cujo timeout de transporte é alinhado a `READINESS_DATABASE_TIMEOUT_MS` | `READINESS_DATABASE_TIMEOUT_MS` (3000) |
 | `provider` | Sim | Caminho do provider configurado: `GroqClientManager.is_configured()` (chaves válidas, sem geração) | `READINESS_PROVIDER_TIMEOUT_MS` (1000) |
-| `embeddings` | Somente com `ARCHIVAL_EXTRACTION_ENABLED=true` | Modelo de embeddings carregado no startup (atributo, sem carregar modelo) | 1s |
+| `embeddings` | Somente com `EMBEDDINGS_RETRIEVAL_ENABLED=true` | Modelo de embeddings carregado no startup (atributo, sem carregar modelo) | 1s |
 | `lifespan` | Sim | `app.state.lifespan_started` (startup concluído) | 1s |
 
 Políticas:
@@ -66,9 +66,19 @@ Políticas:
 - **O check de provider nunca executa geração real.** É barato, limitado e
   verifica configuração do caminho. Deployments que quiserem um probe real de
   rede devem injetar um check próprio com timeout documentado.
+- **O check de banco não abandona workers.** A operação bloqueante roda em um
+  executor dedicado de 1 worker; enquanto um probe está em voo (inclusive após
+  o timeout do registry), novos polls falham rápido em vez de enfileirar
+  trabalho, e o timeout de transporte do cliente de probe (alinhado ao
+  `READINESS_DATABASE_TIMEOUT_MS`) libera o worker. Polling repetido não
+  acumula threads nem esgota o executor.
 - **Feature opcional desligada não bloqueia readiness** (`embeddings` só
-  existe quando habilitado).
-- **Feature obrigatória habilitada e indisponível bloqueia readiness.**
+  existe quando `EMBEDDINGS_RETRIEVAL_ENABLED=true`), e o modelo nunca é
+  construído quando a feature está desligada.
+- **Feature obrigatória habilitada e indisponível bloqueia readiness.** Com
+  a recuperação vetorial habilitada, um modelo ausente torna a instância
+  `not_ready` (o caminho do turno também falha de forma honesta, nunca retorna
+  vazio silenciosamente).
 - Check lento é interrompido pelo timeout aprovado (nunca fica pendurado).
 - Exceções com conteúdo sensível nunca aparecem na resposta nem nos logs:
   o registry emite apenas `event=readiness_check_failed component=<nome>`.
@@ -93,8 +103,9 @@ Políticas:
    o role da aplicação. Timeout curto sugere rede/slow query.
 4. **`provider` unavailable** — chaves do provider ausentes ou inválidas na
    configuração da instância.
-5. **`embeddings` unavailable** (só com archival habilitado) — o modelo não
-   carregou no startup (ex.: `HF_HUB_OFFLINE=1` sem cache local).
+5. **`embeddings` unavailable** (só com `EMBEDDINGS_RETRIEVAL_ENABLED=true`) —
+   o modelo não carregou no startup (ex.: `HF_HUB_OFFLINE=1` sem cache local)
+   ou o processo foi iniciado sem o modelo necessário para o modo ativo.
 
 Cada falha aparece nos logs como `event=readiness_check_failed
 component=<nome>`; nenhum detalhe de exceção é registrado.

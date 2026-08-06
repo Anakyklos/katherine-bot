@@ -74,6 +74,7 @@ class ConversationEngine:
         self,
         clock=time.time,
         archival_extraction_enabled: bool = False,
+        embeddings_enabled: bool = False,
         turn_config: Optional[TurnExecutionConfig] = None,
         *,
         groq_keys: Optional[list] = None,
@@ -94,6 +95,7 @@ class ConversationEngine:
             clock=clock,
             supabase_timeout=self._turn_config.supabase_timeout,
             supabase_factory=supabase_factory,
+            embeddings_enabled=embeddings_enabled,
         )
         self.relationship_config = RelationshipTransitionConfig.defaults()
         self.lock_manager = UserLockManager()

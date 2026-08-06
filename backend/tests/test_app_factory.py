@@ -91,11 +91,23 @@ def test_create_app_without_dependencies_defers_construction_to_lifespan():
 
 
 def test_create_app_defaults_settings_from_environment(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "local")
     monkeypatch.setenv("GROQ_API_KEY", "env-key")
     monkeypatch.setenv("ADMISSION_HMAC_SECRET", SECRET)
     app = main_module.create_app()
     assert app.state.settings.app_env is AppEnvironment.local
     assert app.state.dependencies is None
+
+
+def test_create_app_fails_closed_without_app_env(monkeypatch):
+    """A runtime that forgets APP_ENV never starts in an implicit mode."""
+    from backend.settings import SettingsConfigurationError
+
+    monkeypatch.delenv("APP_ENV", raising=False)
+    monkeypatch.setenv("GROQ_API_KEY", "env-key")
+    monkeypatch.setenv("ADMISSION_HMAC_SECRET", SECRET)
+    with pytest.raises(SettingsConfigurationError):
+        main_module.create_app()
 
 
 def test_create_app_with_default_dependencies_builds_owned_resources_once(monkeypatch):
@@ -228,7 +240,7 @@ def test_builder_cleans_partial_resources_when_startup_fails(monkeypatch):
 
     monkeypatch.setattr(dependencies_module, "ChatConversationEngine", FakeEngineWithClose)
 
-    def boom(settings, engine, auth_client):
+    def boom(settings, engine, **kwargs):
         raise RuntimeError("late startup failure")
 
     monkeypatch.setattr(dependencies_module, "build_health_registry", boom)
@@ -311,12 +323,134 @@ def test_no_per_user_state_in_app_state_or_container():
         "turn_config",
         "health_checks",
         "clock",
+        "persistence_client",
     }
     assert set(deps.__dataclass_fields__) == container_fields
     # No attribute of the container may hold a user identity.
     for field_name in container_fields:
         assert "user" not in field_name.lower()
         assert "request" not in field_name.lower()
+
+
+# ─── DI: routes use only the injected dependency surfaces (review blocker 2) ─
+
+
+def test_routes_use_only_the_correct_dependency():
+    """Auth uses only ``auth_client``; history/admission use only
+    ``persistence_client``; routes never navigate engine internals."""
+    from types import SimpleNamespace as NS
+
+    from backend.emotion_presentation import EmotionStateResponse
+    from backend.process_turn import ProcessTurnResult
+
+    auth_calls = []
+    persist_calls = []
+
+    class AuthOnlyClient:
+        """Exposes ONLY the auth surface; any other use fails loudly."""
+
+        @property
+        def auth(self):
+            return self
+
+        def get_user(self, token):
+            auth_calls.append(token)
+            return NS(user=NS(id="user-123"))
+
+    class PersistenceOnlyClient:
+        """Exposes ONLY rpc/table persistence; no auth surface at all."""
+
+        def rpc(self, name, params):
+            persist_calls.append(("rpc", name))
+            return NS(
+                execute=lambda: NS(
+                    data=[{"decision": "admitted", "retry_after_seconds": 0}]
+                )
+            )
+
+        def table(self, name):
+            persist_calls.append(("table", name))
+            return self
+
+        def select(self, cols):
+            return self
+
+        def eq(self, key, value):
+            return self
+
+        def order(self, col, **kwargs):
+            return self
+
+        def limit(self, n):
+            return self
+
+        def execute(self):
+            return NS(data=[{"content": "msg1", "role": "user"}], error=None)
+
+    class GuardedMemoryManager:
+        @property
+        def supabase(self):
+            raise AssertionError("routes must not navigate engine internals")
+
+    class GuardedEngine:
+        def __init__(self):
+            self.memory_manager = GuardedMemoryManager()
+            self.groq_manager = FakeGroqManager()
+            self.turn_calls = []
+
+        async def process_turn(
+            self, user_id, message, request_id, *, budget=None, mode=None, correlation=None
+        ):
+            self.turn_calls.append((user_id, message, request_id))
+            return ProcessTurnResult(
+                committed=object(),
+                response="di response",
+                emotion_state=EmotionStateResponse(
+                    schema_version=1,
+                    mood_label="NEUTRA",
+                    pad={"pleasure": 0.0, "arousal": 0.0, "dominance": 0.0},
+                    dominant_emotions=[],
+                    timestamp=1000.0,
+                ),
+            )
+
+    engine = GuardedEngine()
+    auth_client = AuthOnlyClient()
+    persistence_client = PersistenceOnlyClient()
+    deps = main_module.ApplicationDependencies(
+        conversation_engine=engine,
+        auth_client=auth_client,
+        admission_config=AdmissionRuntimeConfig.from_values(SECRET),
+        turn_config=TurnExecutionConfig.defaults(),
+        health_checks=HealthRegistry(),
+        clock=time.time,
+        persistence_client=persistence_client,
+    )
+    app = main_module.create_app(settings=_settings(), dependencies=deps)
+    client = TestClient(app)
+
+    # History: auth via auth_client, query via persistence_client only.
+    history = client.get("/history", headers={"Authorization": "Bearer t"})
+    assert history.status_code == 200
+    assert history.json() == [{"content": "msg1", "role": "user"}]
+    assert auth_calls == ["t"]
+    assert ("table", "chat_logs") in persist_calls
+
+    # Chat: auth via auth_client, admission RPC via persistence_client only,
+    # and the engine receives the turn.
+    auth_calls.clear()
+    persist_calls.clear()
+    chat = client.post(
+        "/chat",
+        json={"request_id": "550e8400-e29b-41d4-a716-446655440000", "message": "hi"},
+        headers={"Authorization": "Bearer t"},
+    )
+    assert chat.status_code == 200
+    assert chat.json()["response"] == "di response"
+    assert auth_calls == ["t"]
+    assert ("rpc", "reserve_admission") in persist_calls
+    assert len(engine.turn_calls) == 1
+    assert engine.turn_calls[0][0] == "user-123"
 
 
 # ─── CORS (35-38) ───────────────────────────────────────────────────────────

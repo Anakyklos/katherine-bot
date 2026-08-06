@@ -2,6 +2,9 @@ services:
   backend:
     build:
       context: ./backend
+    # The .env file must declare APP_ENV (local/test/staging/production):
+    # Settings.from_env() fails closed when it is missing, so the backend
+    # never silently runs in an implicit mode.
     env_file: .env
     ports:
       - "8000:8000"

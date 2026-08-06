@@ -200,6 +200,7 @@ class MemoryManager:
         clock=time.time,
         supabase_factory: Optional[Callable[[], Optional[Client]]] = None,
         supabase_timeout: Optional[float] = None,
+        embeddings_enabled: bool = False,
     ):
         if supabase_factory is not None:
             self.supabase: Optional[Client] = supabase_factory()
@@ -210,9 +211,19 @@ class MemoryManager:
                 factory = lambda: _default_supabase_factory()
             self.supabase: Optional[Client] = factory()
 
-        try:
-            self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-        except Exception:
+        # Embeddings are an explicitly configured mode: the SentenceTransformer
+        # model is only constructed when vector retrieval is enabled. A
+        # disabled mode never loads the heavy resource; an enabled mode whose
+        # model fails to load surfaces as ``embedding_model is None`` and is
+        # reported honestly by the readiness ``embeddings`` check instead of
+        # silently degrading retrieval.
+        self.embeddings_enabled = bool(embeddings_enabled)
+        if self.embeddings_enabled:
+            try:
+                self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+            except Exception:
+                self.embedding_model = None
+        else:
             self.embedding_model = None
         self._clock = clock
 
@@ -553,6 +564,12 @@ class MemoryManager:
         supabase = getattr(self, 'supabase', None)
         embedding_model = getattr(self, 'embedding_model', None)
         if not supabase or not embedding_model:
+            if getattr(self, 'embeddings_enabled', False):
+                # The active mode requires vector retrieval; a missing model or
+                # store is a real failure, never a silent empty result. The
+                # readiness ``embeddings`` check blocks traffic in this state,
+                # and this guard makes the turn path fail honestly too.
+                raise ContextLoadError("Recuperação vetorial indisponível.")
             return []
 
         try:

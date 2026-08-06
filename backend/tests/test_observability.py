@@ -309,3 +309,96 @@ def test_events_do_not_change_turn_result(endpoint, caplog):
     assert response.json() == {"response": "response text", "emotion_state": _emotion().model_dump()}
     # Observability must not introduce extra provider/persistence calls.
     assert "event=turn_completed code=ok" in caplog.text
+
+
+# ─── 46. Auth observability: duration, correlation, user hash (blocker 5) ───
+
+
+def _auth_completed_line(caplog_text: str) -> str:
+    return next(
+        line
+        for line in caplog_text.splitlines()
+        if "event=auth_completed" in line
+    )
+
+
+def test_auth_completed_carries_duration_correlation_and_user_hash(endpoint, caplog):
+    client, _, _, _ = endpoint
+    with caplog.at_level(logging.INFO, logger="backend.main"):
+        response = _post(client, _payload())
+    assert response.status_code == 200
+
+    correlation = _correlation_from(caplog.text)
+    assert correlation is not None
+    line = _auth_completed_line(caplog.text)
+    assert "event=auth_completed outcome=ok" in line
+    assert "duration_ms=" in line
+    assert f"correlation={correlation}" in line
+    # The user reference is the non-reversible HMAC, never the raw user id.
+    match = re.search(r"user_ref=([0-9a-f]{64})", line)
+    assert match is not None
+    from backend.admission import AdmissionRuntimeConfig, compute_user_reference
+
+    expected = compute_user_reference(
+        AdmissionRuntimeConfig.from_values(SECRET), "user-a"
+    )
+    assert match.group(1) == expected
+    assert "user-a" not in line
+
+
+def test_auth_failure_401_emits_event_with_duration_and_correlation(endpoint, caplog):
+    from unittest.mock import patch
+
+    from supabase_auth.errors import AuthApiError
+
+    client, _, _, fake_auth = endpoint
+    fake_auth.get_user = lambda _token: (_ for _ in ()).throw(
+        AuthApiError("SENSITIVE_AUTH_MARKER", 400, "error_code")
+    )
+    with caplog.at_level(logging.INFO, logger="backend.main"):
+        response = _post(client, _payload())
+    assert response.status_code == 401
+    correlation = _correlation_from(caplog.text)
+    assert correlation is not None
+    assert "event=auth_failed code=invalid_token" in caplog.text
+    assert "duration_ms=" in caplog.text
+    assert f"correlation={correlation}" in caplog.text
+    assert "SENSITIVE_AUTH_MARKER" not in caplog.text
+
+
+def test_auth_missing_credentials_emits_failure_event(endpoint, caplog):
+    client, _, _, _ = endpoint
+    with caplog.at_level(logging.INFO, logger="backend.main"):
+        response = client.post("/chat", json=_payload())
+    assert response.status_code == 401
+    assert "event=auth_failed code=missing_credentials" in caplog.text
+    assert "duration_ms=" in caplog.text
+
+
+def test_auth_unavailable_503_emits_failure_event(endpoint, caplog):
+    from unittest.mock import patch
+
+    client, _, _, _ = endpoint
+    deps = client.app.state.dependencies
+    with patch.object(deps, "auth_client", None), caplog.at_level(
+        logging.INFO, logger="backend.main"
+    ):
+        response = _post(client, _payload())
+    assert response.status_code == 503
+    assert "event=auth_failed code=service_unavailable" in caplog.text
+    assert "duration_ms=" in caplog.text
+
+
+def test_http_result_carries_turn_correlation(endpoint, caplog):
+    client, _, _, _ = endpoint
+    with caplog.at_level(logging.INFO, logger="backend.main"):
+        response = _post(client, _payload())
+    assert response.status_code == 200
+    correlation = _correlation_from(caplog.text)
+    assert correlation is not None
+    http_line = next(
+        line
+        for line in caplog.text.splitlines()
+        if "event=http_result code=200" in line
+    )
+    assert f"correlation={correlation}" in http_line

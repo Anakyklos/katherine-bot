@@ -59,10 +59,12 @@ EVENT_NAMES = frozenset(
 # ─── Field contract ─────────────────────────────────────────────────────────
 
 #: Allowed field names for event payloads. Low-cardinality, sanitized values
-#: only (codes, phases, durations, HTTP statuses, HMAC correlations).
+#: only (codes, phases, durations, HTTP statuses, HMAC correlations, and the
+#: non-reversible HMAC user reference ``user_ref``).
 ALLOWED_FIELDS = frozenset(
     {
         "correlation",
+        "user_ref",
         "code",
         "stage",
         "outcome",

@@ -8,7 +8,12 @@ sockets, or constructs clients.
 Rules enforced here:
 
 * Environments are a closed enum: ``local``, ``test``, ``staging``,
-  ``production``.
+  ``production``, and ``APP_ENV`` is **required** by :meth:`Settings.from_env`
+  (fail-closed: a deployment that forgets it never silently runs in local
+  mode).
+* The model is frozen and assignment-validated: a constructed instance can
+  never be mutated into an invalid state, so the readiness ``configuration``
+  check can trust the running settings.
 * Numeric and boolean values are strict: no permissive string parsing, no
   bool/float substitution for ints, no silent defaults for secrets.
 * Critical strings are non-empty; URLs are validated; CORS origins are
@@ -17,6 +22,9 @@ Rules enforced here:
   origins, wildcard origins, and enabled features without their dependencies
   are rejected before the application starts serving traffic.
 * Secrets are excluded from ``repr``, ``str``, and sanitized error messages.
+  Direct construction failures raise ``ValidationError`` with
+  ``hide_input_in_errors`` so raw values (URL credentials, keys) never appear
+  in rendered errors.
 
 Environment variables are read only by :meth:`Settings.from_env`; direct
 construction (``Settings(...)``) never consults the environment, which makes
@@ -108,7 +116,8 @@ class SettingsConfigurationError(Exception):
     ``str`` and ``repr`` contain only field names and stable codes, never
     input values. This is the only error type raised by
     :meth:`Settings.from_env`; direct construction raises ``ValidationError``
-    (whose ``input`` values are never rendered by this module).
+    with ``hide_input_in_errors`` enabled, so raw inputs are never rendered
+    by this module either.
     """
 
     def __init__(self, issues: tuple[SettingsIssue, ...]) -> None:
@@ -306,13 +315,18 @@ class Settings(BaseModel):
 
     Direct construction never reads the environment; use :meth:`from_env` for
     environment-driven startup. Secrets are never rendered by ``repr`` or
-    ``str`` and never included in sanitized error messages.
+    ``str`` and never included in sanitized error messages. The model is
+    frozen and assignment-validated, so a running instance can never be
+    mutated into an invalid state.
     """
 
     model_config = ConfigDict(
         extra="forbid",
         arbitrary_types_allowed=True,
         validate_default=True,
+        frozen=True,
+        validate_assignment=True,
+        hide_input_in_errors=True,
     )
 
     app_env: AppEnvironment = AppEnvironment.local
@@ -335,6 +349,12 @@ class Settings(BaseModel):
 
     # ── Feature flags ───────────────────────────────────────────────────────
     archival_extraction_enabled: bool = False
+    #: Explicit mode for vector memory retrieval (SentenceTransformer + RPC).
+    #: When enabled, the embedding model is constructed at startup and the
+    #: ``embeddings`` readiness component must pass before the instance serves
+    #: traffic. When disabled, the model is never constructed and retrieval
+    #: returns no entries by design.
+    embeddings_retrieval_enabled: bool = False
 
     # ── Turn execution (validated by TurnExecutionConfig) ───────────────────
     turn_config: TurnExecutionConfig = Field(default_factory=TurnExecutionConfig.defaults)
@@ -442,7 +462,12 @@ class Settings(BaseModel):
             result.append(entry.strip())
         return tuple(result)
 
-    @field_validator("archival_extraction_enabled", "cors_allow_credentials", mode="before")
+    @field_validator(
+        "archival_extraction_enabled",
+        "embeddings_retrieval_enabled",
+        "cors_allow_credentials",
+        mode="before",
+    )
     @classmethod
     def _validate_strict_bool(cls, value: object) -> object:
         if not isinstance(value, bool):
@@ -558,19 +583,25 @@ class Settings(BaseModel):
         Fails with :class:`SettingsConfigurationError` (sanitized, no input
         values) on any invalid, missing, or unsafe configuration. Defaults to
         ``os.environ``.
+
+        ``APP_ENV`` is **required**: an absent or empty value fails closed
+        instead of silently selecting the least restrictive environment, so a
+        deployment that forgets to declare its mode never runs production
+        traffic under development defaults.
         """
         source: Mapping[str, object] = os.environ if env is None else env
 
         raw_env = source.get("APP_ENV")
         if raw_env is None or not str(raw_env).strip():
-            environment = AppEnvironment.local
-        else:
-            try:
-                environment = AppEnvironment(str(raw_env).strip().lower())
-            except ValueError:
-                raise SettingsConfigurationError(
-                    (SettingsIssue("app_env", "invalid_environment"),)
-                )
+            raise SettingsConfigurationError(
+                (SettingsIssue("app_env", "required"),)
+            )
+        try:
+            environment = AppEnvironment(str(raw_env).strip().lower())
+        except ValueError:
+            raise SettingsConfigurationError(
+                (SettingsIssue("app_env", "invalid_environment"),)
+            )
 
         try:
             turn_config = TurnExecutionConfig.from_env(source)
@@ -595,6 +626,9 @@ class Settings(BaseModel):
             "archival_extraction_enabled": _env_bool(
                 "ARCHIVAL_EXTRACTION_ENABLED", source, False
             ),
+            "embeddings_retrieval_enabled": _env_bool(
+                "EMBEDDINGS_RETRIEVAL_ENABLED", source, False
+            ),
             "turn_config": turn_config,
             "readiness_database_timeout_ms": _env_int(
                 "READINESS_DATABASE_TIMEOUT_MS",
@@ -618,12 +652,19 @@ class Settings(BaseModel):
             raise _sanitize_validation_error(exc)
 
     def ensure_valid(self) -> None:
-        """Re-run the cross-field validation (cheap, no I/O).
+        """Re-validate the complete settings model (cheap, no I/O).
 
-        Used by the readiness ``configuration`` check to confirm the settings
-        instance the application is running with is still valid.
+        Rebuilds the model from the current field values so every field-level,
+        range, and cross-field validator runs again. Because the model is
+        frozen and assignment-validated, a mutated or replaced instance fails
+        here. Used by the readiness ``configuration`` check to confirm the
+        settings instance the application runs with is still valid.
         """
-        self._validate_environment_combinations()
+        values = {
+            name: getattr(self, name)
+            for name in type(self).model_fields
+        }
+        type(self).model_validate(values)
 
     def to_admission_values(self) -> tuple[str, Optional[str]]:
         """Return ``(admission_secret, trusted_proxy_cidrs_csv)`` for admission."""

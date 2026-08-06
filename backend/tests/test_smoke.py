@@ -12,6 +12,7 @@ def test_imports():
         sys.modules['supabase'] = MagicMock()
 
         # Mock environment variables
+        os.environ['APP_ENV'] = 'test'
         os.environ['GROQ_API_KEY'] = 'mock'
         os.environ['SUPABASE_URL'] = 'http://mock.example'
         os.environ['SUPABASE_SERVICE_ROLE_KEY'] = 'mock'

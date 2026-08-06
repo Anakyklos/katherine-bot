@@ -103,7 +103,10 @@ def _app_engine(client_app):
 @pytest.fixture
 def mock_supabase(client_app):
     engine = _app_engine(client_app)
-    with patch.object(engine.memory_manager, 'supabase', MagicMock()) as mock_sb:
+    deps = client_app.app.state.dependencies
+    with patch.object(engine.memory_manager, 'supabase', MagicMock()) as mock_sb, \
+         patch.object(deps, 'auth_client', mock_sb), \
+         patch.object(deps, 'persistence_client', mock_sb):
         mock_sb.rpc.return_value.execute.return_value.data = [
             {"decision": "admitted", "retry_after_seconds": 0}
         ]
@@ -198,8 +201,8 @@ def test_user_is_none(client_app, mock_supabase, mock_engine_process):
 
 
 def test_service_unavailable(client_app, mock_supabase, mock_engine_process):
-    engine = _app_engine(client_app)
-    with patch.object(engine.memory_manager, 'supabase', None):
+    deps = client_app.app.state.dependencies
+    with patch.object(deps, 'auth_client', None):
         response = client_app.post(
             "/chat",
             json=_chat_payload("Hi"),

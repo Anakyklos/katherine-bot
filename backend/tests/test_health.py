@@ -224,6 +224,129 @@ def test_slow_check_expires_at_approved_timeout():
     assert response.json()["components"]["provider"] == "ok"
 
 
+# ─── 31b. DatabaseCheck bounds the real blocking probe (review blocker 4) ────
+
+
+class _ProbeResult:
+    def __init__(self, data=None, error=None):
+        self.data = data if data is not None else []
+        self.error = error
+
+
+class _OkProbeClient:
+    """Duck-typed probe client that succeeds immediately."""
+
+    def table(self, name):
+        return self
+
+    def select(self, cols):
+        return self
+
+    def limit(self, n):
+        return self
+
+    def execute(self):
+        return _ProbeResult(data=[])
+
+
+def test_database_check_timeout_bounds_the_real_blocking_probe():
+    """Repeated polls never accumulate threads and recover once the probe's
+    aligned transport releases the worker (review blocker 4)."""
+    import concurrent.futures
+    import threading
+    import time as _time
+
+    probe_started = threading.Event()
+    release = threading.Event()
+    calls = []
+
+    class BlockingClient(_OkProbeClient):
+        def execute(self):
+            calls.append(_time.monotonic())
+            probe_started.set()
+            # Simulates the aligned transport timeout: the probe self-terminates
+            # shortly after the registry-level await was cancelled.
+            release.wait(timeout=1.0)
+            return _ProbeResult(data=[])
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    check = DatabaseCheck(BlockingClient(), timeout_seconds=0.05, probe_executor=executor)
+
+    async def run_check():
+        try:
+            await check.run()
+            return "ok"
+        except Exception:
+            return "unavailable"
+
+    # First poll times out at the readiness timeout while the thread runs.
+    assert asyncio.run(run_check()) == "unavailable"
+    assert probe_started.is_set()
+
+    # While the probe is still in flight, repeated polls fail fast without
+    # submitting new work: exactly one probe execution has been started.
+    for _ in range(5):
+        assert asyncio.run(run_check()) == "unavailable"
+    assert len(calls) == 1, "no new probe may be submitted while one is in flight"
+
+    # The in-flight probe completes on its own (aligned transport timeout).
+    release.set()
+    deadline = _time.monotonic() + 5.0
+    while _time.monotonic() < deadline:
+        if asyncio.run(run_check()) == "ok":
+            break
+        _time.sleep(0.01)
+    assert asyncio.run(run_check()) == "ok"
+
+    # The executor never grew beyond its single worker: no thread accumulation.
+    assert len(executor._threads) <= 1
+    executor.shutdown(wait=False)
+
+
+def test_database_check_fails_while_probe_in_flight_and_recovers():
+    """A stuck probe makes readiness fail honestly, and recovery is automatic
+    once the probe terminates (review blocker 4)."""
+    import concurrent.futures
+    import threading
+    import time as _time
+
+    release = threading.Event()
+    probe_started = threading.Event()
+    calls = []
+
+    class StuckClient(_OkProbeClient):
+        def execute(self):
+            calls.append(1)
+            probe_started.set()
+            release.wait(timeout=1.0)
+            return _ProbeResult(data=[])
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    check = DatabaseCheck(StuckClient(), timeout_seconds=0.05, probe_executor=executor)
+
+    async def run_check():
+        try:
+            await check.run()
+            return "ok"
+        except Exception:
+            return "unavailable"
+
+    assert asyncio.run(run_check()) == "unavailable"
+    assert probe_started.is_set()
+    # A subsequent poll while in flight does not start a second probe.
+    assert asyncio.run(run_check()) == "unavailable"
+    assert len(calls) == 1
+
+    release.set()
+    deadline = _time.monotonic() + 5.0
+    while _time.monotonic() < deadline:
+        if asyncio.run(run_check()) == "ok":
+            break
+        _time.sleep(0.01)
+    assert asyncio.run(run_check()) == "ok"
+    executor.shutdown(wait=False)
+
+
 # ─── 32. Sensitive marker sanitization ──────────────────────────────────────
 
 
@@ -307,17 +430,17 @@ def test_default_registry_component_set_and_order():
         memory_manager=SimpleNamespace(embedding_model=object(), supabase=object()),
         groq_manager=SimpleNamespace(is_configured=lambda: True),
     )
-    registry = build_health_registry(settings, engine, object())
+    registry = build_health_registry(settings, engine, database_probe_client=object())
     assert registry.names() == ("configuration", "database", "provider")
 
 
-def test_default_registry_includes_embeddings_only_when_enabled():
-    settings = _settings(archival_extraction_enabled=True)
+def test_default_registry_includes_embeddings_only_when_retrieval_enabled():
+    settings = _settings(embeddings_retrieval_enabled=True)
     engine = SimpleNamespace(
         memory_manager=SimpleNamespace(embedding_model=object(), supabase=object()),
         groq_manager=SimpleNamespace(is_configured=lambda: True),
     )
-    registry = build_health_registry(settings, engine, object())
+    registry = build_health_registry(settings, engine, database_probe_client=object())
     assert registry.names() == ("configuration", "database", "provider", "embeddings")
 
 
@@ -329,6 +452,110 @@ def test_embeddings_check_fails_when_model_missing():
             await check.run()
 
     asyncio.run(_run())
+
+
+# ─── 34b. Embeddings lifecycle and readiness (review blocker 3) ──────────────
+
+
+def _embeddings_client(retrieval_enabled: bool, model_available: bool):
+    """Build a /ready client for the retrieval-mode × model-availability grid."""
+    from backend.admission import AdmissionRuntimeConfig
+
+    settings = _settings(embeddings_retrieval_enabled=retrieval_enabled)
+    engine = SimpleNamespace(
+        memory_manager=SimpleNamespace(
+            embedding_model=object() if model_available else None,
+            supabase=object(),
+        ),
+        groq_manager=SimpleNamespace(is_configured=lambda: True),
+    )
+    registry = build_health_registry(
+        settings, engine, database_probe_client=_OkProbeClient()
+    )
+    deps = main_module.ApplicationDependencies(
+        conversation_engine=engine,
+        auth_client=object(),
+        admission_config=AdmissionRuntimeConfig.from_values(SECRET),
+        turn_config=TurnExecutionConfig.defaults(),
+        health_checks=registry,
+        clock=__import__("time").time,
+    )
+    app = main_module.create_app(settings=settings, dependencies=deps)
+    return TestClient(app)
+
+
+@pytest.mark.parametrize(
+    ("retrieval_enabled", "model_available", "expected_status", "embeddings_present"),
+    [
+        # Feature off × model would be available → ready, no embeddings component.
+        (False, True, 200, False),
+        # Feature off × model unavailable → ready, no embeddings component.
+        (False, False, 200, False),
+        # Feature on × model available → ready with embeddings ok.
+        (True, True, 200, True),
+        # Feature on × model unavailable → NOT ready, embeddings fails honestly.
+        (True, False, 503, True),
+    ],
+)
+def test_embeddings_lifecycle_four_scenarios(
+    retrieval_enabled,
+    model_available,
+    expected_status,
+    embeddings_present,
+):
+    client = _embeddings_client(retrieval_enabled, model_available)
+    response = client.get("/ready")
+    assert response.status_code == expected_status
+    body = response.json()
+    components = body["components"]
+    assert ("embeddings" in components) is embeddings_present
+    if embeddings_present:
+        expected = "ok" if model_available else "unavailable"
+        assert components["embeddings"] == expected
+        assert body["status"] == ("ready" if model_available else "not_ready")
+
+
+def test_default_builder_never_constructs_embedding_model_when_disabled(monkeypatch):
+    """Startup with retrieval disabled must not construct SentenceTransformer."""
+    import backend.dependencies as dependencies_module
+    import backend.memory as memory_module
+
+    def _no_model(*_args, **_kwargs):
+        raise AssertionError("embedding model must not be constructed when disabled")
+
+    monkeypatch.setattr(memory_module, "SentenceTransformer", _no_model)
+    settings = _settings(embeddings_retrieval_enabled=False)
+    deps, _owned = dependencies_module.build_default_dependencies(settings)
+    assert deps.conversation_engine.memory_manager.embedding_model is None
+
+
+def test_memory_manager_constructs_model_only_when_enabled(monkeypatch):
+    """Startup with retrieval enabled constructs the model; a failure surfaces
+    as embedding_model is None (readiness then blocks traffic)."""
+    import backend.memory as memory_module
+
+    calls = []
+
+    def _fake_model(*_args, **_kwargs):
+        calls.append(1)
+        return object()
+
+    monkeypatch.setattr(memory_module, "SentenceTransformer", _fake_model)
+
+    disabled = memory_module.MemoryManager(embeddings_enabled=False)
+    assert disabled.embedding_model is None
+    assert calls == []
+
+    enabled = memory_module.MemoryManager(embeddings_enabled=True)
+    assert enabled.embedding_model is not None
+    assert calls == [1]
+
+    def _failing_model(*_args, **_kwargs):
+        raise RuntimeError("model download failed")
+
+    monkeypatch.setattr(memory_module, "SentenceTransformer", _failing_model)
+    broken = memory_module.MemoryManager(embeddings_enabled=True)
+    assert broken.embedding_model is None
 
 
 def test_provider_check_fails_when_manager_unconfigured():

@@ -39,6 +39,7 @@ class ChatConversationEngine(ConversationEngine):
         self,
         clock=time.time,
         archival_extraction_enabled: bool = False,
+        embeddings_enabled: bool = False,
         turn_config: Optional[TurnExecutionConfig] = None,
         *,
         groq_keys: Optional[list] = None,
@@ -47,6 +48,7 @@ class ChatConversationEngine(ConversationEngine):
         super().__init__(
             clock=clock,
             archival_extraction_enabled=archival_extraction_enabled,
+            embeddings_enabled=embeddings_enabled,
             turn_config=turn_config,
             groq_keys=groq_keys,
             supabase_factory=supabase_factory,

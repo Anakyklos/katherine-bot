@@ -71,12 +71,39 @@ def test_valid_settings_from_env_for_local_environment(monkeypatch):
     assert isinstance(settings.turn_config, TurnExecutionConfig)
 
 
-def test_default_environment_is_local_when_app_env_absent():
+def test_missing_app_env_fails_closed():
+    """A deployment that forgets APP_ENV never silently runs in local mode."""
     env = {
         "GROQ_API_KEY": "k",
         "ADMISSION_HMAC_SECRET": SECRET,
     }
-    assert Settings.from_env(env).app_env is AppEnvironment.local
+    with pytest.raises(SettingsConfigurationError) as exc_info:
+        Settings.from_env(env)
+    assert SettingsIssue("app_env", "required") in exc_info.value.issues
+
+    env["APP_ENV"] = "   "
+    with pytest.raises(SettingsConfigurationError) as exc_info:
+        Settings.from_env(env)
+    assert SettingsIssue("app_env", "required") in exc_info.value.issues
+
+
+def test_explicit_environment_modes_are_accepted():
+    """Explicit APP_ENV values work for every supported mode."""
+    for environment in AppEnvironment:
+        env = {
+            "APP_ENV": environment.value,
+            "GROQ_API_KEY": "k",
+            "ADMISSION_HMAC_SECRET": SECRET,
+        }
+        if environment in (AppEnvironment.staging, AppEnvironment.production):
+            env.update(
+                {
+                    "SUPABASE_URL": "https://db.example.com",
+                    "SUPABASE_SERVICE_ROLE_KEY": "sk",
+                    "CORS_ALLOWED_ORIGINS": "https://app.example.com",
+                }
+            )
+        assert Settings.from_env(env).app_env is environment
 
 
 def test_invalid_environment_is_rejected():
@@ -258,6 +285,7 @@ def test_boolean_fields_accept_only_bool():
 
 def test_from_env_rejects_permissive_boolean_parsing():
     env = {
+        "APP_ENV": "local",
         "GROQ_API_KEY": "k",
         "ADMISSION_HMAC_SECRET": SECRET,
         "ARCHIVAL_EXTRACTION_ENABLED": "1",
@@ -272,6 +300,7 @@ def test_from_env_rejects_permissive_boolean_parsing():
 
 def test_from_env_rejects_empty_critical_values():
     env = {
+        "APP_ENV": "local",
         "GROQ_API_KEY": "k",
         "ADMISSION_HMAC_SECRET": SECRET,
         "CORS_ALLOWED_ORIGINS": "   ",
@@ -279,7 +308,11 @@ def test_from_env_rejects_empty_critical_values():
     with pytest.raises(SettingsConfigurationError):
         Settings.from_env(env)
 
-    env = {"GROQ_API_KEY": "", "ADMISSION_HMAC_SECRET": SECRET}
+    env = {
+        "APP_ENV": "local",
+        "GROQ_API_KEY": "",
+        "ADMISSION_HMAC_SECRET": SECRET,
+    }
     with pytest.raises(SettingsConfigurationError) as exc_info:
         Settings.from_env(env)
     assert SettingsIssue("groq_api_key", "empty_secret") in exc_info.value.issues
@@ -287,6 +320,7 @@ def test_from_env_rejects_empty_critical_values():
 
 def test_from_env_rejects_invalid_turn_configuration():
     env = {
+        "APP_ENV": "local",
         "GROQ_API_KEY": "k",
         "ADMISSION_HMAC_SECRET": SECRET,
         "TURN_MAX_ATTEMPTS": "not-a-number",
@@ -294,6 +328,22 @@ def test_from_env_rejects_invalid_turn_configuration():
     with pytest.raises(SettingsConfigurationError) as exc_info:
         Settings.from_env(env)
     assert SettingsIssue("turn_config", "invalid_turn_configuration") in exc_info.value.issues
+
+
+def test_from_env_parses_embeddings_retrieval_flag():
+    env = {
+        "APP_ENV": "local",
+        "GROQ_API_KEY": "k",
+        "ADMISSION_HMAC_SECRET": SECRET,
+        "EMBEDDINGS_RETRIEVAL_ENABLED": "true",
+    }
+    assert Settings.from_env(env).embeddings_retrieval_enabled is True
+
+    env["EMBEDDINGS_RETRIEVAL_ENABLED"] = "false"
+    assert Settings.from_env(env).embeddings_retrieval_enabled is False
+
+    del env["EMBEDDINGS_RETRIEVAL_ENABLED"]
+    assert Settings.from_env(env).embeddings_retrieval_enabled is False
 
 
 def test_secret_too_short_rejected():
@@ -402,6 +452,60 @@ def test_from_env_uses_provided_mapping_without_global_environment(monkeypatch):
 
     monkeypatch.setattr("backend.settings.os.getenv", _fail_read)
     settings = Settings.from_env(
-        {"GROQ_API_KEY": "k", "ADMISSION_HMAC_SECRET": SECRET}
+        {"APP_ENV": "local", "GROQ_API_KEY": "k", "ADMISSION_HMAC_SECRET": SECRET}
     )
     assert settings.app_env is AppEnvironment.local
+
+
+# ─── 10. Immutability (frozen + assignment-validated) ───────────────────────
+
+
+def test_settings_instance_is_immutable():
+    """A constructed Settings can never be mutated into an invalid state."""
+    settings = Settings(**_valid_kwargs())
+    for mutate in (
+        lambda s: setattr(s, "app_env", AppEnvironment.production),
+        lambda s: setattr(s, "cors_allowed_origins", ("https://evil.example",)),
+        lambda s: setattr(s, "readiness_database_timeout_ms", 999_999),
+        lambda s: setattr(s, "groq_api_key", "mutated-secret"),
+    ):
+        with pytest.raises(ValidationError):
+            mutate(settings)
+    # The instance is still the original, valid one.
+    settings.ensure_valid()
+    assert settings.app_env is AppEnvironment.local
+
+
+def test_ensure_valid_revalidates_the_complete_model():
+    """ensure_valid() rebuilds and revalidates the full model, not just the
+    cross-field validator."""
+    settings = Settings(**_valid_kwargs())
+    settings.ensure_valid()  # no-op for a valid frozen instance
+
+    # A replaced settings reference on app.state is caught by the
+    # configuration check because ensure_valid() revalidates everything.
+    from backend.health import ConfigurationCheck
+
+    async def _run():
+        await ConfigurationCheck(settings).run()
+        with pytest.raises(Exception):
+            await ConfigurationCheck("not-a-settings").run()
+
+    import asyncio
+
+    asyncio.run(_run())
+
+
+def test_direct_construction_errors_never_contain_sensitive_values():
+    """hide_input_in_errors: a ValidationError from direct construction never
+    renders URL credentials, keys, or other raw values."""
+    with pytest.raises(ValidationError) as exc_info:
+        Settings(
+            groq_api_key="SUPER-SECRET-KEY-MARKER-12345",
+            admission_hmac_secret="short",
+            supabase_url="https://user:pass@db.example.com",
+        )
+    rendered = str(exc_info.value)
+    assert "SUPER-SECRET-KEY-MARKER-12345" not in rendered
+    assert "user:pass" not in rendered
+    assert "db.example.com" not in rendered

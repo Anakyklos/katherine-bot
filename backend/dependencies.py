@@ -41,8 +41,12 @@ class ApplicationDependencies:
     """Composition root for the active request path.
 
     ``auth_client`` is the authenticated-auth surface used by the request
-    auth dependency (the Supabase client). ``health_checks`` aggregate the
-    readiness probes. ``clock`` provides wall time for domain code.
+    auth dependency (the Supabase client). ``persistence_client`` is the
+    persistence surface used by the history and admission routes; it is
+    exposed explicitly so routes never navigate engine internals and the two
+    surfaces can be injected independently in tests. ``health_checks``
+    aggregate the readiness probes. ``clock`` provides wall time for domain
+    code.
     """
 
     conversation_engine: ChatConversationEngine
@@ -51,6 +55,7 @@ class ApplicationDependencies:
     turn_config: TurnExecutionConfig
     health_checks: HealthRegistry
     clock: Callable[[], float] = field(default_factory=time.time)
+    persistence_client: Any = None
 
 
 def _supabase_factory_from_settings(settings: Settings) -> Callable[[], Optional[Any]]:
@@ -89,6 +94,41 @@ def _supabase_factory_from_settings(settings: Settings) -> Callable[[], Optional
     return factory
 
 
+def _build_readiness_probe_client(settings: Settings) -> Optional[Any]:
+    """Build the dedicated database probe client for readiness checks.
+
+    The transport timeout is aligned with ``readiness_database_timeout_ms`` so
+    a stuck probe self-terminates at the same bound the registry enforces via
+    ``asyncio.wait_for``; the worker thread is never abandoned indefinitely.
+    Returns ``None`` when the runtime Supabase configuration is absent
+    (local/test without a database), which makes the ``database`` check fail
+    honestly.
+    """
+    url = settings.supabase_url
+    key = (
+        settings.supabase_service_role_key.get_secret_value()
+        if settings.supabase_service_role_key is not None
+        else None
+    )
+    if not url or not key:
+        return None
+    try:
+        from supabase import create_client
+        from supabase.lib.client_options import ClientOptions
+
+        options = ClientOptions(
+            postgrest_client_timeout=settings.readiness_database_timeout_ms / 1000.0
+        )
+        return create_client(url, key, options=options)
+    except Exception:
+        emit_event(
+            logger,
+            EVENT_SUPABASE_CLIENT_CREATION_FAILED,
+            level=logging.ERROR,
+        )
+        return None
+
+
 def _close_sync(resource: Any) -> None:
     """Close one resource synchronously during partial startup cleanup."""
     closer = getattr(resource, "close", None)
@@ -123,6 +163,7 @@ def build_default_dependencies(
     try:
         engine = ChatConversationEngine(
             archival_extraction_enabled=settings.archival_extraction_enabled,
+            embeddings_enabled=settings.embeddings_retrieval_enabled,
             turn_config=settings.turn_config,
             groq_keys=list(settings.provider_keys()),
             supabase_factory=_supabase_factory_from_settings(settings),
@@ -135,16 +176,22 @@ def build_default_dependencies(
             cidrs,
         )
 
-        auth_client = engine.memory_manager.supabase
-        health_checks = build_health_registry(settings, engine, auth_client)
+        supabase_client = engine.memory_manager.supabase
+        probe_client = _build_readiness_probe_client(settings)
+        health_checks = build_health_registry(
+            settings,
+            engine,
+            database_probe_client=probe_client,
+        )
 
         dependencies = ApplicationDependencies(
             conversation_engine=engine,
-            auth_client=auth_client,
+            auth_client=supabase_client,
             admission_config=admission_config,
             turn_config=settings.turn_config,
             health_checks=health_checks,
             clock=time.time,
+            persistence_client=supabase_client,
         )
 
         # Owned resources created by this builder. The current engine graph

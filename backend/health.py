@@ -23,10 +23,11 @@ exception text. A failed or timed-out check produces a sanitized
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Mapping, Protocol
+from typing import Any, Callable, Mapping, Optional, Protocol
 
 from .observability import (
     EVENT_READINESS_CHECK_FAILED,
@@ -76,7 +77,7 @@ class HealthRegistry:
 
     Order is deterministic: insertion order, which the default builder
     fixes as ``configuration``, ``database``, ``provider``, then
-    ``embeddings`` (only when the archival feature is enabled).
+    ``embeddings`` (only when the retrieval feature is enabled).
     """
 
     checks: Mapping[str, ReadinessCheck] = field(default_factory=dict)
@@ -144,27 +145,60 @@ class ConfigurationCheck:
 
 
 class DatabaseCheck:
-    """Minimal database/Supabase access check.
+    """Minimal database/Supabase access check with a bounded, non-abandoning probe.
 
-    The default implementation performs one cheap read (limit 1) against the
-    core ``profiles`` table using the application's own client, bounded by an
-    explicit timeout. It never touches user data: no rows are read into
-    memory beyond the transport-level response and no content is logged.
+    The probe runs on a dedicated single-worker executor whose transport
+    timeout is aligned with the readiness timeout (see
+    :func:`build_health_registry` and ``backend.dependencies``). While one
+    probe is still in flight (including after the registry-level timeout
+    cancelled the await), further polls fail fast instead of queueing new
+    work, so repeated readiness polling can never accumulate threads or
+    exhaust the executor. When the in-flight probe self-terminates (bounded
+    transport), the next poll runs a fresh probe.
+
+    It never touches user data: no rows are read into memory beyond the
+    transport-level response and no content is logged.
     """
 
     name = "database"
 
-    def __init__(self, client: Any, timeout_seconds: float) -> None:
+    def __init__(
+        self,
+        client: Any,
+        timeout_seconds: float,
+        *,
+        probe_executor: Optional[concurrent.futures.Executor] = None,
+    ) -> None:
         self._client = client
         self.timeout_seconds = timeout_seconds
+        self._executor = probe_executor or concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="readiness-db",
+        )
+        self._probe_future: Optional[concurrent.futures.Future] = None
 
     async def run(self) -> None:
         if self._client is None:
             raise CheckFailure()
+        if self._probe_future is not None and not self._probe_future.done():
+            # A previous probe is still in flight. Its aligned transport
+            # timeout will release the worker; never pile up work behind it.
+            raise CheckFailure()
+        if self._probe_future is None or self._probe_future.done():
+            self._probe_future = self._executor.submit(self._probe)
+        future = self._probe_future
         try:
-            response = await asyncio.to_thread(self._probe)
+            response = await asyncio.wait_for(
+                asyncio.wrap_future(future),
+                timeout=self.timeout_seconds,
+            )
+        except (asyncio.TimeoutError, concurrent.futures.TimeoutError):
+            raise CheckFailure() from None
         except Exception:
             raise CheckFailure() from None
+        finally:
+            if future.done():
+                self._probe_future = None
         if response is None:
             raise CheckFailure()
 
@@ -206,9 +240,11 @@ class ProviderCheck:
 class EmbeddingsCheck:
     """Checks that embeddings are available when the feature mode requires them.
 
-    Only registered when ``archival_extraction_enabled`` is true. The model is
+    Only registered when ``embeddings_retrieval_enabled`` is true. The model is
     loaded once during startup; this check only verifies the loaded resource
-    exists and never loads a model by itself.
+    exists and never loads a model by itself. A missing model means the active
+    mode cannot retrieve vector memory, so the instance must not serve
+    traffic.
     """
 
     name = "embeddings"
@@ -252,17 +288,18 @@ class LifespanCheck:
 def build_health_registry(
     settings: Settings,
     engine: Any,
-    auth_client: Any,
+    *,
+    database_probe_client: Any = None,
 ) -> HealthRegistry:
     """Build the default ordered registry for the running configuration.
 
     Components:
-    1. ``configuration`` — validated settings.
-    2. ``database`` — minimal Supabase read, bounded by
-       ``readiness_database_timeout_ms``.
+    1. ``configuration`` — validated settings (frozen model, fully revalidated).
+    2. ``database`` — minimal Supabase read via a dedicated probe client whose
+       transport timeout is aligned with ``readiness_database_timeout_ms``.
     3. ``provider`` — provider keys/client path, bounded by
        ``readiness_provider_timeout_ms``.
-    4. ``embeddings`` — only when ``archival_extraction_enabled`` is true.
+    4. ``embeddings`` — only when ``embeddings_retrieval_enabled`` is true.
 
     ``lifespan`` is appended by the application at request time because it
     observes ``app.state``.
@@ -273,7 +310,7 @@ def build_health_registry(
     )
     registry.add(
         DatabaseCheck(
-            auth_client,
+            database_probe_client,
             timeout_seconds=settings.readiness_database_timeout_ms / 1000.0,
         )
     )
@@ -283,7 +320,7 @@ def build_health_registry(
             timeout_seconds=settings.readiness_provider_timeout_ms / 1000.0,
         )
     )
-    if settings.archival_extraction_enabled:
+    if settings.embeddings_retrieval_enabled:
         registry.add(EmbeddingsCheck(engine.memory_manager))
     return registry
 

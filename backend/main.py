@@ -26,6 +26,7 @@ Health semantics
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from contextlib import asynccontextmanager
@@ -54,6 +55,7 @@ from .admission import (
     AdmissionUnavailable,
     build_admission_request,
     compute_turn_correlation,
+    compute_user_reference,
     reserve_admission_sync,
     resolve_network_identity,
 )
@@ -112,18 +114,54 @@ def get_dependencies(request: Request) -> ApplicationDependencies:
     return deps
 
 
+def _duration_ms(started_at: float) -> float:
+    """Render a monotonic elapsed time in milliseconds."""
+    return (time.monotonic() - started_at) * 1000
+
+
+async def get_turn_correlation(request: Request) -> Optional[str]:
+    """Best-effort sanitized correlation reference for the current request.
+
+    Parses the JSON body to extract the request identifier and computes the
+    HMAC correlation under the dedicated turn-correlation domain. This lets
+    auth events that belong to a turn carry the same correlation as the turn
+    events. Never logs raw identifiers; returns ``None`` when the body is
+    unavailable or invalid (for example on pre-validation auth failures).
+    """
+    deps = getattr(request.app.state, "dependencies", None)
+    if deps is None or getattr(deps, "admission_config", None) is None:
+        return None
+    try:
+        body = json.loads(await request.body())
+        request_id = body.get("request_id") if isinstance(body, dict) else None
+        if not request_id:
+            return None
+        return compute_turn_correlation(deps.admission_config, request_id)
+    except Exception:
+        return None
+
+
 def get_current_user(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+    correlation: Optional[str] = Depends(get_turn_correlation),
 ):
     """Authenticate the bearer token against the server-side auth client.
 
     The authenticated identity is resolved per request and never stored in
-    the container or any global. The auth surface is the engine's Supabase
-    client (shared with admission and persistence), and only sanitized codes
-    are logged.
+    the container or any global. The auth surface is ``deps.auth_client``
+    (the injected auth dependency), and only sanitized codes, a monotonic
+    duration, and a non-reversible HMAC user reference are logged.
     """
+    started_at = time.monotonic()
     if not credentials:
+        emit_event(
+            logger,
+            EVENT_AUTH_FAILED,
+            code="missing_credentials",
+            duration_ms=_duration_ms(started_at),
+            correlation=correlation,
+        )
         raise HTTPException(
             status_code=401,
             detail="Not authenticated",
@@ -131,37 +169,90 @@ def get_current_user(
         )
     token = credentials.credentials
     deps = get_dependencies(request)
-    auth_client = deps.conversation_engine.memory_manager.supabase
+    auth_client = deps.auth_client
     try:
         if not auth_client:
-            emit_event(logger, EVENT_AUTH_FAILED, code="service_unavailable")
+            emit_event(
+                logger,
+                EVENT_AUTH_FAILED,
+                code="service_unavailable",
+                duration_ms=_duration_ms(started_at),
+                correlation=correlation,
+            )
             raise HTTPException(status_code=503, detail="Authentication service unavailable")
         auth_response = auth_client.auth.get_user(token)
         if not auth_response.user:
-            emit_event(logger, EVENT_AUTH_FAILED, code="invalid_token")
+            emit_event(
+                logger,
+                EVENT_AUTH_FAILED,
+                code="invalid_token",
+                duration_ms=_duration_ms(started_at),
+                correlation=correlation,
+            )
             raise HTTPException(
                 status_code=401,
                 detail="Authentication failed",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-        emit_event(logger, EVENT_AUTH_COMPLETED, outcome="ok")
+        user_ref = None
+        try:
+            user_ref = compute_user_reference(
+                deps.admission_config, auth_response.user.id
+            )
+        except Exception:
+            # The identity itself is still valid; only the sanitized reference
+            # could not be derived, so the event is emitted without it.
+            user_ref = None
+        emit_event(
+            logger,
+            EVENT_AUTH_COMPLETED,
+            outcome="ok",
+            duration_ms=_duration_ms(started_at),
+            correlation=correlation,
+            user_ref=user_ref,
+        )
         return auth_response.user
     except HTTPException:
         raise
     except AuthApiError as exc:
         if exc.status in (400, 401, 403):
+            emit_event(
+                logger,
+                EVENT_AUTH_FAILED,
+                code="invalid_token",
+                duration_ms=_duration_ms(started_at),
+                correlation=correlation,
+            )
             raise HTTPException(
                 status_code=401,
                 detail="Authentication failed",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-        emit_event(logger, EVENT_AUTH_FAILED, code="upstream_error")
+        emit_event(
+            logger,
+            EVENT_AUTH_FAILED,
+            code="upstream_error",
+            duration_ms=_duration_ms(started_at),
+            correlation=correlation,
+        )
         raise HTTPException(status_code=503, detail="Authentication service unavailable")
     except AuthRetryableError:
-        emit_event(logger, EVENT_AUTH_FAILED, code="transport_error")
+        emit_event(
+            logger,
+            EVENT_AUTH_FAILED,
+            code="transport_error",
+            duration_ms=_duration_ms(started_at),
+            correlation=correlation,
+        )
         raise HTTPException(status_code=503, detail="Authentication service unavailable")
     except Exception:
-        emit_event(logger, EVENT_AUTH_FAILED, code="unexpected")
+        emit_event(
+            logger,
+            EVENT_AUTH_FAILED,
+            code="unexpected",
+            duration_ms=_duration_ms(started_at),
+            correlation=correlation,
+        )
         raise HTTPException(status_code=503, detail="Authentication service unavailable")
 
 
@@ -511,6 +602,11 @@ async def chat_endpoint(
             request.headers.get("x-forwarded-for"),
             admission_config.trusted_proxy_networks,
         )
+        # Sanitized correlation reference for observability: HMAC-SHA256 of
+        # the canonical request id under the dedicated turn-correlation domain
+        # (never the raw request id, user id, message or any secret). Computed
+        # before admission so every event of the turn carries it.
+        correlation = compute_turn_correlation(admission_config, identity.request_id)
         admission_request = build_admission_request(
             user_id=user_id,
             request_identity=identity,
@@ -523,14 +619,10 @@ async def chat_endpoint(
             budget,
             turn_config.supabase_timeout,
             reserve_admission_sync,
-            engine.memory_manager.supabase,
+            deps.persistence_client,
             admission_request,
             allowlist_exceptions=(AdmissionUnavailable,),
         )
-        # Sanitized correlation reference for observability: HMAC-SHA256 of
-        # the canonical request id under the dedicated turn-correlation domain
-        # (never the raw request id, user id, message or any secret).
-        correlation = compute_turn_correlation(admission_config, identity.request_id)
         if admission_result.decision == ADMITTED:
             mode = TurnMode.normal
             logger.info("event=admission_admitted correlation=%s", correlation)
@@ -543,7 +635,12 @@ async def chat_endpoint(
         else:
             logger.info("event=admission_rejected code=%s", admission_result.decision)
             http_exc = _map_admission_rejection(admission_result)
-            emit_event(logger, EVENT_HTTP_RESULT, code=http_exc.status_code)
+            emit_event(
+                logger,
+                EVENT_HTTP_RESULT,
+                code=http_exc.status_code,
+                correlation=correlation,
+            )
             raise http_exc
 
         result = await engine.process_turn(
@@ -563,7 +660,12 @@ async def chat_endpoint(
             mode=mode.value,
             correlation=correlation,
         )
-        emit_event(logger, EVENT_HTTP_RESULT, code=200)
+        emit_event(
+            logger,
+            EVENT_HTTP_RESULT,
+            code=200,
+            correlation=correlation,
+        )
         # The public DTO exposes exactly response + emotion_state; revisions,
         # outbox refs, internal IDs and CommittedTurn are never exposed.
         return ChatResponse(response=result.response, emotion_state=result.emotion_state)
@@ -574,12 +676,22 @@ async def chat_endpoint(
         raise
     except AdmissionUnavailable:
         emit_event(logger, EVENT_TURN_FAILED, code="admission_unavailable")
-        emit_event(logger, EVENT_HTTP_RESULT, code=503)
+        emit_event(
+            logger,
+            EVENT_HTTP_RESULT,
+            code=503,
+            correlation=correlation,
+        )
         raise _admission_unavailable_error()
     except ConflictError as exc:
         emit_event(logger, EVENT_REQUEST_CONFLICT, code=exc.code, correlation=correlation)
         http_exc = _map_process_turn_conflict(exc)
-        emit_event(logger, EVENT_HTTP_RESULT, code=http_exc.status_code)
+        emit_event(
+            logger,
+            EVENT_HTTP_RESULT,
+            code=http_exc.status_code,
+            correlation=correlation,
+        )
         raise http_exc
     except (DeadlineExceeded, TurnExecutionError, GroqPoolExhaustedError,
             GroqRequestError, StatePersistenceError, PersistenceError) as exc:
@@ -593,7 +705,12 @@ async def chat_endpoint(
             code=code,
             correlation=correlation,
         )
-        emit_event(logger, EVENT_HTTP_RESULT, code=http_exc.status_code)
+        emit_event(
+            logger,
+            EVENT_HTTP_RESULT,
+            code=http_exc.status_code,
+            correlation=correlation,
+        )
         raise http_exc
     except Exception:
         # Sanitize logging: avoid logging raw exceptions that might contain
@@ -605,7 +722,12 @@ async def chat_endpoint(
             code=TurnErrorCode.internal_error.value,
             correlation=correlation,
         )
-        emit_event(logger, EVENT_HTTP_RESULT, code=500)
+        emit_event(
+            logger,
+            EVENT_HTTP_RESULT,
+            code=500,
+            correlation=correlation,
+        )
         raise HTTPException(
             status_code=500,
             detail={"code": TurnErrorCode.internal_error.value, "message": "Internal server error."},
@@ -616,7 +738,7 @@ def get_history(request: Request, current_user=Depends(get_current_user)):
     deps = get_dependencies(request)
     user_id = current_user.id
     try:
-        supabase = deps.conversation_engine.memory_manager.supabase
+        supabase = deps.persistence_client
         if not supabase:
             return []
 

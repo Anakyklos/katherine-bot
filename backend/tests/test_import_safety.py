@@ -94,6 +94,7 @@ def _run_guard_script() -> subprocess.CompletedProcess:
             "PYTHONPATH": ".",
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
+            "APP_ENV": "test",
             "GROQ_API_KEY": "mock-groq-key",
             "GROQ_API_KEY_2": "mock-groq-key-2",
             "ADMISSION_HMAC_SECRET": "mock-admission-secret-at-least-32-bytes-xxxx",
@@ -160,6 +161,7 @@ def test_import_blocks_installed_before_import_are_effective():
             "PYTHONPATH": ".",
             "HF_HUB_OFFLINE": "1",
             "TRANSFORMERS_OFFLINE": "1",
+            "APP_ENV": "test",
             "GROQ_API_KEY": "mock-groq-key",
             "ADMISSION_HMAC_SECRET": "mock-admission-secret-at-least-32-bytes-xxxx",
         }

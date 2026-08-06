@@ -9,7 +9,8 @@ eventos de observabilidade permitidos.
 ## Modelo central
 
 Toda configuração de runtime vive em `backend/settings.py` (pydantic v2
-estrito, sem nova dependência). O modelo é congelado e validado:
+estrito, sem nova dependência). O modelo é congelado (`frozen=True`) e
+validado também em atribuição:
 
 - tipos e faixas explícitos (bool não aceita `"true"`/`1`; int não aceita
   `True`/`"5"`/`1.0`; números fora da faixa rejeitados);
@@ -20,6 +21,11 @@ estrito, sem nova dependência). O modelo é congelado e validado:
   produção, feature habilitada sem dependência);
 - campos secretos excluídos de `repr`, `str` e de erros de validação
   sanitizados (`SettingsConfigurationError` expõe apenas `campo:código`);
+- construção direta inválida também não renderiza valores brutos
+  (`hide_input_in_errors=True` no modelo);
+- instância congelada nunca pode ser mutada para um estado inválido, e
+  `ensure_valid()` reconstroi/revalida o modelo completo (usado pelo check
+  `configuration` do readiness);
 - configuração inválida falha antes de a aplicação servir tráfego.
 
 Construção direta (`Settings(...)`) não lê o ambiente; `Settings.from_env()`
@@ -27,8 +33,10 @@ Construção direta (`Settings(...)`) não lê o ambiente; `Settings.from_env()`
 
 ## Ambientes
 
-`APP_ENV` é um enum fechado: `local` (default), `test`, `staging`,
-`production`. Qualquer outro valor falha o startup.
+`APP_ENV` é um enum fechado: `local`, `test`, `staging`, `production`.
+Qualquer outro valor falha o startup, e **`APP_ENV` ausente ou vazio também
+falha (fail-closed)**: um deploy que esqueça a variável nunca roda em modo
+`local` por engano.
 
 | Ambiente | Supabase obrigatório | CORS explícito obrigatório | localhost rejeitado |
 | --- | --- | --- | --- |
@@ -37,8 +45,8 @@ Construção direta (`Settings(...)`) não lê o ambiente; `Settings.from_env()`
 | `staging` | sim | sim | não |
 | `production` | sim | sim | sim (origens e URL do Supabase) |
 
-**Produção exige `APP_ENV=production`.** Sem a variável, o default é `local`:
-deployments reais devem sempre setá-la explicitamente.
+Docker/CI devem declarar `APP_ENV` explicitamente (o job `docker` da CI usa
+`APP_ENV=test`). Produção usa `APP_ENV=production`.
 
 ## Variáveis de ambiente
 
@@ -46,6 +54,7 @@ deployments reais devem sempre setá-la explicitamente.
 
 | Variável | Descrição |
 | --- | --- |
+| `APP_ENV` | Ambiente (`local`, `test`, `staging`, `production`) — obrigatória |
 | `GROQ_API_KEY` | Chave do provider (não vazia) |
 | `ADMISSION_HMAC_SECRET` | Segredo do ledger de admissão (>= 32 bytes UTF-8) |
 
@@ -61,10 +70,10 @@ deployments reais devem sempre setá-la explicitamente.
 
 | Variável | Default | Descrição |
 | --- | --- | --- |
-| `APP_ENV` | `local` | Ambiente (`local`, `test`, `staging`, `production`) |
 | `GROQ_API_KEY_2` | ausente | Segunda chave do provider (pool) |
 | `TRUSTED_PROXY_CIDRS` | vazio | CIDRs de proxies confiáveis (admissão) |
 | `ARCHIVAL_EXTRACTION_ENABLED` | `false` | Habilita extração arquivística (`true`/`false` estritos) |
+| `EMBEDDINGS_RETRIEVAL_ENABLED` | `false` | Habilita recuperação vetorial de memória (SentenceTransformer + RPC). Quando ligado, o modelo é construído no startup e o componente `embeddings` do `/ready` precisa passar; quando desligado, o modelo nunca é construído e a recuperação retorna vazio por design |
 | `READINESS_DATABASE_TIMEOUT_MS` | `3000` | Timeout do check de banco (100–30000) |
 | `READINESS_PROVIDER_TIMEOUT_MS` | `1000` | Timeout do check de provider (100–30000) |
 | `TURN_TOTAL_DEADLINE` | `45.0` | Deadline do turno (validado por `TurnExecutionConfig`) |
@@ -106,13 +115,20 @@ Nomes constantes em `backend/observability.py` (registry fechado):
 event=app_startup_failed
 event=app_shutdown_failed
 event=readiness_check_failed component=<nome>
-event=auth_failed code=<código>
-event=auth_completed outcome=ok
+event=auth_failed code=<código> duration_ms=<ms> correlation=<hmac>
+event=auth_completed outcome=ok duration_ms=<ms> correlation=<hmac> user_ref=<hmac>
 event=turn_completed code=ok duration_ms=<ms> mode=<normal|replay_attempt> correlation=<hmac>
 event=turn_failed code=<código> correlation=<hmac>
 event=request_conflict code=<código> correlation=<hmac>
-event=http_result code=<status>
+event=http_result code=<status> correlation=<hmac>
 ```
+
+Eventos de autenticação são medidos com relógio monotônico (`duration_ms`),
+carregam a correlação sanitizada do request (derivada do request ID sob o
+domínio dedicado) e, no sucesso, uma referência HMAC do usuário autenticado
+(`user_ref`, domínio separado, não reversível). Ausência de credencial,
+token inválido (4xx), 503 e erros inesperados emitem `auth_failed` de forma
+consistente, sem token nem texto bruto do erro.
 
 O fluxo transacional (#272) já emite eventos de fase no engine
 (`event=turn_stage_completed stage=... outcome=...`, `process_turn_attempt`,
@@ -123,9 +139,9 @@ correlação HMAC.
 
 ### Campos permitidos
 
-`correlation`, `code`, `stage`, `outcome`, `phase`, `duration_ms`,
-`latency_ms`, `attempt`, `http_status`, `component`, `mode`, `reason`,
-`result`, `retry`, `conflict`, `deadline_ms`.
+`correlation`, `user_ref`, `code`, `stage`, `outcome`, `phase`,
+`duration_ms`, `latency_ms`, `attempt`, `http_status`, `component`, `mode`,
+`reason`, `result`, `retry`, `conflict`, `deadline_ms`.
 
 ### Dados proibidos em logs e erros
 
@@ -133,9 +149,11 @@ Nunca registre: mensagem, resposta, prompt, memória, appraisal bruto,
 snapshot completo, token, segredo, exceção upstream bruta, URL com
 credenciais, headers de autenticação, `user_id` bruto ou request ID bruto.
 
-Correlação de usuário/request, quando necessária, usa o HMAC-SHA256 do
-request ID sob domínio dedicado (`compute_turn_correlation`), com segredo
-server-side; nunca SHA simples de identificador previsível.
+Correlação de request/turn usa o HMAC-SHA256 do request ID sob domínio
+dedicado (`compute_turn_correlation`), e o usuário autenticado usa referência
+HMAC sob domínio separado (`compute_user_reference`, `user_ref`), ambos com
+segredo server-side; nunca SHA simples de identificador previsível e nunca o
+`user_id`/request ID brutos.
 
 `emit_event` rejeita (falha cedo) nomes de campo fora da allowlist ou
 pertencentes à lista proibida. Nenhum módulo usa `logging.basicConfig()`.

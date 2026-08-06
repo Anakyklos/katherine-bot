@@ -70,11 +70,17 @@ class ApplicationDependencies:
     turn_config: TurnExecutionConfig         # budget/deadline do turno
     health_checks: HealthRegistry            # checks de readiness
     clock: Callable[[], float]               # relógio de parede
+    persistence_client: object               # superfície de persistência (history/admission)
 ```
 
 - Nenhum estado por usuário vive no container ou em singleton: identidade
   autenticada é resolvida por request (`get_current_user`), e snapshots
   emocionais/relacionais permanecem no domínio/persistência.
+- `auth_client` e `persistence_client` são superfícies explícitas: as rotas
+  usam somente a dependência correta (`auth_client` para autenticação,
+  `persistence_client` para history/admission) e nunca navegam por
+  `conversation_engine.memory_manager`. Fakes distintos podem ser injetados
+  para provar o isolamento.
 - `UserLockManager` permanece process-wide porque já é thread-safe por
   construção e é um recurso de infraestrutura, não estado de usuário.
 - Para adicionar uma dependência nova, ver “Procedimento para adicionar uma
@@ -83,12 +89,15 @@ class ApplicationDependencies:
 ## Ordem de startup (lifespan)
 
 ```text
-1. Validar configuração final (Settings já validado; re-validação barata).
+1. Validar configuração final (Settings congelado; re-validação completa).
 2. Se não injetado: build_default_dependencies(settings)
-   a. engine (GroqClientManager + MemoryManager + lock manager)
+   a. engine (GroqClientManager + MemoryManager + lock manager); o modelo de
+      embeddings só é construído quando EMBEDDINGS_RETRIEVAL_ENABLED=true
    b. admission_config a partir dos settings
-   c. health registry (configuration, database, provider[, embeddings])
-   d. container concluído
+   c. cliente de probe de banco dedicado (timeout de transporte alinhado ao
+      READINESS_DATABASE_TIMEOUT_MS)
+   d. health registry (configuration, database, provider[, embeddings])
+   e. container concluído
 3. Falha em qualquer passo:
    a. recursos já criados pelo builder são fechados (cleanup parcial)
    b. app.state.owned_resources é drenado
@@ -137,7 +146,10 @@ Importar `backend.main`, `backend.engine`, `backend.memory`,
 - não imprime nada.
 
 O único acesso a ambiente no import é `Settings.from_env()` na construção do
-app de módulo (`app = create_app()`), que é validação pura.
+app de módulo (`app = create_app()`), que é validação pura. Como `APP_ENV` é
+obrigatório (fail-closed), o runtime (Docker/CI/process manager) precisa
+declará-lo; sem ele, `create_app()` falha com erro sanitizado em vez de rodar
+em modo implícito.
 
 ## Procedimento para adicionar uma dependência nova
 
