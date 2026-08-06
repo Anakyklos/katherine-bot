@@ -56,13 +56,21 @@ Ordem determinística registrada em `backend/health.py`:
 | Componente | Crítico | O que verifica | Timeout padrão |
 | --- | --- | --- | --- |
 | `configuration` | Sim | Settings ainda válidos (re-validação completa do modelo congelado, sem I/O) | 1s |
+| `auth` | Sim | A superfície real de autenticação usada pelas rotas (`auth_client`) existe | 1s |
 | `database` | Sim | Acesso mínimo ao Supabase: leitura `limit 1` em `profiles` com um cliente de probe dedicado, cujo timeout de transporte é alinhado a `READINESS_DATABASE_TIMEOUT_MS` | `READINESS_DATABASE_TIMEOUT_MS` (3000) |
+| `persistence` | Sim | A superfície real de persistência usada por admissão/histórico (`persistence_client`, com `rpc`/`table`) existe | 1s |
 | `provider` | Sim | Caminho do provider configurado: `GroqClientManager.is_configured()` (chaves válidas, sem geração) | `READINESS_PROVIDER_TIMEOUT_MS` (1000) |
 | `embeddings` | Somente com `EMBEDDINGS_RETRIEVAL_ENABLED=true` | Modelo de embeddings carregado no startup (atributo, sem carregar modelo) | 1s |
 | `lifespan` | Sim | `app.state.lifespan_started` (startup concluído) | 1s |
 
 Políticas:
 
+- **O cliente de probe nunca substitui as superfícies reais.** Os checks `auth`
+  e `persistence` validam os clientes que as rotas realmente usam
+  (`auth_client`/`persistence_client`); se a criação do cliente do engine
+  falhar (ou retornar `None`) enquanto o probe dedicado funciona, `/ready`
+  responde 503: uma instância incapaz de autenticar ou persistir não é ready,
+  por mais saudável que o probe esteja.
 - **O check de provider nunca executa geração real.** É barato, limitado e
   verifica configuração do caminho. Deployments que quiserem um probe real de
   rede devem injetar um check próprio com timeout documentado.
@@ -73,11 +81,16 @@ Políticas:
   `READINESS_DATABASE_TIMEOUT_MS`) libera o worker. Polling repetido não
   acumula threads nem esgota o executor.
 - **O registry de readiness é owned pela aplicação.** O builder padrão inclui
-  `health_checks` (que fecha cada check fechável, incluindo o executor do
-  probe com `wait=False`, sem abandonar um probe em voo) e o cliente de probe
-  na tupla de `owned_resources`: são fechados no shutdown e em falha parcial
-  de startup, e nenhuma thread `readiness-db` permanece viva após sair do
-  lifespan.
+  `health_checks` na tupla de `owned_resources`; `DatabaseCheck` é dono do
+  cliente de probe e o fecha apenas após drenar o probe em voo. No shutdown
+  assíncrono, `HealthRegistry.aclose()` chama `DatabaseCheck.aclose()`, que
+  impede novos probes, drena o probe ativo com espera limitada (timeout de
+  transporte alinhado + margem) e só então fecha o executor e o cliente —
+  o cliente nunca é invalidado por baixo de uma thread viva. Em caso
+  patológico (probe ainda ativo após o limite), o cliente é deliberadamente
+  mantido aberto. Em falha parcial de startup, `close()` síncrono encerra o
+  executor sem tocar no cliente. Nenhuma thread `readiness-db` permanece viva
+  após sair do lifespan no fluxo normal.
 - **A guarda de probe é atômica no event loop.** O clear do estado só
   acontece quando a future observada é a que o poll dono aguarda; uma future
   mais nova instalada por um poll concorrente nunca é limpa por engano, então
@@ -111,12 +124,17 @@ Políticas:
 2. **`configuration` unavailable** — settings inválidos em runtime (improvável,
    pois falha cedo; verifique se o processo foi iniciado com configuração
    válida).
-3. **`database` unavailable** — verifique conectividade com o Supabase
+3. **`auth` unavailable** — o cliente real de autenticação não está disponível
+   (a factory do engine falhou ou retornou `None`); autenticação em `/chat`
+   e `/history` também falharia.
+4. **`persistence` unavailable** — o cliente real de persistência não está
+   disponível; admissão e histórico falhariam mesmo com o probe saudável.
+5. **`database` unavailable** — verifique conectividade com o Supabase
    (URL, service role key, rede) e se a tabela `profiles` está acessível com
    o role da aplicação. Timeout curto sugere rede/slow query.
-4. **`provider` unavailable** — chaves do provider ausentes ou inválidas na
+6. **`provider` unavailable** — chaves do provider ausentes ou inválidas na
    configuração da instância.
-5. **`embeddings` unavailable** (só com `EMBEDDINGS_RETRIEVAL_ENABLED=true`) —
+7. **`embeddings` unavailable** (só com `EMBEDDINGS_RETRIEVAL_ENABLED=true`) —
    o modelo não carregou no startup (ex.: `HF_HUB_OFFLINE=1` sem cache local)
    ou o processo foi iniciado sem o modelo necessário para o modo ativo.
 

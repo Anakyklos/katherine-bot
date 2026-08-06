@@ -243,7 +243,12 @@ def test_injected_routes_refuse_outside_lifespan():
 # ─── Readiness resources enter the lifecycle (review blocker 1) ─────────────
 
 
-class _ProbeOkClient:
+class _FakeSupabase:
+    """Duck-typed Supabase surface: auth + table + rpc."""
+
+    def __init__(self):
+        self.auth = object()
+
     def table(self, name):
         return self
 
@@ -251,6 +256,9 @@ class _ProbeOkClient:
         return self
 
     def limit(self, n):
+        return self
+
+    def rpc(self, name, params):
         return self
 
     def execute(self):
@@ -269,8 +277,13 @@ def test_default_builder_shuts_down_readiness_executor(monkeypatch):
 
     monkeypatch.setattr(
         dependencies_module,
+        "_supabase_factory_from_settings",
+        lambda settings: lambda: _FakeSupabase(),
+    )
+    monkeypatch.setattr(
+        dependencies_module,
         "_build_readiness_probe_client",
-        lambda _settings: _ProbeOkClient(),
+        lambda settings: _FakeSupabase(),
     )
     app = main_module.create_app(settings=_settings())
 
@@ -279,13 +292,100 @@ def test_default_builder_shuts_down_readiness_executor(monkeypatch):
         # Running /ready submits a probe, which creates the executor thread.
         response = client.get("/ready")
         assert response.status_code == 200
-        # The owned tuple now includes the closable registry.
+        # The owned tuple includes the closable registry.
         assert any(
             hasattr(resource, "close") and type(resource).__name__ == "HealthRegistry"
             for resource in app.state.owned_resources
         )
-    # After shutdown the registry's close() shut the executor down; the
+    # After shutdown the registry's aclose() shut the executor down; the
     # (completed) probe thread terminates on its own.
+    deadline = _time.monotonic() + 5.0
+    while any(t.name.startswith("readiness-db") for t in threading.enumerate()):
+        assert _time.monotonic() < deadline, "readiness-db thread alive after shutdown"
+        _time.sleep(0.01)
+
+
+# ─── Real surfaces vs probe client (review blocker 1) ───────────────────────
+
+
+def test_ready_fails_when_real_clients_missing_but_probe_works(monkeypatch):
+    """A healthy dedicated probe cannot substitute for the real auth and
+    persistence surfaces the routes use (review blocker 1)."""
+    import backend.dependencies as dependencies_module
+
+    monkeypatch.setattr(
+        dependencies_module,
+        "_supabase_factory_from_settings",
+        lambda settings: lambda: None,
+    )
+    monkeypatch.setattr(
+        dependencies_module,
+        "_build_readiness_probe_client",
+        lambda settings: _FakeSupabase(),
+    )
+    app = main_module.create_app(settings=_settings())
+    with TestClient(app) as client:
+        response = client.get("/ready")
+        assert response.status_code == 503
+        body = response.json()
+        assert body["status"] == "not_ready"
+        assert body["components"]["configuration"] == "ok"
+        assert body["components"]["auth"] == "unavailable"
+        assert body["components"]["persistence"] == "unavailable"
+        assert body["components"]["database"] == "ok"
+        assert body["components"]["provider"] == "ok"
+        assert body["components"]["lifespan"] == "ok"
+
+
+# ─── Shutdown drains an active probe before closing its client (blocker 2) ──
+
+
+def test_shutdown_drains_active_probe_before_closing_client(monkeypatch):
+    """A probe still in flight when the lifespan shuts down is drained with a
+    bounded wait; the probe client is closed only after the thread is done,
+    and no readiness-db thread survives (review blocker 2)."""
+    import threading
+    import time as _time
+    from types import SimpleNamespace
+
+    import backend.dependencies as dependencies_module
+
+    probe_started = threading.Event()
+    release = threading.Event()
+    events = []
+
+    class BlockingProbeClient(_FakeSupabase):
+        def execute(self):
+            probe_started.set()
+            release.wait(timeout=5.0)
+            events.append("probe_done")
+            return SimpleNamespace(data=[], error=None)
+
+        def close(self):
+            events.append("client_closed")
+
+    monkeypatch.setattr(
+        dependencies_module,
+        "_supabase_factory_from_settings",
+        lambda settings: lambda: _FakeSupabase(),
+    )
+    monkeypatch.setattr(
+        dependencies_module,
+        "_build_readiness_probe_client",
+        lambda settings: BlockingProbeClient(),
+    )
+    app = main_module.create_app(settings=_settings(readiness_database_timeout_ms=100))
+    with TestClient(app) as client:
+        response = client.get("/ready")
+        assert response.status_code == 503  # probe timed out, thread still blocked
+        assert probe_started.is_set()
+        # The probe thread is still alive while we are about to shut down.
+        assert any(t.name.startswith("readiness-db") for t in threading.enumerate())
+        # Release the probe so the shutdown drain can complete it.
+        release.set()
+    # Lifespan teardown drained the probe BEFORE closing the client.
+    assert events == ["probe_done", "client_closed"]
+    # No readiness-db thread survives.
     deadline = _time.monotonic() + 5.0
     while any(t.name.startswith("readiness-db") for t in threading.enumerate()):
         assert _time.monotonic() < deadline, "readiness-db thread alive after shutdown"

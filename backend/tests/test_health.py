@@ -245,6 +245,9 @@ class _OkProbeClient:
     def limit(self, n):
         return self
 
+    def rpc(self, name, params):
+        return self
+
     def execute(self):
         return _ProbeResult(data=[])
 
@@ -541,8 +544,20 @@ def test_default_registry_component_set_and_order():
         memory_manager=SimpleNamespace(embedding_model=object(), supabase=object()),
         groq_manager=SimpleNamespace(is_configured=lambda: True),
     )
-    registry = build_health_registry(settings, engine, database_probe_client=object())
-    assert registry.names() == ("configuration", "database", "provider")
+    registry = build_health_registry(
+        settings,
+        engine,
+        auth_client=SimpleNamespace(auth=object()),
+        persistence_client=_OkProbeClient(),
+        database_probe_client=object(),
+    )
+    assert registry.names() == (
+        "configuration",
+        "auth",
+        "database",
+        "persistence",
+        "provider",
+    )
 
 
 def test_default_registry_includes_embeddings_only_when_retrieval_enabled():
@@ -551,8 +566,21 @@ def test_default_registry_includes_embeddings_only_when_retrieval_enabled():
         memory_manager=SimpleNamespace(embedding_model=object(), supabase=object()),
         groq_manager=SimpleNamespace(is_configured=lambda: True),
     )
-    registry = build_health_registry(settings, engine, database_probe_client=object())
-    assert registry.names() == ("configuration", "database", "provider", "embeddings")
+    registry = build_health_registry(
+        settings,
+        engine,
+        auth_client=SimpleNamespace(auth=object()),
+        persistence_client=_OkProbeClient(),
+        database_probe_client=object(),
+    )
+    assert registry.names() == (
+        "configuration",
+        "auth",
+        "database",
+        "persistence",
+        "provider",
+        "embeddings",
+    )
 
 
 def test_embeddings_check_fails_when_model_missing():
@@ -563,6 +591,85 @@ def test_embeddings_check_fails_when_model_missing():
             await check.run()
 
     asyncio.run(_run())
+
+
+# ─── 34c. Real auth/persistence surfaces are readiness-critical (blocker 1) ──
+
+
+def test_auth_check_fails_when_surface_missing():
+    from backend.health import AuthClientCheck
+
+    async def _run(check):
+        try:
+            await check.run()
+            return "ok"
+        except Exception:
+            return "unavailable"
+
+    assert asyncio.run(_run(AuthClientCheck(None))) == "unavailable"
+    assert asyncio.run(_run(AuthClientCheck(object()))) == "unavailable"
+    assert asyncio.run(_run(AuthClientCheck(SimpleNamespace(auth=object())))) == "ok"
+
+
+def test_persistence_check_fails_when_surface_missing():
+    from backend.health import PersistenceClientCheck
+
+    async def _run(check):
+        try:
+            await check.run()
+            return "ok"
+        except Exception:
+            return "unavailable"
+
+    assert asyncio.run(_run(PersistenceClientCheck(None))) == "unavailable"
+    assert asyncio.run(_run(PersistenceClientCheck(object()))) == "unavailable"
+    assert (
+        asyncio.run(_run(PersistenceClientCheck(SimpleNamespace(table=None, rpc=None))))
+        == "ok"
+    )
+
+
+def test_auth_and_persistence_surfaces_are_independent():
+    """With distinct injected surfaces, readiness fails when either the auth
+    or the persistence surface is missing even if the probe client works
+    (review blocker 1)."""
+    settings = _settings()
+    engine = SimpleNamespace(
+        memory_manager=SimpleNamespace(embedding_model=object(), supabase=object()),
+        groq_manager=SimpleNamespace(is_configured=lambda: True),
+    )
+    auth = SimpleNamespace(auth=object())
+    persistence = _OkProbeClient()
+
+    async def _statuses(registry):
+        results = await registry.run_all()
+        return {result.name: result.status.value for result in results}
+
+    # Auth missing, persistence + probe present.
+    registry = build_health_registry(
+        settings,
+        engine,
+        auth_client=None,
+        persistence_client=persistence,
+        database_probe_client=_OkProbeClient(),
+    )
+    by_name = asyncio.run(_statuses(registry))
+    assert by_name["auth"] == "unavailable"
+    assert by_name["persistence"] == "ok"
+    assert by_name["database"] == "ok"
+
+    # Persistence missing, auth + probe present.
+    registry = build_health_registry(
+        settings,
+        engine,
+        auth_client=auth,
+        persistence_client=None,
+        database_probe_client=_OkProbeClient(),
+    )
+    by_name = asyncio.run(_statuses(registry))
+    assert by_name["auth"] == "ok"
+    assert by_name["persistence"] == "unavailable"
+    assert by_name["database"] == "ok"
 
 
 # ─── 34b. Embeddings lifecycle and readiness (review blocker 3) ──────────────
@@ -581,7 +688,11 @@ def _embeddings_client(retrieval_enabled: bool, model_available: bool):
         groq_manager=SimpleNamespace(is_configured=lambda: True),
     )
     registry = build_health_registry(
-        settings, engine, database_probe_client=_OkProbeClient()
+        settings,
+        engine,
+        auth_client=SimpleNamespace(auth=object()),
+        persistence_client=_OkProbeClient(),
+        database_probe_client=_OkProbeClient(),
     )
     deps = main_module.ApplicationDependencies(
         conversation_engine=engine,

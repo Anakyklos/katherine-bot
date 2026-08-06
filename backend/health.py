@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import inspect
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
@@ -76,12 +77,13 @@ class HealthRegistry:
     """Ordered registry of readiness checks with per-check timeouts.
 
     Order is deterministic: insertion order, which the default builder
-    fixes as ``configuration``, ``database``, ``provider``, then
-    ``embeddings`` (only when the retrieval feature is enabled).
+    fixes as ``configuration``, ``auth``, ``database``, ``persistence``,
+    ``provider``, then ``embeddings`` (only when the retrieval feature is
+    enabled).
 
-    The registry is closable: ``close()`` delegates to every registered check
-    that exposes a ``close`` contract (e.g. the database probe executor), so
-    the application can own the whole registry as one lifecycle resource.
+    The registry is closable: ``close()`` (sync, best-effort) and
+    ``aclose()`` (full async protocol) delegate to every registered check,
+    so the application can own the whole registry as one lifecycle resource.
     """
 
     checks: Mapping[str, ReadinessCheck] = field(default_factory=dict)
@@ -96,9 +98,9 @@ class HealthRegistry:
     def close(self) -> None:
         """Close every closable check without aborting on individual failures.
 
-        Never abandons an active probe: each check's ``close`` shuts down its
-        own executor with ``wait=False`` so the in-flight probe self-terminates
-        through its aligned transport timeout and no new work is queued.
+        Synchronous best-effort variant used for partial-startup cleanup: it
+        does NOT drain in-flight probes nor close owned probe clients. Use
+        :meth:`aclose` during the normal async shutdown for the full protocol.
         """
         for check in self.checks.values():
             closer = getattr(check, "close", None)
@@ -106,6 +108,30 @@ class HealthRegistry:
                 continue
             try:
                 closer()
+            except Exception:
+                emit_event(
+                    logger,
+                    EVENT_READINESS_CHECK_FAILED,
+                    level=logging.ERROR,
+                    component=check.name,
+                )
+
+    async def aclose(self) -> None:
+        """Full asynchronous close of every closable check.
+
+        Prefers each check's ``aclose`` (which drains an in-flight probe with
+        a bounded wait before closing the owned probe client, so the client is
+        never invalidated underneath a live thread) and falls back to
+        ``close``. Never aborts on individual failures.
+        """
+        for check in self.checks.values():
+            closer = getattr(check, "aclose", None) or getattr(check, "close", None)
+            if closer is None:
+                continue
+            try:
+                result = closer()
+                if inspect.isawaitable(result):
+                    await result
             except Exception:
                 emit_event(
                     logger,
@@ -193,6 +219,7 @@ class DatabaseCheck:
         timeout_seconds: float,
         *,
         probe_executor: Optional[concurrent.futures.Executor] = None,
+        owns_client: bool = False,
     ) -> None:
         self._client = client
         self.timeout_seconds = timeout_seconds
@@ -202,18 +229,61 @@ class DatabaseCheck:
         )
         self._probe_future: Optional[concurrent.futures.Future] = None
         self._closed = False
+        # When True, this check owns the probe client and closes it in
+        # ``aclose`` only after the in-flight probe is proven done.
+        self._owns_client = owns_client
 
     def close(self) -> None:
-        """Stop accepting new probes without abandoning the active one.
+        """Synchronous best-effort close: stop new probes and release the
+        executor without waiting.
 
-        Shuts the executor down with ``wait=False``: the in-flight probe (if
-        any) keeps running and self-terminates through its aligned transport
-        timeout, and no new work can be queued. Non-daemon executor threads
-        finish on their own once the probe completes, so the process is never
-        blocked by an abandoned future.
+        Deliberately does NOT close the probe client: an in-flight probe
+        thread may still be using it. Use :meth:`aclose` during async
+        shutdown for the full drain-and-close protocol.
         """
         self._closed = True
         self._executor.shutdown(wait=False)
+
+    async def aclose(self) -> None:
+        """Full close protocol: stop new probes, drain the in-flight probe
+        with a bounded wait, then release the executor and close the owned
+        probe client only after the probe thread is proven done.
+
+        The bounded drain uses the aligned transport timeout (readiness
+        timeout plus a small margin), so a real probe self-terminates inside
+        the window. If a probe is still active after the bound (pathological
+        case), the client is deliberately left open: closing it underneath a
+        live thread would invalidate the surface the thread is using. New
+        probes are rejected from this point on.
+        """
+        self._closed = True
+        future = self._probe_future
+        drained = future is None or future.done()
+        if future is not None and not future.done():
+            try:
+                await asyncio.wait_for(
+                    asyncio.wrap_future(future),
+                    timeout=self.timeout_seconds + 1.0,
+                )
+                drained = True
+            except (asyncio.TimeoutError, concurrent.futures.TimeoutError):
+                drained = False
+        self._executor.shutdown(wait=False)
+        if drained and self._owns_client:
+            client, self._client = self._client, None
+            closer = getattr(client, "aclose", None) or getattr(client, "close", None)
+            if closer is not None:
+                try:
+                    result = closer()
+                    if inspect.isawaitable(result):
+                        await result
+                except Exception:
+                    emit_event(
+                        logger,
+                        EVENT_READINESS_CHECK_FAILED,
+                        level=logging.ERROR,
+                        component=self.name,
+                    )
 
     async def run(self) -> None:
         if self._client is None or self._closed:
@@ -253,6 +323,49 @@ class DatabaseCheck:
         if getattr(result, "error", None):
             raise CheckFailure()
         return result
+
+
+class AuthClientCheck:
+    """Checks that the real authentication surface used by the routes exists.
+
+    A healthy probe client can never substitute for this: if the engine's
+    real Supabase client failed to build, ``/chat`` and ``/history`` cannot
+    authenticate no matter how healthy the dedicated database probe is.
+    """
+
+    name = "auth"
+    timeout_seconds = DEFAULT_CHECK_TIMEOUT_SECONDS
+
+    def __init__(self, auth_client: Any) -> None:
+        self._auth_client = auth_client
+
+    async def run(self) -> None:
+        client = self._auth_client
+        if client is None or not hasattr(client, "auth"):
+            raise CheckFailure()
+
+
+class PersistenceClientCheck:
+    """Checks that the real persistence surface used by the routes exists.
+
+    Covers the client actually used by admission (``rpc``) and history
+    (``table``). A dedicated probe client cannot substitute for it: if the
+    real client is missing, persistence routes fail even when ``/ready``
+    probes pass.
+    """
+
+    name = "persistence"
+    timeout_seconds = DEFAULT_CHECK_TIMEOUT_SECONDS
+
+    def __init__(self, persistence_client: Any) -> None:
+        self._persistence_client = persistence_client
+
+    async def run(self) -> None:
+        client = self._persistence_client
+        if client is None:
+            raise CheckFailure()
+        if not hasattr(client, "table") or not hasattr(client, "rpc"):
+            raise CheckFailure()
 
 
 class ProviderCheck:
@@ -333,30 +446,46 @@ def build_health_registry(
     settings: Settings,
     engine: Any,
     *,
+    auth_client: Any = None,
+    persistence_client: Any = None,
     database_probe_client: Any = None,
+    owns_probe_client: bool = False,
 ) -> HealthRegistry:
     """Build the default ordered registry for the running configuration.
 
     Components:
     1. ``configuration`` — validated settings (frozen model, fully revalidated).
-    2. ``database`` — minimal Supabase read via a dedicated probe client whose
-       transport timeout is aligned with ``readiness_database_timeout_ms``.
-    3. ``provider`` — provider keys/client path, bounded by
+    2. ``auth`` — the REAL authentication surface used by the routes exists.
+    3. ``database`` — minimal Supabase read via a dedicated probe client whose
+       transport timeout is aligned with ``readiness_database_timeout_ms``;
+       never a substitute for the real surfaces.
+    4. ``persistence`` — the REAL persistence surface used by admission and
+       history exists.
+    5. ``provider`` — provider keys/client path, bounded by
        ``readiness_provider_timeout_ms``.
-    4. ``embeddings`` — only when ``embeddings_retrieval_enabled`` is true.
+    6. ``embeddings`` — only when ``embeddings_retrieval_enabled`` is true.
 
     ``lifespan`` is appended by the application at request time because it
-    observes ``app.state``.
+    observes ``app.state``. When ``owns_probe_client`` is true the registry
+    (through ``DatabaseCheck.aclose``) closes the probe client after draining
+    any in-flight probe.
     """
     registry = HealthRegistry()
     registry.add(
         ConfigurationCheck(settings)
     )
     registry.add(
+        AuthClientCheck(auth_client)
+    )
+    registry.add(
         DatabaseCheck(
             database_probe_client,
             timeout_seconds=settings.readiness_database_timeout_ms / 1000.0,
+            owns_client=owns_probe_client,
         )
+    )
+    registry.add(
+        PersistenceClientCheck(persistence_client)
     )
     registry.add(
         ProviderCheck(
