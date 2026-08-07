@@ -140,7 +140,7 @@ class ApplicationDependencies:
 | --- | --- | --- |
 | Engine/managers (default) | `build_default_dependencies` | aplicação (shutdown; hoje sem contrato close/aclose no grafo) |
 | Registry de readiness (checks + executor do probe) | `build_default_dependencies` | aplicação (shutdown e startup parcial) |
-| Cliente de probe do banco | `build_default_dependencies` (dono: `DatabaseCheck`) | `DatabaseCheck.aclose()` após drenar o probe em voo; `_close_sync` em startup parcial |
+| Cliente de probe do banco | `build_default_dependencies` (dono: `DatabaseCheck`) | `DatabaseCheck.aclose()` após drenar o probe em voo (mesmo se a drenagem estourar o limite, o cliente é fechado e a future descartada); `_close_sync` em startup parcial |
 | Cliente Supabase (default) | `build_default_dependencies` via factory dos settings | aplicação (se expuser close/aclose) |
 | Container injetado | chamador (teste/deploy) | chamador |
 | Clientes Groq por request | `GroqClientManager` | request-scoped (fechados por call) |

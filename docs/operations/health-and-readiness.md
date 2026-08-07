@@ -56,9 +56,9 @@ Ordem determinística registrada em `backend/health.py`:
 | Componente | Crítico | O que verifica | Timeout padrão |
 | --- | --- | --- | --- |
 | `configuration` | Sim | Settings ainda válidos (re-validação completa do modelo congelado, sem I/O) | 1s |
-| `auth` | Sim | A superfície real de autenticação usada pelas rotas (`auth_client`) existe | 1s |
+| `auth` | Sim | A superfície real de autenticação usada pelas rotas (`auth_client`) é efetivamente chamável: `auth_client.auth.get_user` existe e é callable (nunca é invocada) | 1s |
 | `database` | Sim | Acesso mínimo ao Supabase: leitura `limit 1` em `profiles` com um cliente de probe dedicado, cujo timeout de transporte é alinhado a `READINESS_DATABASE_TIMEOUT_MS` | `READINESS_DATABASE_TIMEOUT_MS` (3000) |
-| `persistence` | Sim | A superfície real de persistência usada por admissão/histórico (`persistence_client`, com `rpc`/`table`) existe | 1s |
+| `persistence` | Sim | A superfície real de persistência usada por admissão/histórico (`persistence_client`) é efetivamente chamável: `table(...)` e `rpc(...)` existem, são callable e são invocadas com argumentos benignos (construção pura de request, sem rede) | 1s |
 | `provider` | Sim | Caminho do provider configurado: `GroqClientManager.is_configured()` (chaves válidas, sem geração) | `READINESS_PROVIDER_TIMEOUT_MS` (1000) |
 | `embeddings` | Somente com `EMBEDDINGS_RETRIEVAL_ENABLED=true` | Modelo de embeddings carregado no startup (atributo, sem carregar modelo) | 1s |
 | `lifespan` | Sim | `app.state.lifespan_started` (startup concluído) | 1s |
@@ -82,15 +82,19 @@ Políticas:
   acumula threads nem esgota o executor.
 - **O registry de readiness é owned pela aplicação.** O builder padrão inclui
   `health_checks` na tupla de `owned_resources`; `DatabaseCheck` é dono do
-  cliente de probe e o fecha apenas após drenar o probe em voo. No shutdown
+  cliente de probe e o fecha após drenar o probe em voo. No shutdown
   assíncrono, `HealthRegistry.aclose()` chama `DatabaseCheck.aclose()`, que
-  impede novos probes, drena o probe ativo com espera limitada (timeout de
-  transporte alinhado + margem) e só então fecha o executor e o cliente —
-  o cliente nunca é invalidado por baixo de uma thread viva. Em caso
-  patológico (probe ainda ativo após o limite), o cliente é deliberadamente
-  mantido aberto. Em falha parcial de startup, `close()` síncrono encerra o
-  executor sem tocar no cliente. Nenhuma thread `readiness-db` permanece viva
-  após sair do lifespan no fluxo normal.
+  impede novos probes e drena o probe ativo com espera limitada (timeout de
+  transporte alinhado + margem). O cleanup é incondicional: se o probe
+  terminar com exceção, a exceção é absorvida e executor/cliente são
+  encerrados; se a drenagem estourar o limite (probe patológico que ignora o
+  timeout de transporte), o executor é encerrado, a future é descartada e o
+  cliente owned é fechado mesmo assim — fechar o transporte falha a chamada
+  em voo e a thread do worker termina, então nenhum recurso owned sobrevive
+  ao lifespan. Em falha parcial de startup, `close()` síncrono encerra o
+  executor (com cancelamento de probes pendentes) sem tocar no cliente.
+  Nenhuma thread `readiness-db` permanece viva após sair do lifespan no fluxo
+  normal.
 - **A guarda de probe é atômica no event loop.** O clear do estado só
   acontece quando a future observada é a que o poll dono aguarda; uma future
   mais nova instalada por um poll concorrente nunca é limpa por engano, então

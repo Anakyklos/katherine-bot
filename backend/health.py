@@ -242,19 +242,21 @@ class DatabaseCheck:
         shutdown for the full drain-and-close protocol.
         """
         self._closed = True
-        self._executor.shutdown(wait=False)
+        self._executor.shutdown(wait=False, cancel_futures=True)
 
     async def aclose(self) -> None:
         """Full close protocol: stop new probes, drain the in-flight probe
         with a bounded wait, then release the executor and close the owned
-        probe client only after the probe thread is proven done.
+        probe client. Cleanup is unconditional:
 
-        The bounded drain uses the aligned transport timeout (readiness
-        timeout plus a small margin), so a real probe self-terminates inside
-        the window. If a probe is still active after the bound (pathological
-        case), the client is deliberately left open: closing it underneath a
-        live thread would invalidate the surface the thread is using. New
-        probes are rejected from this point on.
+        * If the probe completed (success or exception), the worker thread
+          has terminated and the client is closed after the drain. A probe
+          exception is never propagated: it would otherwise escape the drain
+          and skip executor/client cleanup.
+        * If the drain bound expires (a probe ignoring its aligned transport
+          timeout), the owned client is still closed: closing the transport
+          fails the in-flight call, so the worker thread terminates instead
+          of surviving the lifespan. The future reference is always cleared.
         """
         self._closed = True
         future = self._probe_future
@@ -267,9 +269,16 @@ class DatabaseCheck:
                 )
                 drained = True
             except (asyncio.TimeoutError, concurrent.futures.TimeoutError):
+                # The probe is past the drain bound; closing the client below
+                # fails its in-flight call and terminates the worker thread.
                 drained = False
-        self._executor.shutdown(wait=False)
-        if drained and self._owns_client:
+            except Exception:
+                # The probe completed exceptionally: the worker thread has
+                # terminated. Cleanup below is safe; never propagate it.
+                drained = True
+        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._probe_future = None
+        if self._owns_client:
             client, self._client = self._client, None
             closer = getattr(client, "aclose", None) or getattr(client, "close", None)
             if closer is not None:
@@ -326,7 +335,14 @@ class DatabaseCheck:
 
 
 class AuthClientCheck:
-    """Checks that the real authentication surface used by the routes exists.
+    """Checks that the real authentication surface used by the routes is
+    effectively callable (``client.auth.get_user``), not merely present.
+
+    Attribute existence is not enough: ``hasattr(client, "auth")`` passes for
+    ``None`` and for objects without a ``get_user`` method, yet the request
+    auth dependency calls ``auth_client.auth.get_user(token)``. The check
+    therefore verifies the exact callable path the routes use. It never
+    invokes ``get_user`` (that would need a token and hit the network).
 
     A healthy probe client can never substitute for this: if the engine's
     real Supabase client failed to build, ``/chat`` and ``/history`` cannot
@@ -341,17 +357,30 @@ class AuthClientCheck:
 
     async def run(self) -> None:
         client = self._auth_client
-        if client is None or not hasattr(client, "auth"):
+        if client is None:
+            raise CheckFailure()
+        try:
+            auth = getattr(client, "auth", None)
+            get_user = getattr(auth, "get_user", None) if auth is not None else None
+        except Exception:
+            # A surface that raises on attribute access is not usable either.
+            raise CheckFailure() from None
+        if not callable(get_user):
             raise CheckFailure()
 
 
 class PersistenceClientCheck:
-    """Checks that the real persistence surface used by the routes exists.
+    """Checks that the real persistence surface used by the routes is
+    effectively callable: ``table(...)`` and ``rpc(...)`` must exist, be
+    callable, and be invocable without raising.
 
-    Covers the client actually used by admission (``rpc``) and history
-    (``table``). A dedicated probe client cannot substitute for it: if the
-    real client is missing, persistence routes fail even when ``/ready``
-    probes pass.
+    Attribute existence is not enough: ``hasattr(client, "table")`` passes
+    for ``table=None``, yet history calls ``table("chat_logs").select(...)``
+    and admission calls ``rpc("reserve_admission", ...)``. The check builds a
+    query and an RPC request with benign arguments; on the real Supabase
+    client that is pure object construction (no network I/O), so the proof is
+    cheap and honest. A dedicated probe client can never substitute for this
+    surface.
     """
 
     name = "persistence"
@@ -364,7 +393,21 @@ class PersistenceClientCheck:
         client = self._persistence_client
         if client is None:
             raise CheckFailure()
-        if not hasattr(client, "table") or not hasattr(client, "rpc"):
+        try:
+            table = getattr(client, "table", None)
+            rpc = getattr(client, "rpc", None)
+        except Exception:
+            # A surface that raises on attribute access is not usable either.
+            raise CheckFailure() from None
+        if not callable(table) or not callable(rpc):
+            raise CheckFailure()
+        try:
+            table_builder = table("chat_logs")
+            rpc_builder = rpc("match_memories", {})
+        except Exception:
+            # The surfaces exist but fail when invoked; routes cannot use them.
+            raise CheckFailure() from None
+        if table_builder is None or rpc_builder is None:
             raise CheckFailure()
 
 

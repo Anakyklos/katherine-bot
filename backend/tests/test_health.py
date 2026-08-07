@@ -61,6 +61,11 @@ class FailCheck:
         raise CheckFailure()
 
 
+def _ok_auth_client():
+    """Duck-typed auth surface whose exact route path (get_user) is callable."""
+    return SimpleNamespace(auth=SimpleNamespace(get_user=lambda token: None))
+
+
 def _deps_with_checks(checks):
     from backend.admission import AdmissionRuntimeConfig
 
@@ -461,6 +466,102 @@ def test_probe_guard_preserves_newer_future_on_owner_finish():
     asyncio.run(scenario())
 
 
+# ─── 31d. aclose cleanup guarantees (review blockers 2 and 3) ───────────────
+
+
+def test_aclose_cleans_up_when_probe_completes_exceptionally():
+    """A probe that terminates with an exception while aclose is draining
+    must not escape the drain and skip executor/client cleanup (review
+    blocker 2)."""
+    import concurrent.futures
+    import time as _time
+
+    class DelayedFailingClient(_OkProbeClient):
+        def __init__(self):
+            self.closed = False
+
+        def execute(self):
+            _time.sleep(0.05)
+            raise RuntimeError("probe exploded")
+
+        def close(self):
+            self.closed = True
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    client = DelayedFailingClient()
+    check = DatabaseCheck(
+        client,
+        timeout_seconds=0.01,
+        probe_executor=executor,
+        owns_client=True,
+    )
+
+    async def scenario():
+        try:
+            await check.run()  # times out at the readiness bound; probe pending
+        except Exception:
+            pass
+        # aclose must not propagate the probe exception and must clean up.
+        await check.aclose()
+        assert client.closed, "owned client must be closed after an exceptional probe"
+        assert check._probe_future is None
+
+    asyncio.run(scenario())
+    executor.shutdown(wait=False)
+
+
+def test_aclose_guarantees_cleanup_on_drain_timeout():
+    """When the drain bound expires, aclose still clears the future and
+    closes the owned client so no owned resource survives the lifespan
+    (review blocker 3)."""
+    import concurrent.futures
+    import threading
+    import time as _time
+
+    release = threading.Event()
+    calls = []
+
+    class StuckClient(_OkProbeClient):
+        def __init__(self):
+            self.closed = False
+
+        def execute(self):
+            calls.append(1)
+            release.wait(timeout=5.0)
+            return _ProbeResult(data=[])
+
+        def close(self):
+            self.closed = True
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    client = StuckClient()
+    check = DatabaseCheck(
+        client,
+        timeout_seconds=0.01,
+        probe_executor=executor,
+        owns_client=True,
+    )
+
+    async def scenario():
+        try:
+            await check.run()  # times out; probe still blocked
+        except Exception:
+            pass
+        await check.aclose()  # drain bound (0.01 + 1.0) expires; probe stuck
+        assert client.closed, "owned client must be closed even on drain timeout"
+        assert check._probe_future is None
+
+    asyncio.run(scenario())
+    assert calls == [1]
+    # Release the stuck probe so its worker thread terminates on its own.
+    release.set()
+    deadline = _time.monotonic() + 5.0
+    while any(t.is_alive() for t in executor._threads):
+        assert _time.monotonic() < deadline, "probe thread alive after close"
+        _time.sleep(0.01)
+    executor.shutdown(wait=False)
+
+
 # ─── 32. Sensitive marker sanitization ──────────────────────────────────────
 
 
@@ -547,7 +648,7 @@ def test_default_registry_component_set_and_order():
     registry = build_health_registry(
         settings,
         engine,
-        auth_client=SimpleNamespace(auth=object()),
+        auth_client=_ok_auth_client(),
         persistence_client=_OkProbeClient(),
         database_probe_client=object(),
     )
@@ -569,7 +670,7 @@ def test_default_registry_includes_embeddings_only_when_retrieval_enabled():
     registry = build_health_registry(
         settings,
         engine,
-        auth_client=SimpleNamespace(auth=object()),
+        auth_client=_ok_auth_client(),
         persistence_client=_OkProbeClient(),
         database_probe_client=object(),
     )
@@ -597,6 +698,8 @@ def test_embeddings_check_fails_when_model_missing():
 
 
 def test_auth_check_fails_when_surface_missing():
+    """The auth check verifies the callable route path ``auth.get_user``,
+    not mere attribute existence (review blocker 1)."""
     from backend.health import AuthClientCheck
 
     async def _run(check):
@@ -608,10 +711,25 @@ def test_auth_check_fails_when_surface_missing():
 
     assert asyncio.run(_run(AuthClientCheck(None))) == "unavailable"
     assert asyncio.run(_run(AuthClientCheck(object()))) == "unavailable"
-    assert asyncio.run(_run(AuthClientCheck(SimpleNamespace(auth=object())))) == "ok"
+    # False positive fixed: an ``auth`` object without a callable get_user
+    # (or with get_user=None) is unavailable.
+    assert (
+        asyncio.run(_run(AuthClientCheck(SimpleNamespace(auth=object()))))
+        == "unavailable"
+    )
+    assert (
+        asyncio.run(
+            _run(AuthClientCheck(SimpleNamespace(auth=SimpleNamespace(get_user=None))))
+        )
+        == "unavailable"
+    )
+    # The exact path routes call exists and is callable.
+    assert asyncio.run(_run(AuthClientCheck(_ok_auth_client()))) == "ok"
 
 
 def test_persistence_check_fails_when_surface_missing():
+    """The persistence check verifies callable, invocable ``table``/``rpc``
+    surfaces, not mere attribute existence (review blocker 1)."""
     from backend.health import PersistenceClientCheck
 
     async def _run(check):
@@ -623,10 +741,16 @@ def test_persistence_check_fails_when_surface_missing():
 
     assert asyncio.run(_run(PersistenceClientCheck(None))) == "unavailable"
     assert asyncio.run(_run(PersistenceClientCheck(object()))) == "unavailable"
+    # False positive fixed: table=None/rpc=None passes hasattr but cannot be
+    # called by the routes.
     assert (
-        asyncio.run(_run(PersistenceClientCheck(SimpleNamespace(table=None, rpc=None))))
-        == "ok"
+        asyncio.run(
+            _run(PersistenceClientCheck(SimpleNamespace(table=None, rpc=None)))
+        )
+        == "unavailable"
     )
+    # Invocation must not raise and must return a usable builder.
+    assert asyncio.run(_run(PersistenceClientCheck(_OkProbeClient()))) == "ok"
 
 
 def test_auth_and_persistence_surfaces_are_independent():
@@ -638,7 +762,7 @@ def test_auth_and_persistence_surfaces_are_independent():
         memory_manager=SimpleNamespace(embedding_model=object(), supabase=object()),
         groq_manager=SimpleNamespace(is_configured=lambda: True),
     )
-    auth = SimpleNamespace(auth=object())
+    auth = _ok_auth_client()
     persistence = _OkProbeClient()
 
     async def _statuses(registry):
@@ -690,7 +814,7 @@ def _embeddings_client(retrieval_enabled: bool, model_available: bool):
     registry = build_health_registry(
         settings,
         engine,
-        auth_client=SimpleNamespace(auth=object()),
+        auth_client=_ok_auth_client(),
         persistence_client=_OkProbeClient(),
         database_probe_client=_OkProbeClient(),
     )

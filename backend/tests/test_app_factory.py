@@ -243,11 +243,18 @@ def test_injected_routes_refuse_outside_lifespan():
 # ─── Readiness resources enter the lifecycle (review blocker 1) ─────────────
 
 
+class _FakeAuth:
+    """Duck-typed auth surface: the exact ``get_user`` path routes call."""
+
+    def get_user(self, token):
+        return None
+
+
 class _FakeSupabase:
     """Duck-typed Supabase surface: auth + table + rpc."""
 
     def __init__(self):
-        self.auth = object()
+        self.auth = _FakeAuth()
 
     def table(self, name):
         return self
