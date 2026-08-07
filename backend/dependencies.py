@@ -94,15 +94,16 @@ def _supabase_factory_from_settings(settings: Settings) -> Callable[[], Optional
     return factory
 
 
-def _build_readiness_probe_client(settings: Settings) -> Optional[Any]:
-    """Build the dedicated database probe client for readiness checks.
+def _build_database_probe(settings: Settings) -> Optional[Callable[[], Awaitable[None]]]:
+    """Build the real database/Supabase availability probe from settings.
 
-    The transport timeout is aligned with ``readiness_database_timeout_ms`` so
-    a stuck probe self-terminates at the same bound the registry enforces via
-    ``asyncio.wait_for``; the worker thread is never abandoned indefinitely.
-    Returns ``None`` when the runtime Supabase configuration is absent
-    (local/test without a database), which makes the ``database`` check fail
-    honestly.
+    The probe is a bounded async HTTP read of PostgREST
+    (``{supabase_url}/rest/v1/profiles?select=user_id&limit=1``) with the
+    transport timeout aligned to ``readiness_database_timeout_ms``. Because
+    it is plain async I/O, the readiness timeout truly cancels it (no worker
+    thread can outlive the lifespan). Returns ``None`` when the runtime
+    Supabase configuration is absent (local/test without a database), which
+    makes the ``database`` check fail honestly.
     """
     url = settings.supabase_url
     key = (
@@ -112,31 +113,24 @@ def _build_readiness_probe_client(settings: Settings) -> Optional[Any]:
     )
     if not url or not key:
         return None
-    try:
-        from supabase import create_client
-        from supabase.lib.client_options import ClientOptions
+    from .health import _database_health_probe
 
-        options = ClientOptions(
-            postgrest_client_timeout=settings.readiness_database_timeout_ms / 1000.0
-        )
-        return create_client(url, key, options=options)
-    except Exception:
-        emit_event(
-            logger,
-            EVENT_SUPABASE_CLIENT_CREATION_FAILED,
-            level=logging.ERROR,
-        )
-        return None
+    return _database_health_probe(
+        url,
+        key,
+        settings.readiness_database_timeout_ms / 1000.0,
+    )
 
 
-def _build_auth_probe(settings: Settings) -> Optional[Callable[[], None]]:
+def _build_auth_probe(settings: Settings) -> Optional[Callable[[], Awaitable[None]]]:
     """Build the real Auth service availability probe from validated settings.
 
     Probes ``{supabase_url}/auth/v1/health`` (GoTrue health endpoint) with a
-    transport timeout aligned to ``readiness_auth_timeout_ms``. Returns
-    ``None`` when no Supabase URL is configured; the readiness ``auth``
-    component then fails honestly (an instance without a probed Auth service
-    must not report ready).
+    transport timeout aligned to ``readiness_auth_timeout_ms`` over async
+    HTTP, so the readiness timeout truly cancels it. Returns ``None`` when no
+    Supabase URL is configured; the readiness ``auth`` component then fails
+    honestly (an instance without a probed Auth service must not report
+    ready).
     """
     url = settings.supabase_url
     if not url:
@@ -203,16 +197,13 @@ def build_default_dependencies(
         )
 
         supabase_client = engine.memory_manager.supabase
-        probe_client = _build_readiness_probe_client(settings)
-        created.append(probe_client)
         health_checks = build_health_registry(
             settings,
             engine,
             auth_client=supabase_client,
             auth_probe=_build_auth_probe(settings),
             persistence_client=supabase_client,
-            database_probe_client=probe_client,
-            owns_probe_client=True,
+            database_probe=_build_database_probe(settings),
         )
         created.append(health_checks)
 
@@ -229,14 +220,13 @@ def build_default_dependencies(
         # Owned resources created by this builder, closed at shutdown and on
         # partial startup:
         # * ``health_checks`` is the sole owned resource: its async close
-        #   drains any in-flight database probe (bounded by the aligned
-        #   transport timeout) BEFORE closing the owned probe client, so the
-        #   client is never invalidated underneath a live probe thread.
-        #   ``close()`` (sync) is used for partial-startup cleanup and closes
-        #   the executor without touching the client.
-        # * ``probe_client`` is created here but owned by ``DatabaseCheck``
-        #   (``owns_probe_client=True``); it is closed by the registry after
-        #   drain, or by the partial-startup cleanup below.
+        #   cancels any in-flight readiness probe (async HTTP I/O, so the
+        #   cancellation actually stops the request) and awaits its
+        #   termination before returning, so no owned work outlives the
+        #   lifespan. ``close()`` (sync) is used for partial-startup cleanup
+        #   and only rejects new probes.
+        # * Readiness probes are plain async HTTP requests (no client object,
+        #   no executor, no thread), so there is no probe client to own.
         # The engine graph itself does not expose close()/aclose() contracts
         # today (Groq clients are request-scoped; the pinned Supabase SDK has
         # no close), so it is not part of the owned tuple.

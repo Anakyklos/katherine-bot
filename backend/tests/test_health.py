@@ -67,8 +67,21 @@ def _ok_auth_client():
 
 
 def _ok_auth_probe():
-    """A passing Auth availability probe (no network)."""
-    return lambda: None
+    """A passing async Auth availability probe (no network)."""
+
+    async def probe():
+        return None
+
+    return probe
+
+
+def _ok_db_probe():
+    """A passing async database availability probe (no network)."""
+
+    async def probe():
+        return None
+
+    return probe
 
 
 def _deps_with_checks(checks):
@@ -262,28 +275,34 @@ class _OkProbeClient:
         return _ProbeResult(data=[])
 
 
-def test_database_check_timeout_bounds_the_real_blocking_probe():
-    """Repeated polls never accumulate threads and recover once the probe's
-    aligned transport releases the worker (review blocker 4)."""
-    import concurrent.futures
-    import threading
-    import time as _time
+def _slow_db_probe(started=None, release=None):
+    """Build an async database probe that blocks until ``release`` is set."""
+    import asyncio as _asyncio
 
-    probe_started = threading.Event()
-    release = threading.Event()
+    async def probe():
+        if started is not None:
+            started.set()
+        if release is not None:
+            await release.wait()
+        return None
+
+    return probe
+
+
+def test_database_check_timeout_cancels_the_slow_probe():
+    """A slow async probe is cancelled at the readiness timeout: no worker
+    thread survives, no duplicate probe is stacked, and the check recovers
+    once the probe can complete (review blocker 4)."""
+    import asyncio as _asyncio
+
     calls = []
+    release = _asyncio.Event()
 
-    class BlockingClient(_OkProbeClient):
-        def execute(self):
-            calls.append(_time.monotonic())
-            probe_started.set()
-            # Simulates the aligned transport timeout: the probe self-terminates
-            # shortly after the registry-level await was cancelled.
-            release.wait(timeout=1.0)
-            return _ProbeResult(data=[])
+    async def _blocking_probe():
+        calls.append(1)
+        await release.wait()
 
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    check = DatabaseCheck(BlockingClient(), timeout_seconds=0.05, probe_executor=executor)
+    check = DatabaseCheck(_blocking_probe, timeout_seconds=0.05)
 
     async def run_check():
         try:
@@ -292,50 +311,34 @@ def test_database_check_timeout_bounds_the_real_blocking_probe():
         except Exception:
             return "unavailable"
 
-    # First poll times out at the readiness timeout while the thread runs.
-    assert asyncio.run(run_check()) == "unavailable"
-    assert probe_started.is_set()
+    async def scenario():
+        # First poll times out; the probe task was cancelled (no orphaned work).
+        assert await run_check() == "unavailable"
+        assert len(calls) == 1
+        assert check._inflight is None
 
-    # While the probe is still in flight, repeated polls fail fast without
-    # submitting new work: exactly one probe execution has been started.
-    for _ in range(5):
-        assert asyncio.run(run_check()) == "unavailable"
-    assert len(calls) == 1, "no new probe may be submitted while one is in flight"
+        # A fresh probe completes fine once the blocked probe is released.
+        release.set()
+        assert await run_check() == "ok"
+        assert len(calls) == 2
 
-    # The in-flight probe completes on its own (aligned transport timeout).
-    release.set()
-    deadline = _time.monotonic() + 5.0
-    while _time.monotonic() < deadline:
-        if asyncio.run(run_check()) == "ok":
-            break
-        _time.sleep(0.01)
-    assert asyncio.run(run_check()) == "ok"
-
-    # The executor never grew beyond its single worker: no thread accumulation.
-    assert len(executor._threads) <= 1
-    executor.shutdown(wait=False)
+    asyncio.run(scenario())
 
 
 def test_database_check_fails_while_probe_in_flight_and_recovers():
-    """A stuck probe makes readiness fail honestly, and recovery is automatic
-    once the probe terminates (review blocker 4)."""
-    import concurrent.futures
-    import threading
-    import time as _time
+    """A stuck probe makes readiness fail honestly; while a probe is in
+    flight no duplicate is stacked, and once it terminates the next poll
+    runs a fresh one (review blocker 4)."""
+    import asyncio as _asyncio
 
-    release = threading.Event()
-    probe_started = threading.Event()
     calls = []
+    release = _asyncio.Event()
 
-    class StuckClient(_OkProbeClient):
-        def execute(self):
-            calls.append(1)
-            probe_started.set()
-            release.wait(timeout=1.0)
-            return _ProbeResult(data=[])
+    async def _blocking_probe():
+        calls.append(1)
+        await release.wait()
 
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    check = DatabaseCheck(StuckClient(), timeout_seconds=0.05, probe_executor=executor)
+    check = DatabaseCheck(_blocking_probe, timeout_seconds=0.05)
 
     async def run_check():
         try:
@@ -344,44 +347,51 @@ def test_database_check_fails_while_probe_in_flight_and_recovers():
         except Exception:
             return "unavailable"
 
-    assert asyncio.run(run_check()) == "unavailable"
-    assert probe_started.is_set()
-    # A subsequent poll while in flight does not start a second probe.
-    assert asyncio.run(run_check()) == "unavailable"
-    assert len(calls) == 1
+    async def scenario():
+        # First poll times out and cancels its probe.
+        assert await run_check() == "unavailable"
+        assert len(calls) == 1
+        assert check._inflight is None
 
-    release.set()
-    deadline = _time.monotonic() + 5.0
-    while _time.monotonic() < deadline:
-        if asyncio.run(run_check()) == "ok":
-            break
-        _time.sleep(0.01)
-    assert asyncio.run(run_check()) == "ok"
-    executor.shutdown(wait=False)
+        # A probe left in flight makes further polls fail fast (single-probe
+        # guard) without stacking duplicate work.
+        task = _asyncio.ensure_future(check._probe())
+        check._inflight = task
+        await _asyncio.sleep(0)
+        assert len(calls) == 2  # timed-out probe #1 + the in-flight task #2
+        assert await run_check() == "unavailable"
+        assert await run_check() == "unavailable"
+        assert len(calls) == 2, "no duplicate probe while one is in flight"
+        task.cancel()
+        import contextlib
+
+        with contextlib.suppress(BaseException):
+            await task
+
+        # Once the probe can complete, the next poll recovers.
+        release.set()
+        assert await run_check() == "ok"
+        assert len(calls) == 3
+
+    asyncio.run(scenario())
 
 
-# ─── 31c. Probe guard race between concurrent requests (review blocker 4) ────
+# ─── 31c. Single-probe guard under concurrent polls (review blocker 4) ───────
 
 
 def test_concurrent_polls_submit_single_probe():
     """Concurrent /ready polls while a probe is in flight submit exactly one
     probe; the rest fail fast (review blocker 4)."""
-    import asyncio
-    import concurrent.futures
-    import threading
-    import time as _time
+    import asyncio as _asyncio
 
-    release = threading.Event()
     calls = []
+    release = _asyncio.Event()
 
-    class BlockingClient(_OkProbeClient):
-        def execute(self):
-            calls.append(1)
-            release.wait(timeout=1.0)
-            return _ProbeResult(data=[])
+    async def _blocking_probe():
+        calls.append(1)
+        await release.wait()
 
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    check = DatabaseCheck(BlockingClient(), timeout_seconds=0.1, probe_executor=executor)
+    check = DatabaseCheck(_blocking_probe, timeout_seconds=0.1)
 
     async def run_check():
         try:
@@ -391,195 +401,78 @@ def test_concurrent_polls_submit_single_probe():
             return "unavailable"
 
     async def hammer():
-        results = await asyncio.gather(*(run_check() for _ in range(12)))
-        return results
+        return await _asyncio.gather(*(run_check() for _ in range(12)))
 
     results = asyncio.run(hammer())
     assert all(r == "unavailable" for r in results)
     assert len(calls) == 1, "concurrent polls must submit a single probe"
 
     release.set()
-    deadline = _time.monotonic() + 5.0
-    while _time.monotonic() < deadline:
-        if asyncio.run(run_check()) == "ok":
-            break
-        _time.sleep(0.01)
     assert asyncio.run(run_check()) == "ok"
-    executor.shutdown(wait=False)
-
-
-def test_probe_guard_preserves_newer_future_on_owner_finish():
-    """The guarded clear only drops the future the calling poll owns.
-
-    Deterministically reproduces the race: poll A's probe completes; before
-    A's finally runs, poll B installs a newer probe future. A's finally must
-    NOT clear B's reference, otherwise a third poll could submit extra work
-    (review blocker 4).
-    """
-    import asyncio
-    import concurrent.futures
-
-    made = []
-
-    class FakeExecutor:
-        def submit(self, fn, *args, **kwargs):
-            fut = concurrent.futures.Future()
-            made.append(fut)
-            return fut
-
-        def shutdown(self, *args, **kwargs):
-            pass
-
-    check = DatabaseCheck(_OkProbeClient(), timeout_seconds=1.0, probe_executor=FakeExecutor())
-
-    async def run_check():
-        try:
-            await check.run()
-            return "ok"
-        except Exception:
-            return "unavailable"
-
-    async def scenario():
-        # Seed an already-completed future (as if a previous probe finished).
-        old = concurrent.futures.Future()
-        old.set_result(_ProbeResult(data=[]))
-        check._probe_future = old
-
-        # Poll A submits a PENDING future and awaits it.
-        task_a = asyncio.create_task(run_check())
-        await asyncio.sleep(0)
-        fut_a = check._probe_future
-        assert fut_a is not old and not fut_a.done()
-
-        # While A is still awaiting, poll B sees fut_a done? No: fut_a is
-        # pending, so B must fail fast (single-probe invariant holds).
-        assert await run_check() == "unavailable"
-        assert check._probe_future is fut_a
-
-        # Complete A's future; A's continuation is queued. Before A resumes,
-        # simulate B observing fut_a done and installing a newer future. The
-        # guard in A's finally must not clear this newer reference.
-        fut_a.set_result(_ProbeResult(data=[]))
-        fut_b = concurrent.futures.Future()
-        fut_b.set_result(_ProbeResult(data=[]))
-        check._probe_future = fut_b
-
-        await task_a  # A's finally runs the guarded clear here
-        assert check._probe_future is fut_b, "A must not clear B's newer future"
-        assert made == [fut_a]
-
-    asyncio.run(scenario())
 
 
 # ─── 31d. aclose cleanup guarantees (review blockers 2 and 3) ───────────────
 
 
-def test_aclose_cleans_up_when_probe_completes_exceptionally():
-    """A probe that terminates with an exception while aclose is draining
-    must not escape the drain and skip executor/client cleanup (review
-    blocker 2)."""
-    import concurrent.futures
-    import time as _time
+def test_aclose_cancels_inflight_probe():
+    """aclose cancels and awaits an in-flight async probe; no fire-and-forget
+    cleanup and no owned work survives (review blocker 3)."""
+    import asyncio as _asyncio
 
-    class DelayedFailingClient(_OkProbeClient):
-        def __init__(self):
-            self.closed = False
+    cancelled = []
 
-        def execute(self):
-            _time.sleep(0.05)
-            raise RuntimeError("probe exploded")
+    async def _slow_probe():
+        try:
+            await _asyncio.sleep(10)
+        except _asyncio.CancelledError:
+            cancelled.append(1)
+            raise
 
-        def close(self):
-            self.closed = True
-
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    client = DelayedFailingClient()
-    check = DatabaseCheck(
-        client,
-        timeout_seconds=0.01,
-        probe_executor=executor,
-        owns_client=True,
-    )
+    check = DatabaseCheck(_slow_probe, 1.0)
 
     async def scenario():
-        try:
-            await check.run()  # times out at the readiness bound; probe pending
-        except Exception:
-            pass
-        # aclose must not propagate the probe exception and must clean up.
+        # Start the probe directly (simulating an in-flight readiness poll).
+        task = _asyncio.ensure_future(check._probe())
+        check._inflight = task
+        await _asyncio.sleep(0)
         await check.aclose()
-        assert client.closed, "owned client must be closed after an exceptional probe"
-        assert check._probe_future is None
+        assert task.done()
+        assert task.cancelled()
+        assert cancelled == [1]
+        assert check._inflight is None
+        # A second aclose is a no-op.
+        await check.aclose()
 
     asyncio.run(scenario())
-    executor.shutdown(wait=False)
 
 
-def test_aclose_guarantees_cleanup_on_drain_timeout():
-    """aclose never closes the client under a live probe thread: on drain
-    timeout ownership is deferred and released only after the probe
-    terminates (review blocker 3)."""
-    import concurrent.futures
-    import threading
-    import time as _time
+def test_aclose_is_clean_after_expired_ready():
+    """After /ready expires on a slow probe, the probe task was already
+    cancelled by the check itself; aclose stays clean and idempotent."""
+    import asyncio as _asyncio
 
-    release = threading.Event()
-    calls = []
+    cancelled = []
 
-    class StuckClient(_OkProbeClient):
-        def __init__(self):
-            self.closed = False
-            self.active = False
+    async def _slow_probe():
+        try:
+            await _asyncio.sleep(10)
+        except _asyncio.CancelledError:
+            cancelled.append(1)
+            raise
 
-        def execute(self):
-            calls.append(1)
-            self.active = True
-            try:
-                release.wait(timeout=5.0)
-            finally:
-                self.active = False
-            return _ProbeResult(data=[])
-
-        def close(self):
-            # The fake fails loudly if the client is closed while the probe
-            # thread may still be using it.
-            if self.active:
-                raise AssertionError("close() called while execute() still active")
-            self.closed = True
-
-    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-    client = StuckClient()
-    check = DatabaseCheck(
-        client,
-        timeout_seconds=0.01,
-        probe_executor=executor,
-        owns_client=True,
-    )
+    check = DatabaseCheck(_slow_probe, 0.01)
 
     async def scenario():
         try:
-            await check.run()  # times out; probe still blocked
+            await check.run()
         except Exception:
             pass
-        await check.aclose()  # drain bound (0.01 + 1.0) expires; probe stuck
-        # aclose must NOT have closed the client while the thread is active,
-        # and ownership must remain tracked until the probe completes.
-        assert client.closed is False
-        assert check._client is client
-        assert check._deferred_close is not None
-        # Release the probe; the deferred cleanup closes the client and
-        # clears the future only after the thread terminates.
-        release.set()
-        await check._deferred_close
-        assert client.closed is True
-        assert check._probe_future is None
-        deadline = _time.monotonic() + 5.0
-        while any(t.is_alive() for t in executor._threads):
-            assert _time.monotonic() < deadline, "probe thread alive after close"
-            _time.sleep(0.01)
+        assert cancelled == [1], "expired probe must be cancelled by run()"
+        assert check._inflight is None
+        await check.aclose()
+        assert check._inflight is None
 
     asyncio.run(scenario())
-    executor.shutdown(wait=False)
 
 
 # ─── 32. Sensitive marker sanitization ──────────────────────────────────────
@@ -671,7 +564,7 @@ def test_default_registry_component_set_and_order():
         auth_client=_ok_auth_client(),
         auth_probe=_ok_auth_probe(),
         persistence_client=_OkProbeClient(),
-        database_probe_client=object(),
+        database_probe=_ok_db_probe(),
     )
     assert registry.names() == (
         "configuration",
@@ -694,7 +587,7 @@ def test_default_registry_includes_embeddings_only_when_retrieval_enabled():
         auth_client=_ok_auth_client(),
         auth_probe=_ok_auth_probe(),
         persistence_client=_OkProbeClient(),
-        database_probe_client=object(),
+        database_probe=_ok_db_probe(),
     )
     assert registry.names() == (
         "configuration",
@@ -772,7 +665,7 @@ def test_auth_check_fails_when_availability_probe_fails():
     unavailable (review blocker 1)."""
     from backend.health import AuthClientCheck
 
-    def _failing_probe():
+    async def _failing_probe():
         raise RuntimeError("auth service unreachable")
 
     check = AuthClientCheck(_ok_auth_client(), 1.0, probe=_failing_probe)
@@ -806,7 +699,7 @@ def _auth_ready_client(auth_probe):
         auth_client=_ok_auth_client(),
         auth_probe=auth_probe,
         persistence_client=_OkProbeClient(),
-        database_probe_client=_OkProbeClient(),
+        database_probe=_ok_db_probe(),
     )
     deps = main_module.ApplicationDependencies(
         conversation_engine=engine,
@@ -823,7 +716,7 @@ def _auth_ready_client(auth_probe):
 def test_ready_503_when_auth_service_unavailable():
     """Callable auth surface + healthy database probe + Auth service down
     => /ready 503 with auth=unavailable (review blocker 1)."""
-    def _failing_probe():
+    async def _failing_probe():
         raise RuntimeError("auth service unreachable")
 
     client, registry = _auth_ready_client(_failing_probe)
@@ -880,12 +773,12 @@ def test_auth_health_probe_detects_service_availability():
     try:
         base = f"http://127.0.0.1:{server.server_port}"
         ok_probe = _auth_health_probe(f"{base}/auth/v1", None, 1.0)
-        ok_probe()  # healthy Auth service: no raise
+        asyncio.run(ok_probe())  # healthy Auth service: no raise
 
         # Unreachable Auth service (connection refused): sanitized failure.
         bad_probe = _auth_health_probe("http://127.0.0.1:1/auth/v1", None, 1.0)
         with pytest.raises(CheckFailure):
-            bad_probe()
+            asyncio.run(bad_probe())
     finally:
         server.shutdown()
         server.server_close()
@@ -941,7 +834,7 @@ def test_auth_and_persistence_surfaces_are_independent():
         auth_client=None,
         auth_probe=_ok_auth_probe(),
         persistence_client=persistence,
-        database_probe_client=_OkProbeClient(),
+        database_probe=_ok_db_probe(),
     )
     by_name = asyncio.run(_statuses(registry))
     assert by_name["auth"] == "unavailable"
@@ -955,7 +848,7 @@ def test_auth_and_persistence_surfaces_are_independent():
         auth_client=auth,
         auth_probe=_ok_auth_probe(),
         persistence_client=None,
-        database_probe_client=_OkProbeClient(),
+        database_probe=_ok_db_probe(),
     )
     by_name = asyncio.run(_statuses(registry))
     assert by_name["auth"] == "ok"
@@ -984,7 +877,7 @@ def _embeddings_client(retrieval_enabled: bool, model_available: bool):
         auth_client=_ok_auth_client(),
         auth_probe=_ok_auth_probe(),
         persistence_client=_OkProbeClient(),
-        database_probe_client=_OkProbeClient(),
+        database_probe=_ok_db_probe(),
     )
     deps = main_module.ApplicationDependencies(
         conversation_engine=engine,

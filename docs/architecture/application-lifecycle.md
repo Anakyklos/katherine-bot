@@ -94,8 +94,8 @@ class ApplicationDependencies:
    a. engine (GroqClientManager + MemoryManager + lock manager); o modelo de
       embeddings só é construído quando EMBEDDINGS_RETRIEVAL_ENABLED=true
    b. admission_config a partir dos settings
-   c. cliente de probe de banco dedicado (timeout de transporte alinhado ao
-      READINESS_DATABASE_TIMEOUT_MS)
+   c. probes de readiness (auth e database) construídos a partir dos settings:
+      I/O HTTP assíncrono bounded (httpx), sem threads, sem cliente owned
    d. health registry (configuration, auth, database, persistence,
       provider[, embeddings])
    e. container concluído
@@ -139,30 +139,29 @@ class ApplicationDependencies:
 | Recurso | Criado por | Fechado por |
 | --- | --- | --- |
 | Engine/managers (default) | `build_default_dependencies` | aplicação (shutdown; hoje sem contrato close/aclose no grafo) |
-| Registry de readiness (checks + executor do probe) | `build_default_dependencies` | aplicação (shutdown e startup parcial) |
-| Cliente de probe do banco | `build_default_dependencies` (dono: `DatabaseCheck`) | `DatabaseCheck.aclose()` após drenar o probe em voo (mesmo se a drenagem estourar o limite, o cliente é fechado e a future descartada); `_close_sync` em startup parcial |
+| Registry de readiness (checks) | `build_default_dependencies` | aplicação (shutdown e startup parcial) |
+| Probes de readiness (auth/database) | `build_default_dependencies` (callables async) | sem recurso owned (I/O HTTP assíncrono; `aclose()` cancela probes em voo) |
 | Cliente Supabase (default) | `build_default_dependencies` via factory dos settings | aplicação (se expuser close/aclose) |
 | Container injetado | chamador (teste/deploy) | chamador |
 | Clientes Groq por request | `GroqClientManager` | request-scoped (fechados por call) |
 
 O builder padrão retorna `owned = (health_checks,)`. O registry de readiness é
 o único recurso owned: `HealthRegistry.aclose()` prefere o `aclose` de cada
-check; `DatabaseCheck.aclose()` impede novos probes, drena o probe ativo com
-espera limitada (timeout de transporte alinhado + margem) e só então fecha o
-executor e o cliente de probe do qual é dono — o cliente nunca é invalidado
-por baixo de uma thread viva (em caso patológico, o cliente é mantido aberto).
-`HealthRegistry.close()` (síncrono, usado em falha parcial de startup) encerra
-o executor sem tocar no cliente. A versão atual do SDK Supabase pinado não
-expõe `close()`/`aclose()`, e os clientes Groq são request-scoped, então o
-grafo do engine não entra na tupla owned hoje. Em falha parcial de startup, os
-recursos já criados (engine, probe client, registry) são fechados antes da
-exceção propagar.
+check; `AuthClientCheck.aclose()` e `DatabaseCheck.aclose()` **cancelam
+qualquer probe em voo e aguardam sua terminação antes de retornar** — os
+probes são I/O HTTP assíncrono (httpx), então o cancelamento realmente para a
+operação. Não há threads, executors nem clientes de probe owned; nenhum
+trabalho de readiness sobrevive ao lifespan e nenhum cleanup fire-and-forget
+é necessário. `HealthRegistry.close()` (síncrono, usado em falha parcial de
+startup) apenas rejeita novos probes. A versão atual do SDK Supabase pinado
+não expõe `close()`/`aclose()`, e os clientes Groq são request-scoped, então o
+grafo do engine não entra na tupla owned hoje.
 
 O readiness também valida as **superfícies reais** usadas pelas rotas: os
 checks `auth` e `persistence` verificam `auth_client` e `persistence_client`
-(criados com o engine). Um cliente de probe dedicado e saudável nunca
-substitui essas superfícies: se a criação do cliente real falhar, `/ready`
-responde 503 mesmo com o probe funcionando.
+(criados com o engine). Um probe saudável nunca substitui essas superfícies:
+se a criação do cliente real falhar, `/ready` responde 503 mesmo com o probe
+funcionando.
 
 ## Importabilidade
 

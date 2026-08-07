@@ -56,8 +56,8 @@ Ordem determinística registrada em `backend/health.py`:
 | Componente | Crítico | O que verifica | Timeout padrão |
 | --- | --- | --- | --- |
 | `configuration` | Sim | Settings ainda válidos (re-validação completa do modelo congelado, sem I/O) | 1s |
-| `auth` | Sim | A superfície real de autenticação usada pelas rotas é efetivamente chamável (`auth_client.auth.get_user`, nunca invocada) **e** o serviço de Auth está disponível: probe GET bounded de `{supabase_url}/auth/v1/health` (GoTrue), com timeout de transporte alinhado a `READINESS_AUTH_TIMEOUT_MS`, sem token de usuário e sem ler dados de usuário (só o status HTTP é observado; o corpo é descartado) | `READINESS_AUTH_TIMEOUT_MS` (1000) |
-| `database` | Sim | Acesso mínimo ao Supabase: leitura `limit 1` em `profiles` com um cliente de probe dedicado, cujo timeout de transporte é alinhado a `READINESS_DATABASE_TIMEOUT_MS` | `READINESS_DATABASE_TIMEOUT_MS` (3000) |
+| `auth` | Sim | A superfície real de autenticação usada pelas rotas é efetivamente chamável (`auth_client.auth.get_user`, nunca invocada) **e** o serviço de Auth está disponível: probe HTTP assíncrono bounded de `{supabase_url}/auth/v1/health` (GoTrue), com timeout de transporte alinhado a `READINESS_AUTH_TIMEOUT_MS`, sem token de usuário e sem ler dados de usuário (só o status HTTP é observado; o corpo é descartado). Sendo I/O assíncrono, o timeout de readiness realmente cancela o probe | `READINESS_AUTH_TIMEOUT_MS` (1000) |
+| `database` | Sim | Acesso mínimo ao Supabase: probe HTTP assíncrono bounded de `{supabase_url}/rest/v1/profiles?select=user_id&limit=1` (PostgREST), com timeout de transporte alinhado a `READINESS_DATABASE_TIMEOUT_MS`. Sendo I/O assíncrono, o timeout de readiness realmente cancela o probe | `READINESS_DATABASE_TIMEOUT_MS` (3000) |
 | `persistence` | Sim | A superfície real de persistência usada por admissão/histórico (`persistence_client`) é efetivamente chamável: `table(...)` e `rpc(...)` existem, são callable e são invocadas com argumentos benignos (construção pura de request, sem rede) | 1s |
 | `provider` | Sim | Caminho do provider configurado: `GroqClientManager.is_configured()` (chaves válidas, sem geração) | `READINESS_PROVIDER_TIMEOUT_MS` (1000) |
 | `embeddings` | Somente com `EMBEDDINGS_RETRIEVAL_ENABLED=true` | Modelo de embeddings carregado no startup (atributo, sem carregar modelo) | 1s |
@@ -80,29 +80,10 @@ Políticas:
 - **O check de provider nunca executa geração real.** É barato, limitado e
   verifica configuração do caminho. Deployments que quiserem um probe real de
   rede devem injetar um check próprio com timeout documentado.
-- **O check de banco não abandona workers.** A operação bloqueante roda em um
-  executor dedicado de 1 worker; enquanto um probe está em voo (inclusive após
-  o timeout do registry), novos polls falham rápido em vez de enfileirar
-  trabalho, e o timeout de transporte do cliente de probe (alinhado ao
-  `READINESS_DATABASE_TIMEOUT_MS`) libera o worker. Polling repetido não
-  acumula threads nem esgota o executor.
-- **O registry de readiness é owned pela aplicação.** O builder padrão inclui
-  `health_checks` na tupla de `owned_resources`; `DatabaseCheck` é dono do
-  cliente de probe. No shutdown assíncrono, `HealthRegistry.aclose()` chama
-  `DatabaseCheck.aclose()`, que impede novos probes e drena o probe ativo com
-  espera limitada (timeout de transporte alinhado + margem). O cliente nunca
-  é fechado por baixo de uma thread viva: se o probe terminar (sucesso ou
-  exceção), a thread terminou e o cliente é fechado; se a drenagem estourar o
-  limite (probe patológico que ignora o timeout de transporte), o cliente não
-  é fechado e o ownership é mantido rastreável — uma task de cleanup diferido
-  (`_deferred_close`) fecha executor e cliente somente após o probe terminar,
-  e uma segunda chamada a `aclose()` faz join nessa task. No fluxo normal
-  (transporte alinhado), nada sobrevive ao lifespan; no caminho patológico o
-  ownership permanece rastreável até a conclusão. Em falha parcial de
-  startup, `close()` síncrono encerra o executor (cancelando probes
-  pendentes) sem tocar no cliente.
+- **O check de banco não abandona trabalho.** O probe é I/O HTTP assíncrono (httpx) com timeout de transporte alinhado ao `READINESS_DATABASE_TIMEOUT_MS`; o `asyncio.wait_for` do registry realmente cancela a operação, então não existem threads de worker, acumulação de polling nem trabalho órfão após timeout. Enquanto um probe está em voo, novos polls falham rápido (guarda de probe único), sem duplicar requests.
+- **O registry de readiness é owned pela aplicação.** O builder padrão inclui `health_checks` na tupla de `owned_resources`. No shutdown assíncrono, `HealthRegistry.aclose()` chama o `aclose()` de cada check, que **cancela qualquer probe em voo e aguarda sua terminação antes de retornar** — nenhum trabalho owned sobrevive ao lifespan, sem cleanup fire-and-forget e sem ownership perdido. Em falha parcial de startup, `close()` síncrono apenas rejeita novos probes (não há threads nem clientes owned a liberar).
 - **A guarda de probe é atômica no event loop.** O clear do estado só
-  acontece quando a future observada é a que o poll dono aguarda; uma future
+  acontece quando a task observada é a que o poll dono aguarda; uma task
   mais nova instalada por um poll concorrente nunca é limpa por engano, então
   no máximo um probe fica em voo (testado com concorrência determinística).
 - **Feature opcional desligada não bloqueia readiness** (`embeddings` só

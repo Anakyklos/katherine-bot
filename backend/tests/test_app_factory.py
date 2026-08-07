@@ -243,6 +243,15 @@ def test_injected_routes_refuse_outside_lifespan():
 # ─── Readiness resources enter the lifecycle (review blocker 1) ─────────────
 
 
+def _ok_async_probe():
+    """A passing async readiness probe (no network)."""
+
+    async def probe():
+        return None
+
+    return probe
+
+
 class _FakeAuth:
     """Duck-typed auth surface: the exact ``get_user`` path routes call."""
 
@@ -274,11 +283,11 @@ class _FakeSupabase:
         return SimpleNamespace(data=[], error=None)
 
 
-def test_default_builder_shuts_down_readiness_executor(monkeypatch):
+def test_default_builder_shuts_down_readiness_resources(monkeypatch):
     """The readiness registry is owned by the application: after leaving the
-    lifespan no readiness-db executor thread stays alive (review blocker 1)."""
+    lifespan no readiness probe task/thread survives and the owned resources
+    are cleared (review blockers 1-3)."""
     import threading
-    import time as _time
 
     import backend.dependencies as dependencies_module
 
@@ -289,19 +298,26 @@ def test_default_builder_shuts_down_readiness_executor(monkeypatch):
     )
     monkeypatch.setattr(
         dependencies_module,
-        "_build_readiness_probe_client",
-        lambda settings: _FakeSupabase(),
+        "_build_database_probe",
+        lambda settings: _ok_async_probe(),
     )
     monkeypatch.setattr(
         dependencies_module,
         "_build_auth_probe",
-        lambda settings: lambda: None,
+        lambda settings: _ok_async_probe(),
     )
     app = main_module.create_app(settings=_settings())
 
-    assert not [t for t in threading.enumerate() if t.name.startswith("readiness-db")]
+    def _readiness_threads():
+        return [
+            t
+            for t in threading.enumerate()
+            if t.name.startswith("readiness-")
+        ]
+
+    assert _readiness_threads() == []
     with TestClient(app) as client:
-        # Running /ready submits a probe, which creates the executor thread.
+        # Running /ready runs the async probes (no threads are created).
         response = client.get("/ready")
         assert response.status_code == 200
         # The owned tuple includes the closable registry.
@@ -309,20 +325,19 @@ def test_default_builder_shuts_down_readiness_executor(monkeypatch):
             hasattr(resource, "close") and type(resource).__name__ == "HealthRegistry"
             for resource in app.state.owned_resources
         )
-    # After shutdown the registry's aclose() shut the executor down; the
-    # (completed) probe thread terminates on its own.
-    deadline = _time.monotonic() + 5.0
-    while any(t.name.startswith("readiness-db") for t in threading.enumerate()):
-        assert _time.monotonic() < deadline, "readiness-db thread alive after shutdown"
-        _time.sleep(0.01)
+        assert _readiness_threads() == []
+    # After shutdown the owned resources are cleared and nothing remains.
+    assert app.state.owned_resources == ()
+    assert app.state.dependencies is None
+    assert _readiness_threads() == []
 
 
-# ─── Real surfaces vs probe client (review blocker 1) ───────────────────────
+# ─── Real surfaces vs probe (review blocker 1) ──────────────────────────────
 
 
 def test_ready_fails_when_real_clients_missing_but_probe_works(monkeypatch):
-    """A healthy dedicated probe cannot substitute for the real auth and
-    persistence surfaces the routes use (review blocker 1)."""
+    """A healthy probe cannot substitute for the real auth and persistence
+    surfaces the routes use (review blocker 1)."""
     import backend.dependencies as dependencies_module
 
     monkeypatch.setattr(
@@ -332,8 +347,13 @@ def test_ready_fails_when_real_clients_missing_but_probe_works(monkeypatch):
     )
     monkeypatch.setattr(
         dependencies_module,
-        "_build_readiness_probe_client",
-        lambda settings: _FakeSupabase(),
+        "_build_database_probe",
+        lambda settings: _ok_async_probe(),
+    )
+    monkeypatch.setattr(
+        dependencies_module,
+        "_build_auth_probe",
+        lambda settings: _ok_async_probe(),
     )
     app = main_module.create_app(settings=_settings())
     with TestClient(app) as client:
@@ -349,32 +369,36 @@ def test_ready_fails_when_real_clients_missing_but_probe_works(monkeypatch):
         assert body["components"]["lifespan"] == "ok"
 
 
-# ─── Shutdown drains an active probe before closing its client (blocker 2) ──
+# ─── Lifecycle: shutdown cancels in-flight probes (review blocker) ──────────
 
 
-def test_shutdown_drains_active_probe_before_closing_client(monkeypatch):
-    """A probe still in flight when the lifespan shuts down is drained with a
-    bounded wait; the probe client is closed only after the thread is done,
-    and no readiness-db thread survives (review blocker 2)."""
+def test_lifecycle_shutdown_cancels_inflight_probes(monkeypatch):
+    """Real lifecycle: a blocked probe at drain time is cancelled by the
+    lifespan shutdown itself. No fire-and-forget cleanup, no orphaned
+    ownership, no readiness thread survives (review blocker)."""
+    import asyncio as _asyncio
     import threading
-    import time as _time
-    from types import SimpleNamespace
 
     import backend.dependencies as dependencies_module
 
-    probe_started = threading.Event()
-    release = threading.Event()
-    events = []
+    cancelled = []
+    started = threading.Event()
 
-    class BlockingProbeClient(_FakeSupabase):
-        def execute(self):
-            probe_started.set()
-            release.wait(timeout=5.0)
-            events.append("probe_done")
-            return SimpleNamespace(data=[], error=None)
+    async def _blocking_auth_probe():
+        started.set()
+        try:
+            await _asyncio.sleep(10)
+        except _asyncio.CancelledError:
+            cancelled.append("auth")
+            raise
 
-        def close(self):
-            events.append("client_closed")
+    async def _blocking_db_probe():
+        started.set()
+        try:
+            await _asyncio.sleep(10)
+        except _asyncio.CancelledError:
+            cancelled.append("database")
+            raise
 
     monkeypatch.setattr(
         dependencies_module,
@@ -383,47 +407,52 @@ def test_shutdown_drains_active_probe_before_closing_client(monkeypatch):
     )
     monkeypatch.setattr(
         dependencies_module,
-        "_build_readiness_probe_client",
-        lambda settings: BlockingProbeClient(),
+        "_build_auth_probe",
+        lambda settings: _blocking_auth_probe,
+    )
+    monkeypatch.setattr(
+        dependencies_module,
+        "_build_database_probe",
+        lambda settings: _blocking_db_probe,
+    )
+    app = main_module.create_app(
+        settings=_settings(
+            readiness_auth_timeout_ms=100,
+            readiness_database_timeout_ms=100,
+        )
+    )
+    with TestClient(app) as client:
+        response = client.get("/ready")
+        assert response.status_code == 503
+        assert response.json()["components"]["auth"] == "unavailable"
+        assert response.json()["components"]["database"] == "unavailable"
+        assert started.is_set()
+    # Leaving the lifespan cancelled the in-flight probes; nothing survived.
+    assert "auth" in cancelled
+    assert "database" in cancelled
+    assert app.state.dependencies is None
+    assert app.state.owned_resources == ()
+    assert not [
+        t for t in threading.enumerate() if t.name.startswith("readiness-")
+    ]
+
+
+def test_default_builder_cleans_readiness_on_partial_startup(monkeypatch):
+    """Partial startup failure closes the registry created before the
+    failure; the async probe builders never leave owned clients behind."""
+    import backend.dependencies as dependencies_module
+
+    probes_built = []
+
+    monkeypatch.setattr(
+        dependencies_module,
+        "_build_database_probe",
+        lambda settings: probes_built.append("database") or _ok_async_probe(),
     )
     monkeypatch.setattr(
         dependencies_module,
         "_build_auth_probe",
-        lambda settings: lambda: None,
-    )
-    app = main_module.create_app(settings=_settings(readiness_database_timeout_ms=100))
-    with TestClient(app) as client:
-        response = client.get("/ready")
-        assert response.status_code == 503  # probe timed out, thread still blocked
-        assert probe_started.is_set()
-        # The probe thread is still alive while we are about to shut down.
-        assert any(t.name.startswith("readiness-db") for t in threading.enumerate())
-        # Release the probe so the shutdown drain can complete it.
-        release.set()
-    # Lifespan teardown drained the probe BEFORE closing the client.
-    assert events == ["probe_done", "client_closed"]
-    # No readiness-db thread survives.
-    deadline = _time.monotonic() + 5.0
-    while any(t.name.startswith("readiness-db") for t in threading.enumerate()):
-        assert _time.monotonic() < deadline, "readiness-db thread alive after shutdown"
-        _time.sleep(0.01)
-
-
-def test_default_builder_cleans_readiness_on_partial_startup(monkeypatch):
-    """Partial startup failure closes the probe client and registry created
-    before the failure (review blocker 1)."""
-    import backend.dependencies as dependencies_module
-
-    closed = []
-
-    class ClosableProbe:
-        def close(self):
-            closed.append(self)
-
-    monkeypatch.setattr(
-        dependencies_module,
-        "_build_readiness_probe_client",
-        lambda _settings: ClosableProbe(),
+        lambda settings: probes_built.append("auth") or _ok_async_probe(),
     )
 
     def boom(settings, engine, **kwargs):
@@ -432,7 +461,11 @@ def test_default_builder_cleans_readiness_on_partial_startup(monkeypatch):
     monkeypatch.setattr(dependencies_module, "build_health_registry", boom)
     with pytest.raises(RuntimeError):
         dependencies_module.build_default_dependencies(_settings())
-    assert len(closed) == 1, "probe client must be closed on partial startup"
+    # The async probe builders were reached before the registry failure; the
+    # probes are plain callables (no client, no thread), and the builder
+    # cleans the resources it created (the engine) on partial startup, so
+    # nothing owned is leaked.
+    assert probes_built == ["auth", "database"]
 
 
 def test_aclose_and_close_contracts_both_supported():
