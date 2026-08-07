@@ -138,7 +138,93 @@ ALTER TABLE public.chat_logs RENAME CONSTRAINT chat_logs_role_check TO chat_logs
 
 ---
 
-## 5. Testes de integração
+## 5. Drift legado: `public.rls_auto_enable()` — decisão PRESERVE_AND_HARDEN
+
+### Origem
+
+Uma auditoria do projeto Supabase hospedado encontrou a função
+`public.rls_auto_enable()` **não versionada** pelas migrations do repositório,
+com as seguintes características:
+
+- `SECURITY DEFINER`, owner `postgres`, retorno `event_trigger`,
+  `search_path=pg_catalog`;
+- `EXECUTE` concedido a `PUBLIC`, `anon`, `authenticated` e `service_role`;
+- um event trigger associado (mecanismo legado que habilita RLS em tabelas
+  novas).
+
+Isso cria drift entre o ambiente hospedado e o schema versionado: um banco
+limpo nunca recebe a função, mas o ambiente legado a expõe como função
+privilegiada com grants de execução amplos.
+
+### Risco
+
+`SECURITY DEFINER` executa com os privilégios do owner. `EXECUTE` concedido a
+`PUBLIC`/roles de runtime em uma função privilegiada amplia a superfície de
+ataque sem necessidade funcional documentada.
+
+### Decisão: PRESERVE_AND_HARDEN
+
+A migration `20260807201256_harden_rls_auto_enable.sql`:
+
+- identifica o objeto **exatamente** pelo catálogo: schema `public`, nome
+  `rls_auto_enable`, zero argumentos, retorno `event_trigger`;
+- revoga `EXECUTE` apenas de `PUBLIC`, `anon`, `authenticated` e
+  `service_role`;
+- **não** remove, recria, altera o corpo/owner/search_path da função;
+- **não** remove nem altera o event trigger associado;
+- é um no-op em banco limpo (objeto ausente) e idempotente.
+
+### Comportamento por cenário
+
+| Cenário | Resultado |
+|---|---|
+| Banco limpo (`supabase db reset`) | Migration aplica normalmente; a função e o event trigger não existem |
+| Upgrade legado (função existe) | Função e event trigger preservados; os quatro grants de `EXECUTE` são removidos |
+| Reavaliação do bloco de hardening | Sem falha; não recria grants; não duplica nem altera objetos |
+
+### Por que não remover o event trigger nesta entrega
+
+A remoção definitiva do mecanismo (função + event trigger) exige evidência de
+que ele é obsoleto em todos os ambientes, decisão de arquitetura e issue
+separada. Esta PR apenas elimina a exposição às roles de runtime, preservando
+o comportamento do mecanismo legado quando ele existir.
+
+### Validação no catálogo
+
+```sql
+-- Função preservada com a identidade original
+SELECT n.nspname, p.proname, p.pronargs, p.prorettype::regtype::text,
+       p.prosecdef, p.proowner::regrole::text
+FROM pg_proc p
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'public' AND p.proname = 'rls_auto_enable' AND p.pronargs = 0;
+
+-- Event trigger continua associado à mesma função
+SELECT et.evtname, et.evtfoid, et.evtfoid = p.oid AS same_function
+FROM pg_event_trigger et
+JOIN pg_proc p ON p.oid = et.evtfoid
+JOIN pg_namespace n ON n.oid = p.pronamespace
+WHERE n.nspname = 'public' AND p.proname = 'rls_auto_enable';
+
+-- Nenhuma role de runtime mantém EXECUTE
+SELECT has_function_privilege('public',         'public.rls_auto_enable()', 'EXECUTE') AS pub,
+       has_function_privilege('anon',           'public.rls_auto_enable()', 'EXECUTE') AS anon,
+       has_function_privilege('authenticated',  'public.rls_auto_enable()', 'EXECUTE') AS authenticated,
+       has_function_privilege('service_role',   'public.rls_auto_enable()', 'EXECUTE') AS service_role;
+```
+
+### Remoção definitiva futura
+
+Qualquer remoção definitiva da função/event trigger deve:
+
+1. partir de evidência de que o mecanismo é obsoleto (nenhum fluxo legado
+   depende dele);
+2. ser tratada em issue separada com migration própria e testes de upgrade;
+3. ser registrada nesta documentação antes da execução.
+
+---
+
+## 6. Testes de integração
 
 ### Sequência determinística (CI)
 
