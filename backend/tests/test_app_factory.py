@@ -292,6 +292,11 @@ def test_default_builder_shuts_down_readiness_executor(monkeypatch):
         "_build_readiness_probe_client",
         lambda settings: _FakeSupabase(),
     )
+    monkeypatch.setattr(
+        dependencies_module,
+        "_build_auth_probe",
+        lambda settings: lambda: None,
+    )
     app = main_module.create_app(settings=_settings())
 
     assert not [t for t in threading.enumerate() if t.name.startswith("readiness-db")]
@@ -380,6 +385,11 @@ def test_shutdown_drains_active_probe_before_closing_client(monkeypatch):
         dependencies_module,
         "_build_readiness_probe_client",
         lambda settings: BlockingProbeClient(),
+    )
+    monkeypatch.setattr(
+        dependencies_module,
+        "_build_auth_probe",
+        lambda settings: lambda: None,
     )
     app = main_module.create_app(settings=_settings(readiness_database_timeout_ms=100))
     with TestClient(app) as client:

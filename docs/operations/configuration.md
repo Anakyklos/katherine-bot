@@ -76,6 +76,7 @@ Docker/CI devem declarar `APP_ENV` explicitamente (o job `docker` da CI usa
 | `EMBEDDINGS_RETRIEVAL_ENABLED` | `false` | Habilita recuperação vetorial de memória (SentenceTransformer + RPC). Quando ligado, o modelo é construído no startup e o componente `embeddings` do `/ready` precisa passar; quando desligado, o modelo nunca é construído e a recuperação retorna vazio por design |
 | `READINESS_DATABASE_TIMEOUT_MS` | `3000` | Timeout do check de banco (100–30000) |
 | `READINESS_PROVIDER_TIMEOUT_MS` | `1000` | Timeout do check de provider (100–30000) |
+| `READINESS_AUTH_TIMEOUT_MS` | `1000` | Timeout do probe de disponibilidade do serviço de Auth (`/health`, 100–30000). O probe é um GET bounded que nunca depende de token de usuário nem lê dados de usuário |
 | `TURN_TOTAL_DEADLINE` | `45.0` | Deadline do turno (validado por `TurnExecutionConfig`) |
 | `TURN_CONNECT_TIMEOUT` | `3.0` | Timeout de conexão do provider |
 | `TURN_PROVIDER_ATTEMPT_TIMEOUT` | `15.0` | Timeout de uma tentativa de geração |

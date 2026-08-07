@@ -129,6 +129,32 @@ def _build_readiness_probe_client(settings: Settings) -> Optional[Any]:
         return None
 
 
+def _build_auth_probe(settings: Settings) -> Optional[Callable[[], None]]:
+    """Build the real Auth service availability probe from validated settings.
+
+    Probes ``{supabase_url}/auth/v1/health`` (GoTrue health endpoint) with a
+    transport timeout aligned to ``readiness_auth_timeout_ms``. Returns
+    ``None`` when no Supabase URL is configured; the readiness ``auth``
+    component then fails honestly (an instance without a probed Auth service
+    must not report ready).
+    """
+    url = settings.supabase_url
+    if not url:
+        return None
+    key = (
+        settings.supabase_service_role_key.get_secret_value()
+        if settings.supabase_service_role_key is not None
+        else None
+    )
+    from .health import _auth_health_probe
+
+    return _auth_health_probe(
+        f"{url.rstrip('/')}/auth/v1",
+        key,
+        settings.readiness_auth_timeout_ms / 1000.0,
+    )
+
+
 def _close_sync(resource: Any) -> None:
     """Close one resource synchronously during partial startup cleanup."""
     closer = getattr(resource, "close", None)
@@ -183,6 +209,7 @@ def build_default_dependencies(
             settings,
             engine,
             auth_client=supabase_client,
+            auth_probe=_build_auth_probe(settings),
             persistence_client=supabase_client,
             database_probe_client=probe_client,
             owns_probe_client=True,

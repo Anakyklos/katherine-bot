@@ -362,6 +362,10 @@ class Settings(BaseModel):
     # ── Readiness ───────────────────────────────────────────────────────────
     readiness_database_timeout_ms: int = Field(default=3000)
     readiness_provider_timeout_ms: int = Field(default=1000)
+    #: Bounded timeout for the Auth service availability probe (/health).
+    #: The probe is a cheap HTTP GET that never depends on a user token and
+    #: never reads user data; the transport timeout is aligned to this value.
+    readiness_auth_timeout_ms: int = Field(default=1000)
 
     # ── Validators ──────────────────────────────────────────────────────────
 
@@ -530,6 +534,19 @@ class Settings(BaseModel):
             raise _SettingsError("timeout_out_of_range", "readiness_provider_timeout_ms")
         return value
 
+    @field_validator("readiness_auth_timeout_ms", mode="before")
+    @classmethod
+    def _validate_auth_timeout(cls, value: object) -> object:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise _SettingsError("timeout_type", "readiness_auth_timeout_ms")
+        if not (
+            READINESS_PROVIDER_TIMEOUT_MIN_MS
+            <= value
+            <= READINESS_PROVIDER_TIMEOUT_MAX_MS
+        ):
+            raise _SettingsError("timeout_out_of_range", "readiness_auth_timeout_ms")
+        return value
+
     @field_validator("turn_config")
     @classmethod
     def _validate_turn_config(cls, value: object) -> TurnExecutionConfig:
@@ -639,6 +656,13 @@ class Settings(BaseModel):
             ),
             "readiness_provider_timeout_ms": _env_int(
                 "READINESS_PROVIDER_TIMEOUT_MS",
+                source,
+                1000,
+                READINESS_PROVIDER_TIMEOUT_MIN_MS,
+                READINESS_PROVIDER_TIMEOUT_MAX_MS,
+            ),
+            "readiness_auth_timeout_ms": _env_int(
+                "READINESS_AUTH_TIMEOUT_MS",
                 source,
                 1000,
                 READINESS_PROVIDER_TIMEOUT_MIN_MS,

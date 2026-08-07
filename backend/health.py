@@ -26,6 +26,8 @@ import asyncio
 import concurrent.futures
 import inspect
 import logging
+import urllib.error
+import urllib.request
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Mapping, Optional, Protocol
@@ -229,6 +231,10 @@ class DatabaseCheck:
         )
         self._probe_future: Optional[concurrent.futures.Future] = None
         self._closed = False
+        # Deferred cleanup task for a probe still running at drain timeout.
+        # While set, ownership of the in-flight probe and client is tracked
+        # until the deferred task completes.
+        self._deferred_close: Optional[asyncio.Task] = None
         # When True, this check owns the probe client and closes it in
         # ``aclose`` only after the in-flight probe is proven done.
         self._owns_client = owns_client
@@ -247,18 +253,26 @@ class DatabaseCheck:
     async def aclose(self) -> None:
         """Full close protocol: stop new probes, drain the in-flight probe
         with a bounded wait, then release the executor and close the owned
-        probe client. Cleanup is unconditional:
+        probe client.
+
+        The client is NEVER closed while a worker thread may still use it:
 
         * If the probe completed (success or exception), the worker thread
-          has terminated and the client is closed after the drain. A probe
-          exception is never propagated: it would otherwise escape the drain
-          and skip executor/client cleanup.
-        * If the drain bound expires (a probe ignoring its aligned transport
-          timeout), the owned client is still closed: closing the transport
-          fails the in-flight call, so the worker thread terminates instead
-          of surviving the lifespan. The future reference is always cleared.
+          has terminated; the client is closed after the drain. A probe
+          exception is absorbed, never propagated.
+        * If the drain bound expires while the probe is still running (a
+          probe ignoring its aligned transport timeout), the client is NOT
+          closed underneath the live thread. Ownership is kept traceable: the
+          in-flight future stays referenced and a deferred cleanup task
+          (``self._deferred_close``) closes the executor and the client only
+          after the probe actually terminates. The normal path (aligned
+          transport) completes inside the drain bound, so the deferred path
+          only exists for pathological probes.
         """
         self._closed = True
+        if self._deferred_close is not None:
+            await self._deferred_close
+            return
         future = self._probe_future
         drained = future is None or future.done()
         if future is not None and not future.done():
@@ -269,9 +283,15 @@ class DatabaseCheck:
                 )
                 drained = True
             except (asyncio.TimeoutError, concurrent.futures.TimeoutError):
-                # The probe is past the drain bound; closing the client below
-                # fails its in-flight call and terminates the worker thread.
-                drained = False
+                # The probe is still running past the drain bound. Defer the
+                # client close until the probe terminates; never invalidate
+                # the client underneath the live thread. The deferred task is
+                # tracked (``self._deferred_close``) so ownership survives
+                # until completion; a second aclose joins it.
+                self._deferred_close = asyncio.ensure_future(
+                    self._close_after_drain(future)
+                )
+                return
             except Exception:
                 # The probe completed exceptionally: the worker thread has
                 # terminated. Cleanup below is safe; never propagate it.
@@ -279,20 +299,43 @@ class DatabaseCheck:
         self._executor.shutdown(wait=False, cancel_futures=True)
         self._probe_future = None
         if self._owns_client:
-            client, self._client = self._client, None
-            closer = getattr(client, "aclose", None) or getattr(client, "close", None)
-            if closer is not None:
-                try:
-                    result = closer()
-                    if inspect.isawaitable(result):
-                        await result
-                except Exception:
-                    emit_event(
-                        logger,
-                        EVENT_READINESS_CHECK_FAILED,
-                        level=logging.ERROR,
-                        component=self.name,
-                    )
+            await self._close_client()
+
+    async def _close_after_drain(self, future: concurrent.futures.Future) -> None:
+        """Deferred cleanup for a probe still running at drain timeout.
+
+        Awaits the probe's completion (the aligned transport bounds it),
+        then shuts the executor and closes the owned client only after the
+        worker thread is proven done. The future stays referenced by
+        ``self._probe_future`` and the task by ``self._deferred_close`` until
+        completion, so ownership is traceable and never GC'd mid-cleanup.
+        """
+        try:
+            await asyncio.wrap_future(future)
+        except Exception:
+            # Probe failed or was cancelled; the thread has terminated.
+            pass
+        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._probe_future = None
+        if self._owns_client:
+            await self._close_client()
+
+    async def _close_client(self) -> None:
+        client, self._client = self._client, None
+        closer = getattr(client, "aclose", None) or getattr(client, "close", None)
+        if closer is None:
+            return
+        try:
+            result = closer()
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            emit_event(
+                logger,
+                EVENT_READINESS_CHECK_FAILED,
+                level=logging.ERROR,
+                component=self.name,
+            )
 
     async def run(self) -> None:
         if self._client is None or self._closed:
@@ -334,28 +377,118 @@ class DatabaseCheck:
         return result
 
 
+def _auth_health_probe(
+    auth_url: str,
+    apikey: Optional[str],
+    timeout: float,
+) -> Callable[[], None]:
+    """Build the default Auth service availability probe.
+
+    Performs a bounded ``GET {auth_url}/health`` (GoTrue health endpoint).
+    The probe never depends on a user token and never reads user data: only
+    the HTTP status is observed and the body is discarded, so nothing
+    sensitive reaches responses or logs. ``timeout`` is a hard socket
+    transport bound aligned with the readiness timeout.
+    """
+    health_url = f"{auth_url.rstrip('/')}/health"
+
+    def probe() -> None:
+        request = urllib.request.Request(health_url, method="GET")
+        if apikey:
+            request.add_header("apikey", apikey)
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                if response.status != 200:
+                    raise CheckFailure()
+        except CheckFailure:
+            raise
+        except Exception:
+            raise CheckFailure() from None
+
+    return probe
+
+
 class AuthClientCheck:
-    """Checks that the real authentication surface used by the routes is
-    effectively callable (``client.auth.get_user``), not merely present.
+    """Checks that the Auth service can actually authenticate requests.
 
-    Attribute existence is not enough: ``hasattr(client, "auth")`` passes for
-    ``None`` and for objects without a ``get_user`` method, yet the request
-    auth dependency calls ``auth_client.auth.get_user(token)``. The check
-    therefore verifies the exact callable path the routes use. It never
-    invokes ``get_user`` (that would need a token and hit the network).
+    Two independent proofs, both cheap and sanitized:
 
-    A healthy probe client can never substitute for this: if the engine's
-    real Supabase client failed to build, ``/chat`` and ``/history`` cannot
-    authenticate no matter how healthy the dedicated database probe is.
+    1. Surface: the exact route path ``auth_client.auth.get_user`` exists and
+       is callable (never invoked; no token involved).
+    2. Availability: a bounded probe of the Auth service (default: HTTP GET
+       of the GoTrue ``/health`` endpoint with the transport timeout aligned
+       to ``readiness_auth_timeout_ms``). This is a real network probe, so a
+       healthy PostgREST/database probe can never mask an Auth outage.
+
+    Either proof failing makes the component ``unavailable``: an instance
+    whose ``/chat`` and ``/history`` authentication would 503 must not report
+    ready. The probe runs on a dedicated single-worker executor with an
+    in-flight guard, so repeated polls never accumulate threads.
     """
 
     name = "auth"
-    timeout_seconds = DEFAULT_CHECK_TIMEOUT_SECONDS
 
-    def __init__(self, auth_client: Any) -> None:
+    def __init__(
+        self,
+        auth_client: Any,
+        timeout_seconds: float,
+        *,
+        probe: Optional[Callable[[], None]] = None,
+        probe_executor: Optional[concurrent.futures.Executor] = None,
+    ) -> None:
         self._auth_client = auth_client
+        self.timeout_seconds = timeout_seconds
+        self._probe = probe
+        self._executor = probe_executor or concurrent.futures.ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="readiness-auth",
+        )
+        self._probe_future: Optional[concurrent.futures.Future] = None
+        self._closed = False
+        self._deferred_close: Optional[asyncio.Task] = None
+
+    def close(self) -> None:
+        """Synchronous best-effort close: stop new probes and release the
+        executor without waiting (partial-startup cleanup)."""
+        self._closed = True
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+    async def aclose(self) -> None:
+        """Full async close: drain an in-flight probe with a bounded wait,
+        then release the executor. A probe still running past the drain
+        bound is handed to a tracked deferred cleanup task (no owned thread
+        reference is dropped mid-flight)."""
+        self._closed = True
+        if self._deferred_close is not None:
+            await self._deferred_close
+            return
+        future = self._probe_future
+        if future is not None and not future.done():
+            try:
+                await asyncio.wait_for(
+                    asyncio.wrap_future(future),
+                    timeout=self.timeout_seconds + 1.0,
+                )
+            except (asyncio.TimeoutError, concurrent.futures.TimeoutError):
+                self._deferred_close = asyncio.ensure_future(
+                    self._close_after_drain(future)
+                )
+                return
+            except Exception:
+                pass
+        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._probe_future = None
+
+    async def _close_after_drain(self, future: concurrent.futures.Future) -> None:
+        try:
+            await asyncio.wrap_future(future)
+        except Exception:
+            pass
+        self._executor.shutdown(wait=False, cancel_futures=True)
+        self._probe_future = None
 
     async def run(self) -> None:
+        # 1. The exact callable path the routes use must exist.
         client = self._auth_client
         if client is None:
             raise CheckFailure()
@@ -363,10 +496,31 @@ class AuthClientCheck:
             auth = getattr(client, "auth", None)
             get_user = getattr(auth, "get_user", None) if auth is not None else None
         except Exception:
-            # A surface that raises on attribute access is not usable either.
             raise CheckFailure() from None
         if not callable(get_user):
             raise CheckFailure()
+        # 2. The Auth service itself must be reachable.
+        if self._probe is None:
+            raise CheckFailure()
+        if self._closed:
+            raise CheckFailure()
+        if self._probe_future is not None and not self._probe_future.done():
+            raise CheckFailure()
+        if self._probe_future is None or self._probe_future.done():
+            self._probe_future = self._executor.submit(self._probe)
+        future = self._probe_future
+        try:
+            await asyncio.wait_for(
+                asyncio.wrap_future(future),
+                timeout=self.timeout_seconds,
+            )
+        except (asyncio.TimeoutError, concurrent.futures.TimeoutError):
+            raise CheckFailure() from None
+        except Exception:
+            raise CheckFailure() from None
+        finally:
+            if self._probe_future is future and future.done():
+                self._probe_future = None
 
 
 class PersistenceClientCheck:
@@ -490,6 +644,7 @@ def build_health_registry(
     engine: Any,
     *,
     auth_client: Any = None,
+    auth_probe: Optional[Callable[[], None]] = None,
     persistence_client: Any = None,
     database_probe_client: Any = None,
     owns_probe_client: bool = False,
@@ -498,7 +653,9 @@ def build_health_registry(
 
     Components:
     1. ``configuration`` — validated settings (frozen model, fully revalidated).
-    2. ``auth`` — the REAL authentication surface used by the routes exists.
+    2. ``auth`` — the REAL authentication surface used by the routes is
+       callable AND the Auth service is reachable via a bounded availability
+       probe (``auth_probe``; default builds the GoTrue /health probe).
     3. ``database`` — minimal Supabase read via a dedicated probe client whose
        transport timeout is aligned with ``readiness_database_timeout_ms``;
        never a substitute for the real surfaces.
@@ -511,14 +668,20 @@ def build_health_registry(
     ``lifespan`` is appended by the application at request time because it
     observes ``app.state``. When ``owns_probe_client`` is true the registry
     (through ``DatabaseCheck.aclose``) closes the probe client after draining
-    any in-flight probe.
+    any in-flight probe. When ``auth_probe`` is omitted, no availability
+    probe is configured and the ``auth`` component is unavailable (an
+    instance whose auth cannot be probed must not report ready).
     """
     registry = HealthRegistry()
     registry.add(
         ConfigurationCheck(settings)
     )
     registry.add(
-        AuthClientCheck(auth_client)
+        AuthClientCheck(
+            auth_client,
+            timeout_seconds=settings.readiness_auth_timeout_ms / 1000.0,
+            probe=auth_probe,
+        )
     )
     registry.add(
         DatabaseCheck(

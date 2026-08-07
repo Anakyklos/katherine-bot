@@ -262,12 +262,18 @@ def test_numeric_timeouts_reject_out_of_range():
         Settings(**_valid_kwargs(readiness_database_timeout_ms=100_000))
     with pytest.raises(ValidationError):
         Settings(**_valid_kwargs(readiness_provider_timeout_ms=-1))
+    with pytest.raises(ValidationError):
+        Settings(**_valid_kwargs(readiness_auth_timeout_ms=0))
+    with pytest.raises(ValidationError):
+        Settings(**_valid_kwargs(readiness_auth_timeout_ms=50_000))
 
 
 def test_numeric_timeouts_reject_none_bool_and_numeric_strings():
     for value in (None, True, False, "3000", 3.5):
         with pytest.raises(ValidationError):
             Settings(**_valid_kwargs(readiness_database_timeout_ms=value))
+        with pytest.raises(ValidationError):
+            Settings(**_valid_kwargs(readiness_auth_timeout_ms=value))
 
 
 def test_boolean_fields_reject_non_bool_values():

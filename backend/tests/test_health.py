@@ -66,6 +66,11 @@ def _ok_auth_client():
     return SimpleNamespace(auth=SimpleNamespace(get_user=lambda token: None))
 
 
+def _ok_auth_probe():
+    """A passing Auth availability probe (no network)."""
+    return lambda: None
+
+
 def _deps_with_checks(checks):
     from backend.admission import AdmissionRuntimeConfig
 
@@ -511,9 +516,9 @@ def test_aclose_cleans_up_when_probe_completes_exceptionally():
 
 
 def test_aclose_guarantees_cleanup_on_drain_timeout():
-    """When the drain bound expires, aclose still clears the future and
-    closes the owned client so no owned resource survives the lifespan
-    (review blocker 3)."""
+    """aclose never closes the client under a live probe thread: on drain
+    timeout ownership is deferred and released only after the probe
+    terminates (review blocker 3)."""
     import concurrent.futures
     import threading
     import time as _time
@@ -524,13 +529,22 @@ def test_aclose_guarantees_cleanup_on_drain_timeout():
     class StuckClient(_OkProbeClient):
         def __init__(self):
             self.closed = False
+            self.active = False
 
         def execute(self):
             calls.append(1)
-            release.wait(timeout=5.0)
+            self.active = True
+            try:
+                release.wait(timeout=5.0)
+            finally:
+                self.active = False
             return _ProbeResult(data=[])
 
         def close(self):
+            # The fake fails loudly if the client is closed while the probe
+            # thread may still be using it.
+            if self.active:
+                raise AssertionError("close() called while execute() still active")
             self.closed = True
 
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
@@ -548,17 +562,23 @@ def test_aclose_guarantees_cleanup_on_drain_timeout():
         except Exception:
             pass
         await check.aclose()  # drain bound (0.01 + 1.0) expires; probe stuck
-        assert client.closed, "owned client must be closed even on drain timeout"
+        # aclose must NOT have closed the client while the thread is active,
+        # and ownership must remain tracked until the probe completes.
+        assert client.closed is False
+        assert check._client is client
+        assert check._deferred_close is not None
+        # Release the probe; the deferred cleanup closes the client and
+        # clears the future only after the thread terminates.
+        release.set()
+        await check._deferred_close
+        assert client.closed is True
         assert check._probe_future is None
+        deadline = _time.monotonic() + 5.0
+        while any(t.is_alive() for t in executor._threads):
+            assert _time.monotonic() < deadline, "probe thread alive after close"
+            _time.sleep(0.01)
 
     asyncio.run(scenario())
-    assert calls == [1]
-    # Release the stuck probe so its worker thread terminates on its own.
-    release.set()
-    deadline = _time.monotonic() + 5.0
-    while any(t.is_alive() for t in executor._threads):
-        assert _time.monotonic() < deadline, "probe thread alive after close"
-        _time.sleep(0.01)
     executor.shutdown(wait=False)
 
 
@@ -649,6 +669,7 @@ def test_default_registry_component_set_and_order():
         settings,
         engine,
         auth_client=_ok_auth_client(),
+        auth_probe=_ok_auth_probe(),
         persistence_client=_OkProbeClient(),
         database_probe_client=object(),
     )
@@ -671,6 +692,7 @@ def test_default_registry_includes_embeddings_only_when_retrieval_enabled():
         settings,
         engine,
         auth_client=_ok_auth_client(),
+        auth_probe=_ok_auth_probe(),
         persistence_client=_OkProbeClient(),
         database_probe_client=object(),
     )
@@ -698,8 +720,9 @@ def test_embeddings_check_fails_when_model_missing():
 
 
 def test_auth_check_fails_when_surface_missing():
-    """The auth check verifies the callable route path ``auth.get_user``,
-    not mere attribute existence (review blocker 1)."""
+    """The auth check verifies the callable route path ``auth.get_user``
+    AND an Auth availability probe; either missing is unavailable
+    (review blocker 1)."""
     from backend.health import AuthClientCheck
 
     async def _run(check):
@@ -709,22 +732,164 @@ def test_auth_check_fails_when_surface_missing():
         except Exception:
             return "unavailable"
 
-    assert asyncio.run(_run(AuthClientCheck(None))) == "unavailable"
-    assert asyncio.run(_run(AuthClientCheck(object()))) == "unavailable"
-    # False positive fixed: an ``auth`` object without a callable get_user
-    # (or with get_user=None) is unavailable.
-    assert (
-        asyncio.run(_run(AuthClientCheck(SimpleNamespace(auth=object()))))
-        == "unavailable"
+    cases = [
+        # Broken surfaces, even with a working probe.
+        (AuthClientCheck(None, 1.0, probe=_ok_auth_probe()), "unavailable"),
+        (AuthClientCheck(object(), 1.0, probe=_ok_auth_probe()), "unavailable"),
+        (
+            AuthClientCheck(
+                SimpleNamespace(auth=object()), 1.0, probe=_ok_auth_probe()
+            ),
+            "unavailable",
+        ),
+        (
+            AuthClientCheck(
+                SimpleNamespace(auth=SimpleNamespace(get_user=None)),
+                1.0,
+                probe=_ok_auth_probe(),
+            ),
+            "unavailable",
+        ),
+        # Callable surface but no probe configured: unavailable (an instance
+        # whose Auth cannot be probed must not report ready).
+        (AuthClientCheck(_ok_auth_client(), 1.0, probe=None), "unavailable"),
+        # Surface ok + probe ok: available.
+        (
+            AuthClientCheck(_ok_auth_client(), 1.0, probe=_ok_auth_probe()),
+            "ok",
+        ),
+    ]
+    try:
+        for check, expected in cases:
+            assert asyncio.run(_run(check)) == expected
+    finally:
+        for check, _ in cases:
+            check.close()
+
+
+def test_auth_check_fails_when_availability_probe_fails():
+    """A callable auth surface with a failing Auth service probe is
+    unavailable (review blocker 1)."""
+    from backend.health import AuthClientCheck
+
+    def _failing_probe():
+        raise RuntimeError("auth service unreachable")
+
+    check = AuthClientCheck(_ok_auth_client(), 1.0, probe=_failing_probe)
+
+    async def _run():
+        try:
+            await check.run()
+            return "ok"
+        except Exception:
+            return "unavailable"
+
+    try:
+        assert asyncio.run(_run()) == "unavailable"
+    finally:
+        check.close()
+
+
+def _auth_ready_client(auth_probe):
+    """/ready client: callable auth surface, healthy DB/persistence probes,
+    configurable Auth availability probe."""
+    from backend.admission import AdmissionRuntimeConfig
+
+    settings = _settings()
+    engine = SimpleNamespace(
+        memory_manager=SimpleNamespace(embedding_model=object(), supabase=object()),
+        groq_manager=SimpleNamespace(is_configured=lambda: True),
     )
-    assert (
-        asyncio.run(
-            _run(AuthClientCheck(SimpleNamespace(auth=SimpleNamespace(get_user=None))))
-        )
-        == "unavailable"
+    registry = build_health_registry(
+        settings,
+        engine,
+        auth_client=_ok_auth_client(),
+        auth_probe=auth_probe,
+        persistence_client=_OkProbeClient(),
+        database_probe_client=_OkProbeClient(),
     )
-    # The exact path routes call exists and is callable.
-    assert asyncio.run(_run(AuthClientCheck(_ok_auth_client()))) == "ok"
+    deps = main_module.ApplicationDependencies(
+        conversation_engine=engine,
+        auth_client=_ok_auth_client(),
+        admission_config=AdmissionRuntimeConfig.from_values(SECRET),
+        turn_config=TurnExecutionConfig.defaults(),
+        health_checks=registry,
+        clock=__import__("time").time,
+    )
+    app = main_module.create_app(settings=settings, dependencies=deps)
+    return TestClient(app), registry
+
+
+def test_ready_503_when_auth_service_unavailable():
+    """Callable auth surface + healthy database probe + Auth service down
+    => /ready 503 with auth=unavailable (review blocker 1)."""
+    def _failing_probe():
+        raise RuntimeError("auth service unreachable")
+
+    client, registry = _auth_ready_client(_failing_probe)
+    try:
+        response = client.get("/ready")
+        assert response.status_code == 503
+        body = response.json()
+        assert body["status"] == "not_ready"
+        assert body["components"]["auth"] == "unavailable"
+        assert body["components"]["database"] == "ok"
+        assert body["components"]["persistence"] == "ok"
+    finally:
+        registry.close()
+
+
+def test_ready_200_when_auth_service_available():
+    """Callable auth surface + healthy database probe + Auth service up
+    => /ready 200 with auth=ok (review blocker 1)."""
+    client, registry = _auth_ready_client(_ok_auth_probe())
+    try:
+        response = client.get("/ready")
+        assert response.status_code == 200
+        body = response.json()
+        assert body["status"] == "ready"
+        assert body["components"]["auth"] == "ok"
+    finally:
+        registry.close()
+
+
+def test_auth_health_probe_detects_service_availability():
+    """The default probe performs a bounded GET /health and detects an
+    unreachable Auth service without external network (review blocker 1)."""
+    import http.server
+    import threading
+
+    from backend.health import CheckFailure, _auth_health_probe
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/auth/v1/health":
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"version":"v2.0.0"}')
+            else:
+                self.send_response(404)
+                self.end_headers()
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{server.server_port}"
+        ok_probe = _auth_health_probe(f"{base}/auth/v1", None, 1.0)
+        ok_probe()  # healthy Auth service: no raise
+
+        # Unreachable Auth service (connection refused): sanitized failure.
+        bad_probe = _auth_health_probe("http://127.0.0.1:1/auth/v1", None, 1.0)
+        with pytest.raises(CheckFailure):
+            bad_probe()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
 
 
 def test_persistence_check_fails_when_surface_missing():
@@ -774,6 +939,7 @@ def test_auth_and_persistence_surfaces_are_independent():
         settings,
         engine,
         auth_client=None,
+        auth_probe=_ok_auth_probe(),
         persistence_client=persistence,
         database_probe_client=_OkProbeClient(),
     )
@@ -787,6 +953,7 @@ def test_auth_and_persistence_surfaces_are_independent():
         settings,
         engine,
         auth_client=auth,
+        auth_probe=_ok_auth_probe(),
         persistence_client=None,
         database_probe_client=_OkProbeClient(),
     )
@@ -815,6 +982,7 @@ def _embeddings_client(retrieval_enabled: bool, model_available: bool):
         settings,
         engine,
         auth_client=_ok_auth_client(),
+        auth_probe=_ok_auth_probe(),
         persistence_client=_OkProbeClient(),
         database_probe_client=_OkProbeClient(),
     )

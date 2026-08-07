@@ -56,7 +56,7 @@ Ordem determinística registrada em `backend/health.py`:
 | Componente | Crítico | O que verifica | Timeout padrão |
 | --- | --- | --- | --- |
 | `configuration` | Sim | Settings ainda válidos (re-validação completa do modelo congelado, sem I/O) | 1s |
-| `auth` | Sim | A superfície real de autenticação usada pelas rotas (`auth_client`) é efetivamente chamável: `auth_client.auth.get_user` existe e é callable (nunca é invocada) | 1s |
+| `auth` | Sim | A superfície real de autenticação usada pelas rotas é efetivamente chamável (`auth_client.auth.get_user`, nunca invocada) **e** o serviço de Auth está disponível: probe GET bounded de `{supabase_url}/auth/v1/health` (GoTrue), com timeout de transporte alinhado a `READINESS_AUTH_TIMEOUT_MS`, sem token de usuário e sem ler dados de usuário (só o status HTTP é observado; o corpo é descartado) | `READINESS_AUTH_TIMEOUT_MS` (1000) |
 | `database` | Sim | Acesso mínimo ao Supabase: leitura `limit 1` em `profiles` com um cliente de probe dedicado, cujo timeout de transporte é alinhado a `READINESS_DATABASE_TIMEOUT_MS` | `READINESS_DATABASE_TIMEOUT_MS` (3000) |
 | `persistence` | Sim | A superfície real de persistência usada por admissão/histórico (`persistence_client`) é efetivamente chamável: `table(...)` e `rpc(...)` existem, são callable e são invocadas com argumentos benignos (construção pura de request, sem rede) | 1s |
 | `provider` | Sim | Caminho do provider configurado: `GroqClientManager.is_configured()` (chaves válidas, sem geração) | `READINESS_PROVIDER_TIMEOUT_MS` (1000) |
@@ -71,6 +71,12 @@ Políticas:
   falhar (ou retornar `None`) enquanto o probe dedicado funciona, `/ready`
   responde 503: uma instância incapaz de autenticar ou persistir não é ready,
   por mais saudável que o probe esteja.
+- **O componente `auth` prova disponibilidade real, não só contrato local.**
+  Além da superfície chamável, um probe de rede bounded consulta o `/health`
+  do GoTrue: PostgREST saudável não mascara uma queda do serviço de Auth.
+  Uma instância cuja autenticação em `/chat`/`/history` falharia responde
+  `auth=unavailable` no `/ready` (testado com serviço Auth indisponível + banco
+  saudável → 503).
 - **O check de provider nunca executa geração real.** É barato, limitado e
   verifica configuração do caminho. Deployments que quiserem um probe real de
   rede devem injetar um check próprio com timeout documentado.
@@ -82,19 +88,19 @@ Políticas:
   acumula threads nem esgota o executor.
 - **O registry de readiness é owned pela aplicação.** O builder padrão inclui
   `health_checks` na tupla de `owned_resources`; `DatabaseCheck` é dono do
-  cliente de probe e o fecha após drenar o probe em voo. No shutdown
-  assíncrono, `HealthRegistry.aclose()` chama `DatabaseCheck.aclose()`, que
-  impede novos probes e drena o probe ativo com espera limitada (timeout de
-  transporte alinhado + margem). O cleanup é incondicional: se o probe
-  terminar com exceção, a exceção é absorvida e executor/cliente são
-  encerrados; se a drenagem estourar o limite (probe patológico que ignora o
-  timeout de transporte), o executor é encerrado, a future é descartada e o
-  cliente owned é fechado mesmo assim — fechar o transporte falha a chamada
-  em voo e a thread do worker termina, então nenhum recurso owned sobrevive
-  ao lifespan. Em falha parcial de startup, `close()` síncrono encerra o
-  executor (com cancelamento de probes pendentes) sem tocar no cliente.
-  Nenhuma thread `readiness-db` permanece viva após sair do lifespan no fluxo
-  normal.
+  cliente de probe. No shutdown assíncrono, `HealthRegistry.aclose()` chama
+  `DatabaseCheck.aclose()`, que impede novos probes e drena o probe ativo com
+  espera limitada (timeout de transporte alinhado + margem). O cliente nunca
+  é fechado por baixo de uma thread viva: se o probe terminar (sucesso ou
+  exceção), a thread terminou e o cliente é fechado; se a drenagem estourar o
+  limite (probe patológico que ignora o timeout de transporte), o cliente não
+  é fechado e o ownership é mantido rastreável — uma task de cleanup diferido
+  (`_deferred_close`) fecha executor e cliente somente após o probe terminar,
+  e uma segunda chamada a `aclose()` faz join nessa task. No fluxo normal
+  (transporte alinhado), nada sobrevive ao lifespan; no caminho patológico o
+  ownership permanece rastreável até a conclusão. Em falha parcial de
+  startup, `close()` síncrono encerra o executor (cancelando probes
+  pendentes) sem tocar no cliente.
 - **A guarda de probe é atômica no event loop.** O clear do estado só
   acontece quando a future observada é a que o poll dono aguarda; uma future
   mais nova instalada por um poll concorrente nunca é limpa por engano, então
@@ -117,6 +123,7 @@ Políticas:
 
 - `READINESS_DATABASE_TIMEOUT_MS`: faixa 100–30000, default 3000.
 - `READINESS_PROVIDER_TIMEOUT_MS`: faixa 100–30000, default 1000.
+- `READINESS_AUTH_TIMEOUT_MS`: faixa 100–30000, default 1000 (probe `/health`).
 - Checks internos (configuration, embeddings, lifespan): 1s fixo.
 - Valores inválidos são rejeitados pelos settings (falha cedo).
 
