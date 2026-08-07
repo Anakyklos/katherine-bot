@@ -231,7 +231,7 @@ Qualquer remoção definitiva da função/event trigger deve:
 ```bash
 supabase start
 supabase db reset
-supabase test db supabase/tests/database          # pgTAP (63 assertions)
+supabase test db supabase/tests/database          # pgTAP (407 assertions, 5 arquivos)
 
 # Upgrade legado válido
 python -m pytest -q -ra backend/tests/test_legacy_upgrade.py
@@ -241,6 +241,11 @@ supabase db reset                                   # estado limpo para auth tes
 # Matriz PostgREST
 python -m pytest -q -ra backend/tests/test_database_authorization_integration.py
 
+# Drift legado de public.rls_auto_enable() (#291)
+supabase db reset
+bash scripts/hide-migrations-after.sh 20240101000006 \
+  python -m pytest -q -ra backend/tests/test_rls_auto_enable_legacy.py
+
 supabase stop
 ```
 
@@ -249,7 +254,8 @@ supabase stop
 ```bash
 python -m pytest backend/tests \
   --ignore=backend/tests/test_database_authorization_integration.py \
-  --ignore=backend/tests/test_legacy_upgrade.py
+  --ignore=backend/tests/test_legacy_upgrade.py \
+  --ignore=backend/tests/test_rls_auto_enable_legacy.py
 ```
 
 Inclui `test_memory_configuration.py` que testa sanitização de chaves e exceções sem dependência de rede.
