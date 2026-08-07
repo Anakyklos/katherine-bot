@@ -475,6 +475,45 @@ def test_aclose_is_clean_after_expired_ready():
     asyncio.run(scenario())
 
 
+def test_registry_aclose_awaits_async_check_aclose():
+    """HealthRegistry.aclose() must actually await each check's async
+    aclose() to completion. A NameError in the dispatch (e.g. a missing
+    ``inspect`` import) is swallowed by the generic handler and the
+    coroutine is never awaited, silently skipping the cleanup (review
+    blocker)."""
+    from backend.health import HealthRegistry
+
+    awaited = []
+
+    class AsyncCloseCheck:
+        name = "async-close"
+
+        async def aclose(self):
+            # Only reached when the registry actually awaits this coroutine.
+            await asyncio.sleep(0)
+            awaited.append("aclose-ran")
+
+    class SyncCloseCheck:
+        name = "sync-close"
+
+        def close(self):
+            awaited.append("close-ran")
+
+    registry = HealthRegistry(
+        {
+            "async-close": AsyncCloseCheck(),
+            "sync-close": SyncCloseCheck(),
+        }
+    )
+
+    async def scenario():
+        await registry.aclose()
+        # The async aclose ran to completion and the sync close also ran.
+        assert awaited == ["aclose-ran", "close-ran"]
+
+    asyncio.run(scenario())
+
+
 # ─── 32. Sensitive marker sanitization ──────────────────────────────────────
 
 
