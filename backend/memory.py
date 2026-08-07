@@ -200,6 +200,7 @@ class MemoryManager:
         clock=time.time,
         supabase_factory: Optional[Callable[[], Optional[Client]]] = None,
         supabase_timeout: Optional[float] = None,
+        embeddings_enabled: bool = False,
     ):
         if supabase_factory is not None:
             self.supabase: Optional[Client] = supabase_factory()
@@ -210,9 +211,19 @@ class MemoryManager:
                 factory = lambda: _default_supabase_factory()
             self.supabase: Optional[Client] = factory()
 
-        try:
-            self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-        except Exception:
+        # Embeddings are an explicitly configured mode: the SentenceTransformer
+        # model is only constructed when vector retrieval is enabled. A
+        # disabled mode never loads the heavy resource; an enabled mode whose
+        # model fails to load surfaces as ``embedding_model is None`` and is
+        # reported honestly by the readiness ``embeddings`` check instead of
+        # silently degrading retrieval.
+        self.embeddings_enabled = bool(embeddings_enabled)
+        if self.embeddings_enabled:
+            try:
+                self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+            except Exception:
+                self.embedding_model = None
+        else:
             self.embedding_model = None
         self._clock = clock
 
@@ -552,12 +563,24 @@ class MemoryManager:
         # Use getattr for resilience when MemoryManager is mocked in tests
         supabase = getattr(self, 'supabase', None)
         embedding_model = getattr(self, 'embedding_model', None)
+        enabled = bool(getattr(self, 'embeddings_enabled', False))
         if not supabase or not embedding_model:
+            if enabled:
+                # The active mode requires vector retrieval; a missing model or
+                # store is a real failure, never a silent empty result. The
+                # readiness ``embeddings`` check blocks traffic in this state,
+                # and this guard makes the turn path fail honestly too.
+                raise ContextLoadError("Recuperação vetorial indisponível.")
             return []
 
         try:
             query_embedding = self.embedding_model.encode(query).tolist()
         except Exception:
+            if enabled:
+                # In the active mode an embedding failure is a real failure of
+                # the retrieval function, not "no memories". Never degrade
+                # silently.
+                raise ContextLoadError("Falha na geração do embedding.")
             return []
 
         params = {
@@ -567,24 +590,31 @@ class MemoryManager:
             "filter_user_id": user_id,
         }
 
-        # RPC call and response validation in a single protected block
+        # RPC call and response validation in a single protected block. A
+        # transport/RPC error or a structurally invalid response is a failure
+        # of the active retrieval mode; only a valid ``data=[]`` represents
+        # the real absence of memories.
         try:
             response = (
                 self.supabase
                 .rpc("match_memories", params)
                 .execute()
             )
-
-            if (
-                response is None
-                or not hasattr(response, "data")
-                or not isinstance(response.data, list)
-            ):
-                return []
-
-            documents = response.data
         except Exception:
+            if enabled:
+                raise ContextLoadError("Falha na busca vetorial de memórias.")
             return []
+
+        if (
+            response is None
+            or not hasattr(response, "data")
+            or not isinstance(response.data, list)
+        ):
+            if enabled:
+                raise ContextLoadError("Resposta da busca vetorial inválida.")
+            return []
+
+        documents = response.data
 
         entries: list[RetrievedMemory] = []
         for doc in documents:

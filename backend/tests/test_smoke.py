@@ -12,9 +12,12 @@ def test_imports():
         sys.modules['supabase'] = MagicMock()
 
         # Mock environment variables
+        os.environ['APP_ENV'] = 'test'
         os.environ['GROQ_API_KEY'] = 'mock'
-        os.environ['SUPABASE_URL'] = 'mock'
+        os.environ['SUPABASE_URL'] = 'http://mock.example'
         os.environ['SUPABASE_SERVICE_ROLE_KEY'] = 'mock'
+        os.environ['ADMISSION_HMAC_SECRET'] = 'mock-admission-secret-that-is-at-least-32-bytes'
+        os.environ['CORS_ALLOWED_ORIGINS'] = 'http://localhost:3000'
 
         # Attempt to import main
         import backend.main

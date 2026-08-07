@@ -2,7 +2,7 @@ import json
 import asyncio
 import time
 import logging
-from typing import Optional
+from typing import Callable, Optional
 from fastapi import BackgroundTasks
 from .groq_manager import GroqClientManager, GroqPoolExhaustedError, GroqRequestError, ProviderFailure, provider_failure_to_turn_code
 from .emotional_core import AffectiveEngine
@@ -74,19 +74,28 @@ class ConversationEngine:
         self,
         clock=time.time,
         archival_extraction_enabled: bool = False,
+        embeddings_enabled: bool = False,
         turn_config: Optional[TurnExecutionConfig] = None,
+        *,
+        groq_keys: Optional[list] = None,
+        supabase_factory: Optional[Callable[[], Optional[object]]] = None,
     ):
         self._clock = clock
         self._monotonic = time.monotonic
         self._turn_config = turn_config or TurnExecutionConfig.defaults()
         self.archival_extraction_enabled = archival_extraction_enabled
         groq_params = self._turn_config.to_groq_params()
-        self.groq_manager = GroqClientManager(groq_params=groq_params)
+        self.groq_manager = GroqClientManager(
+            groq_params=groq_params,
+            keys=groq_keys,
+        )
         self.presentation = AffectiveEngine()
         self.transition_config = TransitionConfig.defaults()
         self.memory_manager = MemoryManager(
             clock=clock,
             supabase_timeout=self._turn_config.supabase_timeout,
+            supabase_factory=supabase_factory,
+            embeddings_enabled=embeddings_enabled,
         )
         self.relationship_config = RelationshipTransitionConfig.defaults()
         self.lock_manager = UserLockManager()

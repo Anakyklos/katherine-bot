@@ -816,7 +816,7 @@ class TestNewProfileFirstTurn:
 
             # ── Isolate from real SentenceTransformer (would hang in CI)  ──
             with patch("backend.memory.SentenceTransformer", return_value=MagicMock()) as embedding_cls:
-                engine = ConversationEngine(clock=clock)
+                engine = ConversationEngine(clock=clock, embeddings_enabled=True)
             embedding_cls.assert_called_once()
 
             # ── Mock Supabase: empty select (new user), then insert OK     ──

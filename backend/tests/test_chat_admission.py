@@ -73,17 +73,37 @@ class FakeEngine:
         return _turn_result()
 
 
+def _build_app(fake_engine, *, override_auth=True):
+    """Build an application with injected fakes (no lifespan needed)."""
+    from backend.health import HealthRegistry
+    from backend.settings import AppEnvironment, Settings
+    from backend.turn_execution import TurnExecutionConfig
+
+    settings = Settings(
+        app_env=AppEnvironment.local,
+        groq_api_key="k",
+        admission_hmac_secret=SECRET,
+        cors_allowed_origins=("http://localhost:3000",),
+    )
+    deps = main.ApplicationDependencies(
+        conversation_engine=fake_engine,
+        auth_client=fake_engine.memory_manager.supabase,
+        admission_config=AdmissionRuntimeConfig.from_values(SECRET),
+        turn_config=TurnExecutionConfig.defaults(),
+        health_checks=HealthRegistry(),
+    )
+    app = main.create_app(settings=settings, dependencies=deps)
+    if override_auth:
+        app.dependency_overrides[main.get_current_user] = lambda: SimpleNamespace(
+            id="user-a"
+        )
+    return app
+
+
 @pytest.fixture
 def endpoint(monkeypatch):
     fake_engine = FakeEngine()
     captured = {}
-
-    monkeypatch.setattr(main, "engine", fake_engine)
-    monkeypatch.setattr(
-        main,
-        "_admission_config",
-        AdmissionRuntimeConfig.from_values("s" * 32),
-    )
 
     async def fake_run_blocking_write(
         stage_label,
@@ -101,14 +121,12 @@ def endpoint(monkeypatch):
         return func(*args, **kwargs)
 
     monkeypatch.setattr(main, "run_blocking_write", fake_run_blocking_write)
-    main.app.dependency_overrides[main.get_current_user] = lambda: SimpleNamespace(
-        id="user-a"
-    )
-    client = TestClient(main.app)
+    app = _build_app(fake_engine)
+    client = TestClient(app)
     try:
         yield client, fake_engine, captured
     finally:
-        main.app.dependency_overrides.clear()
+        app.dependency_overrides.clear()
 
 
 def test_admitted_runs_process_turn_normal_with_request_id_and_one_budget(endpoint, monkeypatch):
@@ -380,8 +398,7 @@ def test_extra_field_and_wrong_types_use_generic_sanitised_validation(endpoint):
 
 def test_missing_authentication_does_not_reserve(monkeypatch):
     fake_engine = FakeEngine()
-    monkeypatch.setattr(main, "engine", fake_engine)
-    main.app.dependency_overrides.clear()
+    app = _build_app(fake_engine, override_auth=False)
     called = False
 
     def reserve(_client, _request):
@@ -390,7 +407,7 @@ def test_missing_authentication_does_not_reserve(monkeypatch):
         return AdmissionResult(ADMITTED, 0)
 
     monkeypatch.setattr(main, "reserve_admission_sync", reserve)
-    client = TestClient(main.app)
+    client = TestClient(app)
     response = client.post(
         "/chat",
         json={"request_id": UUID, "message": "hello"},
@@ -435,12 +452,7 @@ def test_expired_budget_returns_timeout_before_rpc(endpoint, monkeypatch):
 def test_cancellation_is_propagated_not_converted_to_500(monkeypatch):
     """The endpoint must re-raise CancelledError, never map it to HTTP 500."""
     fake_engine = FakeEngine()
-    monkeypatch.setattr(main, "engine", fake_engine)
-    monkeypatch.setattr(
-        main,
-        "_admission_config",
-        AdmissionRuntimeConfig.from_values("s" * 32),
-    )
+    app = _build_app(fake_engine, override_auth=False)
     monkeypatch.setattr(
         main,
         "reserve_admission_sync",
@@ -465,6 +477,7 @@ def test_cancellation_is_propagated_not_converted_to_500(monkeypatch):
         "headers": [],
         "client": ("127.0.0.1", 1234),
         "server": ("test", 80),
+        "app": app,
     }
     request = main.Request(scope)
 

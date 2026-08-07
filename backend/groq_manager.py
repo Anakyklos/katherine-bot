@@ -185,6 +185,15 @@ class GroqClientManager:
         self._cooldown_duration = 10
         self._index = 0
 
+    def is_configured(self) -> bool:
+        """Return ``True`` when the manager holds validated provider keys.
+
+        Configuration-level availability only: never opens a connection,
+        never runs a completion, and never loads models. Used by the
+        readiness ``provider`` check.
+        """
+        return bool(self._keys)
+
     # ─── Request-scoped async clients ───────────────────────────────────────
     #
     # We use request-scoped AsyncGroq clients instead of a shared cache:

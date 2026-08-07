@@ -23,6 +23,7 @@ from .admission_contracts import (
 MESSAGE_HMAC_DOMAIN = b"message"
 NETWORK_HMAC_DOMAIN = b"network"
 TURN_CORRELATION_DOMAIN = b"turn-correlation"
+USER_REFERENCE_DOMAIN = b"user-reference"
 UNKNOWN_NETWORK_IDENTITY = "unknown"
 
 ADMITTED = "admitted"
@@ -265,6 +266,28 @@ def compute_turn_correlation(
     return hmac.new(
         validated_secret,
         TURN_CORRELATION_DOMAIN + b"\x00" + canonical_request_id.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def compute_user_reference(
+    config: AdmissionRuntimeConfig,
+    user_id: object,
+) -> str:
+    """Compute a non-reversible HMAC reference for an authenticated user.
+
+    Domain-separated from the turn-correlation domain, so the same value never
+    collides across purposes. The raw ``user_id`` is never logged: only this
+    exact lowercase 64-character hex HMAC may be emitted by observability.
+    """
+    if not isinstance(config, AdmissionRuntimeConfig):
+        raise AdmissionUnavailable()
+    if not isinstance(user_id, str) or not user_id or not user_id.strip():
+        raise AdmissionUnavailable()
+    validated_secret = _validate_secret_bytes(config.secret_bytes)
+    return hmac.new(
+        validated_secret,
+        USER_REFERENCE_DOMAIN + b"\x00" + user_id.encode("utf-8"),
         hashlib.sha256,
     ).hexdigest()
 
