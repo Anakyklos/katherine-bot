@@ -18,16 +18,11 @@ Covers:
 
 from __future__ import annotations
 
+import json
 import os
+import subprocess
 
 import pytest
-
-from backend.tests.supabase_db_helpers import (
-    query_scalar_bool,
-    run_psql,
-    run_psql_file,
-    run_supabase,
-)
 
 MIGRATION = "supabase/migrations/20240101000004_transactional_turn_schema.sql"
 MIGRATION_TMP = "supabase/migrations/20240101000004_transactional_turn_schema.sql.tmp"
@@ -38,6 +33,49 @@ _MIGRATION_VERSION_SQL = (
     "WHERE version = '20240101000004'"
     ") AS result"
 )
+
+
+# ---------------------------------------------------------------------------
+# CLI helpers (sanitized; never echo secrets or raw output)
+# ---------------------------------------------------------------------------
+
+
+def _run_cli(args: list[str], check: bool = True) -> subprocess.CompletedProcess:
+    result = subprocess.run(
+        ["supabase", *args],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if check and result.returncode != 0:
+        raise AssertionError("Supabase operation failed")
+    return result
+
+
+def _run_psql(sql: str) -> None:
+    """Execute a SQL script through the local Supabase DB container."""
+    result = subprocess.run(
+        [
+            "docker", "exec", "-i", "supabase_db_app",
+            "psql", "-U", "postgres",
+            "-v", "ON_ERROR_STOP=1", "-q", "-f", "-",
+        ],
+        input=sql,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise AssertionError("psql execution failed")
+
+
+def _query_scalar_bool(query: str, expected_key: str) -> bool:
+    res = _run_cli(["db", "query", "--agent=no", "--output", "json", query])
+    data = json.loads(res.stdout)
+    assert isinstance(data, list) and len(data) == 1, "expected one row"
+    assert expected_key in data[0], "missing expected key"
+    value = data[0][expected_key]
+    assert isinstance(value, bool), "expected boolean"
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -69,7 +107,8 @@ def _ensure_migration_present() -> None:
 
 
 def _run_legacy_fixture() -> None:
-    run_psql_file("supabase/fixtures/legacy_upgrade_valid.sql")
+    with open("supabase/fixtures/legacy_upgrade_valid.sql", encoding="utf-8") as f:
+        _run_psql(f.read())
 
 
 def _close_client(client) -> None:
@@ -106,7 +145,7 @@ def supabase_service_client():
     url = os.environ.get("SUPABASE_URL", "http://127.0.0.1:54321")
     key = os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
     if not key:
-        result = run_supabase("legacy_state_query", ["status", "-o", "env"], check=False)
+        result = _run_cli(["status", "-o", "env"], check=False)
         if result.returncode != 0:
             pytest.skip("Could not extract service role key")
         for line in result.stdout.splitlines():
@@ -130,17 +169,17 @@ def test_valid_legacy_upgrade(supabase_service_client):
     _move_migration_aside()
     try:
         # Reset applies baseline + hardening + admission only (04 hidden).
-        run_supabase("legacy_baseline_reset", ["db", "reset"])
+        _run_cli(["db", "reset"])
 
         # Seed legacy data before the transactional schema exists.
         _run_legacy_fixture()
 
         # Restore and apply the transactional schema migration.
         _restore_migration()
-        run_supabase("legacy_hardening_apply", ["migration", "up", "--local"])
+        _run_cli(["migration", "up", "--local"])
 
         # ---- Migration version registered ----
-        assert query_scalar_bool(_MIGRATION_VERSION_SQL, "result"), (
+        assert _query_scalar_bool(_MIGRATION_VERSION_SQL, "result"), (
             "Transactional schema migration timestamp not registered"
         )
 
@@ -164,14 +203,14 @@ def test_valid_legacy_upgrade(supabase_service_client):
 
         # ---- New tables exist with RLS + FORCE RLS ----
         for tbl in ("turn_requests", "outbox_events"):
-            assert query_scalar_bool(
+            assert _query_scalar_bool(
                 "SELECT EXISTS("
                 "SELECT 1 FROM pg_class WHERE oid = to_regclass('{tbl}') "
                 "AND relrowsecurity = true"
                 ") AS result".format(tbl=tbl),
                 "result",
             ), f"RLS not enabled for {tbl}"
-            assert query_scalar_bool(
+            assert _query_scalar_bool(
                 "SELECT EXISTS("
                 "SELECT 1 FROM pg_class WHERE oid = to_regclass('{tbl}') "
                 "AND relforcerowsecurity = true"
@@ -182,7 +221,7 @@ def test_valid_legacy_upgrade(supabase_service_client):
         # ---- service_role grants on both tables ----
         for tbl in ("turn_requests", "outbox_events"):
             for priv in ("SELECT", "INSERT", "UPDATE", "DELETE"):
-                assert query_scalar_bool(
+                assert _query_scalar_bool(
                     "SELECT EXISTS("
                     "SELECT 1 FROM information_schema.role_table_grants "
                     "WHERE grantee = 'service_role' "
@@ -195,7 +234,7 @@ def test_valid_legacy_upgrade(supabase_service_client):
         # ---- anon / authenticated have no privileges ----
         for role in ("anon", "authenticated"):
             for tbl in ("turn_requests", "outbox_events"):
-                assert not query_scalar_bool(
+                assert not _query_scalar_bool(
                     "SELECT has_table_privilege("
                     f"'{role}', 'public.{tbl}', "
                     "'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER'"
@@ -242,20 +281,20 @@ def test_valid_legacy_upgrade(supabase_service_client):
 @pytest.mark.database_integration
 def test_operational_rollback(supabase_service_client):
     # Fresh reset with the full migration stack (including 04) applied.
-    run_supabase("legacy_baseline_reset", ["db", "reset"])
+    _run_cli(["db", "reset"])
 
     # Seed legacy data that must survive the rollback untouched.
     _run_legacy_fixture()
 
     # Objects exist before rollback.
     for tbl in ("turn_requests", "outbox_events"):
-        assert query_scalar_bool(
+        assert _query_scalar_bool(
             "SELECT EXISTS("
             "SELECT 1 FROM pg_class WHERE oid = to_regclass('{tbl}')"
             ") AS result".format(tbl=tbl),
             "result",
         ), f"{tbl} missing before rollback"
-    assert query_scalar_bool(
+    assert _query_scalar_bool(
         "SELECT EXISTS("
         "SELECT 1 FROM pg_attribute "
         "WHERE attrelid = to_regclass('profiles') AND attname = 'revision'"
@@ -267,7 +306,7 @@ def test_operational_rollback(supabase_service_client):
     # Trigger and helpers are dropped in dependency order: the trigger first
     # (it references the function), then the tables (their CHECK constraints
     # reference the payload helpers), then the helpers and the column.
-    run_psql(
+    _run_psql(
         "DROP TRIGGER IF EXISTS turn_requests_message_refs_null_trigger "
         "ON public.chat_logs;\n"
         "DROP FUNCTION IF EXISTS public.turn_requests_null_message_refs();\n"
@@ -281,26 +320,26 @@ def test_operational_rollback(supabase_service_client):
 
     # Objects are gone after rollback.
     for tbl in ("turn_requests", "outbox_events"):
-        assert not query_scalar_bool(
+        assert not _query_scalar_bool(
             "SELECT EXISTS("
             "SELECT 1 FROM pg_class WHERE oid = to_regclass('{tbl}')"
             ") AS result".format(tbl=tbl),
             "result",
         ), f"{tbl} still exists after rollback"
-    assert not query_scalar_bool(
+    assert not _query_scalar_bool(
         "SELECT EXISTS("
         "SELECT 1 FROM pg_attribute "
         "WHERE attrelid = to_regclass('profiles') AND attname = 'revision'"
         ") AS result",
         "result",
     ), "profiles.revision still exists after rollback"
-    assert not query_scalar_bool(
+    assert not _query_scalar_bool(
         "SELECT EXISTS("
         "SELECT 1 FROM pg_trigger WHERE tgname = 'turn_requests_message_refs_null_trigger'"
         ") AS result",
         "result",
     ), "chat_logs trigger still exists after rollback"
-    assert not query_scalar_bool(
+    assert not _query_scalar_bool(
         "SELECT EXISTS("
         "SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
         "WHERE n.nspname = 'public' "
