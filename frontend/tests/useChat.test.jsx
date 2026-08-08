@@ -10,7 +10,7 @@
  * - No React act() warnings
  * - History lifecycle: deferred response after unmount does not update state
  * - Late history does not overwrite sent messages
- * - Late history does not undo clearHistory()
+ * - Late history does not undo clearScreen()
  * - Normal history loading still works
  * - Abort of history fetch on unmount is silent
  */
@@ -21,6 +21,8 @@ import { useChat } from '../src/features/chat/hooks/useChat';
 
 // Export a configurable mock for api.get so tests can defer / control its resolution.
 const mockApiGet = vi.hoisted(() => vi.fn().mockResolvedValue({ data: [] }));
+const mockApiPost = vi.hoisted(() => vi.fn());
+const mockApiDelete = vi.hoisted(() => vi.fn());
 
 const mockSendMessage = vi.fn();
 
@@ -38,7 +40,8 @@ vi.mock('../src/features/chat/services/chatService', () => ({
 vi.mock('../src/shared/services/apiClient', () => ({
     default: {
         get: (...args) => mockApiGet(...args),
-        post: vi.fn(),
+        post: (...args) => mockApiPost(...args),
+        delete: (...args) => mockApiDelete(...args),
     },
 }));
 
@@ -69,6 +72,8 @@ describe('useChat', () => {
         mockSendMessage.mockReset();
         mockApiGet.mockReset();
         mockApiGet.mockResolvedValue({ data: [] });
+        mockApiPost.mockReset();
+        mockApiDelete.mockReset();
     });
 
     afterEach(() => {
@@ -356,7 +361,7 @@ describe('useChat', () => {
         expect(result.current.messages[1].content).toBe('Bot reply');
     });
 
-    it('late history does not undo clearHistory', async () => {
+    it('late history does not undo clearScreen', async () => {
         let resolveHistory;
         mockApiGet.mockReturnValue(new Promise(r => { resolveHistory = r; }));
 
@@ -364,9 +369,9 @@ describe('useChat', () => {
 
         expect(mockApiGet).toHaveBeenCalled();
 
-        // Clear history while /history is pending
+        // Clear the screen while /history is pending
         await act(async () => {
-            result.current.clearHistory();
+            result.current.clearScreen();
         });
 
         // Resolve history with old data
@@ -433,5 +438,66 @@ describe('useChat', () => {
 
         consoleErrorSpy.mockRestore();
         consoleWarnSpy.mockRestore();
+    });
+
+    it('clearScreen clears local messages and emotionState without HTTP delete', async () => {
+        mockSendMessage.mockResolvedValue(validEmotionResponse('Bot reply'));
+
+        const { result } = renderHook(() => useChat());
+
+        // Build local state: one user message plus an assistant reply and emotion.
+        await act(async () => { result.current.setInput('Hello'); });
+        let sendPromise;
+        await act(async () => { sendPromise = result.current.handleSend(); });
+        await act(async () => { await sendPromise; });
+
+        expect(result.current.messages).toHaveLength(2);
+        expect(result.current.emotionState).not.toBeNull();
+
+        // Clear the screen
+        await act(async () => {
+            result.current.clearScreen();
+        });
+
+        expect(result.current.messages).toEqual([]);
+        expect(result.current.emotionState).toBeNull();
+
+        // No deletion or privacy write is issued: only the /history GET happened.
+        expect(mockApiDelete).not.toHaveBeenCalled();
+        expect(mockApiPost).not.toHaveBeenCalled();
+        expect(mockApiGet).toHaveBeenCalledTimes(1);
+    });
+
+    it('persisted history still loads after clearScreen and remount', async () => {
+        const historyData = [
+            { role: 'user', content: 'stored question' },
+            { role: 'assistant', content: 'stored answer' },
+        ];
+        mockApiGet.mockResolvedValue({ data: historyData });
+
+        const first = renderHook(() => useChat());
+        await waitFor(() => {
+            expect(first.result.current.messages).toEqual(historyData);
+        });
+
+        // Clear the screen: local view is emptied, nothing is deleted server-side.
+        await act(async () => {
+            first.result.current.clearScreen();
+        });
+        expect(first.result.current.messages).toEqual([]);
+
+        // Simulate a reload: unmount and mount a fresh chat.
+        first.unmount();
+        expect(mockApiGet).toHaveBeenCalledTimes(1);
+
+        const second = renderHook(() => useChat());
+        await waitFor(() => {
+            expect(second.result.current.messages).toEqual(historyData);
+        });
+
+        // The persisted history was never removed: /history returns it again.
+        expect(mockApiGet).toHaveBeenCalledTimes(2);
+        expect(mockApiDelete).not.toHaveBeenCalled();
+        expect(mockApiPost).not.toHaveBeenCalled();
     });
 });

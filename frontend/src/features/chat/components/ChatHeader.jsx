@@ -1,16 +1,16 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Trash2, Check, X } from 'lucide-react';
+import { Eraser, Check, X } from 'lucide-react';
 
-const ChatHeader = ({ clearHistory }) => {
+const ChatHeader = ({ clearScreen }) => {
     const [showConfirm, setShowConfirm] = useState(false);
-    const trashRef = useRef(null);
+    const clearButtonRef = useRef(null);
     const prevShowConfirm = useRef(showConfirm);
-    const [shouldFocusTrash, setShouldFocusTrash] = useState(false);
+    const [shouldFocusClearButton, setShouldFocusClearButton] = useState(false);
 
     useEffect(() => {
         // Focus restoration when confirmation closes
-        if (prevShowConfirm.current && !showConfirm && trashRef.current) {
-            trashRef.current.focus();
+        if (prevShowConfirm.current && !showConfirm && clearButtonRef.current) {
+            clearButtonRef.current.focus();
         }
         prevShowConfirm.current = showConfirm;
     }, [showConfirm]);
@@ -30,12 +30,12 @@ const ChatHeader = ({ clearHistory }) => {
     }, [showConfirm]);
 
     const handleClear = () => {
-        clearHistory();
+        clearScreen();
         setShowConfirm(false);
     };
 
-    const handleTrashClick = () => {
-        setShouldFocusTrash(true);
+    const handleClearClick = () => {
+        setShouldFocusClearButton(true);
         setShowConfirm(true);
     };
 
@@ -49,19 +49,19 @@ const ChatHeader = ({ clearHistory }) => {
                 <div
                     className="flex items-center gap-2"
                     role="group"
-                    aria-label="Confirmar limpeza do histórico"
+                    aria-label="Confirmar limpeza da tela"
                 >
                     <span
                         className="text-sm text-gray-400 animate-in fade-in duration-200"
                         id="confirm-text"
                     >
-                        Limpar histórico?
+                        Limpar a tela? O histórico salvo permanece.
                     </span>
                     <button
                         onClick={handleClear}
-                        className="text-red-400 hover:text-red-300 transition-colors p-2 rounded-md hover:bg-gray-800 focus-visible:ring-2 focus-visible:ring-red-400 focus:outline-none"
-                        title="Confirmar limpeza"
-                        aria-label="Confirmar limpeza"
+                        className="text-gray-400 hover:text-gray-200 transition-colors p-2 rounded-md hover:bg-gray-800 focus-visible:ring-2 focus-visible:ring-gray-400 focus:outline-none"
+                        title="Confirmar limpeza da tela"
+                        aria-label="Confirmar limpeza da tela"
                         aria-describedby="confirm-text"
                     >
                         <Check size={20} />
@@ -78,14 +78,14 @@ const ChatHeader = ({ clearHistory }) => {
                 </div>
             ) : (
                 <button
-                    onClick={handleTrashClick}
-                    ref={trashRef}
-                    autoFocus={shouldFocusTrash}
-                    className="text-gray-500 hover:text-red-400 transition-colors p-2 rounded-md hover:bg-gray-800 focus-visible:ring-2 focus-visible:ring-red-400 focus:outline-none"
-                    title="Limpar conversa"
-                    aria-label="Limpar conversa"
+                    onClick={handleClearClick}
+                    ref={clearButtonRef}
+                    autoFocus={shouldFocusClearButton}
+                    className="text-gray-500 hover:text-gray-300 transition-colors p-2 rounded-md hover:bg-gray-800 focus-visible:ring-2 focus-visible:ring-gray-400 focus:outline-none"
+                    title="Limpar tela"
+                    aria-label="Limpar tela"
                 >
-                    <Trash2 size={20} />
+                    <Eraser size={20} />
                 </button>
             )}
         </header>

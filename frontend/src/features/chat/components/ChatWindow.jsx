@@ -15,13 +15,13 @@ const ChatWindow = () => {
         messagesEndRef,
         inputRef,
         handleSend,
-        clearHistory
+        clearScreen
     } = useChat();
 
     return (
         <div className="flex flex-col h-screen max-w-6xl mx-auto relative">
             {/* Header */}
-            <ChatHeader clearHistory={clearHistory} />
+            <ChatHeader clearScreen={clearScreen} />
 
             {/* Main Content Area */}
             <div className="flex-1 flex flex-col md:flex-row overflow-hidden">
