@@ -21,7 +21,6 @@ ALLOWED_OPS = frozenset({
     "rls_auto_enable_reset",
     "rls_auto_enable_upgrade",
     "rls_auto_enable_query",
-    "database_integration_query",
 })
 
 

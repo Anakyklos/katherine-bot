@@ -201,11 +201,15 @@ A migration `20260807201256_harden_rls_auto_enable.sql`:
      `CREATE TABLE AS`, `SELECT INTO` e função `public.rls_auto_enable()`;
    - se presente, valida o estado (função, evento, tags); estado inesperado
      falha explicitamente; trigger desabilitado é reabilitado;
-   - nunca deixa dois event triggers apontando para a função — triggers
-     duplicados legados são removidos.
-3. **Revoga** `EXECUTE` de `PUBLIC`, `anon`, `authenticated` e `service_role`.
-   Nenhuma outra role recebe EXECUTE. O owner `postgres` permanece responsável
-   pela função.
+   - **somente `ensure_rls` é estado reconhecido**: qualquer outro event
+     trigger apontando para `public.rls_auto_enable()` é drift desconhecido e
+     **bloqueia a migration** com erro estável e sanitizado — nunca é
+     removido automaticamente.
+3. **Revoga** `EXECUTE` de `PUBLIC`, `anon`, `authenticated` e `service_role`
+   e valida a postcondition por catálogo: o owner final deve ser `postgres` e
+   nenhuma outra role além do owner pode manter `EXECUTE` efetivo. Um grant
+   inesperado ou owner inesperado **bloqueia a migration** em vez de ser
+   normalizado silenciosamente. Nenhuma outra role recebe EXECUTE.
 
 ### Comportamento por cenário
 
@@ -214,6 +218,11 @@ A migration `20260807201256_harden_rls_auto_enable.sql`:
 | Banco limpo (`supabase db reset`) | Função canônica e trigger `ensure_rls` criados; grants de runtime revogados |
 | Upgrade legado (objeto existe) | Corpo legado convergido para a definição canônica; trigger reconciliado; grants de runtime revogados |
 | Reavaliação da migration | Sem falha; não recria grants; não duplica função/trigger; estado canônico inalterado |
+| Drift desconhecido (trigger extra, grant extra ou owner inesperado) | Migration falha explicitamente; o drift desconhecido é preservado para investigação |
+
+A migration converge somente o drift explicitamente conhecido. Trigger
+adicional apontando à função, grants inesperados ou owner inesperado
+bloqueiam o upgrade para investigação manual.
 
 ### Validação no catálogo
 

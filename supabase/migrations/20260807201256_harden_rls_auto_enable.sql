@@ -30,9 +30,11 @@
 --   * Legacy database (object present): replaces the legacy body with the
 --     canonical definition (CREATE OR REPLACE keeps the OID, owner and
 --     ACL), reconciles the "ensure_rls" event trigger to the canonical
---     configuration (failing explicitly on an unexpected state), drops any
---     duplicate event trigger still pointing at the function, then revokes
---     the runtime EXECUTE grants.
+--     configuration, and revokes the runtime EXECUTE grants. Only the
+--     explicitly known drift is converged: an unrecognized event trigger
+--     pointing at the function, an unexpected owner, or any remaining
+--     EXECUTE grantee other than postgres makes the migration fail
+--     explicitly instead of being normalized or destroyed silently.
 --   * Idempotent: re-evaluating the block converges to the same canonical
 --     state without duplicating objects or recreating grants.
 --
@@ -119,15 +121,18 @@ BEGIN
             'rls_auto_enable: canonical function missing after creation';
     END IF;
 
-    -- Never leave two event triggers pointing at the canonical function.
-    FOR v_dup IN
-        SELECT et.evtname
+    -- Drift guard: only the canonical ensure_rls trigger is recognized.
+    -- An unrecognized event trigger pointing at the function is unknown
+    -- drift: the migration must fail explicitly and never destroy it.
+    IF EXISTS (
+        SELECT 1
         FROM pg_catalog.pg_event_trigger et
         WHERE et.evtfoid = v_fn_oid
           AND et.evtname <> 'ensure_rls'
-    LOOP
-        EXECUTE pg_catalog.format('DROP EVENT TRIGGER %I', v_dup.evtname);
-    END LOOP;
+    ) THEN
+        RAISE EXCEPTION
+            'rls_auto_enable: unexpected event trigger references the function';
+    END IF;
 
     SELECT *
     INTO v_trg
@@ -165,3 +170,37 @@ END $$;
 
 REVOKE EXECUTE ON FUNCTION public.rls_auto_enable()
     FROM PUBLIC, anon, authenticated, service_role;
+
+-- Canonical postcondition: only the known drift is converged. If the final
+-- state still carries unknown drift (unexpected owner, or any grantee other
+-- than the postgres owner with effective EXECUTE), the migration fails
+-- explicitly instead of silently accepting or normalizing it.
+DO $$
+DECLARE
+    v_owner oid;
+BEGIN
+    SELECT p.proowner INTO v_owner
+    FROM pg_catalog.pg_proc p
+    JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'public'
+      AND p.proname = 'rls_auto_enable'
+      AND p.pronargs = 0;
+
+    IF v_owner <> 'postgres'::pg_catalog.regrole THEN
+        RAISE EXCEPTION 'rls_auto_enable: unexpected function owner';
+    END IF;
+
+    IF EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_proc p
+        JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+        CROSS JOIN LATERAL pg_catalog.aclexplode(p.proacl) acl
+        WHERE n.nspname = 'public'
+          AND p.proname = 'rls_auto_enable'
+          AND p.pronargs = 0
+          AND acl.privilege_type = 'EXECUTE'
+          AND acl.grantee <> p.proowner
+    ) THEN
+        RAISE EXCEPTION 'rls_auto_enable: unexpected EXECUTE grants remain';
+    END IF;
+END $$;

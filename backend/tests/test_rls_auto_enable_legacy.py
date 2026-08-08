@@ -14,6 +14,13 @@ arguments, returns ``event_trigger``, fail-closed body) plus the canonical
 ``ensure_rls`` event trigger, with EXECUTE revoked from the four runtime
 grantees. The legacy body is replaced, not preserved byte for byte.
 
+Only the explicitly known drift is converged. Unknown drift blocks the
+upgrade with a stable, sanitized error and is never normalized or destroyed:
+
+1. an unrecognized event trigger pointing at the function;
+2. an unexpected EXECUTE grantee other than postgres;
+3. an unexpected function owner.
+
 This file is executed only by the database CI job against a freshly reset
 local Supabase instance. It must never be collected by the ordinary backend
 job (see the ignore list in ``.github/workflows/ci.yml``).
@@ -33,26 +40,22 @@ Covers:
 3. Clean convergence: applying the migration to a database where the object
    never existed creates the canonical function and ``ensure_rls`` trigger
    and revokes the runtime EXECUTE grants.
+4. Unknown-drift rejection: an extra event trigger, an extra EXECUTE
+   grantee, or an unexpected owner makes the migration fail explicitly, and
+   the unknown object/grant/owner is left untouched.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
 
-from backend.tests.supabase_db_helpers import (
-    query_json,
-    query_scalar_bool,
-    query_scalar_int,
-    query_scalar_text,
-    query_text_array,
-    run_psql,
-    run_psql_file,
-    run_supabase,
-)
+from backend.supabase_cli import run_supabase_op
 
 # The hardening migration is located by its slug so the fixed-width version
 # prefix is derived from the file name: renaming the migration never leaves
@@ -97,6 +100,124 @@ FIXTURE = "supabase/fixtures/legacy_rls_auto_enable_drift.sql"
 EVENT_TRIGGER_NAME = "ensure_rls"
 CANONICAL_TAGS = {"CREATE TABLE", "CREATE TABLE AS", "SELECT INTO"}
 
+
+# ---------------------------------------------------------------------------
+# Sanitized CLI / psql helpers (local to this suite)
+# ---------------------------------------------------------------------------
+
+
+def _run_supabase(op_id: str, args: list[str], check: bool = True):
+    """Run a Supabase CLI command via the sanitized helper."""
+    result = run_supabase_op(op_id, args, check=False)
+    if check and result.returncode != 0:
+        raise AssertionError(f"Supabase operation failed: {op_id}")
+    return result
+
+
+def _run_psql(sql: str) -> None:
+    """Execute a SQL script through the local Supabase DB container."""
+    result = subprocess.run(
+        [
+            "docker", "exec", "-i", "supabase_db_app",
+            "psql", "-U", "postgres",
+            "-v", "ON_ERROR_STOP=1", "-q", "-f", "-",
+        ],
+        input=sql,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise AssertionError("psql execution failed")
+
+
+def _run_psql_file(filepath: str) -> None:
+    """Execute a multi-statement SQL fixture file inside the DB container."""
+    with open(filepath, encoding="utf-8") as f:
+        _run_psql(f.read())
+
+
+def _query_json(query: str) -> list:
+    """Execute a SQL query and return the parsed JSON rows (list of dicts)."""
+    res = _run_supabase(
+        "rls_auto_enable_query",
+        ["db", "query", "--agent=no", "--output", "json", query],
+        check=False,
+    )
+    if res.returncode != 0:
+        raise AssertionError("Query result: operation failed")
+    try:
+        data = json.loads(res.stdout)
+    except json.JSONDecodeError:
+        raise AssertionError("Query result: invalid JSON response")
+    if not isinstance(data, list):
+        raise AssertionError("Query result: expected a list")
+    return data
+
+
+def _query_scalar(query: str, expected_key: str, expected_type: type, type_name: str):
+    data = _query_json(query)
+    if len(data) != 1 or expected_key not in data[0]:
+        raise AssertionError("Query result: expected exactly one scalar row")
+    value = data[0][expected_key]
+    if not isinstance(value, expected_type):
+        raise AssertionError(f"Query result: expected a {type_name} value")
+    return value
+
+
+def _query_scalar_bool(query: str, expected_key: str) -> bool:
+    return _query_scalar(query, expected_key, bool, "boolean")
+
+
+def _query_scalar_int(query: str, expected_key: str) -> int:
+    return _query_scalar(query, expected_key, int, "integer")
+
+
+def _query_scalar_text(query: str, expected_key: str) -> str:
+    return _query_scalar(query, expected_key, str, "text")
+
+
+def _query_text_array(query: str, expected_key: str) -> list[str]:
+    data = _query_json(query)
+    if len(data) != 1 or expected_key not in data[0]:
+        raise AssertionError("Query result: expected exactly one scalar row")
+    value = data[0][expected_key]
+    if not isinstance(value, list):
+        raise AssertionError("Query result: expected an array value")
+    if not all(isinstance(item, str) for item in value):
+        raise AssertionError("Query result: expected an array of strings")
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Migration file manipulation (restored in finally, CI-script aware)
+# ---------------------------------------------------------------------------
+
+
+def _hide_new_migration() -> None:
+    """Hide the new migration before a legacy baseline reset.
+
+    When the CI ``scripts/hide-migrations-after.sh`` already renamed the file
+    to ``<name>.legacy-test-hidden`` it stays as-is; otherwise (direct run)
+    the file is moved to ``<name>.tmp``. Both states are restored later.
+    """
+    if os.path.exists(MIGRATION) and not os.path.exists(MIGRATION_TMP):
+        os.rename(MIGRATION, MIGRATION_TMP)
+
+
+def _restore_new_migration() -> None:
+    """Restore the new migration from either hidden state."""
+    if os.path.exists(MIGRATION_TMP):
+        os.rename(MIGRATION_TMP, MIGRATION)
+    elif os.path.exists(MIGRATION + LEGACY_HIDDEN_SUFFIX):
+        os.rename(MIGRATION + LEGACY_HIDDEN_SUFFIX, MIGRATION)
+
+
+# ---------------------------------------------------------------------------
+# Shared catalog checks
+# ---------------------------------------------------------------------------
+
+_ROLES_WITHOUT_EXECUTE = ("public", "anon", "authenticated", "service_role")
+
 _FUNCTION_IDENTITY_SQL = (
     "SELECT n.nspname, p.proname, p.pronargs, p.prorettype::regtype::text, "
     "p.prosecdef, p.proowner::regrole::text, p.proconfig "
@@ -134,40 +255,9 @@ _MIGRATION_VERSION_SQL = (
 )
 
 
-# ---------------------------------------------------------------------------
-# Migration file manipulation (restored in finally, CI-script aware)
-# ---------------------------------------------------------------------------
-
-
-def _hide_new_migration() -> None:
-    """Hide the new migration before a legacy baseline reset.
-
-    When the CI ``scripts/hide-migrations-after.sh`` already renamed the file
-    to ``<name>.legacy-test-hidden`` it stays as-is; otherwise (direct run)
-    the file is moved to ``<name>.tmp``. Both states are restored later.
-    """
-    if os.path.exists(MIGRATION) and not os.path.exists(MIGRATION_TMP):
-        os.rename(MIGRATION, MIGRATION_TMP)
-
-
-def _restore_new_migration() -> None:
-    """Restore the new migration from either hidden state."""
-    if os.path.exists(MIGRATION_TMP):
-        os.rename(MIGRATION_TMP, MIGRATION)
-    elif os.path.exists(MIGRATION + LEGACY_HIDDEN_SUFFIX):
-        os.rename(MIGRATION + LEGACY_HIDDEN_SUFFIX, MIGRATION)
-
-
-# ---------------------------------------------------------------------------
-# Shared catalog checks
-# ---------------------------------------------------------------------------
-
-_ROLES_WITHOUT_EXECUTE = ("public", "anon", "authenticated", "service_role")
-
-
 def _assert_execute_revoked_from_runtime_roles() -> None:
     for role in _ROLES_WITHOUT_EXECUTE:
-        assert not query_scalar_bool(
+        assert not _query_scalar_bool(
             f"SELECT has_function_privilege('{role}', "
             "'public.rls_auto_enable()', 'EXECUTE') AS result",
             "result",
@@ -175,7 +265,7 @@ def _assert_execute_revoked_from_runtime_roles() -> None:
 
 
 def _assert_owner_keeps_execute() -> None:
-    assert query_scalar_bool(
+    assert _query_scalar_bool(
         "SELECT has_function_privilege('postgres', "
         "'public.rls_auto_enable()', 'EXECUTE') AS result",
         "result",
@@ -183,7 +273,7 @@ def _assert_owner_keeps_execute() -> None:
 
 
 def _function_definition() -> str:
-    return query_scalar_text(
+    return _query_scalar_text(
         "SELECT pg_get_functiondef(p.oid) AS definition "
         "FROM pg_proc p "
         "JOIN pg_namespace n ON n.oid = p.pronamespace "
@@ -193,9 +283,9 @@ def _function_definition() -> str:
     )
 
 
-def _event_trigger_state() -> dict:
+def _event_trigger_state() -> dict | None:
     """Return the ensure_rls event trigger state, or None when absent."""
-    data = query_json(
+    data = _query_json(
         "SELECT et.evtname, et.evtevent, et.evtfoid::text AS evtfoid, "
         "et.evtenabled, et.evttags "
         "FROM pg_event_trigger et WHERE et.evtname = '%s'" % EVENT_TRIGGER_NAME
@@ -207,7 +297,7 @@ def _event_trigger_state() -> dict:
 
 
 def _function_oid() -> str:
-    return query_scalar_text(
+    return _query_scalar_text(
         "SELECT p.oid::text AS oid "
         "FROM pg_proc p "
         "JOIN pg_namespace n ON n.oid = p.pronamespace "
@@ -218,7 +308,7 @@ def _function_oid() -> str:
 
 
 def _trigger_count_for_function() -> int:
-    return query_scalar_int(
+    return _query_scalar_int(
         "SELECT count(*)::int AS count "
         "FROM pg_event_trigger et "
         "JOIN pg_proc p ON p.oid = et.evtfoid "
@@ -231,7 +321,7 @@ def _trigger_count_for_function() -> int:
 
 def _assert_canonical_state(function_oid: str, definition: str) -> None:
     """Assert the converged canonical state (function, trigger and ACL)."""
-    assert query_scalar_bool(
+    assert _query_scalar_bool(
         "SELECT EXISTS("
         "SELECT 1 FROM pg_event_trigger et "
         "JOIN pg_proc p ON p.oid = et.evtfoid "
@@ -270,7 +360,7 @@ def _assert_canonical_state(function_oid: str, definition: str) -> None:
 
     _assert_execute_revoked_from_runtime_roles()
     _assert_owner_keeps_execute()
-    assert query_text_array(_EXECUTE_GRANTEES_SQL, "exec_grantees") == [
+    assert _query_text_array(_EXECUTE_GRANTEES_SQL, "exec_grantees") == [
         "postgres"
     ], "unexpected EXECUTE grantees in canonical state"
 
@@ -279,10 +369,41 @@ def _apply_legacy_drift_fixture() -> None:
     """Reset to the pre-migration baseline and apply the drift fixture."""
     _hide_new_migration()
     try:
-        run_supabase("rls_auto_enable_reset", ["db", "reset"])
-        run_psql_file(FIXTURE)
+        _run_supabase("rls_auto_enable_reset", ["db", "reset"])
+        _run_psql_file(FIXTURE)
     finally:
         _restore_new_migration()
+
+
+def _apply_migration_expect_failure() -> subprocess.CompletedProcess:
+    """Apply the migration expecting a failure; return the CLI result."""
+    res = _run_supabase(
+        "rls_auto_enable_upgrade", ["migration", "up", "--local"], check=False
+    )
+    assert res.returncode != 0, (
+        "expected the hardening migration to fail on unknown drift"
+    )
+    return res
+
+
+def _assert_function_still_legacy() -> None:
+    """Assert the function was not converged (still the fixture body).
+
+    Unknown drift intentionally added by the scenario (extra trigger, extra
+    grantee) is expected to remain: only the known fixture grants must still
+    be present.
+    """
+    assert "WHEN OTHERS" in _function_definition(), (
+        "function body was changed despite the migration failing"
+    )
+    # The four runtime grants of the fixture must still be present. The
+    # owner entry is not asserted because changing the owner rewrites the
+    # ACL entry for the old owner.
+    assert {
+        "PUBLIC", "anon", "authenticated", "service_role",
+    } <= set(_query_text_array(_EXECUTE_GRANTEES_SQL, "exec_grantees")), (
+        "fixture EXECUTE grants were altered by the failed migration"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -298,7 +419,7 @@ def test_legacy_drift_hardened():
     _apply_legacy_drift_fixture()
 
     # ---- Before the upgrade: the drift is fully present ----
-    identity_before = query_json(_FUNCTION_IDENTITY_SQL)
+    identity_before = _query_json(_FUNCTION_IDENTITY_SQL)
     assert len(identity_before) == 1, "fixture function missing before upgrade"
     assert identity_before[0]["proname"] == "rls_auto_enable"
     assert identity_before[0]["nspname"] == "public"
@@ -311,7 +432,7 @@ def test_legacy_drift_hardened():
     assert "WHEN OTHERS" in definition_before, "fixture drift body marker missing"
     assert "quote_ident" in definition_before, "fixture dynamic SQL marker missing"
 
-    exec_grantees_before = query_text_array(_EXECUTE_GRANTEES_SQL, "exec_grantees")
+    exec_grantees_before = _query_text_array(_EXECUTE_GRANTEES_SQL, "exec_grantees")
     assert set(exec_grantees_before) == {
         "PUBLIC", "postgres", "anon", "authenticated", "service_role",
     }, "fixture EXECUTE grantees differ from the confirmed hosted drift"
@@ -325,15 +446,15 @@ def test_legacy_drift_hardened():
     )
 
     # ---- Apply the new hardening migration ----
-    run_supabase("rls_auto_enable_upgrade", ["migration", "up", "--local"])
+    _run_supabase("rls_auto_enable_upgrade", ["migration", "up", "--local"])
 
     # ---- 1. Migration version registered ----
-    assert query_scalar_bool(_MIGRATION_VERSION_SQL, "result"), (
+    assert _query_scalar_bool(_MIGRATION_VERSION_SQL, "result"), (
         "harden_rls_auto_enable migration timestamp not registered"
     )
 
     # ---- 2. Function identity preserved (CREATE OR REPLACE semantics) ----
-    identity_after = query_json(_FUNCTION_IDENTITY_SQL)
+    identity_after = _query_json(_FUNCTION_IDENTITY_SQL)
     assert identity_after == identity_before, (
         "function identity (schema, name, args, return type, SECURITY "
         "DEFINER, owner) changed during the upgrade"
@@ -359,7 +480,7 @@ def test_legacy_drift_hardened():
     _assert_canonical_state(function_oid, definition_after)
 
     # ---- 5. No additional privileges were granted ----
-    exec_grantees_after = query_text_array(_EXECUTE_GRANTEES_SQL, "exec_grantees")
+    exec_grantees_after = _query_text_array(_EXECUTE_GRANTEES_SQL, "exec_grantees")
     assert set(exec_grantees_after) == {"postgres"}, (
         f"unexpected EXECUTE grantees after upgrade: {exec_grantees_after}"
     )
@@ -370,16 +491,16 @@ def test_legacy_drift_hardened():
     # ---- 6. Idempotency: re-evaluating the migration is a no-op ----
     with open(MIGRATION, encoding="utf-8") as f:
         migration_sql = f.read()
-    run_psql(migration_sql)
+    _run_psql(migration_sql)
 
-    assert query_scalar_int(_FUNCTION_COUNT_SQL, "count") == 1, (
+    assert _query_scalar_int(_FUNCTION_COUNT_SQL, "count") == 1, (
         "idempotent re-run created or removed the function"
     )
     assert _function_definition() == definition_after, (
         "idempotent re-run altered the canonical definition"
     )
     _assert_canonical_state(_function_oid(), definition_after)
-    assert query_text_array(_EXECUTE_GRANTEES_SQL, "exec_grantees") == [
+    assert _query_text_array(_EXECUTE_GRANTEES_SQL, "exec_grantees") == [
         "postgres"
     ], "idempotent re-run recreated grants"
 
@@ -398,12 +519,12 @@ def test_clean_database_converges():
     # WITHOUT applying the drift fixture: the object never exists.
     _hide_new_migration()
     try:
-        run_supabase("rls_auto_enable_reset", ["db", "reset"])
+        _run_supabase("rls_auto_enable_reset", ["db", "reset"])
     finally:
         _restore_new_migration()
 
     # Object absent before the upgrade
-    assert not query_scalar_bool(
+    assert not _query_scalar_bool(
         "SELECT EXISTS("
         "SELECT 1 FROM pg_proc p "
         "JOIN pg_namespace n ON n.oid = p.pronamespace "
@@ -416,13 +537,13 @@ def test_clean_database_converges():
     )
 
     # Applying the migration must succeed and create the canonical mechanism
-    run_supabase("rls_auto_enable_upgrade", ["migration", "up", "--local"])
+    _run_supabase("rls_auto_enable_upgrade", ["migration", "up", "--local"])
 
-    assert query_scalar_bool(_MIGRATION_VERSION_SQL, "result"), (
+    assert _query_scalar_bool(_MIGRATION_VERSION_SQL, "result"), (
         "harden_rls_auto_enable migration timestamp not registered"
     )
 
-    identity = query_json(_FUNCTION_IDENTITY_SQL)
+    identity = _query_json(_FUNCTION_IDENTITY_SQL)
     assert len(identity) == 1, "canonical function missing after migration"
     assert identity[0]["prosecdef"] is True
     assert identity[0]["proowner"] == "postgres"
@@ -440,3 +561,131 @@ def test_clean_database_converges():
     )
 
     _assert_canonical_state(_function_oid(), definition)
+
+
+# ---------------------------------------------------------------------------
+# SCENARIO 3: unknown drift blocks the upgrade and is never normalized
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.database_integration
+def test_unknown_event_trigger_blocks_upgrade():
+    """An unrecognized event trigger pointing at rls_auto_enable must make
+    the migration fail and must NOT be dropped."""
+    _apply_legacy_drift_fixture()
+
+    # Add a second, unknown event trigger pointing at the same function.
+    _run_psql(
+        "CREATE EVENT TRIGGER rls_auto_enable_unknown_trigger "
+        "ON ddl_command_end WHEN TAG IN ('CREATE TABLE') "
+        "EXECUTE FUNCTION public.rls_auto_enable();"
+    )
+    assert _trigger_count_for_function() == 2, (
+        "unknown trigger not created before the upgrade"
+    )
+
+    _apply_migration_expect_failure()
+
+    # The migration must not have registered.
+    assert not _query_scalar_bool(_MIGRATION_VERSION_SQL, "result"), (
+        "migration was registered despite unknown drift"
+    )
+    # The unknown trigger must still exist; the canonical one too.
+    assert _query_scalar_bool(
+        "SELECT EXISTS("
+        "SELECT 1 FROM pg_event_trigger "
+        "WHERE evtname = 'rls_auto_enable_unknown_trigger'"
+        ") AS result",
+        "result",
+    ), "unknown event trigger was dropped by the failed migration"
+    assert _trigger_count_for_function() == 2, (
+        "failed migration removed an event trigger"
+    )
+    assert _event_trigger_state() is not None, (
+        "ensure_rls was removed by the failed migration"
+    )
+    # No destructive cleanup: the function still has the legacy body/grants.
+    _assert_function_still_legacy()
+
+
+@pytest.mark.database_integration
+def test_unexpected_execute_grantee_blocks_upgrade():
+    """An EXECUTE grant to an unknown role must make the migration fail and
+    must not be revoked silently."""
+    _apply_legacy_drift_fixture()
+
+    try:
+        _run_psql(
+            "CREATE ROLE rls_probe_grantee NOLOGIN; "
+            "GRANT EXECUTE ON FUNCTION public.rls_auto_enable() "
+            "TO rls_probe_grantee;"
+        )
+        assert _query_scalar_bool(
+            "SELECT has_function_privilege('rls_probe_grantee', "
+            "'public.rls_auto_enable()', 'EXECUTE') AS result",
+            "result",
+        ), "probe role grant not created before the upgrade"
+
+        _apply_migration_expect_failure()
+
+        assert not _query_scalar_bool(_MIGRATION_VERSION_SQL, "result"), (
+            "migration was registered despite unknown grantee"
+        )
+        # The unexpected grant must NOT have been normalized away.
+        assert _query_scalar_bool(
+            "SELECT has_function_privilege('rls_probe_grantee', "
+            "'public.rls_auto_enable()', 'EXECUTE') AS result",
+            "result",
+        ), "unknown EXECUTE grantee was silently revoked"
+        _assert_function_still_legacy()
+    finally:
+        _run_psql(
+            "REVOKE EXECUTE ON FUNCTION public.rls_auto_enable() "
+            "FROM rls_probe_grantee; "
+            "DROP ROLE IF EXISTS rls_probe_grantee;"
+        )
+
+
+@pytest.mark.database_integration
+def test_unexpected_owner_blocks_upgrade():
+    """An unexpected function owner must make the migration fail and must
+    not be silently changed."""
+    _apply_legacy_drift_fixture()
+
+    try:
+        _run_psql(
+            "CREATE ROLE rls_probe_owner NOLOGIN; "
+            "GRANT USAGE, CREATE ON SCHEMA public TO rls_probe_owner; "
+            "GRANT rls_probe_owner TO postgres; "
+            "ALTER FUNCTION public.rls_auto_enable() OWNER TO rls_probe_owner;"
+        )
+        assert _query_scalar_bool(
+            "SELECT p.proowner = 'rls_probe_owner'::regrole AS result "
+            "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+            "WHERE n.nspname = 'public' AND p.proname = 'rls_auto_enable' "
+            "AND p.pronargs = 0",
+            "result",
+        ), "probe owner not applied before the upgrade"
+
+        _apply_migration_expect_failure()
+
+        assert not _query_scalar_bool(_MIGRATION_VERSION_SQL, "result"), (
+            "migration was registered despite unexpected owner"
+        )
+        # The unexpected owner must NOT have been silently changed.
+        assert _query_scalar_bool(
+            "SELECT p.proowner = 'rls_probe_owner'::regrole AS result "
+            "FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace "
+            "WHERE n.nspname = 'public' AND p.proname = 'rls_auto_enable' "
+            "AND p.pronargs = 0",
+            "result",
+        ), "unknown owner was silently replaced"
+        _assert_function_still_legacy()
+    finally:
+        _run_psql(
+            "ALTER FUNCTION public.rls_auto_enable() OWNER TO postgres; "
+            "REVOKE CREATE ON SCHEMA public FROM rls_probe_owner; "
+            "REVOKE USAGE ON SCHEMA public FROM rls_probe_owner; "
+            "REVOKE rls_probe_owner FROM postgres; "
+            "DROP ROLE IF EXISTS rls_probe_owner;"
+        )
