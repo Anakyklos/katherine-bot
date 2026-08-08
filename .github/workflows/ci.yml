@@ -212,6 +212,23 @@ jobs:
           set -euo pipefail
           python -m pytest -q -ra backend/tests/test_process_turn_integration.py
 
+      - name: Reset database for rls_auto_enable legacy tests
+        run: |
+          set -euo pipefail
+          supabase db reset
+
+      - name: Run RLS Auto Enable Legacy Test
+        env:
+          SUPABASE_URL: "http://127.0.0.1:54321"
+          PYTHONPATH: "."
+        run: |
+          set -euo pipefail
+          # Hide every migration AFTER the replay migration (06) so the legacy
+          # scenario starts from a true pre-hardening database; the new
+          # migration is restored inside the test before applying it.
+          bash scripts/hide-migrations-after.sh 20240101000006 \
+            python -m pytest -q -ra backend/tests/test_rls_auto_enable_legacy.py
+
       - name: Stop Supabase
         if: always()
         run: supabase stop
@@ -264,6 +281,7 @@ jobs:
               --ignore=backend/tests/test_transactional_schema_integration.py \
               --ignore=backend/tests/test_atomic_turn_commit_integration.py \
               --ignore=backend/tests/test_process_turn_integration.py \
+              --ignore=backend/tests/test_rls_auto_enable_legacy.py \
               -ra
 
   frontend:
