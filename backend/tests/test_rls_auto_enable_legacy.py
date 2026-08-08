@@ -72,9 +72,14 @@ def _find_harden_migration() -> Path:
     return next((p for p in matches if p.name.endswith(".sql")), matches[0])
 
 
+def _version_from_filename(name: str) -> str:
+    """Extract the fixed-width version prefix from a migration file name."""
+    return Path(name).name.split("_", 1)[0]
+
+
 _HARDEN_MIGRATION = _find_harden_migration()
 MIGRATION = str(_HARDEN_MIGRATION).removesuffix(LEGACY_HIDDEN_SUFFIX).removesuffix(".tmp")
-MIGRATION_VERSION = Path(MIGRATION).name.split("_", 1)[0]
+MIGRATION_VERSION = _version_from_filename(MIGRATION)
 MIGRATION_TMP = f"{MIGRATION}.tmp"
 
 FIXTURE = "supabase/fixtures/legacy_rls_auto_enable_drift.sql"
