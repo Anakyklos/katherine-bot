@@ -198,7 +198,14 @@ export const useChat = () => {
         }
     }, [input, isLoading, cleanupRequest, cleanupFocusTimer]);
 
-    const clearHistory = useCallback(() => {
+    /**
+     * Clears the local chat screen only.
+     *
+     * This removes the in-memory `messages` and `emotionState` from the React
+     * state. It never touches persisted data: the server-side history remains
+     * intact and is reloaded on the next mount.
+     */
+    const clearScreen = useCallback(() => {
         localMessagesVersionRef.current += 1;
         setMessages([]);
         setEmotionState(null);
@@ -213,6 +220,6 @@ export const useChat = () => {
         messagesEndRef,
         inputRef,
         handleSend,
-        clearHistory
+        clearScreen
     };
 };
