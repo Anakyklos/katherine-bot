@@ -1,45 +1,167 @@
 -- 20260807201256_harden_rls_auto_enable.sql
--- Version the security decision for the legacy hosted function
--- public.rls_auto_enable() (#291).
+-- Version the canonical rls_auto_enable() mechanism (#291).
 --
--- Decision: PRESERVE_AND_HARDEN
---   * The function and its event trigger are legacy hosted objects that are
---     NOT versioned by this repository. A hosted audit found the function
---     exposed as SECURITY DEFINER with EXECUTE granted to PUBLIC, anon,
---     authenticated and service_role, which is a privilege drift for a
---     privileged function.
---   * This migration does NOT remove the function or its event trigger (that
---     decision needs separate evidence and a separate issue). It only revokes
---     the runtime EXECUTE grants, keeping the owner able to administer the
---     object under normal PostgreSQL semantics.
+-- Decision: PRESERVE + VERSION + HARDEN
+--
+-- The hosted Supabase project was inspected after the initial hardening and
+-- confirmed to run a real, active mechanism:
+--   * public.rls_auto_enable(): zero arguments, returns event_trigger,
+--     plpgsql, SECURITY DEFINER, owner postgres, search_path pg_catalog.
+--   * Event trigger "ensure_rls" on ddl_command_end, enabled, tags
+--     CREATE TABLE / CREATE TABLE AS / SELECT INTO.
+--   * The mechanism automatically enables ROW LEVEL SECURITY on new tables
+--     in the public schema.
+--   * ACL drift: EXECUTE was granted to PUBLIC, anon, authenticated and
+--     service_role, and the legacy body used dynamic SQL plus a
+--     WHEN OTHERS handler that swallowed failures into a generic log.
+--
+-- The exact origin of the hosted object was not found in the versioned
+-- history of this repository, so it is treated as legacy drift of unproven
+-- origin. Instead of preserving the unversioned, unreviewed body, this
+-- migration brings the mechanism INTO the versioned schema (VERSION),
+-- replaces the legacy body with a reviewed canonical definition (PRESERVE +
+-- HARDEN: the mechanism itself is kept and hardened), and revokes the broad
+-- runtime EXECUTE grants.
 --
 -- Behavior:
---   * Clean database (object absent): the catalog gate does not match, the
---     REVOKE is skipped, nothing is created and the migration is a no-op.
---   * Legacy upgrade (object present): the object is identified EXACTLY by
---     schema (public), name (rls_auto_enable), zero arguments and return
---     type event_trigger; EXECUTE is revoked from PUBLIC, anon,
---     authenticated and service_role only. The function body, owner,
---     search_path and the associated event trigger are left untouched.
---   * Idempotent: re-evaluating the block when the privileges are already
---     removed succeeds without recreating grants or altering the object.
+--   * Clean database (object absent): creates the canonical function and the
+--     canonical "ensure_rls" event trigger, then revokes EXECUTE from
+--     PUBLIC, anon, authenticated and service_role.
+--   * Legacy database (object present): replaces the legacy body with the
+--     canonical definition (CREATE OR REPLACE keeps the OID, owner and
+--     ACL), reconciles the "ensure_rls" event trigger to the canonical
+--     configuration (failing explicitly on an unexpected state), drops any
+--     duplicate event trigger still pointing at the function, then revokes
+--     the runtime EXECUTE grants.
+--   * Idempotent: re-evaluating the block converges to the same canonical
+--     state without duplicating objects or recreating grants.
 --
--- No dynamic SQL is used at runtime; the REVOKE is a static statement with
--- constant, verified identifiers, executed only when the exact object is
--- confirmed in the catalogs.
+-- The canonical body is fail-closed: if the mechanism should protect a new
+-- public table and enabling RLS fails, the error propagates and the DDL
+-- command fails instead of silently leaving an unprotected table. No user-
+-- controlled text is used to form identifiers; the created relation is
+-- resolved by OID from the catalogs and any ALTER TABLE is built with
+-- properly escaped identifiers (pg_catalog.format %I).
+
+CREATE OR REPLACE FUNCTION public.rls_auto_enable()
+RETURNS event_trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = pg_catalog
+AS $function$
+DECLARE
+    v_schema name;
+    v_relname name;
+    v_relkind "char";
+    v_rls boolean;
+    v_cmd record;
+BEGIN
+    FOR v_cmd IN
+        SELECT d.objid
+        FROM pg_catalog.pg_event_trigger_ddl_commands() d
+        WHERE d.classid = 'pg_catalog.pg_class'::pg_catalog.regclass
+    LOOP
+        SELECT n.nspname, c.relname, c.relkind, c.relrowsecurity
+        INTO v_schema, v_relname, v_relkind, v_rls
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.oid = v_cmd.objid;
+
+        IF NOT FOUND THEN
+            RAISE EXCEPTION
+                'rls_auto_enable: relation % not found in the catalogs',
+                v_cmd.objid;
+        END IF;
+
+        -- Only relations in the public schema are covered by the mechanism.
+        IF v_schema <> 'public' THEN
+            CONTINUE;
+        END IF;
+
+        -- Only plain and partitioned tables are covered (the trigger fires
+        -- for CREATE TABLE, CREATE TABLE AS and SELECT INTO).
+        IF v_relkind NOT IN ('r', 'p') THEN
+            CONTINUE;
+        END IF;
+
+        IF v_rls THEN
+            CONTINUE;
+        END IF;
+
+        EXECUTE pg_catalog.format(
+            'ALTER TABLE %I.%I ENABLE ROW LEVEL SECURITY',
+            v_schema,
+            v_relname
+        );
+    END LOOP;
+END
+$function$;
 
 DO $$
+DECLARE
+    v_fn_oid oid;
+    v_dup record;
+    v_trg record;
+    v_canonical_tags text[] := ARRAY[
+        'CREATE TABLE', 'CREATE TABLE AS', 'SELECT INTO'
+    ];
 BEGIN
-    IF EXISTS (
-        SELECT 1
-        FROM pg_proc p
-        JOIN pg_namespace n ON n.oid = p.pronamespace
-        WHERE n.nspname = 'public'
-          AND p.proname = 'rls_auto_enable'
-          AND p.pronargs = 0
-          AND p.prorettype = 'event_trigger'::regtype
-    ) THEN
-        REVOKE EXECUTE ON FUNCTION public.rls_auto_enable()
-            FROM PUBLIC, anon, authenticated, service_role;
+    SELECT p.oid INTO v_fn_oid
+    FROM pg_catalog.pg_proc p
+    JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+    WHERE n.nspname = 'public'
+      AND p.proname = 'rls_auto_enable'
+      AND p.pronargs = 0
+      AND p.prorettype = 'event_trigger'::pg_catalog.regtype;
+
+    IF v_fn_oid IS NULL THEN
+        RAISE EXCEPTION
+            'rls_auto_enable: canonical function missing after creation';
+    END IF;
+
+    -- Never leave two event triggers pointing at the canonical function.
+    FOR v_dup IN
+        SELECT et.evtname
+        FROM pg_catalog.pg_event_trigger et
+        WHERE et.evtfoid = v_fn_oid
+          AND et.evtname <> 'ensure_rls'
+    LOOP
+        EXECUTE pg_catalog.format('DROP EVENT TRIGGER %I', v_dup.evtname);
+    END LOOP;
+
+    SELECT *
+    INTO v_trg
+    FROM pg_catalog.pg_event_trigger
+    WHERE evtname = 'ensure_rls';
+
+    IF v_trg.evtname IS NULL THEN
+        EXECUTE
+            'CREATE EVENT TRIGGER ensure_rls ON ddl_command_end '
+            'WHEN TAG IN (''CREATE TABLE'', ''CREATE TABLE AS'', ''SELECT INTO'') '
+            'EXECUTE FUNCTION public.rls_auto_enable()';
+    ELSE
+        IF v_trg.evtfoid <> v_fn_oid THEN
+            RAISE EXCEPTION
+                'rls_auto_enable: event trigger ensure_rls points to an unexpected function';
+        END IF;
+        IF v_trg.evtevent <> 'ddl_command_end' THEN
+            RAISE EXCEPTION
+                'rls_auto_enable: event trigger ensure_rls has unexpected event %',
+                v_trg.evtevent;
+        END IF;
+        IF NOT (
+            v_trg.evttags @> v_canonical_tags
+            AND v_canonical_tags @> v_trg.evttags
+        ) THEN
+            RAISE EXCEPTION
+                'rls_auto_enable: event trigger ensure_rls has unexpected tags %',
+                v_trg.evttags;
+        END IF;
+        IF v_trg.evtenabled <> 'O' THEN
+            EXECUTE 'ALTER EVENT TRIGGER ensure_rls ENABLE';
+        END IF;
     END IF;
 END $$;
+
+REVOKE EXECUTE ON FUNCTION public.rls_auto_enable()
+    FROM PUBLIC, anon, authenticated, service_role;

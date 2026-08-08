@@ -1,10 +1,14 @@
 BEGIN;
 
 CREATE EXTENSION IF NOT EXISTS pgtap;
-SELECT plan(44);
+SELECT plan(62);
 
 -- =================================================================
--- 1. Migration registered and clean database stays clean (#291)
+-- 1. Canonical mechanism is versioned and clean database converges (#291)
+--    After `supabase db reset`, public.rls_auto_enable() MUST exist as the
+--    canonical versioned definition and ensure_rls MUST be active. This is
+--    the PRESERVE + VERSION + HARDEN contract: clean reset and legacy
+--    upgrade converge to the same state.
 -- =================================================================
 
 -- The migration is matched by its registered name (derived by the CLI from
@@ -20,27 +24,183 @@ SELECT ok(
     'harden_rls_auto_enable migration is registered'
 );
 
+-- ---- Canonical function identity (catalog proof) ----
 SELECT ok(
-    NOT EXISTS(
+    EXISTS(
         SELECT 1
         FROM pg_proc p
         JOIN pg_namespace n ON n.oid = p.pronamespace
         WHERE n.nspname = 'public'
           AND p.proname = 'rls_auto_enable'
+          AND p.pronargs = 0
     ),
-    'public.rls_auto_enable() is not created in a clean database'
+    'public.rls_auto_enable() exists in a clean database'
 );
 
 SELECT ok(
-    NOT EXISTS(
+    (SELECT n.nspname = 'public'
+     FROM pg_proc p
+     JOIN pg_namespace n ON n.oid = p.pronamespace
+     WHERE n.nspname = 'public'
+       AND p.proname = 'rls_auto_enable'
+       AND p.pronargs = 0),
+    'rls_auto_enable is in schema public'
+);
+
+SELECT ok(
+    (SELECT p.pronargs = 0
+     FROM pg_proc p
+     JOIN pg_namespace n ON n.oid = p.pronamespace
+     WHERE n.nspname = 'public'
+       AND p.proname = 'rls_auto_enable'
+       AND p.pronargs = 0),
+    'rls_auto_enable has zero arguments'
+);
+
+SELECT ok(
+    (SELECT p.prorettype = 'event_trigger'::pg_catalog.regtype
+     FROM pg_proc p
+     JOIN pg_namespace n ON n.oid = p.pronamespace
+     WHERE n.nspname = 'public'
+       AND p.proname = 'rls_auto_enable'
+       AND p.pronargs = 0),
+    'rls_auto_enable returns event_trigger'
+);
+
+SELECT ok(
+    (SELECT p.prosecdef
+     FROM pg_proc p
+     JOIN pg_namespace n ON n.oid = p.pronamespace
+     WHERE n.nspname = 'public'
+       AND p.proname = 'rls_auto_enable'
+       AND p.pronargs = 0),
+    'rls_auto_enable is SECURITY DEFINER'
+);
+
+SELECT ok(
+    (SELECT p.proowner = 'postgres'::pg_catalog.regrole
+     FROM pg_proc p
+     JOIN pg_namespace n ON n.oid = p.pronamespace
+     WHERE n.nspname = 'public'
+       AND p.proname = 'rls_auto_enable'
+       AND p.pronargs = 0),
+    'rls_auto_enable is owned by postgres'
+);
+
+SELECT ok(
+    (SELECT p.proconfig = ARRAY['search_path=pg_catalog']::pg_catalog.text[]
+     FROM pg_proc p
+     JOIN pg_namespace n ON n.oid = p.pronamespace
+     WHERE n.nspname = 'public'
+       AND p.proname = 'rls_auto_enable'
+       AND p.pronargs = 0),
+    'rls_auto_enable search_path is exactly pg_catalog'
+);
+
+-- ---- ACL: no runtime role or PUBLIC has EXECUTE ----
+SELECT ok(
+    NOT has_function_privilege(
+        'public', 'public.rls_auto_enable()', 'EXECUTE'
+    ),
+    'PUBLIC has no EXECUTE on rls_auto_enable'
+);
+SELECT ok(
+    NOT has_function_privilege(
+        'anon', 'public.rls_auto_enable()', 'EXECUTE'
+    ),
+    'anon has no EXECUTE on rls_auto_enable'
+);
+SELECT ok(
+    NOT has_function_privilege(
+        'authenticated', 'public.rls_auto_enable()', 'EXECUTE'
+    ),
+    'authenticated has no EXECUTE on rls_auto_enable'
+);
+SELECT ok(
+    NOT has_function_privilege(
+        'service_role', 'public.rls_auto_enable()', 'EXECUTE'
+    ),
+    'service_role has no EXECUTE on rls_auto_enable'
+);
+SELECT ok(
+    has_function_privilege(
+        'postgres', 'public.rls_auto_enable()', 'EXECUTE'
+    ),
+    'owner postgres keeps EXECUTE on rls_auto_enable'
+);
+
+-- ---- Canonical event trigger ensure_rls ----
+SELECT ok(
+    EXISTS(
+        SELECT 1 FROM pg_event_trigger WHERE evtname = 'ensure_rls'
+    ),
+    'event trigger ensure_rls exists'
+);
+
+SELECT ok(
+    EXISTS(
         SELECT 1
         FROM pg_event_trigger et
         JOIN pg_proc p ON p.oid = et.evtfoid
         JOIN pg_namespace n ON n.oid = p.pronamespace
-        WHERE n.nspname = 'public'
+        WHERE et.evtname = 'ensure_rls'
+          AND n.nspname = 'public'
           AND p.proname = 'rls_auto_enable'
+          AND p.pronargs = 0
     ),
-    'no event trigger references rls_auto_enable in a clean database'
+    'ensure_rls is bound to public.rls_auto_enable()'
+);
+
+SELECT ok(
+    (SELECT evtevent = 'ddl_command_end'
+     FROM pg_event_trigger WHERE evtname = 'ensure_rls'),
+    'ensure_rls fires on ddl_command_end'
+);
+
+SELECT ok(
+    (SELECT evtenabled = 'O'
+     FROM pg_event_trigger WHERE evtname = 'ensure_rls'),
+    'ensure_rls is enabled'
+);
+
+SELECT ok(
+    (SELECT evttags @> ARRAY[
+         'CREATE TABLE', 'CREATE TABLE AS', 'SELECT INTO'
+       ]::pg_catalog.text[]
+       AND ARRAY[
+         'CREATE TABLE', 'CREATE TABLE AS', 'SELECT INTO'
+       ]::pg_catalog.text[] @> evttags
+     FROM pg_event_trigger WHERE evtname = 'ensure_rls'),
+    'ensure_rls has exactly the canonical tags'
+);
+
+SELECT ok(
+    (SELECT count(*) = 1
+     FROM pg_event_trigger et
+     JOIN pg_proc p ON p.oid = et.evtfoid
+     JOIN pg_namespace n ON n.oid = p.pronamespace
+     WHERE n.nspname = 'public'
+       AND p.proname = 'rls_auto_enable'
+       AND p.pronargs = 0),
+    'exactly one event trigger points at rls_auto_enable'
+);
+
+-- ---- Behavioral proof: new public tables get RLS automatically ----
+CREATE TABLE public.pgtap_rls_probe (id int);
+SELECT ok(
+    (SELECT relrowsecurity FROM pg_catalog.pg_class
+     WHERE oid = 'public.pgtap_rls_probe'::pg_catalog.regclass),
+    'ensure_rls auto-enables RLS on a new public table'
+);
+DROP TABLE public.pgtap_rls_probe;
+SELECT ok(
+    NOT EXISTS(
+        SELECT 1 FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'public'
+          AND c.relname = 'pgtap_rls_probe'
+    ),
+    'probe table is removed after the behavioral test'
 );
 
 -- =================================================================
