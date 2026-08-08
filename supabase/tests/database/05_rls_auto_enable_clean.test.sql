@@ -7,11 +7,15 @@ SELECT plan(44);
 -- 1. Migration registered and clean database stays clean (#291)
 -- =================================================================
 
+-- The migration is matched by its registered name (derived by the CLI from
+-- the migration file name, without the fixed-width version prefix), so
+-- renaming the timestamp never leaves this test with a stale hard-coded
+-- version.
 SELECT ok(
     EXISTS(
         SELECT 1
         FROM supabase_migrations.schema_migrations
-        WHERE version = '20260807201256'
+        WHERE name = 'harden_rls_auto_enable'
     ),
     'harden_rls_auto_enable migration is registered'
 );

@@ -27,20 +27,55 @@ Covers:
 
 from __future__ import annotations
 
-import json
 import os
-import subprocess
+import re
+from pathlib import Path
 
 import pytest
 
-from backend.supabase_cli import run_supabase_op
+from backend.tests.supabase_db_helpers import (
+    query_json,
+    query_scalar_bool,
+    query_scalar_text,
+    query_text_array,
+    run_psql,
+    run_psql_file,
+    run_supabase,
+)
 
-# The version registered by the CLI-generated migration (fixed-width prefix,
-# ordered after 20240101000006_process_turn_replay.sql).
-MIGRATION_VERSION = "20260807201256"
-MIGRATION = "supabase/migrations/20260807201256_harden_rls_auto_enable.sql"
-MIGRATION_TMP = f"{MIGRATION}.tmp"
+# The hardening migration is located by its slug so the fixed-width version
+# prefix is derived from the file name: renaming the migration never leaves
+# the tests with a stale hard-coded timestamp (see #291).
 LEGACY_HIDDEN_SUFFIX = ".legacy-test-hidden"
+_HARDEN_FILENAME_RE = re.compile(
+    r"^\d+_harden_rls_auto_enable\.sql(?:\.(?:tmp|legacy-test-hidden))?$"
+)
+
+
+def _find_harden_migration() -> Path:
+    """Locate the hardening migration, tolerating CI/direct hidden states.
+
+    CI renames the file to ``<name>.legacy-test-hidden`` before pytest starts
+    and a direct run may leave a ``.tmp`` copy behind; every state must be
+    found so the version can always be derived from the real file name.
+    """
+    matches = [
+        p
+        for p in Path("supabase/migrations").iterdir()
+        if _HARDEN_FILENAME_RE.match(p.name)
+    ]
+    if not matches:
+        raise FileNotFoundError(
+            "supabase/migrations/*_harden_rls_auto_enable.sql not found"
+        )
+    # Prefer the live file; fall back to a leftover hidden state.
+    return next((p for p in matches if p.name.endswith(".sql")), matches[0])
+
+
+_HARDEN_MIGRATION = _find_harden_migration()
+MIGRATION = str(_HARDEN_MIGRATION).removesuffix(LEGACY_HIDDEN_SUFFIX).removesuffix(".tmp")
+MIGRATION_VERSION = Path(MIGRATION).name.split("_", 1)[0]
+MIGRATION_TMP = f"{MIGRATION}.tmp"
 
 FIXTURE = "supabase/fixtures/legacy_rls_auto_enable_drift.sql"
 EVENT_TRIGGER_NAME = "rls_auto_enable_legacy_trigger"
@@ -72,96 +107,6 @@ _MIGRATION_VERSION_SQL = (
     "WHERE version = '%s'"
     ") AS result" % MIGRATION_VERSION
 )
-
-
-# ---------------------------------------------------------------------------
-# Sanitized CLI / psql helpers
-# ---------------------------------------------------------------------------
-
-
-def _run_cli(op_id: str, args: list[str], check: bool = True):
-    """Run a Supabase CLI command via the sanitized helper."""
-    result = run_supabase_op(op_id, args, check=False)
-    if check and result.returncode != 0:
-        raise AssertionError(f"Supabase operation failed: {op_id}")
-    return result
-
-
-def _run_psql(sql: str) -> None:
-    """Execute a SQL script through the local Supabase DB container."""
-    result = subprocess.run(
-        [
-            "docker", "exec", "-i", "supabase_db_app",
-            "psql", "-U", "postgres",
-            "-v", "ON_ERROR_STOP=1", "-q", "-f", "-",
-        ],
-        input=sql,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        raise AssertionError("psql execution failed")
-
-
-def _run_psql_file(filepath: str) -> None:
-    """Execute a multi-statement SQL fixture file inside the DB container."""
-    with open(filepath, encoding="utf-8") as f:
-        _run_psql(f.read())
-
-
-# ---------------------------------------------------------------------------
-# JSON-based query helpers (no textual CLI parsing)
-# ---------------------------------------------------------------------------
-
-
-def _query_json(query: str):
-    """Execute a SQL query and return the parsed JSON rows (list of dicts)."""
-    res = _run_cli(
-        "rls_auto_enable_query",
-        ["db", "query", "--agent=no", "--output", "json", query],
-        check=False,
-    )
-    if res.returncode != 0:
-        raise AssertionError("Query result: operation failed")
-    try:
-        data = json.loads(res.stdout)
-    except json.JSONDecodeError:
-        raise AssertionError("Query result: invalid JSON response")
-    if not isinstance(data, list):
-        raise AssertionError("Query result: expected a list")
-    return data
-
-
-def _query_scalar_bool(query: str, expected_key: str) -> bool:
-    data = _query_json(query)
-    if len(data) != 1 or expected_key not in data[0]:
-        raise AssertionError("Query result: expected exactly one scalar row")
-    value = data[0][expected_key]
-    if not isinstance(value, bool):
-        raise AssertionError("Query result: expected a boolean value")
-    return value
-
-
-def _query_scalar_text(query: str, expected_key: str) -> str:
-    data = _query_json(query)
-    if len(data) != 1 or expected_key not in data[0]:
-        raise AssertionError("Query result: expected exactly one scalar row")
-    value = data[0][expected_key]
-    if not isinstance(value, str):
-        raise AssertionError("Query result: expected a text value")
-    return value
-
-
-def _query_text_array(query: str, expected_key: str) -> list[str]:
-    data = _query_json(query)
-    if len(data) != 1 or expected_key not in data[0]:
-        raise AssertionError("Query result: expected exactly one scalar row")
-    value = data[0][expected_key]
-    if not isinstance(value, list):
-        raise AssertionError("Query result: expected an array value")
-    if not all(isinstance(item, str) for item in value):
-        raise AssertionError("Query result: expected an array of strings")
-    return value
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +142,7 @@ _ROLES_WITHOUT_EXECUTE = ("public", "anon", "authenticated", "service_role")
 
 def _assert_execute_revoked_from_runtime_roles() -> None:
     for role in _ROLES_WITHOUT_EXECUTE:
-        assert not _query_scalar_bool(
+        assert not query_scalar_bool(
             f"SELECT has_function_privilege('{role}', "
             "'public.rls_auto_enable()', 'EXECUTE') AS result",
             "result",
@@ -205,7 +150,7 @@ def _assert_execute_revoked_from_runtime_roles() -> None:
 
 
 def _function_definition() -> str:
-    return _query_scalar_text(
+    return query_scalar_text(
         "SELECT pg_get_functiondef(p.oid) AS definition "
         "FROM pg_proc p "
         "JOIN pg_namespace n ON n.oid = p.pronamespace "
@@ -217,7 +162,7 @@ def _function_definition() -> str:
 
 def _event_trigger_evtfoid() -> str:
     """Return the evtfoid of the fixture event trigger, or '' when absent."""
-    return _query_scalar_text(
+    return query_scalar_text(
         "SELECT COALESCE("
         "(SELECT et.evtfoid::text FROM pg_event_trigger et "
         "WHERE et.evtname = '%s'), '') AS evtfoid" % EVENT_TRIGGER_NAME,
@@ -229,8 +174,8 @@ def _apply_legacy_drift_fixture() -> None:
     """Reset to the pre-migration baseline and apply the drift fixture."""
     _hide_new_migration()
     try:
-        _run_cli("rls_auto_enable_reset", ["db", "reset"])
-        _run_psql_file(FIXTURE)
+        run_supabase("rls_auto_enable_reset", ["db", "reset"])
+        run_psql_file(FIXTURE)
     finally:
         _restore_new_migration()
 
@@ -247,7 +192,7 @@ def test_legacy_drift_hardened():
     _apply_legacy_drift_fixture()
 
     # ---- Before the upgrade: the drift is fully present ----
-    identity_before = _query_json(_FUNCTION_IDENTITY_SQL)
+    identity_before = query_json(_FUNCTION_IDENTITY_SQL)
     assert len(identity_before) == 1, "fixture function missing before upgrade"
     assert identity_before[0]["proname"] == "rls_auto_enable"
     assert identity_before[0]["nspname"] == "public"
@@ -259,7 +204,7 @@ def test_legacy_drift_hardened():
     definition_before = _function_definition()
     assert "NULL" in definition_before, "fixture definition marker missing"
 
-    exec_grantees_before = _query_text_array(_EXECUTE_GRANTEES_SQL, "exec_grantees")
+    exec_grantees_before = query_text_array(_EXECUTE_GRANTEES_SQL, "exec_grantees")
     assert set(exec_grantees_before) == {
         "PUBLIC", "postgres", "anon", "authenticated", "service_role",
     }, "fixture EXECUTE grantees differ from the audited drift"
@@ -268,15 +213,15 @@ def test_legacy_drift_hardened():
     assert trigger_before, "fixture event trigger missing before upgrade"
 
     # ---- Apply the new hardening migration ----
-    _run_cli("rls_auto_enable_upgrade", ["migration", "up", "--local"])
+    run_supabase("rls_auto_enable_upgrade", ["migration", "up", "--local"])
 
     # ---- 1. Migration version registered ----
-    assert _query_scalar_bool(_MIGRATION_VERSION_SQL, "result"), (
+    assert query_scalar_bool(_MIGRATION_VERSION_SQL, "result"), (
         "harden_rls_auto_enable migration timestamp not registered"
     )
 
     # ---- 2. Function still exists with identical identity ----
-    identity_after = _query_json(_FUNCTION_IDENTITY_SQL)
+    identity_after = query_json(_FUNCTION_IDENTITY_SQL)
     assert identity_after == identity_before, (
         "function identity (schema, name, args, return type, SECURITY "
         "DEFINER, owner) changed during the upgrade"
@@ -292,7 +237,7 @@ def test_legacy_drift_hardened():
     assert trigger_after == trigger_before, (
         "event trigger was removed or re-targeted during the upgrade"
     )
-    assert _query_scalar_bool(
+    assert query_scalar_bool(
         "SELECT EXISTS("
         "SELECT 1 FROM pg_event_trigger et "
         "JOIN pg_proc p ON p.oid = et.evtfoid "
@@ -310,7 +255,7 @@ def test_legacy_drift_hardened():
     # ---- 6. No additional privileges were granted ----
     # The structured ACL (aclexplode) must be a strict subset: the owner
     # entry remains, every drift grant is gone, nothing new appeared.
-    exec_grantees_after = _query_text_array(_EXECUTE_GRANTEES_SQL, "exec_grantees")
+    exec_grantees_after = query_text_array(_EXECUTE_GRANTEES_SQL, "exec_grantees")
     assert set(exec_grantees_after) == {"postgres"}, (
         f"unexpected EXECUTE grantees after upgrade: {exec_grantees_after}"
     )
@@ -324,9 +269,9 @@ def test_legacy_drift_hardened():
     # ---- 8. Idempotency: re-evaluating the hardening block is a no-op ----
     with open(MIGRATION, encoding="utf-8") as f:
         hardening_sql = f.read()
-    _run_psql(hardening_sql)
+    run_psql(hardening_sql)
 
-    assert _query_scalar_bool(
+    assert query_scalar_bool(
         "SELECT ("
         "SELECT count(*) FROM pg_proc p "
         "JOIN pg_namespace n ON n.oid = p.pronamespace "
@@ -342,7 +287,7 @@ def test_legacy_drift_hardened():
         "idempotent re-run altered the event trigger"
     )
     _assert_execute_revoked_from_runtime_roles()
-    assert _query_text_array(_EXECUTE_GRANTEES_SQL, "exec_grantees") == [
+    assert query_text_array(_EXECUTE_GRANTEES_SQL, "exec_grantees") == [
         "postgres"
     ], "idempotent re-run recreated grants"
 
@@ -361,12 +306,12 @@ def test_absence_is_noop():
     # WITHOUT applying the drift fixture: the object never exists.
     _hide_new_migration()
     try:
-        _run_cli("rls_auto_enable_reset", ["db", "reset"])
+        run_supabase("rls_auto_enable_reset", ["db", "reset"])
     finally:
         _restore_new_migration()
 
     # Object absent before the upgrade
-    assert not _query_scalar_bool(
+    assert not query_scalar_bool(
         "SELECT EXISTS("
         "SELECT 1 FROM pg_proc p "
         "JOIN pg_namespace n ON n.oid = p.pronamespace "
@@ -376,13 +321,13 @@ def test_absence_is_noop():
     ), "clean baseline unexpectedly contains rls_auto_enable"
 
     # Applying the migration must succeed
-    _run_cli("rls_auto_enable_upgrade", ["migration", "up", "--local"])
+    run_supabase("rls_auto_enable_upgrade", ["migration", "up", "--local"])
 
     # Migration registered, object still absent, no artificial event trigger
-    assert _query_scalar_bool(_MIGRATION_VERSION_SQL, "result"), (
+    assert query_scalar_bool(_MIGRATION_VERSION_SQL, "result"), (
         "harden_rls_auto_enable migration timestamp not registered"
     )
-    assert not _query_scalar_bool(
+    assert not query_scalar_bool(
         "SELECT EXISTS("
         "SELECT 1 FROM pg_proc p "
         "JOIN pg_namespace n ON n.oid = p.pronamespace "
@@ -391,7 +336,7 @@ def test_absence_is_noop():
         "result",
     ), "clean database received an artificial rls_auto_enable function"
 
-    assert not _query_scalar_bool(
+    assert not query_scalar_bool(
         "SELECT EXISTS("
         "SELECT 1 FROM pg_event_trigger et "
         "JOIN pg_proc p ON p.oid = et.evtfoid "
