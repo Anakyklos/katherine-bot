@@ -26,9 +26,9 @@ the authenticated HTTP application layer (#315):
 the #314 semantics: the service is a stateless application layer that
 delegates every operation to `run_privacy_operation`.
 
-Explicitly NOT done here: UI, account/Auth deletion, durable workers/jobs,
-physical retention policy, export, model/formula changes, reactivation of
-archival extraction, #276, #316.
+Explicitly NOT done here: UI, account/Auth deletion (#317), durable
+workers/jobs (#276), physical retention/cleanup policy (#316), export,
+model/formula changes, reactivation of archival extraction.
 
 ## Problem
 
@@ -284,6 +284,6 @@ reversible; idempotency guarantees they are never applied twice.
 ## Out of scope (future leaves)
 
 - UI / settings screens exposing these primitives.
-- Account/Auth user deletion (#316), durable workers (#276), retention and
-  export policies.
+- Account/Auth user deletion with tombstone (#317), durable workers (#276),
+  retention/cleanup (#316) and export policies.
 - Emotional/relationship formula, decay, appraisal or personality changes.
