@@ -327,6 +327,51 @@ jobs:
           set -euo pipefail
           python -m pytest -q -ra backend/tests/test_retention_integration.py
 
+      - name: Run Account Deletion Integration Tests
+        env:
+          SUPABASE_URL: "http://127.0.0.1:54321"
+          SUPABASE_ANON_KEY: "${{ env.SUPABASE_ANON_KEY }}"
+          SUPABASE_SERVICE_ROLE_KEY: "${{ env.SUPABASE_SERVICE_ROLE_KEY }}"
+          PYTHONPATH: "."
+        run: |
+          set -euo pipefail
+          python -m pytest -q -ra backend/tests/test_account_deletion_integration.py
+
+      - name: Reset database for account deletion legacy upgrade test
+        run: |
+          set -euo pipefail
+          supabase db reset
+
+      - name: Run Account Deletion Legacy Upgrade Test
+        env:
+          SUPABASE_URL: "http://127.0.0.1:54321"
+          SUPABASE_SERVICE_ROLE_KEY: "${{ env.SUPABASE_SERVICE_ROLE_KEY }}"
+          PYTHONPATH: "."
+        run: |
+          set -euo pipefail
+          # Simulates a legacy database (migrations before the account
+          # deletion ledger) and applies the new migration via
+          # `supabase migration up --local`.
+          bash scripts/hide-migrations-after.sh 20260809030000 \
+            python -m pytest -q -ra backend/tests/test_account_deletion_legacy.py
+
+      - name: Reset database for account deletion preflight tests
+        run: |
+          set -euo pipefail
+          supabase db reset
+
+      - name: Run Account Deletion Preflight Test (missing dependency -> 23514)
+        env:
+          SUPABASE_URL: "http://127.0.0.1:54321"
+          PYTHONPATH: "."
+        run: |
+          set -euo pipefail
+          # Each case hides the new migration, resets the pre-ledger
+          # baseline, drops exactly one mandatory table and requires the
+          # migration to fail with 23514 before installing anything.
+          bash scripts/hide-migrations-after.sh 20260809030000 \
+            python -m pytest -q -ra backend/tests/test_account_deletion_preflight.py
+
       - name: Stop Supabase
         if: always()
         run: supabase stop
@@ -386,6 +431,9 @@ jobs:
               --ignore=backend/tests/test_privacy_api_integration.py \
               --ignore=backend/tests/test_retention_integration.py \
               --ignore=backend/tests/test_retention_preflight.py \
+              --ignore=backend/tests/test_account_deletion_integration.py \
+              --ignore=backend/tests/test_account_deletion_legacy.py \
+              --ignore=backend/tests/test_account_deletion_preflight.py \
               -ra
 
   frontend:

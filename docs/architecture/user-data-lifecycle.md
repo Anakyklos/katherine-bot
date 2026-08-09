@@ -298,3 +298,117 @@ for user-controlled content. The SQL boundary enforces the binding
 minimum retention horizons with authoritative PostgreSQL time: purge
 cutoffs supplied by the process are clamped, so a fast/misconfigured
 process clock can never advance deletion of rows inside the horizons.
+
+## Account deletion foundation (#324)
+
+The durable PostgreSQL/Supabase foundation for account deletion is its own
+leaf: `supabase/migrations/20260810120000_account_deletion_ledger.sql`
+plus `backend/account_deletion.py` (pure Python contract, no HTTP, no Auth
+Admin, no worker yet). Deleting an account crosses PostgreSQL and Supabase
+Auth; there is no distributed transaction that makes both atomically
+equivalent, so the architecture is: register a durable tombstone, purge the
+PostgreSQL data in one transaction, and only later (#325) delete the Auth
+user after the commit is confirmed. The tombstone survives the
+`profiles` DELETE (the job table has NO FK to `profiles`).
+
+### State machine
+
+`pending -> processing -> (failed | pending retry) -> processing -> completed`
+
+- `pending`: registered, not claimed.
+- `processing`: claimed by exactly one worker (lease owner + expiry). The
+  DB allows only `processing` to carry a lease.
+- `failed`: a worker reported a sanitized `error_code`; retry-eligible
+  after `next_attempt_at` (backoff derived from `attempts`, 30s..1h).
+- `completed`: DB purge committed (`db_purged_at`) AND the future Auth
+  deletion confirmed (#325). Constraints reject every incoherent
+  combination: `completed` requires `db_purged_at` + `completed_at` and
+  NULL `user_id`; `failed` requires `error_code`; attempts are never
+  negative; lease owner and error codes use strict allowlists.
+
+### DB/Auth frontier and `db_purged_at`
+
+`db_purged_at` is the authoritative marker that the PostgreSQL purge
+committed. It becomes non-NULL ONLY in the same transaction that completed
+every delete; any failure rolls the whole attempt back and the marker
+stays empty. It is set while the job is `processing` (purge done, Auth
+deletion pending) and is required for `completed`. A repeated purge after
+a crash (`DB commit` done, process died before Auth) is a safe replay:
+`db_purged_at` is authoritative and no delete depends on the row existing.
+
+### Purge order and locking
+
+The purge deletes the user's rows in one transaction, in FK-safe order
+analyzed from the migrations (no assumed cascade):
+
+1. `outbox_events` (FK profiles/turn_requests CASCADE)
+2. `turn_requests` (FK profiles CASCADE; chat_logs refs SET NULL)
+3. `archival_extractions` (FK profiles/chat_logs CASCADE)
+4. `memories` (FK profiles NO ACTION)
+5. `chat_logs` (FK profiles NO ACTION)
+6. `admission_reservations` (no FK)
+7. `privacy_operations` (no FK)
+8. `profiles` (last: snapshots, persona, `user_profile`)
+
+Before mutating data the purge acquires the SAME per-user advisory
+transaction lock as `commit_turn` and the privacy operations
+(`pg_advisory_xact_lock(hashtextextended(user_id, 0))`), so a concurrent
+turn commit of the same user can never recreate or modify data while the
+account is being deleted. Distinct users are never globally serialized.
+
+### Leases and retries
+
+Claims use `SELECT ... FOR UPDATE SKIP LOCKED`: two workers can never own
+the same job simultaneously. Leases expire, making a dead worker's job
+eligible again; every job-scoped RPC revalidates ownership (worker id +
+unexpired lease), so an old worker cannot purge, fail, retry or finalize
+after losing the lease. Retries are represented in the database:
+`attempts`, `next_attempt_at`, `record_failure` (status `failed`) and
+`record_retry` (status back to `pending`).
+
+### Identity minimization and HMAC policy
+
+While the job still needs to run the purge/Auth deletion, the raw
+`user_id` stays stored. On completion it is removed (NULL): only the
+sanitized reference remains for bounded audit and idempotency. The
+reference is an HMAC-SHA256 (lowercase hex, 64 chars) generated
+server-side with a DEDICATED `account-deletion` HMAC domain, distinct from
+the message/network/correlation/user-reference domains, so a persisted
+reference can never be correlated with `USER_REFERENCE_DOMAIN` values.
+The future HTTP client can never supply this reference; it is produced by
+the trusted backend.
+
+### Idempotency
+
+`(user_ref_hmac_sha256, operation_id)` is UNIQUE. The same pair with the
+same intent fingerprint is an exact replay (no second job); a divergent
+fingerprint is a sanitized `operation_conflict`. Different users never
+collide because the reference is a domain-separated HMAC of the identity.
+No process-local cache.
+
+### Retention of tombstones
+
+Completed tombstones are aged out by `account_deletion_purge_completed`
+(30-day horizon, batch-limited, idempotent, `completed` only, cutoff
+clamped by the DB against `clock_timestamp()` like #316).
+`pending`/`processing`/`failed` jobs are never removed by age. No new
+scheduler: the RPC reuses the operational cleanup model and the future
+worker may call it.
+
+### ACLs
+
+`account_deletion_jobs` is RLS + FORCE RLS with zero policies and no table
+grants (not even `service_role`). All runtime RPCs are `SECURITY DEFINER`
+with `SET search_path = ''`, EXECUTE granted to `service_role` only and
+revoked from `PUBLIC`/`anon`/`authenticated`; internal helpers
+(`account_deletion_validation_error`, `account_deletion_assert_owner`,
+`account_deletion_intent_fingerprint_sha256`) have no runtime grants. No
+dynamic SQL, no raw exception text, no parameters in logs.
+
+### Future leaves
+
+- #325: worker that claims jobs, runs the purge RPC, then deletes the Auth
+  user via Supabase Auth Admin and finalizes the job.
+- #326: HTTP tombstone gate that consults
+  `account_deletion_has_tombstone` before serving operations.
+- #318: tracking of the full deletion pipeline.
