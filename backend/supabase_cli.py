@@ -27,6 +27,12 @@ ALLOWED_OPS = frozenset({
     "retention_preflight_reset",
     "retention_preflight_apply",
     "retention_preflight_query",
+    "account_deletion_preflight_reset",
+    "account_deletion_preflight_apply",
+    "account_deletion_preflight_query",
+    "account_deletion_legacy_reset",
+    "account_deletion_legacy_upgrade",
+    "account_deletion_legacy_query",
 })
 
 

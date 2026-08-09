@@ -11,6 +11,16 @@ transitory** data only:
 | `admission_reservations` | `reserved_at` older than the cutoff | 24h |
 | `privacy_operations` (ledger) | `applied_at` older than the cutoff | 30 days |
 | `outbox_events` | ONLY `completed` / `dead_letter` with `retention_until` past the cutoff | `retention_until` (no age horizon) |
+| `account_deletion_jobs` | ONLY `completed` tombstones with `completed_at` older than the cutoff | 30 days |
+
+The account deletion ledger (#324) is a fourth retention category: its
+completed tombstones are aged out by the privileged RPC
+`account_deletion_purge_completed(cutoff, batch_size)` (batch-limited,
+idempotent, cutoff clamped by the DB against `clock_timestamp()` — a fast
+process clock can never advance deletion). `pending`, `processing` and
+`failed` deletion jobs are NEVER removed by age: they are the durable
+record of an in-flight account deletion. The RPC is ready for the future
+worker (#325) to invoke; no scheduler is created by #324.
 
 User-controlled content is **never** eligible:
 
