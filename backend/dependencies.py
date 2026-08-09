@@ -30,6 +30,7 @@ from .observability import (
     EVENT_SUPABASE_CLIENT_CREATION_FAILED,
     emit_event,
 )
+from .privacy_service import PrivacyService, SupabasePrivacyRepository
 from .settings import Settings
 from .turn_execution import TurnExecutionConfig
 
@@ -56,6 +57,7 @@ class ApplicationDependencies:
     health_checks: HealthRegistry
     clock: Callable[[], float] = field(default_factory=time.time)
     persistence_client: Any = None
+    privacy_service: Any = None
 
 
 def _supabase_factory_from_settings(settings: Settings) -> Callable[[], Optional[Any]]:
@@ -207,6 +209,16 @@ def build_default_dependencies(
         )
         created.append(health_checks)
 
+        # Stateless application service for the #315 privacy HTTP actions.
+        # It receives identity and operation_id per call and never stores
+        # per-user state; the injected clock and the operational turn
+        # configuration drive reset timestamps and the write budget.
+        privacy_service = PrivacyService(
+            repository=SupabasePrivacyRepository(supabase_client),
+            turn_config=settings.turn_config,
+            clock=time.time,
+        )
+
         dependencies = ApplicationDependencies(
             conversation_engine=engine,
             auth_client=supabase_client,
@@ -215,6 +227,7 @@ def build_default_dependencies(
             health_checks=health_checks,
             clock=time.time,
             persistence_client=supabase_client,
+            privacy_service=privacy_service,
         )
 
         # Owned resources created by this builder, closed at shutdown and on

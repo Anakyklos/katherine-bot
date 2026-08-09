@@ -31,6 +31,7 @@ import logging
 import time
 from contextlib import asynccontextmanager
 from typing import Optional
+from uuid import UUID
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -60,7 +61,7 @@ from .admission import (
     resolve_network_identity,
 )
 from .admission_contracts import AdmissionError, RequestIdentity, validate_new_message
-from .atomic_turn_commit import ConflictError, PersistenceError
+from .atomic_turn_commit import ConflictError, PersistenceError, ValidationError
 from .dependencies import (
     ApplicationDependencies,
     build_default_dependencies,
@@ -80,6 +81,13 @@ from .observability import (
     EVENT_TURN_FAILED,
     emit_event,
 )
+from .privacy_operations import (
+    OPERATION_DELETE_HISTORY,
+    OPERATION_DELETE_MEMORIES,
+    OPERATION_RESET_EMOTIONAL_STATE,
+    OPERATION_RESET_RELATIONSHIP_STATE,
+)
+from .privacy_service import PrivacyOperationResponse
 from .process_turn import TurnMode
 from .runtime_containment import validate_worker_configuration
 from .settings import Settings, SettingsConfigurationError
@@ -291,6 +299,19 @@ class ChatResponse(BaseModel):
     emotion_state: EmotionStateResponse
 
 
+class PrivacyOperationInput(BaseModel):
+    """Request body for the four #315 privacy actions.
+
+    Accepts ONLY ``operation_id`` (any canonical UUID version; normalized to
+    lowercase canonical form before reaching the privacy layer). Any extra
+    key, including ``user_id``, is rejected with 422: the authenticated
+    identity always comes from ``current_user.id``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    operation_id: UUID
+
+
 _VALIDATION_MESSAGES = {
     "invalid_request_id": "Invalid request identifier.",
     "message_too_long": "Message exceeds the character limit.",
@@ -467,6 +488,42 @@ def _admission_unavailable_error() -> HTTPException:
     )
 
 
+# ─── Privacy action error mapping (#315) ─────────────────────────────────────
+#
+# Stable, sanitized HTTP mapping for the four privacy actions. Every detail
+# is a public constant; exception text, identifiers and internal envelope
+# content never reach the response. After HTTP input validation, a
+# ValidationError raised by the #314 frontier is an internal contract
+# violation (malformed envelope, divergent identity, unexpected shape) and
+# fails closed as 500, never as 422.
+
+_PRIVACY_CONFLICT_DETAIL = {
+    "code": "operation_conflict",
+    "message": "Operation identifier was already used with a different operation.",
+}
+_PRIVACY_SERVICE_UNAVAILABLE_DETAIL = {
+    "code": "service_unavailable",
+    "message": "Service unavailable.",
+}
+_PRIVACY_PERSISTENCE_DETAIL = {
+    "code": TurnErrorCode.persistence_unavailable.value,
+    "message": "Persistence service unavailable.",
+}
+_PRIVACY_INTERNAL_DETAIL = {
+    "code": TurnErrorCode.internal_error.value,
+    "message": "Internal server error.",
+}
+
+
+def _map_privacy_conflict(exc: ConflictError) -> HTTPException:
+    """Map a #314 privacy conflict to a sanitized 409 or fail closed."""
+    if exc.code != "operation_conflict":
+        raise HTTPException(status_code=500, detail=_PRIVACY_INTERNAL_DETAIL) from None
+    emit_event(logger, EVENT_REQUEST_CONFLICT, code="operation_conflict")
+    emit_event(logger, EVENT_HTTP_RESULT, code=409)
+    return HTTPException(status_code=409, detail=_PRIVACY_CONFLICT_DETAIL)
+
+
 # ─── Lifespan ───────────────────────────────────────────────────────────────
 
 
@@ -592,6 +649,18 @@ def create_app(
     app.get("/live")(live_endpoint)
     app.get("/ready")(ready_endpoint)
     app.get("/health")(health_endpoint)
+    app.post(
+        "/privacy/delete-history", response_model=PrivacyOperationResponse
+    )(privacy_delete_history_endpoint)
+    app.post(
+        "/privacy/delete-memories", response_model=PrivacyOperationResponse
+    )(privacy_delete_memories_endpoint)
+    app.post(
+        "/privacy/reset-emotional-state", response_model=PrivacyOperationResponse
+    )(privacy_reset_emotional_state_endpoint)
+    app.post(
+        "/privacy/reset-relationship", response_model=PrivacyOperationResponse
+    )(privacy_reset_relationship_endpoint)
 
     return app
 
@@ -770,6 +839,118 @@ def get_history(request: Request, current_user=Depends(get_current_user)):
         return response.data[::-1] if response.data else []
     except Exception:
         raise HTTPException(status_code=500, detail="Internal Server Error")
+
+
+# ─── Privacy actions (#315) ──────────────────────────────────────────────────
+#
+# Four thin, authenticated HTTP actions over the #314 privacy frontier. The
+# identity always comes from ``current_user.id`` (never from the body, query
+# string, path or custom headers), the input DTO accepts ONLY a canonical
+# UUID ``operation_id``, and the application logic lives in the stateless
+# ``PrivacyService``. Error mapping is stable and sanitized: 401 auth,
+# 422 input, 409 operation conflict, 503 persistence, 500 fail-closed.
+
+async def _run_privacy_action(
+    operation: str,
+    input_data: PrivacyOperationInput,
+    request: Request,
+    current_user,
+) -> PrivacyOperationResponse:
+    """Run one privacy action through the injected privacy service.
+
+    The service method is selected by the canonical operation constant, so
+    each endpoint invokes exactly its own operation and never another one.
+    """
+    deps = get_dependencies(request)
+    service = deps.privacy_service
+    if service is None:
+        raise HTTPException(
+            status_code=503, detail=_PRIVACY_SERVICE_UNAVAILABLE_DETAIL
+        )
+    user_id = getattr(current_user, "id", None)
+    operation_id = str(input_data.operation_id)
+    try:
+        if operation == OPERATION_DELETE_HISTORY:
+            result = await service.delete_history(user_id, operation_id)
+        elif operation == OPERATION_DELETE_MEMORIES:
+            result = await service.delete_memories(user_id, operation_id)
+        elif operation == OPERATION_RESET_EMOTIONAL_STATE:
+            result = await service.reset_emotional_state(user_id, operation_id)
+        elif operation == OPERATION_RESET_RELATIONSHIP_STATE:
+            result = await service.reset_relationship_state(user_id, operation_id)
+        else:
+            # Fail closed for any unknown operation: never dispatch to an
+            # unrelated method and never surface the operation value.
+            raise HTTPException(status_code=500, detail=_PRIVACY_INTERNAL_DETAIL) from None
+    except HTTPException:
+        raise
+    except ConflictError as exc:
+        http_exc = _map_privacy_conflict(exc)
+        raise http_exc from None
+    except PersistenceError:
+        emit_event(logger, EVENT_HTTP_RESULT, code=503)
+        raise HTTPException(
+            status_code=503, detail=_PRIVACY_PERSISTENCE_DETAIL
+        ) from None
+    except ValidationError:
+        # After HTTP validation, a #314 ValidationError (invalid_rpc_result,
+        # divergent identity, malformed envelope) is a server-side contract
+        # violation: fail closed as 500, never present it as a client 422.
+        emit_event(logger, EVENT_HTTP_RESULT, code=500)
+        raise HTTPException(
+            status_code=500, detail=_PRIVACY_INTERNAL_DETAIL
+        ) from None
+    except Exception:
+        emit_event(logger, EVENT_HTTP_RESULT, code=500)
+        raise HTTPException(
+            status_code=500, detail=_PRIVACY_INTERNAL_DETAIL
+        ) from None
+    emit_event(logger, EVENT_HTTP_RESULT, code=200)
+    return result
+
+
+async def privacy_delete_history_endpoint(
+    input_data: PrivacyOperationInput,
+    request: Request,
+    current_user=Depends(get_current_user),
+):
+    """POST /privacy/delete-history — remove the caller's turn history."""
+    return await _run_privacy_action(
+        OPERATION_DELETE_HISTORY, input_data, request, current_user
+    )
+
+
+async def privacy_delete_memories_endpoint(
+    input_data: PrivacyOperationInput,
+    request: Request,
+    current_user=Depends(get_current_user),
+):
+    """POST /privacy/delete-memories — remove the caller's memories."""
+    return await _run_privacy_action(
+        OPERATION_DELETE_MEMORIES, input_data, request, current_user
+    )
+
+
+async def privacy_reset_emotional_state_endpoint(
+    input_data: PrivacyOperationInput,
+    request: Request,
+    current_user=Depends(get_current_user),
+):
+    """POST /privacy/reset-emotional-state — reset the emotional snapshot."""
+    return await _run_privacy_action(
+        OPERATION_RESET_EMOTIONAL_STATE, input_data, request, current_user
+    )
+
+
+async def privacy_reset_relationship_endpoint(
+    input_data: PrivacyOperationInput,
+    request: Request,
+    current_user=Depends(get_current_user),
+):
+    """POST /privacy/reset-relationship — reset the relationship snapshot."""
+    return await _run_privacy_action(
+        OPERATION_RESET_RELATIONSHIP_STATE, input_data, request, current_user
+    )
 
 
 async def live_endpoint():
