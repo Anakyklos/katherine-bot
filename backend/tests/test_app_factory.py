@@ -606,6 +606,7 @@ def test_no_per_user_state_in_app_state_or_container():
         "health_checks",
         "clock",
         "persistence_client",
+        "privacy_service",
     }
     assert set(deps.__dataclass_fields__) == container_fields
     # No attribute of the container may hold a user identity.

@@ -279,6 +279,21 @@ jobs:
           bash scripts/hide-migrations-after.sh 20240101000006 \
             python -m pytest -q -ra backend/tests/test_privacy_operations_preflight.py
 
+      - name: Reset database for privacy API integration tests
+        run: |
+          set -euo pipefail
+          supabase db reset
+
+      - name: Run Privacy API Integration Tests
+        env:
+          SUPABASE_URL: "http://127.0.0.1:54321"
+          SUPABASE_ANON_KEY: "${{ env.SUPABASE_ANON_KEY }}"
+          SUPABASE_SERVICE_ROLE_KEY: "${{ env.SUPABASE_SERVICE_ROLE_KEY }}"
+          PYTHONPATH: "."
+        run: |
+          set -euo pipefail
+          python -m pytest -q -ra backend/tests/test_privacy_api_integration.py
+
       - name: Stop Supabase
         if: always()
         run: supabase stop
@@ -335,6 +350,7 @@ jobs:
               --ignore=backend/tests/test_privacy_operations_integration.py \
               --ignore=backend/tests/test_privacy_operations_legacy.py \
               --ignore=backend/tests/test_privacy_operations_preflight.py \
+              --ignore=backend/tests/test_privacy_api_integration.py \
               -ra
 
   frontend:
