@@ -253,8 +253,12 @@ CREATE TABLE public.account_deletion_jobs (
         CHECK (intent_fingerprint_sha256 ~ '^[0-9a-f]{64}$'),
     CONSTRAINT account_deletion_jobs_status_check
         CHECK (status IN ('pending', 'processing', 'completed', 'failed')),
+    -- attempts is never negative and never exceeds the operational
+    -- exhaustion ceiling (single authoritative rule, mirrored by
+    -- v_max_attempts = 100 in the RPCs): a schema-level state with more
+    -- attempts than the state machine allows is rejected.
     CONSTRAINT account_deletion_jobs_attempts_check
-        CHECK (attempts >= 0 AND attempts <= 1000),
+        CHECK (attempts >= 0 AND attempts <= 100),
     CONSTRAINT account_deletion_jobs_lease_owner_check
         CHECK (lease_owner IS NULL OR lease_owner ~ '^[A-Za-z0-9_.:-]{1,64}$'),
     -- Lease fields travel together.
@@ -544,10 +548,17 @@ GRANT EXECUTE ON FUNCTION public.account_deletion_has_tombstone(text)
 -- Claims at most one eligible job for a worker. Real PostgreSQL row-level
 -- mechanism: FOR UPDATE SKIP LOCKED guarantees two workers can never own
 -- the same job simultaneously. Eligible:
---   * pending with next_attempt_at <= now;
---   * failed with next_attempt_at <= now (retry after backoff);
---   * processing whose lease has EXPIRED (worker died -> recoverable).
--- Each claim increments attempts (retries are represented in the DB).
+--   * pending with next_attempt_at <= now AND attempts < ceiling;
+--   * failed with next_attempt_at <= now (retry after backoff) AND
+--     attempts < ceiling;
+--   * processing whose lease has EXPIRED with attempts < ceiling
+--     (worker died -> recoverable; the recovery consumes the next
+--     attempt, up to the ceiling).
+-- A processing job whose lease expired AT the attempts ceiling is NEVER
+-- handed to another worker automatically: it is terminalized in place
+-- (failed, error_code attempts_exhausted, lease cleared, next_attempt_at
+-- NULL) and the scan continues, so other eligible jobs still progress
+-- (no starvation) and attempts never exceeds the ceiling.
 CREATE OR REPLACE FUNCTION public.account_deletion_acquire_lease(
     p_worker_id text,
     p_lease_seconds integer,
@@ -562,10 +573,13 @@ AS $$
 DECLARE
     v_job public.account_deletion_jobs%ROWTYPE;
     v_now timestamptz := clock_timestamp();
-    -- Deterministic exhaustion ceiling: a failed job whose attempts reach
-    -- this ceiling becomes TERMINAL (next_attempt_at = NULL) and is never
-    -- claimed again automatically. The tombstone stays blocking and
-    -- remains operationally recoverable by a privileged operator.
+    -- Deterministic exhaustion ceiling (single authoritative rule,
+    -- mirrored by account_deletion_jobs_attempts_check <= 100): a job
+    -- whose attempts reach this ceiling is TERMINAL (next_attempt_at
+    -- NULL) and is never claimed again automatically, neither from
+    -- pending/failed nor from an expired processing lease. The tombstone
+    -- stays blocking and remains operationally recoverable by a
+    -- privileged operator.
     v_max_attempts constant integer := 100;
 BEGIN
     IF p_worker_id IS NULL OR p_worker_id !~ '^[A-Za-z0-9_.:-]{1,64}$' THEN
@@ -593,62 +607,79 @@ BEGIN
         );
     END IF;
 
-    -- Exhausted jobs (failed with next_attempt_at IS NULL) are excluded:
-    -- they are terminal and must never be claimed automatically. New
-    -- attempts are only allowed BELOW the ceiling; a job at the ceiling
-    -- can only be recovered by resuming an expired processing lease.
-    SELECT * INTO v_job
-    FROM public.account_deletion_jobs
-    WHERE (
-            (status IN ('pending', 'failed')
-             AND next_attempt_at IS NOT NULL
-             AND next_attempt_at <= v_now
-             AND attempts < v_max_attempts)
-            OR (status = 'processing' AND lease_expires_at < v_now)
-          )
-    ORDER BY next_attempt_at
-    LIMIT 1
-    FOR UPDATE SKIP LOCKED;
+    LOOP
+        -- Exhausted jobs (failed with next_attempt_at IS NULL) and new
+        -- attempts at/above the ceiling are excluded. Expired processing
+        -- leases are scanned WITHOUT an attempts filter so an
+        -- at-the-ceiling lease can be terminalized below.
+        SELECT * INTO v_job
+        FROM public.account_deletion_jobs
+        WHERE (
+                (status IN ('pending', 'failed')
+                 AND next_attempt_at IS NOT NULL
+                 AND next_attempt_at <= v_now
+                 AND attempts < v_max_attempts)
+                OR (status = 'processing' AND lease_expires_at < v_now)
+              )
+        ORDER BY next_attempt_at
+        LIMIT 1
+        FOR UPDATE SKIP LOCKED;
 
-    IF NOT FOUND THEN
-        RETURN jsonb_build_object('found', false);
-    END IF;
+        IF NOT FOUND THEN
+            RETURN jsonb_build_object('found', false);
+        END IF;
 
-    -- Resuming an expired lease of the LAST attempt does not consume a new
-    -- attempt: attempts never exceeds the ceiling.
-    UPDATE public.account_deletion_jobs
-    SET status = 'processing',
-        lease_owner = p_worker_id,
-        lease_expires_at = v_now + make_interval(secs => p_lease_seconds),
-        attempts = CASE
-            WHEN v_job.attempts < v_max_attempts THEN v_job.attempts + 1
-            ELSE v_job.attempts
-        END,
-        error_code = NULL,
-        updated_at = v_now
-    WHERE job_id = v_job.job_id
-    RETURNING
-        job_id, user_id, user_ref_hmac_sha256, operation_id, status,
-        lease_owner, lease_expires_at, attempts, db_purged_at,
-        intent_fingerprint_sha256
-    INTO
-        v_job.job_id, v_job.user_id, v_job.user_ref_hmac_sha256, v_job.operation_id,
-        v_job.status, v_job.lease_owner, v_job.lease_expires_at, v_job.attempts,
-        v_job.db_purged_at, v_job.intent_fingerprint_sha256;
+        -- Expired lease AT the ceiling: terminalize in place (never
+        -- delivered to another worker automatically), preserving
+        -- db_purged_at and the tombstone, then keep scanning so other
+        -- eligible jobs still progress.
+        IF v_job.status = 'processing' AND v_job.attempts >= v_max_attempts THEN
+            UPDATE public.account_deletion_jobs
+            SET status = 'failed',
+                error_code = 'attempts_exhausted',
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                next_attempt_at = NULL,
+                updated_at = v_now
+            WHERE job_id = v_job.job_id;
+            CONTINUE;
+        END IF;
 
-    RETURN jsonb_build_object(
-        'found', true,
-        'job_id', v_job.job_id::text,
-        'user_id', v_job.user_id,
-        'user_ref_hmac_sha256', v_job.user_ref_hmac_sha256,
-        'operation_id', v_job.operation_id::text,
-        'status', v_job.status,
-        'lease_owner', v_job.lease_owner,
-        'lease_expires_at', v_job.lease_expires_at,
-        'attempts', v_job.attempts,
-        'db_purged_at', v_job.db_purged_at,
-        'intent_fingerprint_sha256', v_job.intent_fingerprint_sha256
-    );
+        -- Recovery/claim below the ceiling: consumes the next attempt.
+        -- v_job.attempts < v_max_attempts is guaranteed here (the
+        -- at-the-ceiling branch above already terminalized), so attempts
+        -- never exceeds the ceiling.
+        UPDATE public.account_deletion_jobs
+        SET status = 'processing',
+            lease_owner = p_worker_id,
+            lease_expires_at = v_now + make_interval(secs => p_lease_seconds),
+            attempts = v_job.attempts + 1,
+            error_code = NULL,
+            updated_at = v_now
+        WHERE job_id = v_job.job_id
+        RETURNING
+            job_id, user_id, user_ref_hmac_sha256, operation_id, status,
+            lease_owner, lease_expires_at, attempts, db_purged_at,
+            intent_fingerprint_sha256
+        INTO
+            v_job.job_id, v_job.user_id, v_job.user_ref_hmac_sha256, v_job.operation_id,
+            v_job.status, v_job.lease_owner, v_job.lease_expires_at, v_job.attempts,
+            v_job.db_purged_at, v_job.intent_fingerprint_sha256;
+
+        RETURN jsonb_build_object(
+            'found', true,
+            'job_id', v_job.job_id::text,
+            'user_id', v_job.user_id,
+            'user_ref_hmac_sha256', v_job.user_ref_hmac_sha256,
+            'operation_id', v_job.operation_id::text,
+            'status', v_job.status,
+            'lease_owner', v_job.lease_owner,
+            'lease_expires_at', v_job.lease_expires_at,
+            'attempts', v_job.attempts,
+            'db_purged_at', v_job.db_purged_at,
+            'intent_fingerprint_sha256', v_job.intent_fingerprint_sha256
+        );
+    END LOOP;
 EXCEPTION
     WHEN OTHERS THEN
         RAISE EXCEPTION 'persistence error' USING ERRCODE = 'P0001';

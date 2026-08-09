@@ -737,6 +737,75 @@ def test_attempts_exhaustion_is_terminal_and_tombstone_preserved(service_client:
         _cleanup_user(user_id)
 
 
+def test_expired_ceiling_lease_is_terminalized_not_reclaimed(service_client: Client):
+    """A processing job whose lease expired AT the attempts ceiling is
+    terminalized in place and NEVER delivered to another worker.
+
+    This closes the exhaustion loophole: without this, the last attempt
+    dying before record_failure/record_retry could be reclaimed an
+    unlimited number of times. The terminal state preserves the tombstone
+    and db_purged_at, and other eligible jobs still progress.
+    """
+    user_id = _uid("ceil")
+    ref = _ref(user_id)
+    op_id = _new_op_id()
+    fp = _fingerprint()
+    try:
+        request = _repo(service_client).request(user_id, ref, op_id, fp)
+        # Fast-forward to the boundary and simulate a worker that died
+        # with the lease held at the ceiling (attempt 100), without ever
+        # calling record_failure/record_retry.
+        _run_sql(
+            "UPDATE public.account_deletion_jobs "
+            "SET attempts = 100, status = 'processing', "
+            "lease_owner = 'worker-dead', "
+            "lease_expires_at = now() - interval '1 second' "
+            f"WHERE job_id = '{request.job_id}'"
+        )
+        # The next poll must NOT hand the job to another worker: it is
+        # terminalized and the poll reports no eligible job.
+        with pytest.raises(PersistenceError):
+            _repo(service_client).acquire_lease("worker-new", 60, 100)
+        row = _run_sql(
+            "SELECT status, error_code, lease_owner IS NULL AS lease_cleared, "
+            "next_attempt_at IS NULL AS terminal "
+            "FROM public.account_deletion_jobs WHERE job_id = "
+            f"'{request.job_id}'"
+        )[0]
+        assert row["status"] == "failed"
+        assert row["error_code"] == "attempts_exhausted"
+        assert row["lease_cleared"] is True
+        assert row["terminal"] is True
+        # The tombstone stays blocking and is never re-acquired.
+        assert _repo(service_client).has_tombstone(ref).exists is True
+        with pytest.raises(PersistenceError):
+            _repo(service_client).acquire_lease("worker-new2", 60, 100)
+
+        # db_purged_at is preserved when it was already set.
+        _run_sql(
+            "UPDATE public.account_deletion_jobs SET db_purged_at = "
+            "now() - interval '1 hour' "
+            f"WHERE job_id = '{request.job_id}'"
+        )
+        _run_sql(
+            "UPDATE public.account_deletion_jobs SET status = 'processing', "
+            "lease_owner = 'worker-dead2', "
+            "lease_expires_at = now() - interval '1 second' "
+            f"WHERE job_id = '{request.job_id}'"
+        )
+        with pytest.raises(PersistenceError):
+            _repo(service_client).acquire_lease("worker-new3", 60, 100)
+        row = _run_sql(
+            "SELECT status, db_purged_at IS NOT NULL AS purged "
+            "FROM public.account_deletion_jobs WHERE job_id = "
+            f"'{request.job_id}'"
+        )[0]
+        assert row["status"] == "failed"
+        assert row["purged"] is True, "terminalization must preserve db_purged_at"
+    finally:
+        _cleanup_user(user_id)
+
+
 # ─── 14/15/16. Finalize and minimization ────────────────────────────────────
 
 def test_finalize_clears_user_id_keeps_ref_and_tombstone(service_client: Client):

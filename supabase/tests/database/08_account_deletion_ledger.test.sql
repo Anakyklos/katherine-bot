@@ -1,7 +1,7 @@
 BEGIN;
 
 CREATE EXTENSION IF NOT EXISTS pgtap;
-SELECT plan(125);
+SELECT plan(140);
 
 -- =================================================================
 -- 1. Table exists with the exact columns
@@ -589,10 +589,15 @@ SELECT is(
 -- =================================================================
 -- 10. Attempts exhaustion (deterministic terminal state)
 -- =================================================================
--- The ceiling is 100. A job at 99 may be claimed once more (the last
--- allowed claim); record_failure at the ceiling makes it TERMINAL
--- (next_attempt_at NULL); the claim never selects exhausted jobs and the
--- tombstone stays blocking.
+-- The ceiling is 100. A job below the ceiling may be claimed (the last
+-- allowed claim reaches 100); record_failure/record_retry at the ceiling
+-- make it TERMINAL (next_attempt_at NULL); an expired processing lease AT
+-- the ceiling is terminalized in place (never handed to another worker);
+-- the claim never selects exhausted jobs; the tombstone stays blocking;
+-- other eligible jobs still progress (no starvation); schema states
+-- above the ceiling are rejected.
+
+-- --- 10.1 record_failure at the ceiling -> terminal ---
 INSERT INTO public.account_deletion_jobs (
     operation_id, user_id, user_ref_hmac_sha256, intent_fingerprint_sha256,
     status, attempts, next_attempt_at
@@ -600,7 +605,6 @@ INSERT INTO public.account_deletion_jobs (
     '55555555-5555-5555-5555-555555555555'::uuid, 'adl-exhaust',
     repeat('5', 64), repeat('6', 64), 'pending', 99, clock_timestamp()
 );
-
 SELECT is(
     (public.account_deletion_acquire_lease('worker-ex', 60, 100)->>'attempts')::integer,
     100,
@@ -625,7 +629,7 @@ SELECT is(
     'exhausted tombstone stays blocking'
 );
 
--- record_retry at the ceiling also becomes a terminal failed job.
+-- --- 10.2 record_retry at the ceiling -> terminal attempts_exhausted ---
 INSERT INTO public.account_deletion_jobs (
     operation_id, user_id, user_ref_hmac_sha256, intent_fingerprint_sha256,
     status, attempts, next_attempt_at
@@ -652,17 +656,142 @@ SELECT is(
     'exhausted retry job is never claimed automatically again'
 );
 
--- Resuming an expired lease of the LAST attempt does not consume a new
--- attempt: attempts never exceeds the ceiling.
-UPDATE public.account_deletion_jobs
-SET status = 'processing',
-    lease_owner = 'worker-ex6',
-    lease_expires_at = now() - interval '1 second'
-WHERE user_ref_hmac_sha256 = repeat('7', 64);
+-- --- 10.3 Expired processing lease BELOW the ceiling is recoverable ---
+-- (attempts 99 -> the recovery consumes the next attempt, reaching 100).
+INSERT INTO public.account_deletion_jobs (
+    operation_id, user_id, user_ref_hmac_sha256, intent_fingerprint_sha256,
+    status, attempts, lease_owner, lease_expires_at, next_attempt_at
+) VALUES (
+    '77777777-7777-7777-7777-777777777777'::uuid, 'adl-recover',
+    repeat('a0', 32), repeat('b0', 32), 'processing', 99,
+    'worker-dead', now() - interval '1 second', now() - interval '1 second'
+);
 SELECT is(
-    (public.account_deletion_acquire_lease('worker-ex7', 60, 100)->>'attempts')::integer,
+    (public.account_deletion_acquire_lease('worker-ex8', 60, 100)->>'attempts')::integer,
     100,
-    'resuming an expired last-attempt lease keeps attempts at the ceiling'
+    'expired lease below the ceiling is recovered and reaches the ceiling'
+);
+SELECT is(
+    (public.account_deletion_acquire_lease('worker-ex9', 60, 100)->>'found'),
+    'false',
+    'after recovery the job is processing at the ceiling: no new claim'
+);
+
+-- --- 10.4 Expired processing lease AT the ceiling is terminalized ---
+-- The job (now processing at 100, lease held by worker-ex8) expires
+-- without record_failure/record_retry: the next claim must NOT deliver it
+-- to another worker; it is terminalized (failed, attempts_exhausted,
+-- lease cleared, next_attempt_at NULL) and db_purged_at is preserved.
+UPDATE public.account_deletion_jobs
+SET lease_expires_at = now() - interval '1 second'
+WHERE user_ref_hmac_sha256 = repeat('a0', 32);
+SELECT is(
+    (public.account_deletion_acquire_lease('worker-ex10', 60, 100)->>'found'),
+    'false',
+    'expired lease at the ceiling is never handed to another worker'
+);
+SELECT is(
+    (SELECT status FROM public.account_deletion_jobs
+      WHERE user_ref_hmac_sha256 = repeat('a0', 32)),
+    'failed',
+    'expired ceiling lease job is terminalized to failed'
+);
+SELECT is(
+    (SELECT error_code FROM public.account_deletion_jobs
+      WHERE user_ref_hmac_sha256 = repeat('a0', 32)),
+    'attempts_exhausted',
+    'terminalized job carries attempts_exhausted'
+);
+SELECT is(
+    (SELECT lease_owner IS NULL AND lease_expires_at IS NULL
+       FROM public.account_deletion_jobs
+      WHERE user_ref_hmac_sha256 = repeat('a0', 32)),
+    true,
+    'terminalized job lease is cleared'
+);
+SELECT is(
+    (SELECT next_attempt_at IS NULL FROM public.account_deletion_jobs
+      WHERE user_ref_hmac_sha256 = repeat('a0', 32)),
+    true,
+    'terminalized job has no next attempt'
+);
+SELECT is(
+    (SELECT db_purged_at IS NOT NULL FROM public.account_deletion_jobs
+      WHERE user_ref_hmac_sha256 = repeat('a0', 32)),
+    false,
+    'terminalized job without prior purge keeps db_purged_at empty'
+);
+SELECT is(
+    (public.account_deletion_has_tombstone(repeat('a0', 32))->>'exists'),
+    'true',
+    'terminalized tombstone stays blocking'
+);
+SELECT is(
+    (public.account_deletion_acquire_lease('worker-ex11', 60, 100)->>'found'),
+    'false',
+    'a new poll never re-acquires the terminalized job'
+);
+
+-- --- 10.5 Terminalization preserves db_purged_at when already set ---
+INSERT INTO public.account_deletion_jobs (
+    operation_id, user_id, user_ref_hmac_sha256, intent_fingerprint_sha256,
+    status, attempts, lease_owner, lease_expires_at, next_attempt_at,
+    db_purged_at
+) VALUES (
+    '88888888-8888-8888-8888-888888888888'::uuid, 'adl-purged-ex',
+    repeat('c0', 32), repeat('d0', 32), 'processing', 100,
+    'worker-dead2', now() - interval '1 second', now() - interval '1 second',
+    now() - interval '2 hours'
+);
+SELECT is(
+    (public.account_deletion_acquire_lease('worker-ex12', 60, 100)->>'found'),
+    'false',
+    'expired ceiling lease with db_purged_at is never handed to another worker'
+);
+SELECT is(
+    (SELECT db_purged_at IS NOT NULL FROM public.account_deletion_jobs
+      WHERE user_ref_hmac_sha256 = repeat('c0', 32)),
+    true,
+    'terminalization preserves db_purged_at'
+);
+SELECT is(
+    (SELECT status FROM public.account_deletion_jobs
+      WHERE user_ref_hmac_sha256 = repeat('c0', 32)),
+    'failed',
+    'db_purged_at job is terminalized to failed'
+);
+
+-- --- 10.6 No starvation: another eligible job still progresses ---
+-- The terminalized jobs above are skipped; a new eligible pending job is
+-- claimed in the same poll.
+INSERT INTO public.account_deletion_jobs (
+    operation_id, user_id, user_ref_hmac_sha256, intent_fingerprint_sha256,
+    status, attempts, next_attempt_at
+) VALUES (
+    '99999999-9999-9999-9999-999999999999'::uuid, 'adl-starvation',
+    repeat('e0', 32), repeat('f0', 32), 'pending', 0, clock_timestamp()
+);
+SELECT is(
+    (public.account_deletion_acquire_lease('worker-ex13', 60, 100)->>'user_id'),
+    'adl-starvation',
+    'an eligible job is claimed even when exhausted jobs were terminalized'
+);
+
+-- --- 10.7 Schema rejects attempts above the ceiling ---
+SELECT throws_ok(
+    'INSERT INTO public.account_deletion_jobs
+        (operation_id, user_id, user_ref_hmac_sha256, intent_fingerprint_sha256,
+         status, attempts)
+     VALUES (gen_random_uuid(), ''u-1'', repeat(''a'', 64), repeat(''b'', 64),
+         ''pending'', 101)',
+    NULL, NULL,
+    'attempts above the ceiling are rejected by the schema'
+);
+SELECT throws_ok(
+    'UPDATE public.account_deletion_jobs SET attempts = 101
+      WHERE user_ref_hmac_sha256 = repeat(''e0'', 32)',
+    NULL, NULL,
+    'updates above the ceiling are rejected by the schema'
 );
 
 -- =================================================================
