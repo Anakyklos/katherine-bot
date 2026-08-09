@@ -20,6 +20,23 @@
 --     now) are eligible. Active states (pending, processing, failed) are
 --     never purged by age.
 --
+-- DB-authoritative cutoff clamp (security invariant)
+-- ==================================================
+-- The three purge RPCs accept a caller-supplied p_cutoff but NEVER trust it
+-- absolutely: each function clamps the effective cutoff against
+-- authoritative PostgreSQL time (clock_timestamp()) so that the binding
+-- minimum retention horizons are enforced BY THE DATABASE:
+--
+--   * admission_reservations: effective cutoff <= db_now - 24h;
+--   * privacy_operations:     effective cutoff <= db_now - 30 days;
+--   * outbox_events:          effective cutoff <= db_now.
+--
+-- A caller cutoff (or a fast/misconfigured process clock) can therefore
+-- only REDUCE progress (an older cutoff purges fewer rows); it can never
+-- ADVANCE deletion: rows inside the horizons, and outbox events whose
+-- retention_until is still in the future, are protected regardless of the
+-- caller. The runner's process clock is advisory for scheduling only.
+--
 -- NOT covered: chat_logs, memories, archival_extractions, profiles
 -- snapshots, turn_requests. User-controlled data and the replay/history
 -- ledger get NO automatic TTL; they remain until an explicit user action or
@@ -113,9 +130,16 @@ REVOKE ALL ON FUNCTION public.retention_purge_validation_error(timestamptz, inte
 -- =================================================================
 -- 3. purge_admission_reservations
 -- =================================================================
--- Deletes up to p_batch_size rows with reserved_at < p_cutoff and returns
--- the number of rows deleted. Rows at or after the cutoff (current quota
--- ledger) are never touched.
+-- Deletes up to p_batch_size rows with reserved_at < effective cutoff and
+-- returns the number of rows deleted. Rows at or after the cutoff (current
+-- quota ledger) are never touched.
+--
+-- The effective cutoff is the caller-supplied p_cutoff CLAMPED to never
+-- exceed db_now - 24h, using authoritative PostgreSQL time
+-- (clock_timestamp()). The database therefore enforces the binding 24h
+-- minimum retention horizon: a caller cutoff (or a fast process clock)
+-- can only reduce progress, never advance deletion; rows inside the
+-- horizon are protected regardless of the caller.
 CREATE OR REPLACE FUNCTION public.purge_admission_reservations(
     p_cutoff timestamptz,
     p_batch_size integer
@@ -127,17 +151,20 @@ SECURITY DEFINER
 SET search_path = ''
 AS $$
 DECLARE
+    v_cutoff timestamptz;
     v_deleted integer;
 BEGIN
     IF public.retention_purge_validation_error(p_cutoff, p_batch_size) IS NOT NULL THEN
         RAISE EXCEPTION 'invalid retention parameters';
     END IF;
 
+    v_cutoff := LEAST(p_cutoff, clock_timestamp() - interval '24 hours');
+
     DELETE FROM public.admission_reservations
     WHERE (user_id, request_id) IN (
         SELECT user_id, request_id
         FROM public.admission_reservations
-        WHERE reserved_at < p_cutoff
+        WHERE reserved_at < v_cutoff
         ORDER BY reserved_at
         LIMIT p_batch_size
     );
@@ -154,9 +181,14 @@ GRANT EXECUTE ON FUNCTION public.purge_admission_reservations(timestamptz, integ
 -- =================================================================
 -- 4. purge_privacy_operations
 -- =================================================================
--- Deletes up to p_batch_size ledger rows with applied_at < p_cutoff and
--- returns the number of rows deleted. Rows inside the retention horizon
--- stay, preserving the #314 replay/idempotency/conflict semantics.
+-- Deletes up to p_batch_size ledger rows with applied_at < effective
+-- cutoff and returns the number of rows deleted. Rows inside the retention
+-- horizon stay, preserving the #314 replay/idempotency/conflict semantics.
+--
+-- The effective cutoff is the caller-supplied p_cutoff CLAMPED to never
+-- exceed db_now - 30 days (authoritative PostgreSQL time). The database
+-- enforces the binding 30-day minimum retention horizon regardless of the
+-- caller's cutoff or clock.
 CREATE OR REPLACE FUNCTION public.purge_privacy_operations(
     p_cutoff timestamptz,
     p_batch_size integer
@@ -168,17 +200,20 @@ SECURITY DEFINER
 SET search_path = ''
 AS $$
 DECLARE
+    v_cutoff timestamptz;
     v_deleted integer;
 BEGIN
     IF public.retention_purge_validation_error(p_cutoff, p_batch_size) IS NOT NULL THEN
         RAISE EXCEPTION 'invalid retention parameters';
     END IF;
 
+    v_cutoff := LEAST(p_cutoff, clock_timestamp() - interval '30 days');
+
     DELETE FROM public.privacy_operations
     WHERE (user_id, operation_id) IN (
         SELECT user_id, operation_id
         FROM public.privacy_operations
-        WHERE applied_at < p_cutoff
+        WHERE applied_at < v_cutoff
         ORDER BY applied_at
         LIMIT p_batch_size
     );
@@ -196,10 +231,15 @@ GRANT EXECUTE ON FUNCTION public.purge_privacy_operations(timestamptz, integer)
 -- 5. purge_outbox_events
 -- =================================================================
 -- Deletes up to p_batch_size FINAL outbox events whose retention_until is
--- PAST the cutoff and returns the number of rows deleted. The status
--- predicate is explicit and fail-closed: pending, processing and failed
--- events are never purged by age, and a final event whose retention_until
--- has not yet expired stays.
+-- PAST the effective cutoff and returns the number of rows deleted. The
+-- status predicate is explicit and fail-closed: pending, processing and
+-- failed events are never purged by age, and a final event whose
+-- retention_until has not yet expired stays.
+--
+-- The effective cutoff is the caller-supplied p_cutoff CLAMPED to never
+-- exceed db_now (authoritative PostgreSQL time). The database therefore
+-- enforces the binding rule that an event is only removable after its
+-- retention_until has passed, regardless of the caller's cutoff or clock.
 CREATE OR REPLACE FUNCTION public.purge_outbox_events(
     p_cutoff timestamptz,
     p_batch_size integer
@@ -211,11 +251,14 @@ SECURITY DEFINER
 SET search_path = ''
 AS $$
 DECLARE
+    v_cutoff timestamptz;
     v_deleted integer;
 BEGIN
     IF public.retention_purge_validation_error(p_cutoff, p_batch_size) IS NOT NULL THEN
         RAISE EXCEPTION 'invalid retention parameters';
     END IF;
+
+    v_cutoff := LEAST(p_cutoff, clock_timestamp());
 
     DELETE FROM public.outbox_events
     WHERE id IN (
@@ -223,7 +266,7 @@ BEGIN
         FROM public.outbox_events
         WHERE status IN ('completed', 'dead_letter')
           AND retention_until IS NOT NULL
-          AND retention_until < p_cutoff
+          AND retention_until < v_cutoff
         ORDER BY retention_until
         LIMIT p_batch_size
     );

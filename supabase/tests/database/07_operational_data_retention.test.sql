@@ -1,7 +1,7 @@
 BEGIN;
 
 CREATE EXTENSION IF NOT EXISTS pgtap;
-SELECT plan(44);
+SELECT plan(53);
 
 -- =================================================================
 -- 1. Migration and indexes (#316)
@@ -352,7 +352,112 @@ SELECT is(
 );
 
 -- =================================================================
--- 9. Cleanup never attaches to user-controlled tables
+-- 9. Future cutoff cannot advance deletion (DB-authoritative clamp)
+-- =================================================================
+-- The purge RPCs clamp the caller-supplied cutoff against authoritative
+-- PostgreSQL time (clock_timestamp()): a future cutoff must never remove
+-- rows inside the binding minimum horizons, and the genuinely expired
+-- rows remain removable.
+INSERT INTO public.admission_reservations
+    (user_id, request_id, message_hmac_sha256, network_hmac_sha256,
+     estimated_units, reserved_at)
+VALUES
+    ('ret-adm-future-expired', '33333333-3333-3333-3333-333333333333',
+     repeat('a', 64), repeat('b', 64), 10,
+     now() - interval '25 hours'),
+    ('ret-adm-future-current', '44444444-4444-4444-4444-444444444444',
+     repeat('c', 64), repeat('d', 64), 10,
+     now() - interval '23 hours');
+
+SELECT is(
+    public.purge_admission_reservations(now() + interval '1 day', 100),
+    1,
+    'future cutoff removes only the admission row older than 24h'
+);
+SELECT is(
+    (SELECT count(*)::integer FROM public.admission_reservations WHERE user_id = 'ret-adm-future-current'),
+    1,
+    'admission row younger than 24h survives a future cutoff'
+);
+SELECT is(
+    (SELECT count(*)::integer FROM public.admission_reservations WHERE user_id = 'ret-adm-future-expired'),
+    0,
+    'admission row older than 24h is still removable under a future cutoff'
+);
+
+INSERT INTO public.privacy_operations
+    (user_id, operation_id, operation, operation_payload_sha256, status,
+     applied_at, result)
+VALUES
+    ('ret-prv-future-expired', '33333333-3333-3333-3333-333333333333',
+     'delete_history', repeat('e', 64), 'applied',
+     now() - interval '31 days', '{"status":"applied"}'::jsonb),
+    ('ret-prv-future-current', '44444444-4444-4444-4444-444444444444',
+     'delete_memories', repeat('f', 64), 'applied',
+     now() - interval '29 days', '{"status":"applied"}'::jsonb);
+
+SELECT is(
+    public.purge_privacy_operations(now() + interval '1 day', 100),
+    1,
+    'future cutoff removes only the privacy ledger row older than 30 days'
+);
+SELECT is(
+    (SELECT count(*)::integer FROM public.privacy_operations WHERE user_id = 'ret-prv-future-current'),
+    1,
+    'privacy ledger row younger than 30 days survives a future cutoff'
+);
+SELECT is(
+    (SELECT count(*)::integer FROM public.privacy_operations WHERE user_id = 'ret-prv-future-expired'),
+    0,
+    'privacy ledger row older than 30 days is still removable under a future cutoff'
+);
+
+-- Outbox: FK to profiles(user_id); seed the profile first.
+INSERT INTO public.profiles
+    (user_id, persona_config, user_profile, relationship_state,
+     emotional_state, revision)
+VALUES (
+    'ret-outbox-future', 'persona', '{}'::jsonb,
+    '{"schema_version":1,"trust":0.5,"affection":0.3,"tension":0.0,"triggers":[],"timestamp":1700000000.0}'::jsonb,
+    '{"schema_version":1,"pleasure":0.0,"arousal":0.0,"dominance":0.0,"libido":0.0,"aggression":0.0,"connection":0.5,"energy":0.8,"tension":0.0,"coping_mode":"HEALTHY","timestamp":1700000000.0}'::jsonb,
+    1
+);
+
+INSERT INTO public.outbox_events
+    (id, event_type, contract_version, user_id, turn_request_id, payload,
+     status, attempts, next_attempt_at, lease_owner, lease_expires_at,
+     idempotency_key, error_code, created_at, updated_at, processed_at,
+     dead_lettered_at, retention_until)
+VALUES
+    ('bbbbbbbb-cccc-cccc-cccc-cccccccccccc', 'turn_completed', 1,
+     'ret-outbox-future', NULL, '{"ref":"g"}'::jsonb,
+     'completed', 1, NULL, NULL, NULL, 'ret-outbox-f-k-expired', NULL,
+     now(), now(), now() - interval '2 days', NULL,
+     now() - interval '1 day'),
+    ('bbbbbbbb-eeee-eeee-eeee-eeeeeeeeeeee', 'turn_completed', 1,
+     'ret-outbox-future', NULL, '{"ref":"h"}'::jsonb,
+     'completed', 1, NULL, NULL, NULL, 'ret-outbox-f-k-future', NULL,
+     now(), now(), now() - interval '2 days', NULL,
+     now() + interval '1 day');
+
+SELECT is(
+    public.purge_outbox_events(now() + interval '1 day', 100),
+    1,
+    'future cutoff removes only the outbox event with expired retention_until'
+);
+SELECT is(
+    (SELECT count(*)::integer FROM public.outbox_events WHERE id = 'bbbbbbbb-eeee-eeee-eeee-eeeeeeeeeeee'),
+    1,
+    'outbox event with future retention_until survives a future cutoff'
+);
+SELECT is(
+    (SELECT count(*)::integer FROM public.outbox_events WHERE id = 'bbbbbbbb-cccc-cccc-cccc-cccccccccccc'),
+    0,
+    'outbox event with expired retention_until is still removable under a future cutoff'
+);
+
+-- =================================================================
+-- 10. Cleanup never attaches to user-controlled tables
 -- =================================================================
 -- The retention migration must not attach any purge trigger to
 -- user-controlled tables (chat_logs, memories, archival_extractions,

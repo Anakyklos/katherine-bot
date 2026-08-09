@@ -294,4 +294,7 @@ Operational retention/cleanup (#316) is implemented by its own leaf:
 `python -m backend.retention_cli --once` command. It covers ONLY
 operational data (`admission_reservations`, the privacy operation ledger,
 final outbox events) and deliberately never introduces an automatic TTL
-for user-controlled content.
+for user-controlled content. The SQL boundary enforces the binding
+minimum retention horizons with authoritative PostgreSQL time: purge
+cutoffs supplied by the process are clamped, so a fast/misconfigured
+process clock can never advance deletion of rows inside the horizons.

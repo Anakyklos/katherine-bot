@@ -22,6 +22,10 @@ boundary:
      corruption.
  7.  Cleanup never touches user-controlled content (chat_logs, memories,
      profiles snapshots, turn_requests) of users A and B.
+ 8.  A runner with an artificially fast process clock cannot advance
+     deletion: the SQL boundary clamps every purge cutoff against
+     authoritative PostgreSQL time, so rows inside the binding horizons
+     survive.
 """
 
 from __future__ import annotations
@@ -478,3 +482,51 @@ def test_user_content_never_touched(service_client: Client):
     finally:
         _cleanup_user(user_a)
         _cleanup_user(user_b)
+
+
+# ─── 8. Fast process clock cannot advance deletion (SQL boundary) ───────────
+
+
+def test_future_clock_cannot_violate_policy(service_client: Client):
+    """A runner with an artificially fast process clock must not advance
+    deletion.
+
+    The runner computes cutoffs from the injected clock (here ~400 days in
+    the future), so every caller cutoff is a future timestamp. The SQL
+    boundary clamps each purge cutoff against authoritative PostgreSQL time
+    (``clock_timestamp()``), so only genuinely expired rows are removed:
+    rows inside the binding 24h/30d horizons and outbox events whose
+    ``retention_until`` is still in the future survive.
+    """
+    user_id = _uid("clock")
+    _seed_profile(user_id)
+    _seed_admission(user_id, expired_hours=25, current_hours=23)
+    _seed_privacy_ledger(user_id, expired_days=31, current_days=29)
+    _seed_outbox(user_id, completed_expired=True, completed_future=True)
+    try:
+        def future_clock() -> float:
+            return time.time() + 400 * 86400
+
+        result = asyncio.run(_runner(service_client, clock=future_clock).run_once())
+        admission = result.results[RetentionCategory.ADMISSION_RESERVATIONS.value]
+        privacy = result.results[RetentionCategory.PRIVACY_OPERATIONS.value]
+        outbox = result.results[RetentionCategory.OUTBOX_EVENTS.value]
+        # Only genuinely expired rows are purged per category.
+        assert admission.purged == 1
+        assert privacy.purged == 1
+        assert outbox.purged == 1
+        # Rows inside the binding horizons survive the future clock.
+        assert _count(
+            "admission_reservations",
+            f"user_id = '{user_id}' AND reserved_at >= now() - interval '24 hours'",
+        ) == 1
+        assert _count(
+            "privacy_operations",
+            f"user_id = '{user_id}' AND applied_at >= now() - interval '30 days'",
+        ) == 1
+        assert _count(
+            "outbox_events",
+            f"user_id = '{user_id}' AND retention_until >= now()",
+        ) == 1
+    finally:
+        _cleanup_user(user_id)

@@ -69,11 +69,35 @@ Optional parameters:
 The round:
 
 1. Computes cutoffs from the injected clock: admission `now - 24h`,
-   privacy ledger `now - 30d`, outbox `now`.
+   privacy ledger `now - 30d`, outbox `now`. These are scheduling
+   hints: the SQL boundary clamps every cutoff against authoritative
+   PostgreSQL time, so a fast/misconfigured process clock can never
+   advance deletion (see "DB-authoritative cutoff clamp" below).
 2. For each category, runs bounded batches (each batch is one transactional
    `DELETE ... LIMIT batch_size` purge RPC) until a partial batch or the
    per-category cap (10 000 rows) is reached.
 3. Prints a sanitized aggregate summary and exits 0.
+
+## DB-authoritative cutoff clamp
+
+The three purge RPCs never trust the caller-supplied cutoff absolutely:
+each one clamps the effective cutoff against PostgreSQL time
+(`clock_timestamp()`):
+
+| RPC | Effective cutoff never exceeds |
+|---|---|
+| `purge_admission_reservations` | `db_now - 24h` |
+| `purge_privacy_operations` | `db_now - 30 days` |
+| `purge_outbox_events` | `db_now` |
+
+Consequences:
+
+- Rows inside the binding horizons (admission < 24h, privacy ledger
+  < 30 days) and outbox events whose `retention_until` is still in the
+  future are protected BY THE DATABASE, regardless of the process clock.
+- A lagging process clock only reduces progress (an older cutoff purges
+  fewer rows); a fast process clock can never delete early.
+- `p_cutoff` remains an upper bound on progress, not a license to delete.
 
 ## Verifying success
 
@@ -149,6 +173,9 @@ eligible).
 - Policy is versioned: `RETENTION_POLICY_SCHEMA_VERSION = 1`; the SQL
   boundary (migration `20260809030000_operational_data_retention.sql`)
   enforces the same eligibility contracts fail-closed.
+- The SQL boundary enforces the binding minimum retention horizons with
+  authoritative PostgreSQL time (`clock_timestamp()`): caller cutoffs are
+  clamped, so a fast process clock can never advance deletion.
 - Batch size is explicit and limited; a round never loads a whole table
   into memory.
 - No global locks; concurrency-safe by idempotent bounded deletes.
