@@ -70,6 +70,7 @@ from backend.privacy_operations import (
 from backend.privacy_service import (
     PrivacyOperationResponse,
     PrivacyService,
+    SupabasePrivacyRepository,
 )
 from backend.process_turn import ProcessTurnResult
 from backend.settings import AppEnvironment, Settings
@@ -372,6 +373,22 @@ def test_route_without_bearer_returns_401_and_does_not_call_service(path):
     assert service.calls == [], "the privacy service must not be reached"
 
 
+@pytest.mark.parametrize("path", sorted(PATHS.values()))
+def test_route_without_wired_service_returns_503_constant(path):
+    """When ``privacy_service`` is not wired in the container, every privacy
+    endpoint fails closed with the sanitized 503 service-unavailable payload
+    (never a 500 and never an internal detail)."""
+    app = _make_app(service=None)
+    client = TestClient(app)
+    response = client.post(
+        path, json={"operation_id": OP_ID}, headers=_auth_headers()
+    )
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": {"code": "service_unavailable", "message": "Service unavailable."}
+    }
+
+
 # ─── 2. Identity comes exclusively from current_user.id ─────────────────────
 
 
@@ -612,6 +629,65 @@ def test_delete_operations_send_empty_payload():
     asyncio.run(service.delete_history("user-a", OP_ID))
     asyncio.run(service.delete_memories("user-a", OP_ID_2))
     assert captured == [("delete_history", {}), ("delete_memories", {})]
+
+
+# ─── Repository: malformed Supabase response shapes fail closed ─────────────
+
+
+def _repo_with_response(response) -> SupabasePrivacyRepository:
+    client = SimpleNamespace(
+        rpc=lambda name, params: SimpleNamespace(execute=lambda: response)
+    )
+    return SupabasePrivacyRepository(client)
+
+
+def test_repository_accepts_single_mapping_response():
+    repo = _repo_with_response(SimpleNamespace(data={"status": "applied"}))
+    assert repo.call("delete_history", {}) == {"status": "applied"}
+
+
+def test_repository_accepts_single_element_list_response():
+    repo = _repo_with_response(SimpleNamespace(data=[{"status": "applied"}]))
+    assert repo.call("delete_history", {}) == {"status": "applied"}
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        SimpleNamespace(data=[]),
+        SimpleNamespace(data=[{"a": 1}, {"b": 2}]),
+        SimpleNamespace(data="not-a-mapping"),
+        SimpleNamespace(data=None),
+        SimpleNamespace(),  # missing ``data`` attribute
+        "not-a-response",
+        None,
+    ],
+)
+def test_repository_maps_malformed_response_shapes_to_persistence_error(response):
+    repo = _repo_with_response(response)
+    with pytest.raises(PersistenceError) as exc:
+        repo.call("delete_history", {})
+    assert exc.value.code == "database_error"
+    assert "persistence error" in str(exc.value)
+
+
+def test_repository_maps_rpc_exception_to_persistence_error_sanitized():
+    class ExplodingClient:
+        def rpc(self, name, params):
+            raise RuntimeError(SENTINEL_EXC)
+
+    repo = SupabasePrivacyRepository(ExplodingClient())
+    with pytest.raises(PersistenceError) as exc:
+        repo.call("delete_history", {})
+    assert SENTINEL_EXC not in str(exc.value)
+    assert "persistence error" in str(exc.value)
+
+
+def test_repository_without_client_raises_sanitized_persistence_error():
+    repo = SupabasePrivacyRepository(None)
+    with pytest.raises(PersistenceError) as exc:
+        repo.call("delete_history", {})
+    assert exc.value.code == "database_error"
 
 
 # ─── 12. Idempotent replay, same public result, no second mutation ──────────

@@ -119,22 +119,33 @@ class SupabasePrivacyRepository:
         self._client = client
 
     def call(self, rpc_name: str, params: Mapping[str, Any]) -> Mapping[str, Any]:
+        """Invoke one privacy RPC and return the parsed result mapping.
+
+        The response shape is validated fail-closed INSIDE the try/except:
+        a missing/unreachable client, a response without ``data``, a list
+        that is not exactly one element, or a non-dict payload all surface
+        as a sanitized ``PersistenceError``. Upstream exceptions (which may
+        carry connection details, identifiers or payload content) are never
+        surfaced.
+        """
         if self._client is None:
             raise PersistenceError("database_error", "persistence error")
         try:
             response = self._client.rpc(rpc_name, params).execute()
+            data = getattr(response, "data", None)
+            if isinstance(data, list):
+                if len(data) != 1:
+                    raise PersistenceError("database_error", "persistence error")
+                data = data[0]
+            if not isinstance(data, dict):
+                raise PersistenceError("database_error", "persistence error")
+            return data
+        except PersistenceError:
+            raise
         except Exception:
             # Sanitized: the upstream exception may carry connection details,
             # identifiers or payload content and is never surfaced.
             raise PersistenceError("database_error", "persistence error") from None
-        data = response.data
-        if isinstance(data, list):
-            if len(data) != 1:
-                raise PersistenceError("database_error", "persistence error")
-            data = data[0]
-        if not isinstance(data, dict):
-            raise PersistenceError("database_error", "persistence error")
-        return data
 
 
 class PrivacyService:

@@ -850,6 +850,16 @@ def get_history(request: Request, current_user=Depends(get_current_user)):
 # ``PrivacyService``. Error mapping is stable and sanitized: 401 auth,
 # 422 input, 409 operation conflict, 503 persistence, 500 fail-closed.
 
+#: Dispatch table: canonical #314 operation constant -> PrivacyService method.
+#: Each endpoint passes its own operation constant, so exactly one service
+#: method runs per request and adding a new operation is a single entry.
+_PRIVACY_ACTION_METHOD = {
+    OPERATION_DELETE_HISTORY: "delete_history",
+    OPERATION_DELETE_MEMORIES: "delete_memories",
+    OPERATION_RESET_EMOTIONAL_STATE: "reset_emotional_state",
+    OPERATION_RESET_RELATIONSHIP_STATE: "reset_relationship_state",
+}
+
 
 async def _run_privacy_action(
     operation: str,
@@ -859,8 +869,9 @@ async def _run_privacy_action(
 ) -> PrivacyOperationResponse:
     """Run one privacy action through the injected privacy service.
 
-    The service method is selected by the canonical operation constant, so
-    each endpoint invokes exactly its own operation and never another one.
+    The service method is resolved from the canonical operation constant via
+    ``_PRIVACY_ACTION_METHOD``, so each endpoint invokes exactly its own
+    operation and never another one.
     """
     deps = get_dependencies(request)
     service = deps.privacy_service
@@ -868,19 +879,13 @@ async def _run_privacy_action(
         raise HTTPException(
             status_code=503, detail=_PRIVACY_SERVICE_UNAVAILABLE_DETAIL
         )
+    method_name = _PRIVACY_ACTION_METHOD.get(operation)
+    if method_name is None:
+        raise HTTPException(status_code=500, detail=_PRIVACY_INTERNAL_DETAIL) from None
     user_id = getattr(current_user, "id", None)
     operation_id = str(input_data.operation_id)
     try:
-        if operation == OPERATION_DELETE_HISTORY:
-            result = await service.delete_history(user_id, operation_id)
-        elif operation == OPERATION_DELETE_MEMORIES:
-            result = await service.delete_memories(user_id, operation_id)
-        elif operation == OPERATION_RESET_EMOTIONAL_STATE:
-            result = await service.reset_emotional_state(user_id, operation_id)
-        elif operation == OPERATION_RESET_RELATIONSHIP_STATE:
-            result = await service.reset_relationship_state(user_id, operation_id)
-        else:
-            raise HTTPException(status_code=500, detail=_PRIVACY_INTERNAL_DETAIL)
+        result = await getattr(service, method_name)(user_id, operation_id)
     except HTTPException:
         raise
     except ConflictError as exc:
