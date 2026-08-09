@@ -63,7 +63,11 @@ from backend.retention_policy import (
     default_retention_policy,
     retention_cutoffs,
 )
-from backend.turn_execution import TurnExecutionConfig
+from backend.turn_execution import (
+    DeadlineExceeded,
+    TurnExecutionConfig,
+    TurnExecutionError,
+)
 
 NOW = 1700000000.0  # 2023-11-14T22:13:20+00:00
 HOUR = 3600.0
@@ -324,6 +328,63 @@ def test_per_category_cap_bounds_a_round():
     assert len(repo.remaining(RetentionCategory.ADMISSION_RESERVATIONS.value)) == 4
 
 
+def test_round_timeout_limits_work_per_round():
+    """A small ``round_timeout_seconds`` interrupts a round mid-category.
+
+    The timeout is an upper bound on the work done per round: once the
+    budget is exhausted the runner cannot start another batch, so the round
+    stops (failing closed with ``DeadlineExceeded``) before the category is
+    drained and rows stay for a later round. Progress is never blocked: a
+    subsequent round with a fresh budget keeps purging.
+    """
+    rows = [
+        (f"row-{i}", _dt.datetime.fromtimestamp(NOW - 2 * DAY, tz=_dt.timezone.utc), "row")
+        for i in range(50)
+    ]
+
+    class SlowFakeRetentionRepository(FakeRetentionRepository):
+        def _purge(self, category: str, cutoff: str, batch_size: int) -> int:
+            # Deliberately slow purge: each batch outlives the tiny budget,
+            # forcing the runner to stop before the category is drained.
+            time.sleep(0.2)
+            return super()._purge(category, cutoff, batch_size)
+
+    repo = SlowFakeRetentionRepository(
+        {
+            RetentionCategory.ADMISSION_RESERVATIONS.value: rows,
+            RetentionCategory.PRIVACY_OPERATIONS.value: [],
+            RetentionCategory.OUTBOX_EVENTS.value: [],
+        }
+    )
+    config = RetentionConfig(
+        batch_size=3, max_rows_per_category=50, round_timeout_seconds=0.05
+    )
+    runner = RetentionRunner(
+        repository=repo,
+        config=config,
+        clock=lambda: NOW,
+        turn_config=TurnExecutionConfig.defaults(),
+    )
+
+    # The budget is a hard upper bound: the round is interrupted with
+    # purged < max_rows_per_category and rows left for the next round.
+    with pytest.raises(DeadlineExceeded):
+        asyncio.run(runner.run_once())
+    remaining_after_first = repo.remaining(RetentionCategory.ADMISSION_RESERVATIONS.value)
+    assert len(remaining_after_first) > 0, "the timeout must leave rows for the next round"
+    assert len(remaining_after_first) < len(rows), (
+        "the timeout must not block the batches that fit inside the budget"
+    )
+
+    # Progress is not blocked: the next round purges again before timing out.
+    with pytest.raises(DeadlineExceeded):
+        asyncio.run(runner.run_once())
+    remaining_after_second = repo.remaining(RetentionCategory.ADMISSION_RESERVATIONS.value)
+    assert len(remaining_after_second) < len(remaining_after_first), (
+        "later rounds must keep making progress"
+    )
+
+
 # ─── 11. Idempotent second run ──────────────────────────────────────────────
 
 
@@ -483,7 +544,40 @@ def test_failure_log_is_sanitized(caplog):
         with pytest.raises(PersistenceError):
             asyncio.run(runner.run_once())
     assert "event=retention_failed" in caplog.text
-    assert "database_error" not in caplog.text or "persistence error" not in caplog.text
+    assert "database_error" not in caplog.text
+    assert "persistence error" not in caplog.text
+    assert "SECRET" not in caplog.text
+
+
+def test_generic_exception_log_is_sanitized(caplog):
+    """The non-PersistenceError failure branch also logs sanitized.
+
+    ``RetentionRunner._purge_category`` maps generic upstream failures to a
+    ``retention_failed`` event with ``code=purge_failed``; the upstream
+    exception text (which may carry secrets) must never reach the logs.
+    """
+
+    class ExplodingRepo:
+        def purge_admission_reservations(self, cutoff, batch_size):
+            # Generic upstream failure carrying a sensitive detail.
+            raise Exception("upstream failure with SECRET content")  # noqa: TRY002
+
+        def purge_privacy_operations(self, cutoff, batch_size):
+            raise AssertionError("must not be reached")
+
+        def purge_outbox_events(self, cutoff, batch_size):
+            raise AssertionError("must not be reached")
+
+    runner = _runner(ExplodingRepo())
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(TurnExecutionError):
+            asyncio.run(runner.run_once())
+    # The generic branch logs a sanitized retention_failed event. Event
+    # values are rendered without quotes (``code=purge_failed``).
+    assert "event=retention_failed" in caplog.text
+    assert "code=purge_failed" in caplog.text
+    # Upstream exception details and secrets never leak into the logs.
+    assert "upstream failure with SECRET content" not in caplog.text
     assert "SECRET" not in caplog.text
 
 

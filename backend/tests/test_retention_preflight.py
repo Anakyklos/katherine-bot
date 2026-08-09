@@ -22,6 +22,7 @@ import json
 import os
 import re
 import subprocess
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -76,10 +77,34 @@ def _run_supabase(op_id: str, args: list[str], check: bool = True):
     return result
 
 
+def _db_container_name() -> str:
+    """Name of the local Supabase Postgres container.
+
+    ``supabase start`` names the database container ``supabase_db_<project_id>``
+    where ``project_id`` comes from ``supabase/config.toml`` (default ``app``).
+    Deriving the name from that configuration keeps this suite portable across
+    projects with a different ``project_id``; the ``SUPABASE_DB_CONTAINER``
+    environment variable overrides it for setups that cannot use the default
+    naming.
+    """
+    override = os.environ.get("SUPABASE_DB_CONTAINER")
+    if override:
+        return override
+    project_id = "app"
+    try:
+        with open("supabase/config.toml", "rb") as f:
+            configured = tomllib.load(f).get("project_id")
+    except (OSError, tomllib.TOMLDecodeError):
+        configured = None
+    if isinstance(configured, str) and configured:
+        project_id = configured
+    return f"supabase_db_{project_id}"
+
+
 def _run_psql(sql: str) -> None:
     result = subprocess.run(
         [
-            "docker", "exec", "-i", "supabase_db_app",
+            "docker", "exec", "-i", _db_container_name(),
             "psql", "-U", "postgres",
             "-v", "ON_ERROR_STOP=1", "-q", "-f", "-",
         ],
