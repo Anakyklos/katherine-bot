@@ -21,6 +21,9 @@ ALLOWED_OPS = frozenset({
     "rls_auto_enable_reset",
     "rls_auto_enable_upgrade",
     "rls_auto_enable_query",
+    "privacy_legacy_reset",
+    "privacy_legacy_upgrade",
+    "privacy_legacy_query",
 })
 
 
