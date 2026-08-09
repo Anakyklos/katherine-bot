@@ -28,15 +28,25 @@
 --   processing  -> claimed by exactly one worker (lease owner + expiry)
 --   failed      -> a worker reported a sanitized failure; retry eligible
 --                  after next_attempt_at (backoff derived from attempts)
+--                  UNLESS next_attempt_at IS NULL, which is the TERMINAL
+--                  exhausted state (attempts ceiling reached): never
+--                  claimed automatically again, tombstone stays blocking
 --   completed   -> DB purge committed (db_purged_at) AND Auth deletion
 --                  confirmed later (#325); user_id minimized to NULL
+--
+-- ``db_purged_at`` is authoritative and NEVER cleared: once the DB purge
+-- committed, retry/failure transitions (e.g. the future Auth deletion
+-- failed) move the job to pending/failed while PRESERVING the marker, so
+-- a later purge call returns already_purged without repeating deletes.
 --
 -- Constraints reject incoherent states (details in the table DDL):
 --   * only processing carries a lease; pending/completed/failed never do;
 --   * completed <=> db_purged_at NOT NULL AND completed_at NOT NULL;
 --   * completed requires user_id IS NULL (identity minimization);
 --   * failed requires a sanitized error_code;
---   * attempts is never negative; identifiers use strict allowlists.
+--   * attempts is never negative; identifiers use strict allowlists;
+--   * pending always has next_attempt_at; only a terminal failed job may
+--     have next_attempt_at NULL.
 --
 -- Concurrency (binding decision, mirrors commit_turn / #314)
 -- ==========================================================
@@ -117,7 +127,8 @@ BEGIN
               'account_deletion_acquire_lease', 'account_deletion_purge',
               'account_deletion_record_failure', 'account_deletion_record_retry',
               'account_deletion_finalize', 'account_deletion_purge_completed',
-              'account_deletion_validation_error', 'account_deletion_intent_fingerprint_sha256'
+              'account_deletion_validation_error', 'account_deletion_intent_fingerprint_sha256',
+              'account_deletion_assert_owner'
           )
     ) THEN
         RAISE EXCEPTION 'Cannot apply account deletion ledger: account deletion functions already exist (unexpected drift)'
@@ -213,7 +224,10 @@ CREATE TABLE public.account_deletion_jobs (
     attempts integer NOT NULL DEFAULT 0,
     lease_owner text,
     lease_expires_at timestamptz,
-    next_attempt_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    -- NULL only for a TERMINAL failed job (attempts exhausted): never
+    -- claimed automatically again. pending always has a scheduled value
+    -- (enforced by account_deletion_jobs_pending_next_attempt_check).
+    next_attempt_at timestamptz DEFAULT clock_timestamp(),
     db_purged_at timestamptz,
     error_code text,
     requested_at timestamptz NOT NULL DEFAULT clock_timestamp(),
@@ -261,18 +275,22 @@ CREATE TABLE public.account_deletion_jobs (
             (status = 'completed' AND user_id IS NULL)
             OR (status <> 'completed' AND user_id IS NOT NULL)
         ),
-    -- db_purged_at is set exactly when the purge transaction committed.
-    -- It may be non-NULL while the job is processing (purge committed,
-    -- awaiting the future Auth deletion confirmation in #325) and is
-    -- REQUIRED for completed. pending/failed never carry it.
+    -- db_purged_at is the authoritative marker that the purge transaction
+    -- committed. It is REQUIRED for completed and may be present in ANY
+    -- active state: once set it is NEVER cleared, so retry/failure after
+    -- the DB purge (e.g. the future Auth deletion failed) transition the
+    -- job to pending/failed while preserving the marker.
     CONSTRAINT account_deletion_jobs_db_purged_state_check
         CHECK (
             (status = 'completed' AND db_purged_at IS NOT NULL)
-            OR status = 'processing'
-            OR (status IN ('pending', 'failed') AND db_purged_at IS NULL)
+            OR status IN ('pending', 'processing', 'failed')
         ),
     CONSTRAINT account_deletion_jobs_completed_at_state_check
         CHECK ((status = 'completed') = (completed_at IS NOT NULL)),
+    -- pending always has a scheduled next_attempt_at (even if already
+    -- past); only a terminal failed job may have next_attempt_at NULL.
+    CONSTRAINT account_deletion_jobs_pending_next_attempt_check
+        CHECK (status <> 'pending' OR next_attempt_at IS NOT NULL),
     CONSTRAINT account_deletion_jobs_error_code_check
         CHECK (error_code IS NULL OR error_code ~ '^[a-z0-9_]{1,64}$'),
     -- failed jobs must carry a sanitized error_code.
@@ -544,6 +562,11 @@ AS $$
 DECLARE
     v_job public.account_deletion_jobs%ROWTYPE;
     v_now timestamptz := clock_timestamp();
+    -- Deterministic exhaustion ceiling: a failed job whose attempts reach
+    -- this ceiling becomes TERMINAL (next_attempt_at = NULL) and is never
+    -- claimed again automatically. The tombstone stays blocking and
+    -- remains operationally recoverable by a privileged operator.
+    v_max_attempts constant integer := 100;
 BEGIN
     IF p_worker_id IS NULL OR p_worker_id !~ '^[A-Za-z0-9_.:-]{1,64}$' THEN
         RETURN jsonb_build_object(
@@ -570,10 +593,17 @@ BEGIN
         );
     END IF;
 
+    -- Exhausted jobs (failed with next_attempt_at IS NULL) are excluded:
+    -- they are terminal and must never be claimed automatically. New
+    -- attempts are only allowed BELOW the ceiling; a job at the ceiling
+    -- can only be recovered by resuming an expired processing lease.
     SELECT * INTO v_job
     FROM public.account_deletion_jobs
     WHERE (
-            (status IN ('pending', 'failed') AND next_attempt_at <= v_now)
+            (status IN ('pending', 'failed')
+             AND next_attempt_at IS NOT NULL
+             AND next_attempt_at <= v_now
+             AND attempts < v_max_attempts)
             OR (status = 'processing' AND lease_expires_at < v_now)
           )
     ORDER BY next_attempt_at
@@ -584,11 +614,16 @@ BEGIN
         RETURN jsonb_build_object('found', false);
     END IF;
 
+    -- Resuming an expired lease of the LAST attempt does not consume a new
+    -- attempt: attempts never exceeds the ceiling.
     UPDATE public.account_deletion_jobs
     SET status = 'processing',
         lease_owner = p_worker_id,
         lease_expires_at = v_now + make_interval(secs => p_lease_seconds),
-        attempts = v_job.attempts + 1,
+        attempts = CASE
+            WHEN v_job.attempts < v_max_attempts THEN v_job.attempts + 1
+            ELSE v_job.attempts
+        END,
         error_code = NULL,
         updated_at = v_now
     WHERE job_id = v_job.job_id
@@ -848,6 +883,8 @@ DECLARE
     v_job public.account_deletion_jobs;
     v_now timestamptz := clock_timestamp();
     v_next_attempt_at timestamptz;
+    -- Same deterministic ceiling as account_deletion_acquire_lease.
+    v_max_attempts constant integer := 100;
 BEGIN
     IF p_error_code IS NULL OR p_error_code !~ '^[a-z0-9_]{1,64}$' THEN
         RETURN jsonb_build_object(
@@ -860,8 +897,15 @@ BEGIN
 
     v_job := public.account_deletion_assert_owner(p_job_id, p_worker_id);
 
-    v_next_attempt_at := v_now
-        + make_interval(secs => LEAST(3600, 30 * v_job.attempts)::double precision);
+    -- Attempts exhausted: the job becomes TERMINAL (next_attempt_at NULL),
+    -- never claimed automatically again. The tombstone stays blocking and
+    -- db_purged_at (if the DB purge already committed) is preserved.
+    IF v_job.attempts >= v_max_attempts THEN
+        v_next_attempt_at := NULL;
+    ELSE
+        v_next_attempt_at := v_now
+            + make_interval(secs => LEAST(3600, 30 * v_job.attempts)::double precision);
+    END IF;
 
     UPDATE public.account_deletion_jobs
     SET status = 'failed',
@@ -910,8 +954,32 @@ DECLARE
     v_job public.account_deletion_jobs;
     v_now timestamptz := clock_timestamp();
     v_next_attempt_at timestamptz;
+    -- Same deterministic ceiling as account_deletion_acquire_lease.
+    v_max_attempts constant integer := 100;
 BEGIN
     v_job := public.account_deletion_assert_owner(p_job_id, p_worker_id);
+
+    -- Attempts exhausted: a voluntary deferral becomes a TERMINAL failure
+    -- (next_attempt_at NULL, error_code attempts_exhausted), never claimed
+    -- automatically again. The tombstone stays blocking and db_purged_at
+    -- (if the DB purge already committed) is preserved.
+    IF v_job.attempts >= v_max_attempts THEN
+        UPDATE public.account_deletion_jobs
+        SET status = 'failed',
+            error_code = 'attempts_exhausted',
+            lease_owner = NULL,
+            lease_expires_at = NULL,
+            next_attempt_at = NULL,
+            updated_at = v_now
+        WHERE job_id = v_job.job_id;
+
+        RETURN jsonb_build_object(
+            'status', 'failed',
+            'job_id', v_job.job_id::text,
+            'error_code', 'attempts_exhausted',
+            'next_attempt_at', NULL
+        );
+    END IF;
 
     v_next_attempt_at := v_now
         + make_interval(secs => LEAST(3600, 30 * v_job.attempts)::double precision);

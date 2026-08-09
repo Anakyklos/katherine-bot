@@ -1,7 +1,7 @@
 BEGIN;
 
 CREATE EXTENSION IF NOT EXISTS pgtap;
-SELECT plan(114);
+SELECT plan(125);
 
 -- =================================================================
 -- 1. Table exists with the exact columns
@@ -41,6 +41,7 @@ SELECT is(
         'account_deletion_jobs_lease_owner_check',
         'account_deletion_jobs_lease_pair_check',
         'account_deletion_jobs_lease_state_check',
+        'account_deletion_jobs_pending_next_attempt_check',
         'account_deletion_jobs_pkey',
         'account_deletion_jobs_status_check',
         'account_deletion_jobs_user_id_check',
@@ -320,6 +321,36 @@ SELECT throws_ok(
     NULL, NULL,
     'completed with a raw user_id is rejected (identity minimization)'
 );
+-- failed after the DB purge PRESERVES db_purged_at (retry/failure after
+-- the purge is representable; the marker is never cleared)
+SELECT lives_ok(
+    'INSERT INTO public.account_deletion_jobs
+        (operation_id, user_id, user_ref_hmac_sha256, intent_fingerprint_sha256,
+         status, attempts, error_code, db_purged_at, next_attempt_at)
+     VALUES (gen_random_uuid(), ''u-1'', repeat(''a'', 64), repeat(''b'', 64),
+         ''failed'', 2, ''auth_unavailable'', now() - interval ''1 hour'',
+         now() + interval ''1 minute'')',
+    'failed job preserves db_purged_at (post-purge failure is representable)'
+);
+-- pending after the DB purge PRESERVES db_purged_at (retry after purge)
+SELECT lives_ok(
+    'INSERT INTO public.account_deletion_jobs
+        (operation_id, user_id, user_ref_hmac_sha256, intent_fingerprint_sha256,
+         status, attempts, db_purged_at, next_attempt_at)
+     VALUES (gen_random_uuid(), ''u-1'', repeat(''a'', 64), repeat(''b'', 64),
+         ''pending'', 2, now() - interval ''1 hour'', now() + interval ''1 minute'')',
+    'pending job preserves db_purged_at (post-purge retry is representable)'
+);
+-- pending must always have a scheduled next_attempt_at
+SELECT throws_ok(
+    'INSERT INTO public.account_deletion_jobs
+        (operation_id, user_id, user_ref_hmac_sha256, intent_fingerprint_sha256,
+         status, next_attempt_at)
+     VALUES (gen_random_uuid(), ''u-1'', repeat(''a'', 64), repeat(''b'', 64),
+         ''pending'', NULL)',
+    NULL, NULL,
+    'pending without next_attempt_at is rejected'
+);
 -- failed requires a sanitized error_code
 SELECT throws_ok(
     'INSERT INTO public.account_deletion_jobs
@@ -555,6 +586,88 @@ SELECT is(
     'tombstone lookup still works after completion'
 );
 
+-- =================================================================
+-- 10. Attempts exhaustion (deterministic terminal state)
+-- =================================================================
+-- The ceiling is 100. A job at 99 may be claimed once more (the last
+-- allowed claim); record_failure at the ceiling makes it TERMINAL
+-- (next_attempt_at NULL); the claim never selects exhausted jobs and the
+-- tombstone stays blocking.
+INSERT INTO public.account_deletion_jobs (
+    operation_id, user_id, user_ref_hmac_sha256, intent_fingerprint_sha256,
+    status, attempts, next_attempt_at
+) VALUES (
+    '55555555-5555-5555-5555-555555555555'::uuid, 'adl-exhaust',
+    repeat('5', 64), repeat('6', 64), 'pending', 99, clock_timestamp()
+);
+
+SELECT is(
+    (public.account_deletion_acquire_lease('worker-ex', 60, 100)->>'attempts')::integer,
+    100,
+    'the last allowed claim reaches the attempts ceiling'
+);
+SELECT is(
+    (public.account_deletion_record_failure(
+        (SELECT job_id FROM public.account_deletion_jobs
+          WHERE user_ref_hmac_sha256 = repeat('5', 64)),
+        'worker-ex', 'auth_unavailable')->>'next_attempt_at') IS NULL,
+    true,
+    'record_failure at the ceiling produces a terminal job (next_attempt_at NULL)'
+);
+SELECT is(
+    (public.account_deletion_acquire_lease('worker-ex2', 60, 100)->>'found'),
+    'false',
+    'exhausted jobs are never claimed automatically again'
+);
+SELECT is(
+    (public.account_deletion_has_tombstone(repeat('5', 64))->>'exists'),
+    'true',
+    'exhausted tombstone stays blocking'
+);
+
+-- record_retry at the ceiling also becomes a terminal failed job.
+INSERT INTO public.account_deletion_jobs (
+    operation_id, user_id, user_ref_hmac_sha256, intent_fingerprint_sha256,
+    status, attempts, next_attempt_at
+) VALUES (
+    '66666666-6666-6666-6666-666666666666'::uuid, 'adl-exhaust2',
+    repeat('7', 64), repeat('8', 64), 'pending', 99, clock_timestamp()
+);
+SELECT is(
+    (public.account_deletion_acquire_lease('worker-ex4', 60, 100)->>'attempts')::integer,
+    100,
+    'the retry boundary claim reaches the ceiling'
+);
+SELECT is(
+    (public.account_deletion_record_retry(
+        (SELECT job_id FROM public.account_deletion_jobs
+          WHERE user_ref_hmac_sha256 = repeat('7', 64)),
+        'worker-ex4')->>'error_code'),
+    'attempts_exhausted',
+    'record_retry at the ceiling becomes a terminal attempts_exhausted failure'
+);
+SELECT is(
+    (public.account_deletion_acquire_lease('worker-ex5', 60, 100)->>'found'),
+    'false',
+    'exhausted retry job is never claimed automatically again'
+);
+
+-- Resuming an expired lease of the LAST attempt does not consume a new
+-- attempt: attempts never exceeds the ceiling.
+UPDATE public.account_deletion_jobs
+SET status = 'processing',
+    lease_owner = 'worker-ex6',
+    lease_expires_at = now() - interval '1 second'
+WHERE user_ref_hmac_sha256 = repeat('7', 64);
+SELECT is(
+    (public.account_deletion_acquire_lease('worker-ex7', 60, 100)->>'attempts')::integer,
+    100,
+    'resuming an expired last-attempt lease keeps attempts at the ceiling'
+);
+
+-- =================================================================
+-- 11. Retention of completed tombstones
+-- =================================================================
 -- Retention: a recent completed tombstone is retained; an old completed
 -- tombstone is removed; active/failed jobs are never removed by age.
 SELECT is(

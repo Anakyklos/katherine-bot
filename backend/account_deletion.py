@@ -74,6 +74,12 @@ ACCOUNT_DELETION_STATUSES = frozenset(
 ERROR_VALIDATION_FAILED = "validation_failed"
 ERROR_OPERATION_CONFLICT = "operation_conflict"
 ERROR_STATE_CONFLICT = "state_conflict"
+ERROR_ATTEMPTS_EXHAUSTED = "attempts_exhausted"
+
+#: Deterministic exhaustion ceiling (mirrors the SQL constant): a failed
+#: job whose attempts reach this ceiling is terminal (next_attempt_at NULL)
+#: and never claimed automatically again.
+ACCOUNT_DELETION_MAX_ATTEMPTS = 100
 
 #: Lowercase hex patterns (same as the database).
 _HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -414,17 +420,24 @@ def _parse_failure_result(response: object) -> FailureResult:
     if "error" in envelope:
         error = _parse_error_envelope(envelope)
         raise ValidationError(ERROR_VALIDATION_FAILED, error.message)
-    _require_fields(envelope, frozenset({"status", "job_id", "error_code", "next_attempt_at"}), label="failure result")
+    _require_fields(
+        envelope,
+        frozenset({"status", "job_id", "error_code"}),
+        frozenset({"next_attempt_at"}),
+        label="failure result",
+    )
     if _require_text(envelope, "status") != "failed":
         raise PersistenceError("database_error", "malformed retention response")
     error_code = _require_text(envelope, "error_code")
     if not _ERROR_CODE_RE.match(error_code):
         raise PersistenceError("database_error", "malformed retention response")
+    # next_attempt_at is NULL for a TERMINAL exhausted job (PostgREST may
+    # send the field as null or omit it).
     return FailureResult(
         status="failed",
         job_id=_require_uuid_text(envelope, "job_id"),
         error_code=error_code,
-        next_attempt_at=_require_text(envelope, "next_attempt_at"),
+        next_attempt_at=_optional_text(envelope, "next_attempt_at"),
     )
 
 
@@ -433,14 +446,34 @@ def _parse_retry_result(response: object) -> RetryResult:
     if "error" in envelope:
         error = _parse_error_envelope(envelope)
         raise ValidationError(ERROR_VALIDATION_FAILED, error.message)
-    _require_fields(envelope, frozenset({"status", "job_id", "next_attempt_at"}), label="retry result")
-    if _require_text(envelope, "status") != "retry_scheduled":
-        raise PersistenceError("database_error", "malformed retention response")
-    return RetryResult(
-        status="retry_scheduled",
-        job_id=_require_uuid_text(envelope, "job_id"),
-        next_attempt_at=_require_text(envelope, "next_attempt_at"),
-    )
+    # Normal deferral: back to pending with a scheduled next_attempt_at.
+    if envelope.get("status") == "retry_scheduled":
+        _require_fields(
+            envelope,
+            frozenset({"status", "job_id", "next_attempt_at"}),
+            label="retry result",
+        )
+        return RetryResult(
+            status="retry_scheduled",
+            job_id=_require_uuid_text(envelope, "job_id"),
+            next_attempt_at=_require_text(envelope, "next_attempt_at"),
+        )
+    # Exhausted deferral: the attempts ceiling was reached, the job became
+    # a terminal failed job (next_attempt_at NULL, absent from the
+    # PostgREST response).
+    if envelope.get("status") == "failed" and envelope.get("error_code") == ERROR_ATTEMPTS_EXHAUSTED:
+        _require_fields(
+            envelope,
+            frozenset({"status", "job_id", "error_code"}),
+            frozenset({"next_attempt_at"}),
+            label="retry result",
+        )
+        return RetryResult(
+            status="failed",
+            job_id=_require_uuid_text(envelope, "job_id"),
+            next_attempt_at=None,
+        )
+    raise PersistenceError("database_error", "malformed retention response")
 
 
 def _parse_finalize_result(response: object) -> FinalizeResult:

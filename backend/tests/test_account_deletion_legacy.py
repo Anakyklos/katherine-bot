@@ -365,3 +365,57 @@ def test_legacy_upgrade_applies_account_deletion_ledger():
         ), "completed job must minimize the raw user_id"
     finally:
         _restore_new_migration()
+
+
+@pytest.mark.database_integration
+def test_legacy_upgrade_fails_closed_on_drift():
+    """The legacy upgrade must also fail closed on drift.
+
+    A database that already contains an object owned by the new migration
+    (for example a preexisting ``account_deletion_assert_owner`` function
+    that the migration would otherwise silently replace via
+    CREATE OR REPLACE) must reject the upgrade with 23514, install nothing
+    and leave the migration unregistered.
+    """
+    _hide_new_migration()
+    try:
+        _run_supabase("account_deletion_legacy_reset", ["db", "reset"])
+        _seed_legacy_data()
+
+        # Install drift before restoring the new migration.
+        _run_psql(
+            "CREATE OR REPLACE FUNCTION public.account_deletion_assert_owner("
+            "p_job_id uuid, p_worker_id text) RETURNS text "
+            "LANGUAGE sql IMMUTABLE AS $$ SELECT 'drift'::text $$;"
+        )
+
+        _restore_new_migration()
+        res = _run_supabase(
+            "account_deletion_legacy_upgrade", ["migration", "up", "--local"], check=False
+        )
+        assert res.returncode != 0, "expected the legacy upgrade to fail on drift"
+        assert "23514" in res.stderr, (
+            f"expected SQLSTATE 23514 from the drift gate, got: {res.stderr[-500:]}"
+        )
+
+        # Nothing was installed and the migration is not registered.
+        assert not _query_scalar_bool(
+            "SELECT EXISTS("
+            "SELECT 1 FROM pg_class c "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = 'public' AND c.relname = 'account_deletion_jobs'"
+            ") AS result"
+        ), "account_deletion_jobs was created despite the drift failure"
+        assert not _query_scalar_bool(
+            "SELECT EXISTS("
+            "SELECT 1 FROM supabase_migrations.schema_migrations "
+            f"WHERE version = '{MIGRATION_VERSION}'"
+            ") AS result"
+        ), "account deletion migration registered despite the drift failure"
+        # Legacy data remains untouched.
+        assert _query_scalar_int(
+            "SELECT count(*)::int AS result FROM public.profiles "
+            f"WHERE user_id = '{LEGACY_USER}'"
+        ) == 1, "legacy data was modified by the failed upgrade"
+    finally:
+        _restore_new_migration()

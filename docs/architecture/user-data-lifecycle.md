@@ -315,16 +315,23 @@ user after the commit is confirmed. The tombstone survives the
 
 `pending -> processing -> (failed | pending retry) -> processing -> completed`
 
-- `pending`: registered, not claimed.
+- `pending`: registered, not claimed. Always has a scheduled
+  `next_attempt_at`.
 - `processing`: claimed by exactly one worker (lease owner + expiry). The
   DB allows only `processing` to carry a lease.
 - `failed`: a worker reported a sanitized `error_code`; retry-eligible
   after `next_attempt_at` (backoff derived from `attempts`, 30s..1h).
+  A `failed` job whose `attempts` reached the deterministic ceiling (100)
+  is TERMINAL: `next_attempt_at` becomes NULL, it is never claimed
+  automatically again, and the tombstone stays blocking and operationally
+  recoverable by a privileged operator. `record_retry` at the ceiling also
+  becomes a terminal `failed` job with `error_code = attempts_exhausted`.
 - `completed`: DB purge committed (`db_purged_at`) AND the future Auth
   deletion confirmed (#325). Constraints reject every incoherent
   combination: `completed` requires `db_purged_at` + `completed_at` and
   NULL `user_id`; `failed` requires `error_code`; attempts are never
-  negative; lease owner and error codes use strict allowlists.
+  negative; lease owner and error codes use strict allowlists;
+  `pending` always has `next_attempt_at`.
 
 ### DB/Auth frontier and `db_purged_at`
 
@@ -332,9 +339,13 @@ user after the commit is confirmed. The tombstone survives the
 committed. It becomes non-NULL ONLY in the same transaction that completed
 every delete; any failure rolls the whole attempt back and the marker
 stays empty. It is set while the job is `processing` (purge done, Auth
-deletion pending) and is required for `completed`. A repeated purge after
-a crash (`DB commit` done, process died before Auth) is a safe replay:
-`db_purged_at` is authoritative and no delete depends on the row existing.
+deletion pending) and is required for `completed`. Once set it is NEVER
+cleared: retry/failure after the DB purge (e.g. the future Auth deletion
+failed) transition the job to `pending`/`failed` while PRESERVING the
+marker, and a reacquired job's purge returns `already_purged` without
+repeating deletes. A repeated purge after a crash (`DB commit` done,
+process died before Auth) is a safe replay for the same reason: no delete
+depends on the row existing.
 
 ### Purge order and locking
 

@@ -240,6 +240,21 @@ def test_failure_and_retry_and_finalize_parse():
     assert finalize.status == "completed"
 
 
+def test_exhausted_retry_parses_as_terminal_failed():
+    """record_retry at the attempts ceiling returns a terminal failed job
+    (error_code attempts_exhausted, next_attempt_at absent/NULL)."""
+    repo = _client(
+        {
+            "status": "failed",
+            "job_id": JOB_ID,
+            "error_code": "attempts_exhausted",
+        }
+    )
+    result = repo.record_retry(JOB_ID, "worker-1")
+    assert result.status == "failed"
+    assert result.next_attempt_at is None
+
+
 def test_purge_completed_int_parses():
     repo = _client(3)
     assert repo.purge_completed("2026-01-01T00:00:00+00:00", 10) == 3

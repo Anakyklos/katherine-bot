@@ -193,3 +193,75 @@ def test_preflight_fails_closed_on_missing_table(missing_table: str):
         ), "account_deletion_ledger was registered despite the failed preflight"
     finally:
         _restore_new_migration()
+
+
+@pytest.mark.database_integration
+def test_preflight_fails_closed_on_drift_of_own_object():
+    """A preexisting object with a name owned by the migration must block it.
+
+    Every object this migration creates (including internal helpers such as
+    ``account_deletion_assert_owner``) is part of the drift gate: a
+    preexisting function with one of those names must fail the migration
+    with 23514 BEFORE anything is installed or replaced.
+    """
+    _hide_new_migration()
+    try:
+        _run_supabase("account_deletion_preflight_reset", ["db", "reset"])
+
+        # Install drift: a preexisting function that the migration also
+        # creates via CREATE OR REPLACE (would otherwise be silently
+        # replaced instead of blocking the upgrade).
+        _run_psql(
+            "CREATE OR REPLACE FUNCTION public.account_deletion_assert_owner("
+            "p_job_id uuid, p_worker_id text) RETURNS text "
+            "LANGUAGE sql IMMUTABLE AS $$ SELECT 'drift'::text $$;"
+        )
+        assert _query_scalar_bool(
+            "SELECT EXISTS("
+            "SELECT 1 FROM pg_proc p "
+            "JOIN pg_namespace n ON n.oid = p.pronamespace "
+            "WHERE n.nspname = 'public' AND p.proname = 'account_deletion_assert_owner'"
+            ") AS result"
+        ), "drift function was not actually installed"
+
+        _restore_new_migration()
+
+        res = _run_supabase(
+            "account_deletion_preflight_apply", ["migration", "up", "--local"], check=False
+        )
+        assert res.returncode != 0, (
+            "expected the account deletion migration to fail on drift of its own object"
+        )
+        assert "23514" in res.stderr, (
+            f"expected SQLSTATE 23514 from the drift gate, got: {res.stderr[-500:]}"
+        )
+
+        # NONE of the new objects may be installed; the migration is not
+        # registered. The preexisting drift function itself remains (the
+        # migration failed before touching it), so it is excluded from the
+        # installed-check.
+        assert not _query_scalar_bool(
+            "SELECT EXISTS("
+            "SELECT 1 FROM pg_class c "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE n.nspname = 'public' AND c.relname = 'account_deletion_jobs'"
+            ") AS result"
+        ), "account_deletion_jobs was created despite the drift failure"
+        for fn in MIGRATION_FUNCTIONS:
+            if fn == "account_deletion_assert_owner":
+                continue
+            assert not _query_scalar_bool(
+                "SELECT EXISTS("
+                "SELECT 1 FROM pg_proc p "
+                "JOIN pg_namespace n ON n.oid = p.pronamespace "
+                f"WHERE n.nspname = 'public' AND p.proname = '{fn}'"
+                ") AS result"
+            ), f"{fn} was installed despite the drift failure"
+        assert not _query_scalar_bool(
+            "SELECT EXISTS("
+            "SELECT 1 FROM supabase_migrations.schema_migrations "
+            "WHERE name = 'account_deletion_ledger'"
+            ") AS result"
+        ), "account_deletion_ledger was registered despite the drift failure"
+    finally:
+        _restore_new_migration()

@@ -605,8 +605,139 @@ def test_repeated_purge_on_empty_db_is_safe(service_client: Client):
         _cleanup_user(user_id)
 
 
-# ─── 14/15/16. Finalize and minimization ────────────────────────────────────
+# ─── 14. Failure/retry AFTER the DB purge preserve db_purged_at ─────────────
 
+
+def test_failure_after_purge_preserves_marker_and_retries_safely(service_client: Client):
+    """The future flow purge DB -> Auth fails -> retry must be representable.
+
+    After a successful purge, record_failure and record_retry transition the
+    job to failed/pending WITHOUT clearing db_purged_at; a reacquired job's
+    purge returns already_purged without repeating deletes; finalization
+    remains possible and minimizes user_id.
+    """
+    user_id = _uid("postpurge")
+    _seed_full_user(user_id)
+    ref = _ref(user_id)
+    op_id = _new_op_id()
+    fp = _fingerprint()
+    try:
+        # Purge succeeds first.
+        request = _repo(service_client).request(user_id, ref, op_id, fp)
+        job = _repo(service_client).acquire_lease("worker-pp", 60, 100)
+        purged = _repo(service_client).purge(job.job_id, "worker-pp", fp)
+        assert purged.status == "purged"
+        assert purged.db_purged_at is not None
+
+        # Auth deletion fails (simulated): record_failure keeps the marker
+        # and the tombstone stays blocking.
+        failure = _repo(service_client).record_failure(
+            job.job_id, "worker-pp", "auth_unavailable"
+        )
+        assert failure.status == "failed"
+        row = _run_sql(
+            "SELECT status, db_purged_at IS NOT NULL AS purged "
+            "FROM public.account_deletion_jobs WHERE job_id = "
+            f"'{job.job_id}'"
+        )[0]
+        assert row["status"] == "failed"
+        assert row["purged"] is True, "db_purged_at must survive record_failure"
+        assert _repo(service_client).has_tombstone(ref).exists is True
+
+        # Reacquire after the retry window: the purge replays safely.
+        _run_sql(
+            "UPDATE public.account_deletion_jobs SET next_attempt_at = "
+            "now() - interval '1 second' "
+            f"WHERE job_id = '{job.job_id}'"
+        )
+        reclaimed = _repo(service_client).acquire_lease("worker-pp2", 60, 100)
+        assert reclaimed.job_id == job.job_id
+        assert reclaimed.db_purged_at == purged.db_purged_at
+        replay = _repo(service_client).purge(reclaimed.job_id, "worker-pp2", fp)
+        assert replay.status == "already_purged"
+        # No delete was repeated: the user tables were already empty and
+        # stay empty; counts are zero.
+        assert replay.counts["profiles"] == 0
+        assert _count("profiles", f"user_id = '{user_id}'") == 0
+
+        # Purge -> record_retry -> reacquire is also safe.
+        _repo(service_client).record_retry(reclaimed.job_id, "worker-pp2")
+        row = _run_sql(
+            "SELECT status, db_purged_at IS NOT NULL AS purged "
+            "FROM public.account_deletion_jobs WHERE job_id = "
+            f"'{job.job_id}'"
+        )[0]
+        assert row["status"] == "pending"
+        assert row["purged"] is True, "db_purged_at must survive record_retry"
+        _run_sql(
+            "UPDATE public.account_deletion_jobs SET next_attempt_at = "
+            "now() - interval '1 second' "
+            f"WHERE job_id = '{job.job_id}'"
+        )
+        reclaimed2 = _repo(service_client).acquire_lease("worker-pp3", 60, 100)
+        assert reclaimed2.job_id == job.job_id
+        replay2 = _repo(service_client).purge(reclaimed2.job_id, "worker-pp3", fp)
+        assert replay2.status == "already_purged"
+
+        # Finalization after all retries is possible and minimizes user_id.
+        finalized = _repo(service_client).finalize(reclaimed2.job_id, "worker-pp3")
+        assert finalized.status == "completed"
+        row = _run_sql(
+            "SELECT user_id, user_ref_hmac_sha256, status "
+            "FROM public.account_deletion_jobs WHERE job_id = "
+            f"'{job.job_id}'"
+        )[0]
+        assert row["user_id"] is None
+        assert row["user_ref_hmac_sha256"] == ref
+        assert row["status"] == "completed"
+        assert request.job_id == job.job_id
+    finally:
+        _cleanup_user(user_id)
+
+
+def test_attempts_exhaustion_is_terminal_and_tombstone_preserved(service_client: Client):
+    """The attempts ceiling produces a deterministic terminal state.
+
+    The last allowed claim reaches the ceiling; record_failure at the
+    ceiling makes the job terminal (next_attempt_at NULL); no new automatic
+    claim happens; the tombstone stays blocking and preserved.
+    """
+    user_id = _uid("exhaust")
+    ref = _ref(user_id)
+    op_id = _new_op_id()
+    fp = _fingerprint()
+    try:
+        request = _repo(service_client).request(user_id, ref, op_id, fp)
+        # Fast-forward to the boundary: 99 attempts already consumed.
+        _run_sql(
+            "UPDATE public.account_deletion_jobs SET attempts = 99 "
+            f"WHERE job_id = '{request.job_id}'"
+        )
+        # Last allowed claim: 99 -> 100.
+        job = _repo(service_client).acquire_lease("worker-ex", 60, 100)
+        assert job.attempts == 100
+        # record_failure at the ceiling -> TERMINAL (next_attempt_at NULL).
+        failure = _repo(service_client).record_failure(
+            job.job_id, "worker-ex", "auth_unavailable"
+        )
+        assert failure.status == "failed"
+        row = _run_sql(
+            "SELECT next_attempt_at IS NULL AS terminal "
+            "FROM public.account_deletion_jobs WHERE job_id = "
+            f"'{job.job_id}'"
+        )[0]
+        assert row["terminal"] is True
+        # No new automatic claim: the exhausted job is never selected.
+        with pytest.raises(PersistenceError):
+            _repo(service_client).acquire_lease("worker-ex2", 60, 100)
+        # The tombstone stays blocking.
+        assert _repo(service_client).has_tombstone(ref).exists is True
+        assert _count("account_deletion_jobs", f"user_ref_hmac_sha256 = '{ref}'") == 1
+    finally:
+        _cleanup_user(user_id)
+
+
+# ─── 14/15/16. Finalize and minimization ────────────────────────────────────
 
 def test_finalize_clears_user_id_keeps_ref_and_tombstone(service_client: Client):
     user_id = _uid("final")
