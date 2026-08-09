@@ -40,6 +40,8 @@ EVENT_TURN_COMPLETED = "turn_completed"
 EVENT_TURN_FAILED = "turn_failed"
 EVENT_REQUEST_CONFLICT = "request_conflict"
 EVENT_HTTP_RESULT = "http_result"
+EVENT_RETENTION_COMPLETED = "retention_completed"
+EVENT_RETENTION_FAILED = "retention_failed"
 
 EVENT_NAMES = frozenset(
     {
@@ -53,6 +55,8 @@ EVENT_NAMES = frozenset(
         EVENT_TURN_FAILED,
         EVENT_REQUEST_CONFLICT,
         EVENT_HTTP_RESULT,
+        EVENT_RETENTION_COMPLETED,
+        EVENT_RETENTION_FAILED,
     }
 )
 

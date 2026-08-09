@@ -24,6 +24,9 @@ ALLOWED_OPS = frozenset({
     "privacy_legacy_reset",
     "privacy_legacy_upgrade",
     "privacy_legacy_query",
+    "retention_preflight_reset",
+    "retention_preflight_apply",
+    "retention_preflight_query",
 })
 
 

@@ -284,6 +284,14 @@ reversible; idempotency guarantees they are never applied twice.
 ## Out of scope (future leaves)
 
 - UI / settings screens exposing these primitives.
-- Account/Auth user deletion with tombstone (#317), durable workers (#276),
-  retention/cleanup (#316) and export policies.
+- Account/Auth user deletion with tombstone (#317), durable workers (#276)
+  and export policies.
 - Emotional/relationship formula, decay, appraisal or personality changes.
+
+Operational retention/cleanup (#316) is implemented by its own leaf:
+`supabase/migrations/20260809030000_operational_data_retention.sql` plus
+`backend/retention_policy.py`, `backend/retention.py` and the
+`python -m backend.retention_cli --once` command. It covers ONLY
+operational data (`admission_reservations`, the privacy operation ledger,
+final outbox events) and deliberately never introduces an automatic TTL
+for user-controlled content.
