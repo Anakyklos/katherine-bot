@@ -261,6 +261,24 @@ jobs:
           bash scripts/hide-migrations-after.sh 20240101000006 \
             python -m pytest -q -ra backend/tests/test_privacy_operations_legacy.py
 
+      - name: Reset database for privacy operations preflight tests
+        run: |
+          set -euo pipefail
+          supabase db reset
+
+      - name: Run Privacy Operations Preflight Test (missing dependency -> 23514)
+        env:
+          SUPABASE_URL: "http://127.0.0.1:54321"
+          PYTHONPATH: "."
+        run: |
+          set -euo pipefail
+          # The preflight gate must be exercised by CI, not just exist: each
+          # case hides the new migration, resets the pre-privacy baseline,
+          # drops exactly one mandatory table and requires the migration to
+          # fail with 23514 before installing any object.
+          bash scripts/hide-migrations-after.sh 20240101000006 \
+            python -m pytest -q -ra backend/tests/test_privacy_operations_preflight.py
+
       - name: Stop Supabase
         if: always()
         run: supabase stop
@@ -316,6 +334,7 @@ jobs:
               --ignore=backend/tests/test_rls_auto_enable_legacy.py \
               --ignore=backend/tests/test_privacy_operations_integration.py \
               --ignore=backend/tests/test_privacy_operations_legacy.py \
+              --ignore=backend/tests/test_privacy_operations_preflight.py \
               -ra
 
   frontend:

@@ -1,7 +1,7 @@
 BEGIN;
 
 CREATE EXTENSION IF NOT EXISTS pgtap;
-SELECT plan(99);
+SELECT plan(116);
 
 -- =================================================================
 -- 1. Migration and ledger (#314)
@@ -256,6 +256,56 @@ SELECT function_privs_are(
 SELECT ok(
     NOT has_function_privilege('public', 'public.privacy_op_validation_error(text, uuid, jsonb)', 'EXECUTE'),
     'PUBLIC has no EXECUTE on privacy_op_validation_error'
+);
+
+-- =================================================================
+-- 3.1 Neutral snapshot verifier (reset semantics, issue #314 review)
+-- =================================================================
+SELECT has_function(
+    'public', 'privacy_is_neutral_snapshot', ARRAY['jsonb', 'text'],
+    'privacy_is_neutral_snapshot(jsonb, text) exists'
+);
+SELECT function_privs_are(
+    'public', 'privacy_is_neutral_snapshot', ARRAY['jsonb', 'text'],
+    'service_role', ARRAY[]::text[],
+    'service_role has no EXECUTE on privacy_is_neutral_snapshot'
+);
+SELECT ok(
+    NOT has_function_privilege('public', 'public.privacy_is_neutral_snapshot(jsonb, text)', 'EXECUTE'),
+    'PUBLIC has no EXECUTE on privacy_is_neutral_snapshot'
+);
+
+-- Behavioral: the helper accepts the canonical neutral v1 output of the
+-- Python domain constructors and rejects structurally valid non-neutral v1
+-- snapshots. This pins the SQL constants to the domain so the two boundaries
+-- cannot silently diverge.
+SELECT ok(
+    public.privacy_is_neutral_snapshot(
+        '{"schema_version":1,"pleasure":0.0,"arousal":0.0,"dominance":0.0,"libido":0.0,"aggression":0.0,"connection":0.5,"energy":0.8,"tension":0.0,"coping_mode":"HEALTHY","timestamp":1700000000.0}'::jsonb,
+        'emotional'
+    ),
+    'privacy_is_neutral_snapshot accepts the canonical neutral emotional v1 snapshot'
+);
+SELECT ok(
+    NOT public.privacy_is_neutral_snapshot(
+        '{"schema_version":1,"pleasure":0.9,"arousal":0.8,"dominance":0.7,"libido":0.1,"aggression":0.1,"connection":0.5,"energy":0.8,"tension":0.1,"coping_mode":"MANIC","timestamp":1700000000.0}'::jsonb,
+        'emotional'
+    ),
+    'privacy_is_neutral_snapshot rejects a valid but non-neutral emotional v1 snapshot'
+);
+SELECT ok(
+    public.privacy_is_neutral_snapshot(
+        '{"schema_version":1,"trust":0.5,"affection":0.3,"tension":0.0,"triggers":[],"timestamp":1700000000.0}'::jsonb,
+        'relationship'
+    ),
+    'privacy_is_neutral_snapshot accepts the canonical neutral relationship v1 snapshot'
+);
+SELECT ok(
+    NOT public.privacy_is_neutral_snapshot(
+        '{"schema_version":1,"trust":0.9,"affection":0.8,"tension":0.1,"triggers":[],"timestamp":1700000000.0}'::jsonb,
+        'relationship'
+    ),
+    'privacy_is_neutral_snapshot rejects a valid but non-neutral relationship v1 snapshot'
 );
 
 -- =================================================================
@@ -675,6 +725,49 @@ SELECT is(
     'rejected reset leaves no durable ledger row'
 );
 
+-- Valid v1 but semantically NON-NEUTRAL snapshots are rejected without any
+-- mutation, revision bump or ledger record (issue #314 review).
+SELECT is(
+    (SELECT public.reset_emotional_state(
+        'privacy_tap_reset', '77777777-7777-7777-7777-777777777777'::uuid,
+        '{"schema_version":1,"pleasure":0.9,"arousal":0.8,"dominance":0.7,"libido":0.1,"aggression":0.1,"connection":0.5,"energy":0.8,"tension":0.1,"coping_mode":"MANIC","timestamp":1700000000.0}'::jsonb
+    )->'error'->>'code'),
+    'validation_failed',
+    'valid but non-neutral emotional v1 snapshot is rejected with validation_failed'
+);
+SELECT is(
+    (SELECT revision FROM public.profiles WHERE user_id = 'privacy_tap_reset')::bigint,
+    8::bigint,
+    'non-neutral emotional reset does not change revision'
+);
+SELECT is(
+    (SELECT count(*)::integer FROM public.privacy_operations
+     WHERE user_id = 'privacy_tap_reset'
+       AND operation_id = '77777777-7777-7777-7777-777777777777'::uuid),
+    0,
+    'non-neutral emotional reset leaves no durable ledger row'
+);
+SELECT is(
+    (SELECT public.reset_relationship_state(
+        'privacy_tap_reset', '88888888-8888-8888-8888-888888888888'::uuid,
+        '{"schema_version":1,"trust":0.9,"affection":0.8,"tension":0.1,"triggers":[],"timestamp":1700000000.0}'::jsonb
+    )->'error'->>'code'),
+    'validation_failed',
+    'valid but non-neutral relationship v1 snapshot is rejected with validation_failed'
+);
+SELECT is(
+    (SELECT revision FROM public.profiles WHERE user_id = 'privacy_tap_reset')::bigint,
+    8::bigint,
+    'non-neutral relationship reset does not change revision'
+);
+SELECT is(
+    (SELECT count(*)::integer FROM public.privacy_operations
+     WHERE user_id = 'privacy_tap_reset'
+       AND operation_id = '88888888-8888-8888-8888-888888888888'::uuid),
+    0,
+    'non-neutral relationship reset leaves no durable ledger row'
+);
+
 -- =================================================================
 -- 7. User isolation (A's operations never touch B, and vice versa)
 -- =================================================================
@@ -706,6 +799,43 @@ SELECT is(
     (SELECT count(*)::integer FROM public.memories WHERE user_id = 'privacy_tap_reset'),
     1,
     'user B operations never touch user A memories'
+);
+
+-- =================================================================
+-- 8. SQL-side authenticated_user_id bounds (issue #314 review)
+--    The SQL validation mirrors the persistent ledger contract
+--    (char_length BETWEEN 1 AND 128 AND btrim <> ''): invalid identities
+--    return a predictable validation envelope, never a generic P0001.
+-- =================================================================
+SELECT is(
+    (SELECT public.delete_history(
+        '   ', '99999999-9999-9999-9999-999999999998'::uuid, '{}'::jsonb
+    )->'error'->>'code'),
+    'validation_failed',
+    'whitespace-only user_id fails with validation_failed (predictable)'
+);
+SELECT is(
+    (SELECT public.delete_history(
+        repeat('x', 129), '99999999-9999-9999-9999-999999999997'::uuid, '{}'::jsonb
+    )->'error'->>'code'),
+    'validation_failed',
+    '129-character user_id fails with validation_failed (predictable)'
+);
+SELECT is(
+    (SELECT public.delete_history(
+        repeat('y', 128), '99999999-9999-9999-9999-999999999996'::uuid, '{}'::jsonb
+    )->>'status'),
+    'applied',
+    '128-character user_id is accepted (boundary)'
+);
+SELECT is(
+    (SELECT count(*)::integer FROM public.privacy_operations
+     WHERE operation_id IN (
+         '99999999-9999-9999-9999-999999999998'::uuid,
+         '99999999-9999-9999-9999-999999999997'::uuid
+     )),
+    0,
+    'invalid identities leave no durable ledger rows'
 );
 
 SELECT * FROM finish();

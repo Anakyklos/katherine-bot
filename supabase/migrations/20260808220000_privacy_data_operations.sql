@@ -51,8 +51,14 @@
 -- =================================================================
 -- 0. PREFLIGHT: fail closed on missing dependencies and drift
 -- =================================================================
+-- Every mandatory dependency is checked INDIVIDUALLY: a partially
+-- incomplete schema can never pass because at least one table of the set
+-- exists. Missing drift detection here would let the primitives install on
+-- top of a broken schema, so each absence raises 23514 BEFORE any object of
+-- this migration is created.
 DO $$
 BEGIN
+    -- Drift: objects created by THIS migration must not exist yet.
     IF EXISTS (
         SELECT 1
         FROM pg_class c
@@ -73,10 +79,38 @@ BEGIN
               'delete_history', 'delete_memories',
               'reset_emotional_state', 'reset_relationship_state',
               'privacy_apply_operation', 'privacy_operation_payload_sha256',
-              'privacy_op_validation_error'
+              'privacy_op_validation_error', 'privacy_is_neutral_snapshot'
           )
     ) THEN
         RAISE EXCEPTION 'Cannot apply privacy operations: privacy functions already exist (unexpected drift)'
+            USING ERRCODE = '23514';
+    END IF;
+
+    -- Required tables: EVERY dependency must exist. to_regclass is NULL-safe
+    -- (no exception on missing relations) and each check is explicit, so a
+    -- single existing table can never mask another missing one.
+    IF pg_catalog.to_regclass('public.chat_logs') IS NULL THEN
+        RAISE EXCEPTION 'Missing dependency: public.chat_logs (issue #270)'
+            USING ERRCODE = '23514';
+    END IF;
+    IF pg_catalog.to_regclass('public.memories') IS NULL THEN
+        RAISE EXCEPTION 'Missing dependency: public.memories (issue #270)'
+            USING ERRCODE = '23514';
+    END IF;
+    IF pg_catalog.to_regclass('public.archival_extractions') IS NULL THEN
+        RAISE EXCEPTION 'Missing dependency: public.archival_extractions (issue #270)'
+            USING ERRCODE = '23514';
+    END IF;
+    IF pg_catalog.to_regclass('public.turn_requests') IS NULL THEN
+        RAISE EXCEPTION 'Missing dependency: public.turn_requests (issue #270)'
+            USING ERRCODE = '23514';
+    END IF;
+    IF pg_catalog.to_regclass('public.outbox_events') IS NULL THEN
+        RAISE EXCEPTION 'Missing dependency: public.outbox_events (issue #270)'
+            USING ERRCODE = '23514';
+    END IF;
+    IF pg_catalog.to_regclass('public.admission_reservations') IS NULL THEN
+        RAISE EXCEPTION 'Missing dependency: public.admission_reservations (issue #270)'
             USING ERRCODE = '23514';
     END IF;
 
@@ -87,20 +121,6 @@ BEGIN
           AND a.attname = 'revision'
     ) THEN
         RAISE EXCEPTION 'Missing dependency: profiles.revision column (issue #270)'
-            USING ERRCODE = '23514';
-    END IF;
-
-    IF NOT EXISTS (
-        SELECT 1
-        FROM pg_class c
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE n.nspname = 'public'
-          AND c.relname IN (
-              'chat_logs', 'memories', 'archival_extractions',
-              'turn_requests', 'outbox_events', 'admission_reservations'
-          )
-    ) THEN
-        RAISE EXCEPTION 'Missing dependency: privacy target tables (issue #270/#271)'
             USING ERRCODE = '23514';
     END IF;
 
@@ -197,6 +217,11 @@ REVOKE ALL ON FUNCTION public.privacy_operation_payload_sha256(jsonb)
 -- =================================================================
 -- 3. Base validation helper (returns an error envelope or NULL)
 -- =================================================================
+-- Mirrors the persistent ledger constraint exactly:
+--   char_length(user_id) BETWEEN 1 AND 128 AND btrim(user_id) <> ''
+-- Invalid identities (NULL, empty, whitespace-only, oversized) fail with a
+-- predictable validation envelope BEFORE any lock, mutation or ledger row,
+-- never with a generic persistence error from the ledger CHECK.
 CREATE OR REPLACE FUNCTION public.privacy_op_validation_error(
     p_user_id text,
     p_operation_id uuid,
@@ -206,11 +231,13 @@ LANGUAGE plpgsql
 IMMUTABLE
 AS $$
 BEGIN
-    IF p_user_id IS NULL OR p_user_id = '' THEN
+    IF p_user_id IS NULL
+       OR pg_catalog.char_length(p_user_id) NOT BETWEEN 1 AND 128
+       OR pg_catalog.btrim(p_user_id) = '' THEN
         RETURN jsonb_build_object(
             'error', jsonb_build_object(
                 'code', 'validation_failed',
-                'message', 'authenticated_user_id is required'
+                'message', 'authenticated_user_id is invalid'
             )
         );
     END IF;
@@ -238,6 +265,61 @@ REVOKE ALL ON FUNCTION public.privacy_op_validation_error(text, uuid, jsonb)
     FROM PUBLIC, anon, authenticated, service_role;
 
 -- =================================================================
+-- 3.1 Neutral snapshot verifier (reset semantics, issue #314 review)
+-- =================================================================
+-- The resets must ONLY ever persist the CANONICAL NEUTRAL state produced by
+-- the domain (EmotionalStateV1.neutral(...) / RelationshipStateV1.neutral(...)).
+-- A structurally valid v1 snapshot that is NOT neutral (for example
+-- pleasure = 0.9, coping_mode = 'MANIC') must be rejected.
+--
+-- Where neutrality is PRODUCED vs VERIFIED:
+--   * PRODUCED: backend/emotional_domain/models.py (EmotionalStateV1.neutral)
+--     and backend/relationship.py (RelationshipStateV1.neutral). The adapter
+--     backend/privacy_operations.py reconstructs the canonical neutral
+--     snapshot through those constructors and compares the payload.
+--   * VERIFIED here: this SQL helper is the privileged boundary check. The
+--     constant values below intentionally mirror the domain constructors and
+--     are pinned by cross-boundary tests: the pgTAP and integration suites
+--     prove this helper accepts the exact output of the Python constructors
+--     and rejects valid-but-non-neutral v1 snapshots, so the two boundaries
+--     cannot silently diverge.
+-- No second emotional/relationship model is created: this helper only
+-- compares scalar values against the canonical neutral constants and still
+-- requires the full v1 contract (jsonb_snapshot_contract) first.
+CREATE OR REPLACE FUNCTION public.privacy_is_neutral_snapshot(
+    p_payload jsonb,
+    p_snapshot_kind text
+) RETURNS boolean
+LANGUAGE sql
+IMMUTABLE
+SET search_path = pg_catalog
+AS $$
+    SELECT
+        public.jsonb_snapshot_contract(p_payload, p_snapshot_kind)
+        AND (
+            (p_snapshot_kind = 'emotional' AND
+             (p_payload->>'pleasure')::double precision = 0.0 AND
+             (p_payload->>'arousal')::double precision = 0.0 AND
+             (p_payload->>'dominance')::double precision = 0.0 AND
+             (p_payload->>'libido')::double precision = 0.0 AND
+             (p_payload->>'aggression')::double precision = 0.0 AND
+             (p_payload->>'connection')::double precision = 0.5 AND
+             (p_payload->>'energy')::double precision = 0.8 AND
+             (p_payload->>'tension')::double precision = 0.0 AND
+             p_payload->>'coping_mode' = 'HEALTHY')
+            OR
+            (p_snapshot_kind = 'relationship' AND
+             (p_payload->>'trust')::double precision = 0.5 AND
+             (p_payload->>'affection')::double precision = 0.3 AND
+             (p_payload->>'tension')::double precision = 0.0 AND
+             p_payload->'triggers' = '[]'::jsonb)
+        )
+$$;
+
+REVOKE ALL ON FUNCTION public.privacy_is_neutral_snapshot(jsonb, text)
+    FROM PUBLIC, anon, authenticated, service_role;
+
+-- =================================================================
 -- 4. Core: single transactional engine for all four operations
 -- =================================================================
 -- Executes every step of an operation in ONE transaction:
@@ -253,10 +335,12 @@ REVOKE ALL ON FUNCTION public.privacy_op_validation_error(text, uuid, jsonb)
 -- a constant sanitized 'persistence error' P0001, never SQLERRM/SQLSTATE).
 --
 -- The resets reuse the EXISTING v1 snapshot contract (jsonb_snapshot_contract
--- from #271). No second emotional/relationship model is created in SQL: the
--- caller (server-side domain) produces EmotionalStateV1.neutral(...) /
--- RelationshipStateV1.neutral(...) snapshots and this function requires the
--- exact v1 allowlist/version already used by commit_turn.
+-- from #271) AND additionally require the canonical NEUTRAL state produced by
+-- the domain (EmotionalStateV1.neutral(...) / RelationshipStateV1.neutral(...),
+-- verified by privacy_is_neutral_snapshot). No second emotional/relationship
+-- model is created in SQL: the caller (server-side domain) produces the neutral
+-- snapshots and this function requires the exact v1 allowlist/version already
+-- used by commit_turn plus the canonical neutral values.
 CREATE OR REPLACE FUNCTION public.privacy_apply_operation(
     p_authenticated_user_id text,
     p_operation text,
@@ -304,25 +388,29 @@ BEGIN
         );
     END IF;
 
-    -- Resets require a VALID v1 snapshot produced by the domain. The
-    -- snapshot is the operation payload and is bound to the operation_id by
-    -- the fingerprint below.
+    -- Resets require the CANONICAL NEUTRAL v1 snapshot produced by the
+    -- domain (EmotionalStateV1.neutral / RelationshipStateV1.neutral).
+    -- privacy_is_neutral_snapshot first enforces the full v1 contract and
+    -- then verifies the exact canonical neutral values, so a structurally
+    -- valid but non-neutral snapshot can never be persisted. The snapshot
+    -- is the operation payload and is bound to the operation_id by the
+    -- fingerprint below.
     IF p_operation = 'reset_emotional_state'
-       AND NOT public.jsonb_snapshot_contract(p_operation_payload, 'emotional') THEN
+       AND NOT public.privacy_is_neutral_snapshot(p_operation_payload, 'emotional') THEN
         RETURN jsonb_build_object(
             'error', jsonb_build_object(
                 'code', 'validation_failed',
-                'message', 'emotional_state snapshot violates the v1 contract'
+                'message', 'emotional_state snapshot must be the canonical neutral v1 state'
             )
         );
     END IF;
 
     IF p_operation = 'reset_relationship_state'
-       AND NOT public.jsonb_snapshot_contract(p_operation_payload, 'relationship') THEN
+       AND NOT public.privacy_is_neutral_snapshot(p_operation_payload, 'relationship') THEN
         RETURN jsonb_build_object(
             'error', jsonb_build_object(
                 'code', 'validation_failed',
-                'message', 'relationship_state snapshot violates the v1 contract'
+                'message', 'relationship_state snapshot must be the canonical neutral v1 state'
             )
         );
     END IF;
@@ -491,7 +579,7 @@ REVOKE ALL ON FUNCTION public.privacy_apply_operation(text, text, uuid, jsonb)
 -- 5. Public RPC primitives (thin, server-owned wrappers)
 -- =================================================================
 -- Each wrapper fixes the operation name. The core performs validation
--- (including the v1 snapshot contract for resets), locking, idempotency,
+-- (including the v1 neutral contract for resets), locking, idempotency,
 -- mutation, revision bump and the durable ledger record.
 CREATE OR REPLACE FUNCTION public.delete_history(
     p_authenticated_user_id text,
@@ -586,7 +674,7 @@ COMMENT ON FUNCTION public.delete_memories(text, uuid, jsonb) IS
 'Atomic, idempotent privacy primitive (#314). Removes memories and archival/candidate material that may still represent ungoverned memory in one transaction. Preserves chat history and snapshots. Same per-user advisory lock as commit_turn. Replay-safe via the durable privacy_operations ledger; divergent payloads conflict sanitized. SECURITY DEFINER, service_role only.';
 
 COMMENT ON FUNCTION public.reset_emotional_state(text, uuid, jsonb) IS
-'Atomic, idempotent privacy primitive (#314). Replaces ONLY profiles.emotional_state with a validated v1 snapshot (produced by the domain, EmotionalStateV1.neutral) and increments profiles.revision exactly once. Preserves history, memories and the relationship snapshot. Same per-user advisory lock as commit_turn. Replay-safe via the durable privacy_operations ledger; divergent payloads conflict sanitized. SECURITY DEFINER, service_role only.';
+'Atomic, idempotent privacy primitive (#314). Replaces ONLY profiles.emotional_state with the canonical NEUTRAL v1 snapshot (EmotionalStateV1.neutral, verified by privacy_is_neutral_snapshot) and increments profiles.revision exactly once. Preserves history, memories and the relationship snapshot. Same per-user advisory lock as commit_turn. Replay-safe via the durable privacy_operations ledger; divergent payloads conflict sanitized. SECURITY DEFINER, service_role only.';
 
 COMMENT ON FUNCTION public.reset_relationship_state(text, uuid, jsonb) IS
-'Atomic, idempotent privacy primitive (#314). Replaces ONLY profiles.relationship_state with a validated v1 snapshot (produced by the domain, RelationshipStateV1.neutral) and increments profiles.revision exactly once. Preserves history, memories and the emotional snapshot. Same per-user advisory lock as commit_turn. Replay-safe via the durable privacy_operations ledger; divergent payloads conflict sanitized. SECURITY DEFINER, service_role only.';
+'Atomic, idempotent privacy primitive (#314). Replaces ONLY profiles.relationship_state with the canonical NEUTRAL v1 snapshot (RelationshipStateV1.neutral, verified by privacy_is_neutral_snapshot) and increments profiles.revision exactly once. Preserves history, memories and the emotional snapshot. Same per-user advisory lock as commit_turn. Replay-safe via the durable privacy_operations ledger; divergent payloads conflict sanitized. SECURITY DEFINER, service_role only.';

@@ -81,7 +81,15 @@ never reach the increment path.
 `p_authenticated_user_id` is the ONLY identity input. `user_id` / `bond_label`
 inside payloads and snapshots are rejected at any depth by the existing
 `jsonb_snapshot_contract` validation. No body/snapshot-controlled identity is
-ever trusted.
+ever trusted. The identity is validated exactly as received (never normalized)
+against the persistent ledger contract — `1 <= char_length(user_id) <= 128`
+and `btrim(user_id) <> ''` — in BOTH the Python adapter (before the RPC) and
+the SQL helper (`privacy_op_validation_error`): empty, whitespace-only and
+oversized identities fail with a predictable `validation_failed` envelope
+instead of a generic persistence error. The adapter also binds the RPC result
+to the expected identity: a result whose `user_id` differs from the
+`authenticated_user_id` requested fails closed and never echoes the divergent
+value.
 
 ### 5. Server-owned RPCs, minimal grants
 
@@ -89,8 +97,9 @@ ever trusted.
 - `EXECUTE` granted to `service_role` ONLY; revoked from
   `PUBLIC`, `anon` and `authenticated`.
 - The internal core (`privacy_apply_operation`) and helpers
-  (`privacy_operation_payload_sha256`, `privacy_op_validation_error`) have NO
-  grants at all (owner `postgres` only).
+  (`privacy_operation_payload_sha256`, `privacy_op_validation_error`,
+  `privacy_is_neutral_snapshot`) have NO grants at all (owner `postgres`
+  only).
 - `privacy_operations` is `RLS + FORCE RLS` with no policies and NO table
   grants (not even `service_role`): the RPCs are the only access path.
 - Direct access to the internal structures follows the existing minimum
@@ -140,14 +149,41 @@ touches `memories` or the profile/persona/snapshots.
 
 No second emotional/relationship model is created in SQL. The resets reuse
 the EXISTING v1 contract validation (`jsonb_snapshot_contract`, migration
-#271) with the exact version and allowlist already used by `commit_turn`:
+#271) with the exact version and allowlist already used by `commit_turn`,
+AND additionally require the canonical NEUTRAL state (issue #314 review):
 
-- The server-side domain produces `EmotionalStateV1.neutral(...)` /
-  `RelationshipStateV1.neutral(...)` snapshots (the operation payload).
+- Neutrality is PRODUCED by the domain: `EmotionalStateV1.neutral(...)` /
+  `RelationshipStateV1.neutral(...)`. The Python adapter reconstructs the
+  canonical neutral snapshot through those constructors (using the payload's
+  own timestamp) and requires an exact match, so a structurally valid v1
+  snapshot with non-neutral values (for example `pleasure = 0.9`,
+  `coping_mode = 'MANIC'`) is rejected before the RPC.
+- Neutrality is VERIFIED at the privileged SQL boundary by
+  `privacy_is_neutral_snapshot(payload, kind)`: it first enforces the full v1
+  contract (`jsonb_snapshot_contract`) and then compares every state field
+  against the canonical neutral constants that mirror the domain
+  constructors. Cross-boundary tests (pgTAP and the real-database suites)
+  pin the SQL constants to the exact output of the Python constructors, so
+  the two boundaries cannot silently diverge.
 - The RPC requires `schema_version == 1`, the exact v1 field set/ranges,
-  positive timestamp, no identity/internal keys, size bound.
-- Malformed or non-v1 snapshots are rejected with `validation_failed`
-  before any mutation or ledger record.
+  positive timestamp, no identity/internal keys, size bound AND the canonical
+  neutral values.
+- Malformed, non-v1 or valid-but-non-neutral snapshots are rejected with
+  `validation_failed` before any mutation or ledger record.
+
+## Preflight (fail closed on any missing dependency)
+
+The migration preflight checks EVERY mandatory dependency individually with
+`pg_catalog.to_regclass(...) IS NULL` (NULL-safe) and raises SQLSTATE 23514
+before creating any object of the migration when any of the six required
+tables (`chat_logs`, `memories`, `archival_extractions`, `turn_requests`,
+`outbox_events`, `admission_reservations`), `profiles.revision`,
+`jsonb_snapshot_contract`, `pgcrypto` — or any drift of this migration's own
+objects — is missing. A partially incomplete schema can never pass because
+at least one table of the set exists. The CI preflight suite
+(`backend/tests/test_privacy_operations_preflight.py`) drops exactly one
+required table on a compatible baseline and proves the migration fails with
+23514 before installing the ledger or any function.
 
 ## Error envelopes
 

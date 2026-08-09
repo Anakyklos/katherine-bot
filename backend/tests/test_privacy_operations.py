@@ -193,12 +193,27 @@ def test_validate_rejects_bad_payload(operation, payload):
 
 @pytest.mark.parametrize(
     "bad_user_id",
-    [None, "", 123],
+    [None, "", 123, "   ", "\t\n", "x" * 129],
 )
 def test_validate_rejects_bad_user_id(bad_user_id):
     with pytest.raises(ValidationError) as exc:
         validate_privacy_operation_input(
             OPERATION_DELETE_HISTORY, bad_user_id, VALID_OP_ID, {}
+        )
+    assert exc.value.code == "invalid_user_id"
+
+
+@pytest.mark.parametrize("good_user_id", ["a", "x" * 128])
+def test_validate_accepts_user_id_boundaries(good_user_id):
+    validate_privacy_operation_input(
+        OPERATION_DELETE_HISTORY, good_user_id, VALID_OP_ID, {}
+    )
+
+
+def test_validate_rejects_oversized_user_id():
+    with pytest.raises(ValidationError) as exc:
+        validate_privacy_operation_input(
+            OPERATION_DELETE_HISTORY, "x" * 129, VALID_OP_ID, {}
         )
     assert exc.value.code == "invalid_user_id"
 
@@ -270,6 +285,62 @@ def test_validate_accepts_valid_inputs():
     )
 
 
+def test_validate_rejects_valid_but_non_neutral_emotional_snapshot():
+    """A structurally valid v1 snapshot with non-neutral values must be
+    rejected by a reset (issue #314 review)."""
+    snapshot = neutral_emotional_snapshot(1700000000.0)
+    snapshot["pleasure"] = 0.9
+    snapshot["arousal"] = 0.8
+    snapshot["dominance"] = 0.7
+    snapshot["coping_mode"] = "MANIC"
+    with pytest.raises(ValidationError) as exc:
+        validate_privacy_operation_input(
+            OPERATION_RESET_EMOTIONAL_STATE, "user-a", VALID_OP_ID, snapshot
+        )
+    assert exc.value.code == "invalid_operation_payload"
+    assert "neutral" in str(exc.value)
+
+
+def test_validate_rejects_valid_but_non_neutral_relationship_snapshot():
+    snapshot = neutral_relationship_snapshot(1700000000.0)
+    snapshot["trust"] = 0.9
+    snapshot["affection"] = 0.8
+    snapshot["tension"] = 0.1
+    with pytest.raises(ValidationError) as exc:
+        validate_privacy_operation_input(
+            OPERATION_RESET_RELATIONSHIP_STATE, "user-a", VALID_OP_ID, snapshot
+        )
+    assert exc.value.code == "invalid_operation_payload"
+    assert "neutral" in str(exc.value)
+
+
+def test_neutral_snapshots_are_accepted_for_resets():
+    validate_privacy_operation_input(
+        OPERATION_RESET_EMOTIONAL_STATE,
+        "user-a",
+        VALID_OP_ID,
+        neutral_emotional_snapshot(1700000000.0),
+    )
+    validate_privacy_operation_input(
+        OPERATION_RESET_RELATIONSHIP_STATE,
+        "user-a",
+        VALID_OP_ID,
+        neutral_relationship_snapshot(1700000000.0),
+    )
+
+
+def test_reset_neutrality_uses_domain_constructors_only():
+    """The neutrality contract is derived from the domain constructors; no
+    independent second model is created by the adapter."""
+    from backend.emotional_domain import EmotionalStateV1
+    from backend.relationship import RelationshipStateV1
+
+    emotional = neutral_emotional_snapshot(1700000000.0)
+    assert emotional == EmotionalStateV1.neutral(timestamp=1700000000.0).to_dict()
+    relationship = neutral_relationship_snapshot(1700000000.0)
+    assert relationship == RelationshipStateV1.neutral(timestamp=1700000000.0).to_dict()
+
+
 # ═══════════════════════════════════════════════════════════════════════
 # 4. RPC payload building
 # ═══════════════════════════════════════════════════════════════════════
@@ -293,7 +364,7 @@ def test_build_rpc_payload():
 
 def test_parse_success_result():
     parsed = parse_privacy_operation_result(
-        _success_result(), OPERATION_DELETE_HISTORY, VALID_OP_ID
+        _success_result(), OPERATION_DELETE_HISTORY, VALID_OP_ID, "user-a"
     )
     assert isinstance(parsed, PrivacyOperationResult)
     assert parsed.operation == OPERATION_DELETE_HISTORY
@@ -306,10 +377,10 @@ def test_parse_success_result():
 
 def test_parse_replay_result_is_identical():
     first = parse_privacy_operation_result(
-        _success_result(), OPERATION_DELETE_HISTORY, VALID_OP_ID
+        _success_result(), OPERATION_DELETE_HISTORY, VALID_OP_ID, "user-a"
     )
     second = parse_privacy_operation_result(
-        _success_result(), OPERATION_DELETE_HISTORY, VALID_OP_ID
+        _success_result(), OPERATION_DELETE_HISTORY, VALID_OP_ID, "user-a"
     )
     assert second.to_db_row() == first.to_db_row()
 
@@ -325,6 +396,7 @@ def test_parse_conflict_result():
             },
             OPERATION_DELETE_HISTORY,
             VALID_OP_ID,
+            "user-a",
         )
     assert exc.value.code == "operation_conflict"
 
@@ -340,6 +412,7 @@ def test_parse_validation_error_result():
             },
             OPERATION_DELETE_HISTORY,
             VALID_OP_ID,
+            "user-a",
         )
     assert exc.value.code == "validation_failed"
 
@@ -350,6 +423,7 @@ def test_parse_unknown_error_is_sanitized_persistence():
             {"error": {"code": "database_error", "message": "SECRET_LEAK"}},
             OPERATION_DELETE_HISTORY,
             VALID_OP_ID,
+            "user-a",
         )
     assert "SECRET_LEAK" not in str(exc.value)
 
@@ -373,7 +447,31 @@ def test_parse_rejects_malformed_success(mutate):
     result = _success_result()
     mutate(result)
     with pytest.raises(ValidationError):
-        parse_privacy_operation_result(result, OPERATION_DELETE_HISTORY, VALID_OP_ID)
+        parse_privacy_operation_result(
+            result, OPERATION_DELETE_HISTORY, VALID_OP_ID, "user-a"
+        )
+
+
+def test_parse_accepts_correct_user():
+    parsed = parse_privacy_operation_result(
+        _success_result(), OPERATION_DELETE_HISTORY, VALID_OP_ID, "user-a"
+    )
+    assert parsed.user_id == "user-a"
+
+
+def test_parse_rejects_divergent_user_sanitized():
+    """A result belonging to another user fails closed; the divergent identity
+    (which may be a sensitive attacker-controlled value) is never echoed."""
+    divergent = "SUPER-SECRET-DIVERGENT-USER-MARKER"
+    result = _success_result()
+    result["user_id"] = divergent
+    with pytest.raises(ValidationError) as exc:
+        parse_privacy_operation_result(
+            result, OPERATION_DELETE_HISTORY, VALID_OP_ID, "user-a"
+        )
+    assert exc.value.code == "invalid_rpc_result"
+    assert divergent not in str(exc.value)
+    assert "does not match" in str(exc.value)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -401,6 +499,29 @@ def test_run_validates_before_rpc():
     assert calls == [], "RPC must never be called for invalid input"
 
 
+def test_run_validates_user_id_before_rpc():
+    """Invalid identities (whitespace-only, oversized) never reach the RPC."""
+    calls = []
+
+    async def rpc_client(name: str, params: dict) -> dict:
+        calls.append((name, params))
+        return _success_result()
+
+    for bad_user in ("   ", "x" * 129):
+        with pytest.raises(ValidationError) as exc:
+            asyncio.run(
+                run_privacy_operation(
+                    rpc_client=rpc_client,
+                    operation=OPERATION_DELETE_HISTORY,
+                    authenticated_user_id=bad_user,
+                    operation_id=VALID_OP_ID,
+                    payload={},
+                )
+            )
+        assert exc.value.code == "invalid_user_id"
+    assert calls == [], "RPC must never be called for an invalid identity"
+
+
 def test_run_success_single_call():
     calls = []
 
@@ -422,6 +543,29 @@ def test_run_success_single_call():
     assert calls[0][1]["p_authenticated_user_id"] == "user-a"
     assert calls[0][1]["p_operation_id"] == VALID_OP_ID
     assert result.to_db_row() == _success_result()
+
+
+def test_run_rejects_result_of_another_user():
+    """run_privacy_operation forwards the expected identity to the parser: a
+    result whose user_id diverges fails closed and never echoes the value."""
+    divergent = "SECRET-OTHER-USER-MARKER"
+
+    async def rpc_client(name: str, params: dict) -> dict:
+        result = _success_result()
+        result["user_id"] = divergent
+        return result
+
+    with pytest.raises(ValidationError) as exc:
+        asyncio.run(
+            run_privacy_operation(
+                rpc_client=rpc_client,
+                operation=OPERATION_DELETE_HISTORY,
+                authenticated_user_id="user-a",
+                operation_id=VALID_OP_ID,
+                payload={},
+            )
+        )
+    assert divergent not in str(exc.value)
 
 
 def test_run_uses_correct_rpc_name_per_operation():

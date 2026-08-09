@@ -9,15 +9,24 @@ primitives exposed by the PostgreSQL RPC layer (migration
   turn_requests, derived outbox_events and archival_extractions).
 - ``delete_memories``: atomically removes memories and archival/candidate
   material that may still represent ungoverned memory.
-- ``reset_emotional_state``: replaces ONLY the emotional snapshot with a
-  validated v1 neutral snapshot produced by the domain.
-- ``reset_relationship_state``: replaces ONLY the relationship snapshot with a
-  validated v1 neutral snapshot produced by the domain.
+- ``reset_emotional_state``: replaces ONLY the emotional snapshot with the
+  canonical neutral v1 snapshot produced by the domain
+  (``EmotionalStateV1.neutral``).
+- ``reset_relationship_state``: replaces ONLY the relationship snapshot with
+  the canonical neutral v1 snapshot produced by the domain
+  (``RelationshipStateV1.neutral``).
 
 Design guarantees (implemented and enforced by the database):
 
 - Identity comes ONLY from ``authenticated_user_id`` (server-side boundary).
-  No ``user_id`` inside a payload/snapshot is ever trusted.
+  No ``user_id`` inside a payload/snapshot is ever trusted, and the identity
+  is validated exactly as received (1-128 chars, not whitespace-only) so it
+  matches the persistent ledger contract. RPC results whose ``user_id`` does
+  not equal the expected authenticated identity fail closed in the adapter.
+- Resets ONLY accept the canonical NEUTRAL snapshot: a structurally valid v1
+  snapshot with non-neutral values is rejected both in Python (by
+  reconstructing the neutral state through the domain constructors) and at
+  the privileged SQL boundary (``privacy_is_neutral_snapshot``).
 - Every applied operation records a durable ledger row keyed by
   (user_id, operation_id) storing the sanitized public result and the
   fingerprint of the operation payload. Replay of the same operation_id with
@@ -166,9 +175,56 @@ def _validate_operation_id(operation_id: Any) -> None:
 
 
 def _validate_user_id(user_id: Any) -> None:
-    if not isinstance(user_id, str) or not user_id:
+    """Validate the authenticated identity exactly as received.
+
+    Mirrors the persistent ledger contract
+    (``char_length(user_id) BETWEEN 1 AND 128 AND btrim(user_id) <> ''``):
+    rejects None, non-strings, empty strings, whitespace-only strings and
+    strings longer than 128 characters BEFORE the RPC, so invalid identities
+    never reach the database as generic persistence errors. The value is
+    validated exactly as received from the trusted boundary; it is never
+    normalized or altered.
+    """
+    if not isinstance(user_id, str):
         raise ValidationError(
-            "invalid_user_id", "authenticated_user_id must be a non-empty string"
+            "invalid_user_id", "authenticated_user_id must be a string"
+        )
+    if not user_id or user_id.isspace() or len(user_id) > 128:
+        raise ValidationError(
+            "invalid_user_id",
+            "authenticated_user_id must be 1-128 characters and not whitespace-only",
+        )
+
+
+def _validate_reset_neutral(payload: Mapping[str, Any], field_name: str) -> None:
+    """Verify that a reset payload is the canonical neutral v1 snapshot.
+
+    Neutrality is PRODUCED by the domain constructors
+    (``EmotionalStateV1.neutral`` / ``RelationshipStateV1.neutral``): this
+    helper reconstructs the canonical neutral snapshot through those
+    constructors using the payload's own timestamp and requires an exact
+    match, so a structurally valid v1 snapshot with non-neutral values
+    (for example pleasure = 0.9 or coping_mode = 'MANIC') is rejected.
+    """
+    timestamp = payload.get("timestamp")
+    if isinstance(timestamp, bool) or not isinstance(timestamp, (int, float)):
+        raise ValidationError(
+            "invalid_operation_payload", "reset snapshot must be the canonical neutral state"
+        )
+    try:
+        if field_name == "emotional_state":
+            expected = EmotionalStateV1.neutral(timestamp=float(timestamp)).to_dict()
+        else:
+            expected = RelationshipStateV1.neutral(timestamp=float(timestamp)).to_dict()
+    except Exception:
+        # The domain rejects the timestamp; the payload is not canonical.
+        raise ValidationError(
+            "invalid_operation_payload", "reset snapshot must be the canonical neutral state"
+        ) from None
+
+    if payload != expected:
+        raise ValidationError(
+            "invalid_operation_payload", "reset snapshot must be the canonical neutral state"
         )
 
 
@@ -200,11 +256,19 @@ def validate_privacy_operation_input(
 
     field_name = _RESET_SNAPSHOT_FIELD.get(operation)
     if field_name is not None:
-        # Resets REQUIRE a valid v1 snapshot produced by the domain. The
-        # shared snapshot validator enforces the exact v1 contract used by
-        # commit_turn (schema_version == 1, exact field set, ranges, no
-        # identity/internal keys, size bound).
+        # Resets REQUIRE the CANONICAL NEUTRAL v1 snapshot produced by the
+        # domain. The shared snapshot validator first enforces the exact v1
+        # contract used by commit_turn (schema_version == 1, exact field set,
+        # ranges, no identity/internal keys, size bound); the neutrality check
+        # then reconstructs the canonical neutral snapshot through the domain
+        # constructors using the payload's own timestamp and compares, so a
+        # structurally valid but semantically non-neutral v1 snapshot is
+        # rejected. The single canonical definition of the neutral values is
+        # the domain (EmotionalStateV1.neutral / RelationshipStateV1.neutral);
+        # the SQL boundary verifies the same contract independently
+        # (privacy_is_neutral_snapshot) and cross-boundary tests pin both.
         _validate_snapshot_payload(payload, field_name)
+        _validate_reset_neutral(payload, field_name)
 
 
 def build_privacy_operation_rpc_payload(
@@ -261,17 +325,21 @@ def parse_privacy_operation_result(
     result: Mapping[str, Any],
     expected_operation: str,
     expected_operation_id: str,
+    expected_user_id: str,
 ) -> PrivacyOperationResult:
     """Parse the RPC result into a PrivacyOperationResult.
 
     The success envelope is validated strictly: exactly the expected fields
     must be present (missing/extra fields indicate contract corruption), the
-    operation and operation_id must match the request, and revision and every
-    count must be non-negative integers.
+    operation, operation_id AND user_id must match the request, and revision
+    and every count must be non-negative integers. A result whose user_id does
+    not equal the expected authenticated identity fails closed with a constant
+    sanitized message: the divergent identity is NEVER echoed (it may be a
+    sensitive value controlled by an attacker).
 
     Raises:
         ConflictError: If the result indicates an operation conflict.
-        ValidationError: If the result is malformed.
+        ValidationError: If the result is malformed or belongs to another user.
         PersistenceError: If the result indicates an unexpected database error.
     """
     if not isinstance(result, Mapping):
@@ -309,6 +377,13 @@ def parse_privacy_operation_result(
         raise ValidationError("invalid_rpc_result", "status must be applied")
     if not isinstance(user_id, str) or not user_id:
         raise ValidationError("invalid_rpc_result", "user_id must be a non-empty string")
+    if user_id != expected_user_id:
+        # Fail closed: a privileged privacy result belonging to another user
+        # must never be accepted or normalized. The message is constant and
+        # never carries the divergent identity.
+        raise ValidationError(
+            "invalid_rpc_result", "result user_id does not match the authenticated user"
+        )
     if isinstance(revision, bool) or not isinstance(revision, int):
         raise ValidationError("invalid_rpc_result", "revision must be an integer")
     if revision < 0:
@@ -406,4 +481,6 @@ async def run_privacy_operation(
     except Exception as exc:  # noqa: BLE001 - sanitize any RPC-level failure
         raise PersistenceError("database_error", "persistence error") from None
 
-    return parse_privacy_operation_result(result, operation, operation_id)
+    return parse_privacy_operation_result(
+        result, operation, operation_id, authenticated_user_id
+    )

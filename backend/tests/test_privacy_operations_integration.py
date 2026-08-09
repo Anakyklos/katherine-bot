@@ -53,7 +53,7 @@ import pytest
 from postgrest.exceptions import APIError
 from supabase import Client, create_client
 
-from backend.atomic_turn_commit import ConflictError, PersistenceError
+from backend.atomic_turn_commit import ConflictError, PersistenceError, ValidationError
 from backend.privacy_operations import (
     OPERATION_DELETE_HISTORY,
     OPERATION_DELETE_MEMORIES,
@@ -560,6 +560,61 @@ def test_reset_rejects_malformed_snapshot_atomically(service_client: Client):
         _cleanup_user(user_id)
 
 
+def test_reset_rejects_valid_but_non_neutral_emotional_snapshot(service_client: Client):
+    """A structurally valid v1 emotional snapshot with non-neutral values must
+    be rejected by reset_emotional_state without touching snapshot, revision
+    or the ledger (issue #314 review)."""
+    user_id = _uid("re_non_neutral")
+    _seed_user(user_id, revision=3)
+    non_neutral = neutral_emotional_snapshot(1700000000.0)
+    non_neutral["pleasure"] = 0.9
+    non_neutral["arousal"] = 0.8
+    non_neutral["dominance"] = 0.7
+    non_neutral["libido"] = 0.1
+    non_neutral["aggression"] = 0.1
+    non_neutral["tension"] = 0.1
+    non_neutral["coping_mode"] = "MANIC"
+    try:
+        result = _call_rpc(
+            service_client,
+            "reset_emotional_state",
+            _rpc_params(user_id, new_operation_id(), non_neutral),
+        )
+        assert result["error"]["code"] == "validation_failed"
+        rows = _run_sql(
+            f"SELECT revision, emotional_state FROM public.profiles WHERE user_id = '{user_id}'"
+        )
+        assert rows[0]["revision"] == 3
+        assert rows[0]["emotional_state"]["coping_mode"] == "MANIC"
+        assert _count("privacy_operations", user_id) == 0
+    finally:
+        _cleanup_user(user_id)
+
+
+def test_reset_rejects_valid_but_non_neutral_relationship_snapshot(service_client: Client):
+    user_id = _uid("rr_non_neutral")
+    _seed_user(user_id, revision=4)
+    non_neutral = neutral_relationship_snapshot(1700000000.0)
+    non_neutral["trust"] = 0.9
+    non_neutral["affection"] = 0.8
+    non_neutral["tension"] = 0.1
+    try:
+        result = _call_rpc(
+            service_client,
+            "reset_relationship_state",
+            _rpc_params(user_id, new_operation_id(), non_neutral),
+        )
+        assert result["error"]["code"] == "validation_failed"
+        rows = _run_sql(
+            f"SELECT revision, relationship_state FROM public.profiles WHERE user_id = '{user_id}'"
+        )
+        assert rows[0]["revision"] == 4
+        assert rows[0]["relationship_state"]["trust"] == 0.9
+        assert _count("privacy_operations", user_id) == 0
+    finally:
+        _cleanup_user(user_id)
+
+
 # ---------------------------------------------------------------------------
 # 5/6. Revision exactly once + durable idempotent replay
 # ---------------------------------------------------------------------------
@@ -996,6 +1051,70 @@ def test_validation_errors_do_not_echo_payload(service_client: Client):
         serialized = json.dumps(result)
         assert "attacker-hidden-user" not in serialized
         assert _count("profiles", "attacker-hidden-user") == 0
+    finally:
+        _cleanup_user(user_id)
+
+
+def test_sql_validation_rejects_invalid_user_ids_without_ledger_rows(service_client: Client):
+    """Whitespace-only and oversized identities fail with a predictable
+    validation envelope through the SQL boundary and never create ledger rows
+    (issue #314 review)."""
+    user_id = _uid("uid_bounds")
+    _seed_user(user_id, revision=2)
+    try:
+        ws_result = _call_rpc(
+            service_client, "delete_history", _rpc_params("   ", new_operation_id())
+        )
+        assert ws_result["error"]["code"] == "validation_failed"
+
+        long_result = _call_rpc(
+            service_client, "delete_history", _rpc_params("x" * 129, new_operation_id())
+        )
+        assert long_result["error"]["code"] == "validation_failed"
+
+        # No ledger rows for the invalid identities.
+        assert _run_sql(
+            "SELECT count(*)::integer AS count FROM public.privacy_operations "
+            "WHERE user_id = '   ' OR user_id = '" + "x" * 129 + "'"
+        )[0]["count"] == 0
+
+        # Boundary: exactly 128 characters is accepted (no-op for missing user).
+        ok_user = "y" * 128
+        ok_result = _call_rpc(
+            service_client, "delete_history", _rpc_params(ok_user, new_operation_id())
+        )
+        assert "error" not in ok_result
+        assert ok_result["status"] == "applied"
+        assert ok_result["user_id"] == ok_user
+    finally:
+        _cleanup_user(user_id)
+
+
+def test_backend_adapter_rejects_divergent_result_user(service_client: Client):
+    """The adapter fails closed when the RPC result belongs to another user
+    and never exposes the divergent identity (issue #314 review)."""
+    user_id = _uid("adapter_div")
+    _seed_user(user_id, revision=2)
+    divergent = "SECRET-DIVERGENT-USER-MARKER"
+
+    async def rpc_client(name: str, params: dict) -> dict:
+        result = _call_rpc(service_client, name, params)
+        result["user_id"] = divergent
+        return result
+
+    try:
+        with pytest.raises(ValidationError) as exc:
+            asyncio.run(
+                run_privacy_operation(
+                    rpc_client=rpc_client,
+                    operation=OPERATION_DELETE_HISTORY,
+                    authenticated_user_id=user_id,
+                    operation_id=new_operation_id(),
+                    payload={},
+                )
+            )
+        assert exc.value.code == "invalid_rpc_result"
+        assert divergent not in str(exc.value)
     finally:
         _cleanup_user(user_id)
 
