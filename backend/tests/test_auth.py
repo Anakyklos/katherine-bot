@@ -73,6 +73,7 @@ def client_app(mock_external_dependencies):
     from backend.dependencies import ApplicationDependencies
     from backend.health import HealthRegistry
     from backend.settings import AppEnvironment, Settings
+    from backend.tests.fixtures.account_deletion_fakes import NoTombstoneGate
     from backend.turn_execution import TurnExecutionConfig
 
     engine = ChatConversationEngine()
@@ -90,6 +91,7 @@ def client_app(mock_external_dependencies):
         ),
         turn_config=TurnExecutionConfig.defaults(),
         health_checks=HealthRegistry(),
+        account_deletion_service=NoTombstoneGate(),
     )
     app = main.create_app(settings=settings, dependencies=deps)
     return TestClient(app)

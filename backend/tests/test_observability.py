@@ -21,6 +21,7 @@ from backend.emotion_presentation import EmotionStateResponse
 from backend.health import HealthRegistry
 from backend.process_turn import ProcessTurnResult, TurnMode
 from backend.settings import AppEnvironment, Settings
+from backend.tests.fixtures.account_deletion_fakes import NoTombstoneGate
 from backend.turn_execution import (
     DeadlineExceeded,
     TurnErrorCode,
@@ -134,6 +135,7 @@ def endpoint(monkeypatch):
         turn_config=TurnExecutionConfig.defaults(),
         health_checks=HealthRegistry(),
         clock=__import__("time").time,
+        account_deletion_service=NoTombstoneGate(),
     )
     app = main_module.create_app(settings=_settings(), dependencies=deps)
     client = TestClient(app)

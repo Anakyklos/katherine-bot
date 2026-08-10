@@ -51,6 +51,9 @@ EVENT_ACCOUNT_DELETION_RETRY_SCHEDULED = "account_deletion_retry_scheduled"
 EVENT_ACCOUNT_DELETION_FAILED = "account_deletion_failed"
 EVENT_ACCOUNT_DELETION_COMPLETED = "account_deletion_completed"
 EVENT_ACCOUNT_DELETION_LEASE_LOST = "account_deletion_lease_lost"
+EVENT_ACCOUNT_DELETION_REQUESTED = "account_deletion_requested"
+EVENT_ACCOUNT_DELETION_BLOCKED = "account_deletion_blocked"
+EVENT_ACCOUNT_DELETION_GATE_UNAVAILABLE = "account_deletion_gate_unavailable"
 
 EVENT_NAMES = frozenset(
     {
@@ -75,6 +78,9 @@ EVENT_NAMES = frozenset(
         EVENT_ACCOUNT_DELETION_FAILED,
         EVENT_ACCOUNT_DELETION_COMPLETED,
         EVENT_ACCOUNT_DELETION_LEASE_LOST,
+        EVENT_ACCOUNT_DELETION_REQUESTED,
+        EVENT_ACCOUNT_DELETION_BLOCKED,
+        EVENT_ACCOUNT_DELETION_GATE_UNAVAILABLE,
     }
 )
 

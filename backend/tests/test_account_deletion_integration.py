@@ -55,6 +55,7 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
+from fastapi.testclient import TestClient
 from supabase import Client, create_client
 
 from backend.account_deletion import (
@@ -1417,3 +1418,212 @@ def test_worker_auth_failure_preserves_db_purged_at_then_completes(
         assert _repo(service_client).has_tombstone(ref).exists is True
     finally:
         _cleanup_user(user_id)
+
+
+# ─── #326 HTTP API: real job creation and tombstone gate ────────────────────
+#
+# End-to-end against the local Supabase instance: the authenticated HTTP
+# endpoint creates a REAL job through the #324 contract, the tombstone gate
+# blocks /history and /chat, the replay stays idempotent, and account B is
+# not affected. The Auth Admin surface is never touched here (the worker is
+# not part of these scenarios).
+
+
+@pytest.fixture(scope="module")
+def anon_key() -> str:
+    return _required_env("SUPABASE_ANON_KEY")
+
+
+@pytest.fixture(scope="module")
+def app_client(
+    supabase_url: str,
+    service_role_key: str,
+) -> tuple[TestClient, Client]:
+    """The real FastAPI application wired to the local Supabase instance."""
+    from backend.account_deletion_service import AccountDeletionService
+    from backend.admission import AdmissionRuntimeConfig
+    from backend.dependencies import ApplicationDependencies
+    from backend.health import HealthRegistry
+    from backend.main import create_app
+    from backend.settings import AppEnvironment, Settings
+    from backend.turn_execution import TurnExecutionConfig
+
+    client = create_client(supabase_url, service_role_key)
+    admission_config = AdmissionRuntimeConfig.from_values(SECRET.decode("utf-8"))
+    account_deletion_service = AccountDeletionService(
+        repository=SupabaseAccountDeletionRepository(client),
+        turn_config=TurnExecutionConfig.defaults(),
+        admission_config=admission_config,
+    )
+    settings = Settings(
+        app_env=AppEnvironment.local,
+        groq_api_key="ci-groq-key",
+        admission_hmac_secret=SECRET.decode("utf-8"),
+        cors_allowed_origins=("http://localhost:3000",),
+    )
+    engine = SimpleNamespace(
+        memory_manager=SimpleNamespace(supabase=client),
+        groq_manager=SimpleNamespace(is_configured=lambda: True),
+    )
+    deps = ApplicationDependencies(
+        conversation_engine=engine,
+        auth_client=client,
+        admission_config=admission_config,
+        turn_config=TurnExecutionConfig.defaults(),
+        health_checks=HealthRegistry(),
+        clock=time.time,
+        persistence_client=client,
+        account_deletion_service=account_deletion_service,
+    )
+    app = create_app(settings=settings, dependencies=deps)
+    yield TestClient(app), client
+    _close_client(client)
+
+
+@pytest.fixture(scope="module")
+def users(
+    supabase_url: str,
+    anon_key: str,
+    service_client: Client,
+) -> dict[str, dict]:
+    """Two real GoTrue users (``a`` and ``b``) with valid sessions."""
+    created: list[dict] = []
+    for label in ("a", "b"):
+        email = f"adl-api-{label}-{uuid.uuid4().hex[:8]}@test.local"
+        password = "password123"
+        anon = create_client(supabase_url, anon_key)
+        try:
+            anon.auth.sign_up({"email": email, "password": password})
+            response = anon.auth.sign_in_with_password(
+                {"email": email, "password": password}
+            )
+            assert response is not None and response.user is not None
+            assert (
+                response.session is not None
+                and response.session.access_token is not None
+            )
+            created.append(
+                {
+                    "label": label,
+                    "id": response.user.id,
+                    "token": response.session.access_token,
+                    "email": email,
+                }
+            )
+        finally:
+            _close_client(anon)
+    yield {entry["label"]: entry for entry in created}
+    for entry in created:
+        for user in service_client.auth.admin.list_users():
+            if user.email == entry["email"]:
+                service_client.auth.admin.delete_user(user.id)
+
+
+def test_http_delete_account_creates_real_job_and_gate_blocks(
+    app_client: tuple[TestClient, Client],
+    users: dict[str, dict],
+):
+    """#326 scenario 29 (part 1): POST /privacy/delete-account creates a REAL
+    #324 job from current_user.id alone; the tombstone then blocks /history
+    and /chat; the replay is idempotent."""
+    client, _ = app_client
+    user = users["a"]
+    user_b = users["b"]
+    headers_a = {"Authorization": f"Bearer {user['token']}"}
+    headers_b = {"Authorization": f"Bearer {user_b['token']}"}
+    operation_id = _new_op_id()
+    try:
+        # Active user B can use /history before any tombstone exists.
+        history_b = client.get("/history", headers=headers_b)
+        assert history_b.status_code == 200
+
+        # First request: honest accepted state, nothing internal.
+        response = client.post(
+            "/privacy/delete-account",
+            json={"operation_id": operation_id},
+            headers=headers_a,
+        )
+        assert response.status_code == 200
+        assert response.json() == {"status": "accepted"}
+
+        # A real job row exists, bound to the server-derived reference.
+        rows = _run_sql(
+            "SELECT job_id::text, user_ref_hmac_sha256, user_id, status "
+            "FROM public.account_deletion_jobs "
+            f"WHERE operation_id = '{operation_id}'"
+        )
+        assert len(rows) == 1
+        assert rows[0]["user_ref_hmac_sha256"] == _ref(user["id"])
+        assert rows[0]["user_id"] == user["id"]
+        assert rows[0]["status"] == "pending"
+        job_id = rows[0]["job_id"]
+
+        # The tombstone gate blocks /history BEFORE any chat_logs read.
+        history_a = client.get("/history", headers=headers_a)
+        assert history_a.status_code == 423
+        assert history_a.json() == {
+            "detail": {
+                "code": "account_deletion_pending",
+                "message": "Account deletion is pending.",
+            }
+        }
+
+        # The tombstone gate blocks /chat BEFORE admission.
+        chat_a = client.post(
+            "/chat",
+            json={
+                "request_id": str(uuid.uuid4()),
+                "message": "hello",
+            },
+            headers=headers_a,
+        )
+        assert chat_a.status_code == 423
+        assert chat_a.json()["detail"]["code"] == "account_deletion_pending"
+
+        # Replay: same operation_id -> same honest state, no second job.
+        replay = client.post(
+            "/privacy/delete-account",
+            json={"operation_id": operation_id},
+            headers=headers_a,
+        )
+        assert replay.status_code == 200
+        assert replay.json() == {"status": "accepted"}
+        assert _count(
+            "account_deletion_jobs", f"operation_id = '{operation_id}'"
+        ) == 1
+
+        # Account B is not affected: /history still works.
+        history_b_after = client.get("/history", headers=headers_b)
+        assert history_b_after.status_code == 200
+
+        # The public response and the 423 payload never leak the job id.
+        assert job_id not in replay.text
+        assert job_id not in history_a.text
+    finally:
+        _cleanup_user(user["id"])
+        _cleanup_user(user_b["id"])
+
+
+def test_http_delete_account_rejects_spoofed_identity_before_rpc(
+    app_client: tuple[TestClient, Client],
+    users: dict[str, dict],
+):
+    """#326 scenario 29 (part 2): a body carrying user_id/user_ref/job_id is
+    rejected with 422 and NO job is created (identity comes exclusively from
+    the authenticated user)."""
+    client, _ = app_client
+    user = users["a"]
+    headers = {"Authorization": f"Bearer {user['token']}"}
+    for extra in (
+        {"operation_id": _new_op_id(), "user_id": "attacker"},
+        {"operation_id": _new_op_id(), "user_ref": "a" * 64},
+        {"operation_id": _new_op_id(), "job_id": str(uuid.uuid4())},
+    ):
+        operation_id = extra["operation_id"]
+        response = client.post(
+            "/privacy/delete-account", json=extra, headers=headers
+        )
+        assert response.status_code == 422
+        assert _count(
+            "account_deletion_jobs", f"operation_id = '{operation_id}'"
+        ) == 0, "no job may be created from a spoofed body"

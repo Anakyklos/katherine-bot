@@ -79,6 +79,7 @@ def test_endpoint_cancellation_drains_reservation_and_never_calls_engine(monkeyp
     fake_engine = FakeEngine()
     from backend.health import HealthRegistry
     from backend.settings import AppEnvironment, Settings
+    from backend.tests.fixtures.account_deletion_fakes import NoTombstoneGate
     from backend.turn_execution import TurnExecutionConfig
 
     settings = Settings(
@@ -93,6 +94,7 @@ def test_endpoint_cancellation_drains_reservation_and_never_calls_engine(monkeyp
         admission_config=AdmissionRuntimeConfig.from_values("s" * 32),
         turn_config=TurnExecutionConfig.defaults(),
         health_checks=HealthRegistry(),
+        account_deletion_service=NoTombstoneGate(),
     )
     app = main.create_app(settings=settings, dependencies=deps)
 

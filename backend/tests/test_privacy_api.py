@@ -259,7 +259,10 @@ def _make_app(
     auth_user_id: str = "user-123",
     persistence=None,
     engine=None,
+    account_deletion_service=None,
 ):
+    from backend.tests.fixtures.account_deletion_fakes import NoTombstoneGate
+
     settings = _settings()
     deps = main_module.ApplicationDependencies(
         conversation_engine=engine if engine is not None else FakeEngine(supabase=object()),
@@ -270,6 +273,11 @@ def _make_app(
         clock=time.time,
         persistence_client=persistence,
         privacy_service=service,
+        account_deletion_service=(
+            account_deletion_service
+            if account_deletion_service is not None
+            else NoTombstoneGate()
+        ),
     )
     return main_module.create_app(settings=settings, dependencies=deps)
 
@@ -976,7 +984,7 @@ def test_sentinels_never_reach_logs_or_responses(caplog):
 
 def test_no_route_uses_background_tasks():
     app = _make_app(service=RecordingPrivacyService(result=_result(OPERATION_DELETE_HISTORY)))
-    for path in PATHS.values():
+    for path in [*PATHS.values(), "/privacy/delete-account"]:
         route = next(r for r in app.routes if getattr(r, "path", None) == path)
         calls = [d.call for d in route.dependant.dependencies if d.call is not None]
         assert BackgroundTasks not in calls, f"{path} must not use BackgroundTasks"

@@ -22,6 +22,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from .account_deletion import SupabaseAccountDeletionRepository
+from .account_deletion_service import AccountDeletionService
 from .admission import AdmissionRuntimeConfig
 from .chat_engine import ChatConversationEngine
 from .health import build_health_registry, HealthRegistry
@@ -58,6 +60,7 @@ class ApplicationDependencies:
     clock: Callable[[], float] = field(default_factory=time.time)
     persistence_client: Any = None
     privacy_service: Any = None
+    account_deletion_service: Any = None
 
 
 def _supabase_factory_from_settings(settings: Settings) -> Callable[[], Optional[Any]]:
@@ -219,6 +222,17 @@ def build_default_dependencies(
             clock=time.time,
         )
 
+        # Stateless application service for the #326 account deletion API.
+        # It reuses the SAME Supabase client (never creates a second one), the
+        # same admission secret for the server-derived HMAC reference, and the
+        # same operational timeout/budget. Identity and operation_id are
+        # per-call arguments; the container stores no user state.
+        account_deletion_service = AccountDeletionService(
+            repository=SupabaseAccountDeletionRepository(supabase_client),
+            turn_config=settings.turn_config,
+            admission_config=admission_config,
+        )
+
         dependencies = ApplicationDependencies(
             conversation_engine=engine,
             auth_client=supabase_client,
@@ -228,6 +242,7 @@ def build_default_dependencies(
             clock=time.time,
             persistence_client=supabase_client,
             privacy_service=privacy_service,
+            account_deletion_service=account_deletion_service,
         )
 
         # Owned resources created by this builder, closed at shutdown and on

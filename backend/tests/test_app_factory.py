@@ -54,6 +54,8 @@ class FakeEngine:
 
 
 def _fake_dependencies(**overrides) -> main_module.ApplicationDependencies:
+    from backend.tests.fixtures.account_deletion_fakes import NoTombstoneGate
+
     settings = _settings()
     engine = FakeEngine(supabase=object())
     kwargs = {
@@ -63,6 +65,7 @@ def _fake_dependencies(**overrides) -> main_module.ApplicationDependencies:
         "turn_config": TurnExecutionConfig.defaults(),
         "health_checks": HealthRegistry(),
         "clock": time.time,
+        "account_deletion_service": NoTombstoneGate(),
     }
     kwargs.update(overrides)
     return main_module.ApplicationDependencies(**kwargs)
@@ -607,6 +610,7 @@ def test_no_per_user_state_in_app_state_or_container():
         "clock",
         "persistence_client",
         "privacy_service",
+        "account_deletion_service",
     }
     assert set(deps.__dataclass_fields__) == container_fields
     # No attribute of the container may hold a user identity.
@@ -621,6 +625,7 @@ def test_no_per_user_state_in_app_state_or_container():
 def test_routes_use_only_the_correct_dependency():
     """Auth uses only ``auth_client``; history/admission use only
     ``persistence_client``; routes never navigate engine internals."""
+    from backend.tests.fixtures.account_deletion_fakes import NoTombstoneGate
     from types import SimpleNamespace as NS
 
     from backend.emotion_presentation import EmotionStateResponse
@@ -708,6 +713,7 @@ def test_routes_use_only_the_correct_dependency():
         health_checks=HealthRegistry(),
         clock=time.time,
         persistence_client=persistence_client,
+        account_deletion_service=NoTombstoneGate(),
     )
     app = main_module.create_app(settings=_settings(), dependencies=deps)
     client = TestClient(app)

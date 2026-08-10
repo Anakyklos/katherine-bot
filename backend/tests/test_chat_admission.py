@@ -77,6 +77,7 @@ def _build_app(fake_engine, *, override_auth=True):
     """Build an application with injected fakes (no lifespan needed)."""
     from backend.health import HealthRegistry
     from backend.settings import AppEnvironment, Settings
+    from backend.tests.fixtures.account_deletion_fakes import NoTombstoneGate
     from backend.turn_execution import TurnExecutionConfig
 
     settings = Settings(
@@ -91,6 +92,7 @@ def _build_app(fake_engine, *, override_auth=True):
         admission_config=AdmissionRuntimeConfig.from_values(SECRET),
         turn_config=TurnExecutionConfig.defaults(),
         health_checks=HealthRegistry(),
+        account_deletion_service=NoTombstoneGate(),
     )
     app = main.create_app(settings=settings, dependencies=deps)
     if override_auth:

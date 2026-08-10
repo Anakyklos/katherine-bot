@@ -133,11 +133,20 @@ def app_client(
     supabase_url: str, service_role_key: str
 ) -> tuple[TestClient, Client]:
     """The real FastAPI application wired to the local Supabase instance."""
+    from backend.account_deletion import SupabaseAccountDeletionRepository
+    from backend.account_deletion_service import AccountDeletionService
+
     client = create_client(supabase_url, service_role_key)
     privacy_service = PrivacyService(
         repository=SupabasePrivacyRepository(client),
         turn_config=TurnExecutionConfig.defaults(),
         clock=time.time,
+    )
+    admission_config = AdmissionRuntimeConfig.from_values(SECRET)
+    account_deletion_service = AccountDeletionService(
+        repository=SupabaseAccountDeletionRepository(client),
+        turn_config=TurnExecutionConfig.defaults(),
+        admission_config=admission_config,
     )
     settings = Settings(
         app_env=AppEnvironment.local,
@@ -148,12 +157,13 @@ def app_client(
     deps = ApplicationDependencies(
         conversation_engine=_FakeEngine(),
         auth_client=client,
-        admission_config=AdmissionRuntimeConfig.from_values(SECRET),
+        admission_config=admission_config,
         turn_config=TurnExecutionConfig.defaults(),
         health_checks=HealthRegistry(),
         clock=time.time,
         persistence_client=client,
         privacy_service=privacy_service,
+        account_deletion_service=account_deletion_service,
     )
     app = create_app(settings=settings, dependencies=deps)
     yield TestClient(app), client

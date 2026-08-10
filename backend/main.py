@@ -42,6 +42,11 @@ from pydantic import BaseModel, ConfigDict, StrictStr, field_validator
 from pydantic_core import PydanticCustomError
 from supabase_auth.errors import AuthApiError, AuthRetryableError
 
+from .account_deletion_service import (
+    AccountDeletionBlocked,
+    AccountDeletionRequestResponse,
+    AccountDeletionUnavailable,
+)
 from .admission import (
     ADMITTED,
     APPLICATION_RATE_LIMITED,
@@ -72,6 +77,9 @@ from .groq_manager import GroqPoolExhaustedError, GroqRequestError
 from .health import build_ready_response
 from .memory import StatePersistenceError
 from .observability import (
+    EVENT_ACCOUNT_DELETION_BLOCKED,
+    EVENT_ACCOUNT_DELETION_GATE_UNAVAILABLE,
+    EVENT_ACCOUNT_DELETION_REQUESTED,
     EVENT_APP_STARTUP_FAILED,
     EVENT_AUTH_COMPLETED,
     EVENT_AUTH_FAILED,
@@ -96,6 +104,7 @@ from .turn_execution import (
     TurnErrorCode,
     TurnExecutionError,
     create_budget,
+    run_blocking_read,
     run_blocking_write,
 )
 
@@ -306,6 +315,21 @@ class PrivacyOperationInput(BaseModel):
     lowercase canonical form before reaching the privacy layer). Any extra
     key, including ``user_id``, is rejected with 422: the authenticated
     identity always comes from ``current_user.id``.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    operation_id: UUID
+
+
+class AccountDeletionInput(BaseModel):
+    """Request body for ``POST /privacy/delete-account``.
+
+    Accepts ONLY ``operation_id`` (any canonical UUID version; normalized to
+    lowercase canonical form before reaching the ledger). Any extra key —
+    ``user_id``, ``user_ref``, ``job_id``, HMACs or anything else — is
+    rejected with 422 BEFORE any RPC runs: the authenticated identity and
+    the server-derived HMAC reference come exclusively from
+    ``current_user.id`` and the server-side admission secret.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -524,6 +548,73 @@ def _map_privacy_conflict(exc: ConflictError) -> HTTPException:
     return HTTPException(status_code=409, detail=_PRIVACY_CONFLICT_DETAIL)
 
 
+# ─── Account deletion error mapping (#326) ───────────────────────────────────
+#
+# Stable, sanitized HTTP mapping for the account deletion API and the
+# tombstone gate. Every detail is a public constant; exception text,
+# identifiers, HMACs, operation ids, job ids, SQL and internal timestamps
+# never reach a response. Fail-closed: a tombstone-store failure is never
+# interpreted as "user active".
+
+_ACCOUNT_DELETION_BLOCKED_DETAIL = {
+    "code": "account_deletion_pending",
+    "message": "Account deletion is pending.",
+}
+_ACCOUNT_DELETION_UNAVAILABLE_DETAIL = {
+    "code": "service_unavailable",
+    "message": "Service unavailable.",
+}
+_ACCOUNT_DELETION_CONFLICT_DETAIL = {
+    "code": "operation_conflict",
+    "message": "Operation identifier was already used with a different operation.",
+}
+_ACCOUNT_DELETION_INTERNAL_DETAIL = {
+    "code": TurnErrorCode.internal_error.value,
+    "message": "Internal server error.",
+}
+
+
+async def _enforce_account_deletion_gate(
+    deps: ApplicationDependencies, user_id: str
+) -> None:
+    """Single centralized tombstone gate for normal account actions.
+
+    Runs immediately after authentication and BEFORE any useful work of the
+    route (admission, history reads, privacy mutations, provider/engine
+    calls). ``account_deletion_service.assert_active`` is the one reusable
+    boundary; routes never copy the tombstone logic.
+
+    Fail-closed: an absent service, a persistence failure, a timeout, a
+    malformed payload or an unavailable store returns a sanitized 503 and
+    the route never continues. A present tombstone returns 423
+    ``account_deletion_pending`` (pending, processing, failed, or completed
+    while the tombstone still exists within retention).
+    """
+    service = deps.account_deletion_service
+    if service is None:
+        emit_event(
+            logger, EVENT_ACCOUNT_DELETION_GATE_UNAVAILABLE, code="not_configured"
+        )
+        emit_event(logger, EVENT_HTTP_RESULT, code=503)
+        raise HTTPException(
+            status_code=503, detail=_ACCOUNT_DELETION_UNAVAILABLE_DETAIL
+        )
+    try:
+        await service.assert_active(user_id)
+    except AccountDeletionBlocked:
+        emit_event(logger, EVENT_ACCOUNT_DELETION_BLOCKED)
+        emit_event(logger, EVENT_HTTP_RESULT, code=423)
+        raise HTTPException(
+            status_code=423, detail=_ACCOUNT_DELETION_BLOCKED_DETAIL
+        ) from None
+    except AccountDeletionUnavailable:
+        emit_event(logger, EVENT_ACCOUNT_DELETION_GATE_UNAVAILABLE)
+        emit_event(logger, EVENT_HTTP_RESULT, code=503)
+        raise HTTPException(
+            status_code=503, detail=_ACCOUNT_DELETION_UNAVAILABLE_DETAIL
+        ) from None
+
+
 # ─── Lifespan ───────────────────────────────────────────────────────────────
 
 
@@ -661,6 +752,9 @@ def create_app(
     app.post(
         "/privacy/reset-relationship", response_model=PrivacyOperationResponse
     )(privacy_reset_relationship_endpoint)
+    app.post(
+        "/privacy/delete-account", response_model=AccountDeletionRequestResponse
+    )(account_delete_endpoint)
 
     return app
 
@@ -680,8 +774,12 @@ async def chat_endpoint(
     started_at = time.monotonic()
     correlation = None
     try:
-        budget = create_budget(turn_config)
         user_id = getattr(current_user, "id", None)
+        # Tombstone gate: runs immediately after authentication and before
+        # admission, history/state reads, embeddings, provider calls,
+        # engine.process_turn and every turn write (#326, fail-closed).
+        await _enforce_account_deletion_gate(deps, user_id)
+        budget = create_budget(turn_config)
         identity = RequestIdentity(input_data.request_id)
         peer_host = request.client.host if request.client is not None else None
         network_identity = resolve_network_identity(
@@ -821,22 +919,37 @@ async def chat_endpoint(
         )
 
 
-def get_history(request: Request, current_user=Depends(get_current_user)):
+def _read_chat_logs(supabase: Any, user_id: str) -> list:
+    """Blocking history query (dispatched off the event loop)."""
+    response = (
+        supabase.table("chat_logs")
+        .select("*")
+        .eq("user_id", user_id)
+        .order("created_at", desc=True)
+        .limit(50)
+        .execute()
+    )
+    return response.data[::-1] if response.data else []
+
+
+async def get_history(request: Request, current_user=Depends(get_current_user)):
     deps = get_dependencies(request)
     user_id = current_user.id
+    # Tombstone gate: must run before ANY read of chat_logs (#326).
+    await _enforce_account_deletion_gate(deps, user_id)
+    budget = create_budget(deps.turn_config)
     try:
         supabase = deps.persistence_client
         if not supabase:
             return []
-
-        response = supabase.table("chat_logs")\
-            .select("*")\
-            .eq("user_id", user_id)\
-            .order("created_at", desc=True)\
-            .limit(50)\
-            .execute()
-
-        return response.data[::-1] if response.data else []
+        return await run_blocking_read(
+            "history",
+            budget,
+            deps.turn_config.supabase_timeout,
+            _read_chat_logs,
+            supabase,
+            user_id,
+        )
     except Exception:
         raise HTTPException(status_code=500, detail="Internal Server Error")
 
@@ -862,12 +975,15 @@ async def _run_privacy_action(
     each endpoint invokes exactly its own operation and never another one.
     """
     deps = get_dependencies(request)
+    user_id = getattr(current_user, "id", None)
+    # Tombstone gate: the four privacy actions are blocked before any
+    # mutation once an account deletion tombstone exists (#326).
+    await _enforce_account_deletion_gate(deps, user_id)
     service = deps.privacy_service
     if service is None:
         raise HTTPException(
             status_code=503, detail=_PRIVACY_SERVICE_UNAVAILABLE_DETAIL
         )
-    user_id = getattr(current_user, "id", None)
     operation_id = str(input_data.operation_id)
     try:
         if operation == OPERATION_DELETE_HISTORY:
@@ -951,6 +1067,70 @@ async def privacy_reset_relationship_endpoint(
     return await _run_privacy_action(
         OPERATION_RESET_RELATIONSHIP_STATE, input_data, request, current_user
     )
+
+
+# ─── Account deletion (#326) ─────────────────────────────────────────────────
+
+
+async def account_delete_endpoint(
+    input_data: AccountDeletionInput,
+    request: Request,
+    current_user=Depends(get_current_user),
+):
+    """POST /privacy/delete-account — register an account deletion request.
+
+    Deliberately exempt from the tombstone gate: this endpoint must remain
+    reachable with base authentication so an idempotent replay keeps working
+    while the token is still accepted. The identity comes exclusively from
+    ``current_user.id``; the server derives the HMAC reference (dedicated
+    ``account-deletion`` domain) and the deterministic intent fingerprint,
+    and the #324 ledger guarantees idempotency: the same user + operation_id
+    + intent is an exact replay, never a second job.
+
+    The public response exposes ONLY ``status`` (``accepted``/``completed``),
+    never job ids, operation ids, HMACs, timestamps, upstream errors or SQL.
+    """
+    deps = get_dependencies(request)
+    service = deps.account_deletion_service
+    if service is None:
+        emit_event(
+            logger, EVENT_ACCOUNT_DELETION_GATE_UNAVAILABLE, code="not_configured"
+        )
+        emit_event(logger, EVENT_HTTP_RESULT, code=503)
+        raise HTTPException(
+            status_code=503, detail=_ACCOUNT_DELETION_UNAVAILABLE_DETAIL
+        )
+    user_id = getattr(current_user, "id", None)
+    operation_id = str(input_data.operation_id)
+    try:
+        result = await service.request(user_id, operation_id)
+    except ConflictError as exc:
+        # Divergent reuse of the same operation_id -> sanitized 409.
+        emit_event(logger, EVENT_REQUEST_CONFLICT, code=exc.code)
+        emit_event(logger, EVENT_HTTP_RESULT, code=409)
+        raise HTTPException(
+            status_code=409, detail=_ACCOUNT_DELETION_CONFLICT_DETAIL
+        ) from None
+    except (PersistenceError, AccountDeletionUnavailable, DeadlineExceeded, TurnExecutionError):
+        emit_event(logger, EVENT_HTTP_RESULT, code=503)
+        raise HTTPException(
+            status_code=503, detail=_ACCOUNT_DELETION_UNAVAILABLE_DETAIL
+        ) from None
+    except ValidationError:
+        # After HTTP validation, a #324 ValidationError is a server-side
+        # contract violation: fail closed as 500, never as a client 422.
+        emit_event(logger, EVENT_HTTP_RESULT, code=500)
+        raise HTTPException(
+            status_code=500, detail=_ACCOUNT_DELETION_INTERNAL_DETAIL
+        ) from None
+    except Exception:
+        emit_event(logger, EVENT_HTTP_RESULT, code=500)
+        raise HTTPException(
+            status_code=500, detail=_ACCOUNT_DELETION_INTERNAL_DETAIL
+        ) from None
+    emit_event(logger, EVENT_ACCOUNT_DELETION_REQUESTED)
+    emit_event(logger, EVENT_HTTP_RESULT, code=200)
+    return result
 
 
 async def live_endpoint():
