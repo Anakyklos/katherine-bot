@@ -169,8 +169,10 @@ def test_acquire_lease_empty_queue_is_nominal_none():
 
 def test_acquire_lease_empty_queue_with_extra_fields_fails_closed():
     """A ``found:false`` envelope carrying extra fields is malformed: the
-    empty-queue contract is exactly ``{"found": false}``, nothing else."""
+    empty-queue contract is exactly ``{"found": false}``, nothing else. An
+    envelope that omits ``found`` entirely also fails closed."""
     for bad in (
+        {},
         {"found": False, "sneaky": 1},
         {"found": False, "job_id": JOB_ID},
         {"found": "false"},

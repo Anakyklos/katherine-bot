@@ -236,8 +236,10 @@ class AccountDeletionWorker:
     def run_once(self) -> WorkerRunResult:
         """Process up to ``max_batch`` jobs and return a sanitized summary.
 
-        Never sleeps and never polls: when ``acquire_lease`` returns
-        ``None`` (empty queue) the round ends with ``no_work=True``.
+        Never sleeps and never polls. ``no_work`` means the round found an
+        entirely empty queue (zero jobs claimed): it is set only when the
+        very first acquire returns ``None``. A queue that drains mid-round
+        (after jobs were processed) does not set ``no_work``.
 
         Raises:
             PersistenceError/ValidationError: On an operational failure of
@@ -250,6 +252,7 @@ class AccountDeletionWorker:
             code="started",
         )
         result = WorkerRunResult()
+        claimed_any = False
         for _ in range(self._config.max_batch):
             job = self._repository.acquire_lease(
                 self._config.worker_id,
@@ -257,10 +260,14 @@ class AccountDeletionWorker:
                 self._config.max_batch,
             )
             if job is None:
-                result.no_work = True
-                emit_event(self._logger, EVENT_ACCOUNT_DELETION_NO_WORK)
+                # Queue drained for this round: nominal, never an error.
                 break
+            claimed_any = True
             self._process_job(job, result)
+        if not claimed_any:
+            # An entirely empty queue: no job was eligible at all.
+            result.no_work = True
+            emit_event(self._logger, EVENT_ACCOUNT_DELETION_NO_WORK)
         return result
 
     # ─── Per-job pipeline (DB-first, fail-closed) ───────────────────────────

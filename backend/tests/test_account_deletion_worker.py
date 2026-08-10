@@ -305,6 +305,40 @@ def test_cli_once_acquisition_failure_exits_one(caplog):
     assert cli_main(["--once"], env={"SUPABASE_URL": "http://x", "SUPABASE_SERVICE_ROLE_KEY": "k"}, worker_factory=factory) == 1
 
 
+def test_cli_once_interrupt_propagates_never_round_failed():
+    """Operator-initiated termination (KeyboardInterrupt) must propagate
+    with its original semantics and never be reported as round_failed."""
+
+    def factory(config: AccountDeletionRuntimeConfig) -> AccountDeletionWorker:
+        raise KeyboardInterrupt()
+
+    with pytest.raises(KeyboardInterrupt):
+        cli_main(["--once"], env={"SUPABASE_URL": "http://x", "SUPABASE_SERVICE_ROLE_KEY": "k"}, worker_factory=factory)
+
+
+def test_cli_once_system_exit_propagates():
+    def factory(config: AccountDeletionRuntimeConfig) -> AccountDeletionWorker:
+        raise SystemExit(3)
+
+    with pytest.raises(SystemExit) as exc:
+        cli_main(["--once"], env={"SUPABASE_URL": "http://x", "SUPABASE_SERVICE_ROLE_KEY": "k"}, worker_factory=factory)
+    assert exc.value.code == 3
+
+
+def test_cli_reuses_worker_defaults_single_source_of_truth():
+    """The CLI must not redefine the SQL-bounded defaults: they come from
+    the worker module so the two entrypoints can never drift."""
+    from backend.account_deletion_worker import (
+        DEFAULT_LEASE_SECONDS as WORKER_LEASE,
+        DEFAULT_MAX_BATCH as WORKER_BATCH,
+    )
+
+    assert cli_module.DEFAULT_LEASE_SECONDS is WORKER_LEASE
+    assert cli_module.DEFAULT_MAX_BATCH is WORKER_BATCH
+    # The CLI-only auth timeout stays local (no worker counterpart).
+    assert cli_module.DEFAULT_AUTH_TIMEOUT_SECONDS == 10.0
+
+
 # ─── 3. DB purge before Auth ────────────────────────────────────────────────
 
 
@@ -314,6 +348,7 @@ def test_db_purge_before_auth_and_finalize_after(caplog):
     with caplog.at_level(logging.INFO):
         result = _worker(repo, auth).run_once()
     assert result.completed == 1
+    assert result.no_work is False, "a round that claimed a job is never no_work"
     assert [c[0] for c in _domain_calls(repo)] == ["purge", "finalize"]
     assert auth.calls == [USER_ID]
     assert "account_deletion_db_purged" in caplog.text
@@ -634,10 +669,11 @@ def test_two_workers_never_process_same_job():
         outcomes = [future.result(timeout=60) for future in futures]
 
     assert len(claims) == 1, "exactly one worker must claim the single job"
-    # Exactly one worker completed the job. At least one worker observed an
-    # empty queue (the loser immediately; the winner on its trailing probe).
+    # Exactly one worker completed the job. The loser observed an empty
+    # queue; the winner may or may not (its trailing probe drains mid-round,
+    # which is not no_work).
     assert sum(o[0] for o in outcomes) == 1
-    assert sum(o[1] for o in outcomes) >= 1
+    assert any(o[1] for o in outcomes)
 
 
 # ─── 14. Lost lease prevents finalize ───────────────────────────────────────

@@ -51,6 +51,8 @@ from typing import Any, Callable, Mapping, Optional
 
 from backend.account_deletion import SupabaseAccountDeletionRepository
 from backend.account_deletion_worker import (
+    DEFAULT_LEASE_SECONDS,
+    DEFAULT_MAX_BATCH,
     AccountDeletionWorker,
     AccountDeletionWorkerConfig,
     SupabaseAccountDeletionAuthAdmin,
@@ -59,8 +61,9 @@ from backend.observability import EVENT_ACCOUNT_DELETION_FAILED, emit_event
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_LEASE_SECONDS = 300
-DEFAULT_MAX_BATCH = 10
+#: The worker module is the single source of truth for the SQL-bounded
+#: defaults (lease 1..3600, max_batch 1..1000); the CLI reuses them so the
+#: two entrypoints can never drift.
 DEFAULT_AUTH_TIMEOUT_SECONDS = 10.0
 
 
@@ -242,6 +245,11 @@ def main(
                 ),
             )
         result = worker.run_once()
+    except (KeyboardInterrupt, SystemExit):
+        # Operator-initiated termination or process errors must propagate
+        # with their original exit semantics; they are never a round_failed
+        # operational failure.
+        raise
     except Exception:
         emit_event(
             logger, EVENT_ACCOUNT_DELETION_FAILED, level=logging.ERROR, code="round_failed"
