@@ -160,6 +160,28 @@ def test_acquire_lease_parses():
     assert job.status == STATUS_PROCESSING
 
 
+def test_acquire_lease_empty_queue_is_nominal_none():
+    """#325: the RPC ``found:false`` envelope is the NOMINAL empty-queue
+    result. It returns ``None`` and never raises a persistence error."""
+    repo = _client({"found": False})
+    assert repo.acquire_lease("worker-1", 60, 100) is None
+
+
+def test_acquire_lease_empty_queue_with_extra_fields_fails_closed():
+    """A ``found:false`` envelope carrying extra fields is malformed: the
+    empty-queue contract is exactly ``{"found": false}``, nothing else. An
+    envelope that omits ``found`` entirely also fails closed."""
+    for bad in (
+        {},
+        {"found": False, "sneaky": 1},
+        {"found": False, "job_id": JOB_ID},
+        {"found": "false"},
+    ):
+        repo = _client(bad)
+        with pytest.raises(PersistenceError):
+            repo.acquire_lease("worker-1", 60, 100)
+
+
 def test_purge_parses_counts():
     repo = _client(
         {
