@@ -36,6 +36,9 @@ Design guarantees (enforced by the database, mirrored here)
   (bools rejected where ints are expected), UUID/hex/status validation,
   unknown or missing fields fail closed, and a divergent identity in an
   RPC result never leaks into an exception message.
+* ``acquire_lease`` returns ``None`` for the NOMINAL empty-queue result
+  (RPC envelope ``{"found": false}``, #325): no eligible job is not an
+  error. Every other malformed payload still fails closed.
 """
 
 from __future__ import annotations
@@ -330,13 +333,25 @@ def _parse_tombstone_result(response: object) -> TombstoneStatus:
     return TombstoneStatus(exists=exists, status=status)
 
 
-def _parse_acquired_job(response: object, expected_user_id: Optional[str] = None) -> AcquiredJob:
+def _parse_acquired_job(
+    response: object, expected_user_id: Optional[str] = None
+) -> Optional[AcquiredJob]:
+    """Parse one ``account_deletion_acquire_lease`` result.
+
+    ``{"found": false}`` is the NOMINAL empty-queue contract (#325): no
+    eligible job exists and the caller must not treat that as a persistence
+    failure. Returns ``None``. Any other payload shape (including a
+    ``found:false`` envelope carrying extra fields) is malformed and fails
+    closed with ``PersistenceError``.
+    """
     envelope = _require_mapping(response, "acquire result")
     if "error" in envelope:
         error = _parse_error_envelope(envelope)
         raise ValidationError(ERROR_VALIDATION_FAILED, error.message)
     if envelope.get("found") is False:
-        raise PersistenceError("database_error", "malformed retention response")
+        if set(envelope) != frozenset({"found"}):
+            raise PersistenceError("database_error", "malformed retention response")
+        return None
     _require_fields(
         envelope,
         frozenset(
@@ -523,7 +538,13 @@ class AccountDeletionRepository:
 
     def acquire_lease(
         self, worker_id: str, lease_seconds: int, max_batch: int
-    ) -> AcquiredJob: ...
+    ) -> Optional[AcquiredJob]:
+        """Claim one eligible job, or ``None`` when the queue is empty.
+
+        ``None`` (from the RPC ``found:false`` envelope) is the nominal
+        empty-queue result (#325), never a persistence failure.
+        """
+        ...
 
     def purge(
         self,
@@ -602,7 +623,7 @@ class SupabaseAccountDeletionRepository:
         lease_seconds: int,
         max_batch: int,
         expected_user_id: Optional[str] = None,
-    ) -> AcquiredJob:
+    ) -> Optional[AcquiredJob]:
         data = _rpc_call(
             self._client,
             "account_deletion_acquire_lease",

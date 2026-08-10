@@ -32,6 +32,13 @@ Covers the mandatory scenarios of #324:
 
 Uses independent connections, barriers and direct SQL state manipulation
 (no long sleeps).
+
+Since #325 this file also exercises the durable worker end to end against
+the real database with a FAKE Auth Admin boundary (scenarios 20-30 below):
+DB-first ordering, empty-queue nominal behavior, retry/attempts gating by
+``next_attempt_at``, lease-loss recovery, crash-after-purge re-executability,
+two real workers on independent clients, ``completed`` + user_id
+minimization, and preservation of account B.
 """
 
 from __future__ import annotations
@@ -54,6 +61,15 @@ from backend.account_deletion import (
     SupabaseAccountDeletionRepository,
     compute_account_deletion_user_ref,
     compute_intent_fingerprint,
+)
+from backend.account_deletion_worker import (
+    ERROR_AUTH_UNAVAILABLE,
+    OUTCOME_ALREADY_ABSENT,
+    OUTCOME_AUTH_ERROR,
+    OUTCOME_DELETED,
+    AccountDeletionWorker,
+    AccountDeletionWorkerConfig,
+    AuthDeleteResult,
 )
 from backend.atomic_turn_commit import PersistenceError
 from backend.privacy_operations import (
@@ -395,11 +411,10 @@ def test_concurrent_claims_only_one_wins(
             try:
                 barrier.wait(timeout=30)
                 job = _repo(own_client).acquire_lease(worker, 60, 100)
-                with lock:
-                    winners.append(job.job_id)
-            except PersistenceError:
-                # No eligible job: the expected outcome for the loser.
-                pass
+                if job is not None:
+                    with lock:
+                        winners.append(job.job_id)
+                # The loser receives the nominal empty-queue None (#325).
             except BaseException as exc:  # noqa: BLE001
                 with lock:
                     errors.append(exc)
@@ -413,9 +428,9 @@ def test_concurrent_claims_only_one_wins(
 
         assert errors == [], f"concurrent claims failed: {errors}"
         assert len(winners) == 1, "exactly one worker must win the claim"
-        # A third claim while the lease is active finds no eligible job.
-        with pytest.raises(PersistenceError):
-            _repo(service_client).acquire_lease("worker-2", 60, 100)
+        # A third claim while the lease is active finds no eligible job:
+        # the empty-queue result is nominal None (#325), not an error.
+        assert _repo(service_client).acquire_lease("worker-2", 60, 100) is None
     finally:
         _cleanup_user(user_id)
 
@@ -429,9 +444,9 @@ def test_expired_lease_requeues_job(service_client: Client):
         request = _repo(service_client).request(user_id, ref, op_id, fp)
         job = _repo(service_client).acquire_lease("worker-a", 60, 100)
         assert job.job_id == request.job_id
-        # A second claim while the lease is active finds nothing.
-        with pytest.raises(PersistenceError):
-            _repo(service_client).acquire_lease("worker-b", 60, 100)
+        # A second claim while the lease is active finds nothing: the
+        # empty-queue result is nominal None (#325), not an error.
+        assert _repo(service_client).acquire_lease("worker-b", 60, 100) is None
         # Expire the lease directly (deterministic, no sleeps).
         _run_sql(
             "UPDATE public.account_deletion_jobs "
@@ -728,8 +743,7 @@ def test_attempts_exhaustion_is_terminal_and_tombstone_preserved(service_client:
         )[0]
         assert row["terminal"] is True
         # No new automatic claim: the exhausted job is never selected.
-        with pytest.raises(PersistenceError):
-            _repo(service_client).acquire_lease("worker-ex2", 60, 100)
+        assert _repo(service_client).acquire_lease("worker-ex2", 60, 100) is None
         # The tombstone stays blocking.
         assert _repo(service_client).has_tombstone(ref).exists is True
         assert _count("account_deletion_jobs", f"user_ref_hmac_sha256 = '{ref}'") == 1
@@ -764,8 +778,7 @@ def test_expired_ceiling_lease_is_terminalized_not_reclaimed(service_client: Cli
         )
         # The next poll must NOT hand the job to another worker: it is
         # terminalized and the poll reports no eligible job.
-        with pytest.raises(PersistenceError):
-            _repo(service_client).acquire_lease("worker-new", 60, 100)
+        assert _repo(service_client).acquire_lease("worker-new", 60, 100) is None
         row = _run_sql(
             "SELECT status, error_code, lease_owner IS NULL AS lease_cleared, "
             "next_attempt_at IS NULL AS terminal "
@@ -778,8 +791,7 @@ def test_expired_ceiling_lease_is_terminalized_not_reclaimed(service_client: Cli
         assert row["terminal"] is True
         # The tombstone stays blocking and is never re-acquired.
         assert _repo(service_client).has_tombstone(ref).exists is True
-        with pytest.raises(PersistenceError):
-            _repo(service_client).acquire_lease("worker-new2", 60, 100)
+        assert _repo(service_client).acquire_lease("worker-new2", 60, 100) is None
 
         # db_purged_at is preserved when it was already set.
         _run_sql(
@@ -793,8 +805,7 @@ def test_expired_ceiling_lease_is_terminalized_not_reclaimed(service_client: Cli
             "lease_expires_at = now() - interval '1 second' "
             f"WHERE job_id = '{request.job_id}'"
         )
-        with pytest.raises(PersistenceError):
-            _repo(service_client).acquire_lease("worker-new3", 60, 100)
+        assert _repo(service_client).acquire_lease("worker-new3", 60, 100) is None
         row = _run_sql(
             "SELECT status, db_purged_at IS NOT NULL AS purged "
             "FROM public.account_deletion_jobs WHERE job_id = "
@@ -1015,3 +1026,394 @@ def test_different_users_not_globally_blocked(
     finally:
         _cleanup_user(user_a)
         _cleanup_user(user_b)
+
+
+# ─── 20-30. Durable worker end to end (#325, real DB + FAKE Auth Admin) ─────
+
+
+class _FakeAuthAdmin:
+    """Fake Auth Admin boundary for integration tests (never touches Auth)."""
+
+    def __init__(self, result: AuthDeleteResult) -> None:
+        self.result = result
+        self.calls: list[str] = []
+        self.exc: BaseException | None = None
+
+    def hard_delete(self, user_id: str) -> AuthDeleteResult:
+        self.calls.append(user_id)
+        if self.exc is not None:
+            raise self.exc
+        return self.result
+
+
+def _it_worker(
+    client: Client,
+    auth: _FakeAuthAdmin,
+    worker_id: str,
+    *,
+    lease_seconds: int = 60,
+    max_batch: int = 5,
+) -> AccountDeletionWorker:
+    return AccountDeletionWorker(
+        repository=SupabaseAccountDeletionRepository(client),
+        auth_admin=auth,
+        config=AccountDeletionWorkerConfig(
+            worker_id=worker_id, lease_seconds=lease_seconds, max_batch=max_batch
+        ),
+    )
+
+
+def test_worker_empty_queue_is_nominal_no_work(service_client: Client):
+    """Real DB, no jobs: run_once returns no_work and never touches Auth."""
+    auth = _FakeAuthAdmin(AuthDeleteResult(outcome=OUTCOME_DELETED))
+    result = _it_worker(service_client, auth, "it-worker-empty").run_once()
+    assert result.no_work is True
+    assert result.completed == 0
+    assert auth.calls == []
+
+
+def test_worker_db_first_end_to_end_preserves_b_and_minimizes(
+    service_client: Client,
+):
+    """#325 scenario 21/22/23: worker processes A (DB purge BEFORE Auth),
+    completes the job with user_id minimized, and B stays fully intact."""
+    user_a = _uid("wrk-a")
+    user_b = _uid("wrk-b")
+    _seed_full_user(user_a)
+    _seed_full_user(user_b)
+    ref_a = _ref(user_a)
+    ref_b = _ref(user_b)
+    op_a = _new_op_id()
+    fp = _fingerprint()
+    try:
+        request = _repo(service_client).request(user_a, ref_a, op_a, fp)
+        auth = _FakeAuthAdmin(AuthDeleteResult(outcome=OUTCOME_DELETED))
+        result = _it_worker(service_client, auth, "it-worker-e2e").run_once()
+        assert result.completed == 1
+        assert auth.calls == [user_a], "Auth must be called exactly once for A"
+        # Every table of A is gone.
+        for table in (
+            "outbox_events",
+            "turn_requests",
+            "archival_extractions",
+            "memories",
+            "chat_logs",
+            "admission_reservations",
+            "privacy_operations",
+            "profiles",
+        ):
+            assert _count(table, f"user_id = '{user_a}'") == 0, f"{table} not purged"
+        # B is completely preserved.
+        for table, expected in (
+            ("outbox_events", 1),
+            ("turn_requests", 1),
+            ("archival_extractions", 1),
+            ("memories", 1),
+            ("chat_logs", 2),
+            ("admission_reservations", 1),
+            ("privacy_operations", 1),
+            ("profiles", 1),
+        ):
+            assert _count(table, f"user_id = '{user_b}'") == expected, (
+                f"{table} of B lost"
+            )
+        # Job completed, user_id minimized, HMAC ref and tombstone preserved.
+        row = _run_sql(
+            "SELECT status, user_id, user_ref_hmac_sha256 "
+            "FROM public.account_deletion_jobs WHERE job_id = "
+            f"'{request.job_id}'"
+        )[0]
+        assert row["status"] == "completed"
+        assert row["user_id"] is None
+        assert row["user_ref_hmac_sha256"] == ref_a
+        assert _repo(service_client).has_tombstone(ref_a).exists is True
+        assert _repo(service_client).has_tombstone(ref_b).exists is False
+    finally:
+        _cleanup_user(user_a)
+        _cleanup_user(user_b)
+
+
+def test_worker_auth_already_absent_is_idempotent_success(service_client: Client):
+    user_id = _uid("wrk-absent")
+    _seed_profile(user_id)
+    ref = _ref(user_id)
+    op_id = _new_op_id()
+    fp = _fingerprint()
+    try:
+        request = _repo(service_client).request(user_id, ref, op_id, fp)
+        auth = _FakeAuthAdmin(AuthDeleteResult(outcome=OUTCOME_ALREADY_ABSENT))
+        result = _it_worker(service_client, auth, "it-worker-absent").run_once()
+        assert result.completed == 1
+        row = _run_sql(
+            "SELECT status, user_id FROM public.account_deletion_jobs "
+            f"WHERE job_id = '{request.job_id}'"
+        )[0]
+        assert row["status"] == "completed"
+        assert row["user_id"] is None
+    finally:
+        _cleanup_user(user_id)
+
+
+def test_worker_next_attempt_at_gates_early_processing(service_client: Client):
+    """#325 scenario 11: after a sanitized Auth failure the DB schedules
+    next_attempt_at; an immediate poll finds no eligible job (no sleeps)."""
+    user_id = _uid("wrk-gate")
+    ref = _ref(user_id)
+    op_id = _new_op_id()
+    fp = _fingerprint()
+    try:
+        request = _repo(service_client).request(user_id, ref, op_id, fp)
+        auth = _FakeAuthAdmin(
+            AuthDeleteResult(outcome=OUTCOME_AUTH_ERROR, error_code=ERROR_AUTH_UNAVAILABLE)
+        )
+        first = _it_worker(service_client, auth, "it-worker-gate1").run_once()
+        assert first.retry_scheduled == 1
+        # next_attempt_at is in the future: the job is not eligible yet.
+        assert _repo(service_client).acquire_lease("it-worker-gate2", 60, 5) is None
+        row = _run_sql(
+            "SELECT status, db_purged_at IS NOT NULL AS purged "
+            "FROM public.account_deletion_jobs WHERE job_id = "
+            f"'{request.job_id}'"
+        )[0]
+        assert row["status"] == "pending"
+        assert row["purged"] is True, "DB-first purge committed before the Auth retry"
+        # Open the retry window deterministically, then the job is eligible.
+        _run_sql(
+            "UPDATE public.account_deletion_jobs SET next_attempt_at = "
+            "now() - interval '1 second' "
+            f"WHERE job_id = '{request.job_id}'"
+        )
+        auth2 = _FakeAuthAdmin(AuthDeleteResult(outcome=OUTCOME_DELETED))
+        second = _it_worker(service_client, auth2, "it-worker-gate3").run_once()
+        assert second.completed == 1
+        assert _repo(service_client).has_tombstone(ref).exists is True
+    finally:
+        _cleanup_user(user_id)
+
+
+def test_worker_attempts_exhausted_not_reprocessed(service_client: Client):
+    """#325 scenario 12: at the ceiling a failure is terminal and the worker
+    never sees the job again (tombstone preserved, no automatic retry)."""
+    user_id = _uid("wrk-exh")
+    ref = _ref(user_id)
+    op_id = _new_op_id()
+    fp = _fingerprint()
+    try:
+        request = _repo(service_client).request(user_id, ref, op_id, fp)
+        _run_sql(
+            "UPDATE public.account_deletion_jobs SET attempts = 99 "
+            f"WHERE job_id = '{request.job_id}'"
+        )
+        auth = _FakeAuthAdmin(
+            AuthDeleteResult(outcome=OUTCOME_AUTH_ERROR, error_code=ERROR_AUTH_UNAVAILABLE)
+        )
+        result = _it_worker(service_client, auth, "it-worker-exh").run_once()
+        assert result.failed == 1
+        assert result.retry_scheduled == 0
+        row = _run_sql(
+            "SELECT status, error_code, next_attempt_at IS NULL AS terminal "
+            "FROM public.account_deletion_jobs WHERE job_id = "
+            f"'{request.job_id}'"
+        )[0]
+        assert row["status"] == "failed"
+        assert row["error_code"] == "attempts_exhausted"
+        assert row["terminal"] is True
+        # Never claimed again automatically.
+        assert _repo(service_client).acquire_lease("it-worker-exh2", 60, 5) is None
+        assert _repo(service_client).has_tombstone(ref).exists is True
+    finally:
+        _cleanup_user(user_id)
+
+
+def test_two_real_workers_never_process_same_job(
+    supabase_url: str, service_role_key: str
+):
+    """#325 scenario 13: two workers on independent clients race; exactly one
+    claims and completes the job, the other observes an empty queue."""
+    user_id = _uid("wrk-race")
+    _seed_full_user(user_id)
+    ref = _ref(user_id)
+    op_id = _new_op_id()
+    fp = _fingerprint()
+    barrier = threading.Barrier(2)
+    outcomes: list[tuple[int, bool]] = []
+    errors: list[BaseException] = []
+    lock = threading.Lock()
+    try:
+        client = create_client(supabase_url, service_role_key)
+        request = _repo(client).request(user_id, ref, op_id, fp)
+        _close_client(client)
+
+        def _run(worker_id: str, auth_result: AuthDeleteResult):
+            own_client = create_client(supabase_url, service_role_key)
+            try:
+                barrier.wait(timeout=30)
+                auth = _FakeAuthAdmin(auth_result)
+                result = _it_worker(own_client, auth, worker_id).run_once()
+                with lock:
+                    outcomes.append((result.completed, result.no_work))
+            except BaseException as exc:  # noqa: BLE001
+                with lock:
+                    errors.append(exc)
+            finally:
+                _close_client(own_client)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [
+                pool.submit(_run, "it-worker-race-a", AuthDeleteResult(outcome=OUTCOME_DELETED)),
+                pool.submit(_run, "it-worker-race-b", AuthDeleteResult(outcome=OUTCOME_DELETED)),
+            ]
+            for future in futures:
+                future.result(timeout=120)
+
+        assert errors == [], f"concurrent worker run failed: {errors}"
+        assert sum(o[0] for o in outcomes) == 1, "exactly one worker completes the job"
+        # The job is completed and the user data is gone.
+        assert _count("profiles", f"user_id = '{user_id}'") == 0
+        row = _run_sql(
+            "SELECT status FROM public.account_deletion_jobs "
+            f"WHERE user_ref_hmac_sha256 = '{ref}'"
+        )[0]
+        assert row["status"] == "completed"
+        assert request.job_id is not None
+    finally:
+        _cleanup_user(user_id)
+
+
+def test_worker_lease_lost_blocks_finalize_and_other_worker_recovers(
+    service_client: Client, supabase_url: str, service_role_key: str
+):
+    """#325 scenarios 14/15: worker A loses its lease during external work and
+    CANNOT finalize; worker B recovers, skips the destructive purge
+    (db_purged_at authoritative) and completes safely."""
+    user_id = _uid("wrk-lease")
+    _seed_full_user(user_id)
+    ref = _ref(user_id)
+    op_id = _new_op_id()
+    fp = _fingerprint()
+    try:
+        request = _repo(service_client).request(user_id, ref, op_id, fp)
+        # Worker A: acquires and purges, then its lease expires while the
+        # external Auth call would run. finalize must fail closed.
+        client_a = create_client(supabase_url, service_role_key)
+        job = _repo(client_a).acquire_lease("it-worker-a", 60, 5)
+        _repo(client_a).purge(job.job_id, "it-worker-a", fp)
+        _run_sql(
+            "UPDATE public.account_deletion_jobs "
+            "SET lease_expires_at = now() - interval '1 second' "
+            f"WHERE job_id = '{job.job_id}'"
+        )
+        with pytest.raises(PersistenceError):
+            _repo(client_a).finalize(job.job_id, "it-worker-a")
+        _close_client(client_a)
+
+        # Worker B on an independent client reclaims the job.
+        client_b = create_client(supabase_url, service_role_key)
+        auth_b = _FakeAuthAdmin(AuthDeleteResult(outcome=OUTCOME_DELETED))
+        result = _it_worker(client_b, auth_b, "it-worker-b").run_once()
+        assert result.completed == 1
+        assert auth_b.calls == [user_id]
+        row = _run_sql(
+            "SELECT status, user_id, db_purged_at IS NOT NULL AS purged "
+            "FROM public.account_deletion_jobs WHERE job_id = "
+            f"'{request.job_id}'"
+        )[0]
+        assert row["status"] == "completed"
+        assert row["user_id"] is None
+        assert row["purged"] is True
+        assert _count("profiles", f"user_id = '{user_id}'") == 0
+        _close_client(client_b)
+    finally:
+        _cleanup_user(user_id)
+
+
+def test_worker_crash_after_purge_before_auth_is_reexecutable(
+    service_client: Client, supabase_url: str, service_role_key: str
+):
+    """#325 scenario 16: worker A dies (KeyboardInterrupt) after the DB purge
+    committed and before Auth; worker B recovers via db_purged_at without
+    repeating the destructive purge."""
+    user_id = _uid("wrk-crash")
+    _seed_full_user(user_id)
+    ref = _ref(user_id)
+    op_id = _new_op_id()
+    fp = _fingerprint()
+    try:
+        request = _repo(service_client).request(user_id, ref, op_id, fp)
+        client_a = create_client(supabase_url, service_role_key)
+        auth_a = _FakeAuthAdmin(AuthDeleteResult(outcome=OUTCOME_DELETED))
+        auth_a.exc = KeyboardInterrupt()
+        with pytest.raises(KeyboardInterrupt):
+            _it_worker(client_a, auth_a, "it-worker-crash-a").run_once()
+        _close_client(client_a)
+        # The purge committed: all tables are gone, the marker is durable.
+        assert _count("profiles", f"user_id = '{user_id}'") == 0
+        row = _run_sql(
+            "SELECT db_purged_at IS NOT NULL AS purged, status "
+            "FROM public.account_deletion_jobs WHERE job_id = "
+            f"'{request.job_id}'"
+        )[0]
+        assert row["purged"] is True
+        assert row["status"] == "processing"
+        # The dead worker's lease expires; worker B can reclaim the job.
+        _run_sql(
+            "UPDATE public.account_deletion_jobs "
+            "SET lease_expires_at = now() - interval '1 second' "
+            f"WHERE job_id = '{request.job_id}'"
+        )
+
+        # Worker B recovers: purge is a safe replay (already_purged), Auth
+        # delete runs, finalize completes.
+        client_b = create_client(supabase_url, service_role_key)
+        auth_b = _FakeAuthAdmin(AuthDeleteResult(outcome=OUTCOME_DELETED))
+        result = _it_worker(client_b, auth_b, "it-worker-crash-b").run_once()
+        assert result.completed == 1
+        assert auth_b.calls == [user_id]
+        final_row = _run_sql(
+            "SELECT status, user_id FROM public.account_deletion_jobs "
+            f"WHERE job_id = '{request.job_id}'"
+        )[0]
+        assert final_row["status"] == "completed"
+        assert final_row["user_id"] is None
+        _close_client(client_b)
+    finally:
+        _cleanup_user(user_id)
+
+
+def test_worker_auth_failure_preserves_db_purged_at_then_completes(
+    service_client: Client,
+):
+    """#325 scenario 10: an Auth failure after the DB purge must preserve
+    db_purged_at; the retry skips the purge and finalizes."""
+    user_id = _uid("wrk-post")
+    _seed_full_user(user_id)
+    ref = _ref(user_id)
+    op_id = _new_op_id()
+    fp = _fingerprint()
+    try:
+        request = _repo(service_client).request(user_id, ref, op_id, fp)
+        auth = _FakeAuthAdmin(
+            AuthDeleteResult(outcome=OUTCOME_AUTH_ERROR, error_code=ERROR_AUTH_UNAVAILABLE)
+        )
+        first = _it_worker(service_client, auth, "it-worker-post1").run_once()
+        assert first.retry_scheduled == 1
+        row = _run_sql(
+            "SELECT status, db_purged_at IS NOT NULL AS purged "
+            "FROM public.account_deletion_jobs WHERE job_id = "
+            f"'{request.job_id}'"
+        )[0]
+        assert row["status"] == "pending"
+        assert row["purged"] is True, "db_purged_at must survive an Auth retry"
+        # Open the retry window; the next worker skips the destructive purge.
+        _run_sql(
+            "UPDATE public.account_deletion_jobs SET next_attempt_at = "
+            "now() - interval '1 second' "
+            f"WHERE job_id = '{request.job_id}'"
+        )
+        auth2 = _FakeAuthAdmin(AuthDeleteResult(outcome=OUTCOME_DELETED))
+        second = _it_worker(service_client, auth2, "it-worker-post2").run_once()
+        assert second.completed == 1
+        assert _count("profiles", f"user_id = '{user_id}'") == 0
+        assert _repo(service_client).has_tombstone(ref).exists is True
+    finally:
+        _cleanup_user(user_id)
