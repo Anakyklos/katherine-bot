@@ -167,6 +167,14 @@ class SupabaseAccountDeletionAuthAdmin:
             return AuthDeleteResult(
                 outcome=OUTCOME_AUTH_ERROR, error_code=ERROR_AUTH_UNAVAILABLE
             )
+        except ValueError:
+            # Client-side validation failure (e.g. an invalid UUID rejected
+            # by the SDK before any network call). Deterministic, never
+            # transient. The upstream message (which may echo the id) is
+            # never propagated or logged.
+            return AuthDeleteResult(
+                outcome=OUTCOME_AUTH_ERROR, error_code=ERROR_AUTH_FAILED
+            )
         except Exception:
             # Transport-level failures the SDK lets escape (connect errors,
             # read timeouts) are transient. The upstream message is never

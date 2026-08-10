@@ -187,6 +187,12 @@ def _build_client(config: AccountDeletionRuntimeConfig) -> Any:
     from supabase import create_client
     from supabase.lib.client_options import SyncClientOptions
 
+    # httpx INFO request logs print the full request URL, which embeds the
+    # raw Auth user UUID in the admin path (DELETE /auth/v1/admin/users/<id>).
+    # The raw identity must never reach logs; this one-shot process is the
+    # only place real clients are built, so silence httpx request logging.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
     http_client = httpx.Client(timeout=config.auth_timeout_seconds)
     options = SyncClientOptions(
         postgrest_client_timeout=config.auth_timeout_seconds,

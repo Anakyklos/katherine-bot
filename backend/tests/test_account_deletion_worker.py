@@ -66,6 +66,7 @@ from backend.account_deletion_worker import (
     AuthDeleteResult,
     SupabaseAccountDeletionAuthAdmin,
 )
+import backend.account_deletion_cli as cli_module
 from backend.account_deletion_cli import (
     AccountDeletionRuntimeConfig,
     main as cli_main,
@@ -474,6 +475,19 @@ def test_adapter_transport_exception_classifies_unavailable_without_leak():
     assert SECRET_SENTINEL not in str(result)
 
 
+def test_adapter_client_side_validation_error_classifies_failed():
+    """The real SDK raises a bare ValueError for an invalid UUID before any
+    network call (supabase_auth.helpers.validate_uuid). That is a
+    deterministic client-side failure -> auth_failed, never transient, and
+    the echoed id must not leak into the structured result."""
+    exc = ValueError(f"Invalid id, '{USER_ID}' is not a valid uuid")
+    adapter = SupabaseAccountDeletionAuthAdmin(_admin_api_with_delete(exc=exc))
+    result = adapter.hard_delete(USER_ID)
+    assert result.outcome == OUTCOME_AUTH_ERROR
+    assert result.error_code == ERROR_AUTH_FAILED
+    assert USER_ID not in str(result)
+
+
 def test_adapter_forbidden_classifies_forbidden():
     for status in (401, 403):
         exc = AuthApiError("not authorized", status, "no_authorization")
@@ -848,6 +862,48 @@ def test_cli_real_client_builder_is_lazy():
         worker_factory=lambda cfg: _worker(FakeRepository(jobs=[]), FakeAuthAdmin()),
     )
     assert code == 0
+
+
+def test_cli_build_client_silences_httpx_request_logs():
+    """The raw Auth user UUID is embedded in the admin request URL; httpx
+    INFO request logging must be silenced by the only real-client builder.
+    Building the client with a dummy URL opens no socket (no request)."""
+    import logging
+
+    import httpx
+    import supabase._sync.client as supabase_sync
+
+    orig_level = logging.getLogger("httpx").level
+    orig_create = supabase_sync.create_client
+    try:
+        # Ensure the real client is actually constructed (no factory).
+        config = AccountDeletionRuntimeConfig.from_env(
+            {"SUPABASE_URL": "http://127.0.0.1:1", "SUPABASE_SERVICE_ROLE_KEY": "k"}
+        )
+        client = None
+        try:
+            client = cli_module._build_client(config)
+            assert isinstance(client, supabase_sync.Client)
+            assert logging.getLogger("httpx").level == logging.WARNING
+        finally:
+            if client is not None:
+                for attr, session_attr in (
+                    ("_postgrest", "session"),
+                    ("_storage", "session"),
+                    ("_functions", "_client"),
+                ):
+                    transport = getattr(client, attr, None)
+                    if transport is None:
+                        continue
+                    session = getattr(transport, session_attr, None)
+                    if session is not None and hasattr(session, "close"):
+                        session.close()
+                auth = getattr(client, "auth", None)
+                if auth is not None and hasattr(auth, "close"):
+                    auth.close()
+    finally:
+        logging.getLogger("httpx").setLevel(orig_level)
+        supabase_sync.create_client = orig_create
 
 
 # ─── 24. Log sanitization ───────────────────────────────────────────────────
