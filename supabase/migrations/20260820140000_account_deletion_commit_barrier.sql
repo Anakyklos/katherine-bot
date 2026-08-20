@@ -823,3 +823,11 @@ REVOKE ALL ON FUNCTION public.commit_turn(
 GRANT EXECUTE ON FUNCTION public.commit_turn(
     text, uuid, bigint, text, text, text, jsonb, jsonb, text, jsonb, jsonb, text, text
 ) TO service_role;
+
+-- =================================================================
+-- 3. Restore the public contract comment (lost when the historical
+--    12-parameter signature was dropped above).
+-- =================================================================
+COMMENT ON FUNCTION public.commit_turn(
+    text, uuid, bigint, text, text, text, jsonb, jsonb, text, jsonb, jsonb, text, text
+) IS 'Atomic turn commit RPC (#271). Executes a complete turn as a single transaction: profile CAS, message inserts, snapshot update, turn_request completion, outbox events. Fail-closed: any error rolls back everything. Replay-safe: idempotent retries return the exact stored public result without writes. Lease/reclaim is protected by an atomic conditional UPDATE ... RETURNING. When p_account_deletion_user_ref is provided (server-derived HMAC, hex-64), the account deletion commit barrier runs inside the same transaction under the same per-user advisory lock: a blocking tombstone returns the sanitized account_deletion_pending conflict envelope with zero writes.';
