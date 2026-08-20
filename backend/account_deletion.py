@@ -491,6 +491,38 @@ def _parse_retry_result(response: object) -> RetryResult:
     raise PersistenceError("database_error", "malformed retention response")
 
 
+# ─── Commit barrier ────────────────────────────────────────────────────────
+
+
+class CommitBarrierResult:
+    """Result of the transactional commit barrier (``#329``).
+
+    ``blocked`` being ``True`` means the account-deletion ledger holds a
+    tombstone for the server-derived reference and the turn commit MUST be
+    refused. ``blocked`` being ``False`` means the commit may proceed.
+    The envelope is strictly validated: any unexpected shape fails closed
+    with ``PersistenceError``.
+    """
+
+    def __init__(self, blocked: bool, error: Optional[AccountDeletionError] = None) -> None:
+        self.blocked = blocked
+        self.error = error
+
+
+def _parse_commit_barrier_result(response: object) -> CommitBarrierResult:
+    envelope = _require_mapping(response, "account_deletion_commit_barrier response")
+    error_envelope = envelope.get("error")
+    if error_envelope is not None:
+        error = _parse_error_envelope(error_envelope)
+        if error.code == "account_deletion_pending":
+            return CommitBarrierResult(blocked=True, error=error)
+        # Unexpected error codes are NOT a license to proceed: fail closed.
+        raise PersistenceError("database_error", "persistence error")
+    if envelope.get("blocked") is not True:
+        raise PersistenceError("database_error", "persistence error")
+    return CommitBarrierResult(blocked=False)
+
+
 def _parse_finalize_result(response: object) -> FinalizeResult:
     envelope = _require_mapping(response, "finalize result")
     if "error" in envelope:
@@ -561,6 +593,18 @@ class AccountDeletionRepository:
     def finalize(self, job_id: str, worker_id: str) -> FinalizeResult: ...
 
     def purge_completed(self, cutoff: str, batch_size: int) -> int: ...
+
+    def commit_barrier(self, user_ref_hmac_sha256: str) -> CommitBarrierResult:
+        """Race-safe check of the deletion ledger at the commit boundary.
+
+        Read-only; the caller is responsible for holding the SAME per-user
+        advisory xact lock that ``account_deletion_request`` and the purge
+        hold, so the check and the subsequent writes execute as one
+        serialized unit under the lock. The lookup is by the server-derived
+        HMAC reference only, so it remains authoritative after finalize
+        minimizes ``user_id`` to ``NULL`` (#329).
+        """
+        ...
 
 
 def _rpc_call(
@@ -688,3 +732,11 @@ class SupabaseAccountDeletionRepository:
             {"p_cutoff": cutoff, "p_batch_size": batch_size},
         )
         return _parse_int_result(data)
+
+    def commit_barrier(self, user_ref_hmac_sha256: str) -> CommitBarrierResult:
+        data = _rpc_call(
+            self._client,
+            "account_deletion_commit_barrier",
+            {"p_user_ref_hmac_sha256": user_ref_hmac_sha256},
+        )
+        return _parse_commit_barrier_result(data)

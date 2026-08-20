@@ -122,12 +122,19 @@ class ProcessTurnInput:
     budget: TurnBudget
     correlation: str
     mode: TurnMode = TurnMode.normal
+    account_deletion_user_ref: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.correlation, str) or not _CORRELATION_RE.fullmatch(
             self.correlation
         ):
             raise ValueError("correlation must be a 64-char lowercase hex HMAC")
+        if self.account_deletion_user_ref is not None and not _CORRELATION_RE.fullmatch(
+            self.account_deletion_user_ref
+        ):
+            raise ValueError(
+                "account_deletion_user_ref must be a 64-char lowercase hex HMAC"
+            )
 
 
 @dataclass(frozen=True)
@@ -475,22 +482,34 @@ class ProcessTurn:
 
         # ---- 10. Atomic commit with CAS (exactly one operation) ---------------
         try:
+            commit_kwargs: dict[str, Any] = {
+                "authenticated_user_id": inp.authenticated_user_id,
+                "request_id": inp.request_id,
+                "expected_revision": state.revision,
+                "user_message": inp.user_message,
+                "assistant_message": response_text,
+                "emotional_state": emotional_snapshot,
+                "relationship_state": relationship_snapshot,
+                "public_response": response_text,
+                "outbox_events": outbox_events,
+                "replay_payload": replay_payload,
+                "lease_owner": self._lease_owner,
+            }
+            # Account-deletion commit barrier (#329): the SQL-side boundary
+            # runs under the SAME per-user advisory lock used by
+            # account_deletion_request and the purge, keyed solely on the
+            # server-derived HMAC reference (never the raw user_id), so it
+            # remains authoritative after finalize minimizes user_id to NULL.
+            if inp.account_deletion_user_ref is not None:
+                commit_kwargs["account_deletion_user_ref"] = (
+                    inp.account_deletion_user_ref
+                )
             return await run_blocking_write(
                 "commit_turn",
                 budget,
                 self._supabase_timeout,
                 self._commit_repository.commit,
-                authenticated_user_id=inp.authenticated_user_id,
-                request_id=inp.request_id,
-                expected_revision=state.revision,
-                user_message=inp.user_message,
-                assistant_message=response_text,
-                emotional_state=emotional_snapshot,
-                relationship_state=relationship_snapshot,
-                public_response=response_text,
-                outbox_events=outbox_events,
-                replay_payload=replay_payload,
-                lease_owner=self._lease_owner,
+                **commit_kwargs,
                 allowlist_exceptions=_REPOSITORY_ERRORS,
             )
         except ConflictError as exc:

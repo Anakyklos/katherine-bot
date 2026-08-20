@@ -687,7 +687,7 @@ def test_routes_use_only_the_correct_dependency():
             self.turn_calls = []
 
         async def process_turn(
-            self, user_id, message, request_id, *, budget=None, mode=None, correlation=None
+            self, user_id, message, request_id, *, budget=None, mode=None, correlation=None, account_deletion_user_ref=None
         ):
             self.turn_calls.append((user_id, message, request_id))
             return ProcessTurnResult(

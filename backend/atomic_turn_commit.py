@@ -99,6 +99,10 @@ _EVENT_TYPE_RE = re.compile(r"^[a-z0-9_]{1,64}$")
 # UUID regex (same as database: lowercase hex, canonical form).
 _UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
+# Account deletion user reference: the exact server-derived HMAC format
+# (never the raw user_id), matching the SQL commit barrier (#329).
+_HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+
 # Stable domain conflict codes returned by the RPC.
 CONFLICT_CODES = frozenset(
     {
@@ -106,6 +110,11 @@ CONFLICT_CODES = frozenset(
         "request_payload_conflict",
         "request_in_progress",
         "lease_conflict",
+        # Authoritative transactional boundary for account deletion (#329):
+        # a commit attempt made after a deletion request is accepted (or
+        # after purge/finalize, when user_id is minimized to NULL) fails
+        # with this code and never writes rows.
+        "account_deletion_pending",
     }
 )
 
@@ -540,6 +549,7 @@ def validate_atomic_commit_input(
     public_response: str,
     outbox_events: list[tuple[str, Mapping[str, Any], str]],
     replay_payload: Mapping[str, Any],
+    account_deletion_user_ref: Optional[str] = None,
 ) -> None:
     """Validate all inputs before attempting the atomic commit.
 
@@ -603,8 +613,10 @@ def validate_atomic_commit_input(
         _validate_outbox_event_payload(payload, i)
         _validate_idempotency_key(idempotency_key)
 
-    _validate_replay_payload(replay_payload, request_id)
+        _validate_replay_payload(replay_payload, request_id)
 
+    # account_deletion_user_ref is validated against the exact server-derived
+    # HMAC format (never the raw user_id), matching the SQL commit barrier (#329).
     # Single authoritative source for the public response: replay_payload.response
     # must equal public_response (mirrors the SQL constraint).
     if replay_payload.get("response") != public_response:
@@ -612,6 +624,15 @@ def validate_atomic_commit_input(
             "invalid_public_response",
             "public_response must equal replay_payload.response",
         )
+
+    if account_deletion_user_ref is not None:
+        if not isinstance(account_deletion_user_ref, str) or not _HEX64_RE.fullmatch(
+            account_deletion_user_ref
+        ):
+            raise ValidationError(
+                "invalid_account_deletion_user_ref",
+                "account_deletion_user_ref must be 64 lowercase hex characters",
+            )
 
 
 def build_commit_turn_rpc_payload(
@@ -627,10 +648,15 @@ def build_commit_turn_rpc_payload(
     replay_payload: Mapping[str, Any],
     payload_hash_sha256: str,
     lease_owner: Optional[str],
+    account_deletion_user_ref: Optional[str] = None,
 ) -> dict[str, Any]:
     """Build the payload for the commit_turn PostgreSQL RPC function.
 
     Empty mappings are preserved as {} and never implicitly converted to NULL.
+    The optional ``account_deletion_user_ref`` activates the SQL-side commit
+    barrier (#329): it must be the exact server-derived HMAC reference,
+    never the raw user_id. When absent the RPC behaves byte-identically to
+    the historical contract.
     """
     outbox_array = []
     for event_type, payload, idempotency_key in outbox_events:
@@ -655,6 +681,11 @@ def build_commit_turn_rpc_payload(
         "p_replay_payload": dict(replay_payload),
         "p_outbox_events": outbox_array,
         "p_lease_owner": lease_owner,
+        **(  # SQL-side account deletion commit barrier (#329).
+            {"p_account_deletion_user_ref": account_deletion_user_ref}
+            if account_deletion_user_ref is not None
+            else {}
+        ),
     }
 
 
@@ -923,21 +954,18 @@ async def commit_turn(
     outbox_events: list[tuple[str, Mapping[str, Any], str]],
     replay_payload: Mapping[str, Any],
     lease_owner: Optional[str] = None,
+    account_deletion_user_ref: Optional[str] = None,
 ) -> CommittedTurn:
     """Execute an atomic turn commit via the PostgreSQL RPC function.
-
     Validation runs BEFORE the RPC is invoked, so invalid input never reaches
     the database. The RPC is awaited exactly once. Unexpected persistence
     failures raised by the RPC client are converted to PersistenceError with a
     sanitized constant message.
-
     Args:
         rpc_client: An awaitable callable ``rpc_client(name, params) -> Mapping``.
         All other parameters match validate_atomic_commit_input.
-
     Returns:
         A CommittedTurn instance with the public committed data.
-
     Raises:
         ValidationError: If input validation fails (RPC is NOT called).
         ConflictError: If a concurrent modification or in-progress state is detected.
@@ -954,10 +982,17 @@ async def commit_turn(
         public_response=public_response,
         outbox_events=outbox_events,
         replay_payload=replay_payload,
+        account_deletion_user_ref=account_deletion_user_ref,
     )
-
     if lease_owner is not None:
         _validate_lease_owner(lease_owner)
+    if account_deletion_user_ref is not None and not _HEX64_RE.fullmatch(
+        account_deletion_user_ref
+    ):
+        raise ValidationError(
+            "invalid_account_deletion_user_ref",
+            "account_deletion_user_ref must be 64 lowercase hex characters",
+        )
 
     # The canonical payload hash covers every input that determines the turn's
     # identity, content and side effects (outbox + replay).
@@ -985,11 +1020,11 @@ async def commit_turn(
         relationship_state=relationship_state,
         public_response=public_response,
         outbox_events=outbox_events,
-        replay_payload=replay_payload,
+                replay_payload=replay_payload,
         payload_hash_sha256=payload_hash_sha256,
         lease_owner=lease_owner,
+        account_deletion_user_ref=account_deletion_user_ref,
     )
-
     try:
         result = await rpc_client("commit_turn", rpc_payload)
     except Exception as exc:  # noqa: BLE001 - sanitize any RPC-level failure

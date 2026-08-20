@@ -30,6 +30,7 @@ from .atomic_turn_commit import (
     ConflictError,
     PersistenceError,
     ValidationError,
+    _HEX64_RE,
     _parse_error_envelope,
     _validate_lease_owner,
     commit_turn,
@@ -184,6 +185,16 @@ class TurnCommitRepository:
         lease_owner = kwargs.get("lease_owner")
         if lease_owner is not None:
             _validate_lease_owner(lease_owner)
+
+        # The optional account-deletion barrier reference (#329) must be the
+        # exact server-derived HMAC format (never the raw user_id).
+        user_ref = kwargs.get("account_deletion_user_ref")
+        if user_ref is not None:
+            if not isinstance(user_ref, str) or not _HEX64_RE.fullmatch(user_ref):
+                raise ValidationError(
+                    "invalid_account_deletion_user_ref",
+                    "account_deletion_user_ref must be 64 lowercase hex characters",
+                )
 
         async def _rpc_client(name: str, params: Mapping[str, Any]) -> Mapping[str, Any]:
             response = client.rpc(name, dict(params)).execute()

@@ -670,6 +670,50 @@ class TestValidateAtomicCommitInput:
             validate_atomic_commit_input(**valid_inputs)
         assert exc.value.code == "invalid_outbox_events"
 
+    def test_account_deletion_user_ref_valid_accepted(self, valid_inputs):
+        # #329: the exact server-derived HMAC format (64 lowercase hex) is
+        # accepted by the commit boundary.
+        valid_inputs["account_deletion_user_ref"] = "a" * 64
+        validate_atomic_commit_input(**valid_inputs)
+
+    def test_account_deletion_user_ref_none_accepted(self, valid_inputs):
+        # Historical contract: without the barrier reference everything
+        # behaves byte-identically to the pre-#329 RPC.
+        valid_inputs["account_deletion_user_ref"] = None
+        validate_atomic_commit_input(**valid_inputs)
+
+    def test_account_deletion_user_ref_rejects_raw_user_id(self, valid_inputs):
+        # The barrier is keyed on the HMAC reference, NEVER the raw
+        # user_id (#329): a plain user identifier is a validation failure.
+        valid_inputs["account_deletion_user_ref"] = "user_123"
+        with pytest.raises(ValidationError) as exc:
+            validate_atomic_commit_input(**valid_inputs)
+        assert exc.value.code == "invalid_account_deletion_user_ref"
+
+    def test_account_deletion_user_ref_rejects_invalid_hex(self, valid_inputs):
+        valid_inputs["account_deletion_user_ref"] = "g" * 64
+        with pytest.raises(ValidationError) as exc:
+            validate_atomic_commit_input(**valid_inputs)
+        assert exc.value.code == "invalid_account_deletion_user_ref"
+
+    def test_account_deletion_user_ref_rejects_uppercase_hex(self, valid_inputs):
+        valid_inputs["account_deletion_user_ref"] = "A" * 64
+        with pytest.raises(ValidationError) as exc:
+            validate_atomic_commit_input(**valid_inputs)
+        assert exc.value.code == "invalid_account_deletion_user_ref"
+
+    def test_account_deletion_user_ref_rejects_wrong_length(self, valid_inputs):
+        valid_inputs["account_deletion_user_ref"] = "a" * 32
+        with pytest.raises(ValidationError) as exc:
+            validate_atomic_commit_input(**valid_inputs)
+        assert exc.value.code == "invalid_account_deletion_user_ref"
+
+    def test_account_deletion_user_ref_rejects_non_string(self, valid_inputs):
+        valid_inputs["account_deletion_user_ref"] = 1234
+        with pytest.raises(ValidationError) as exc:
+            validate_atomic_commit_input(**valid_inputs)
+        assert exc.value.code == "invalid_account_deletion_user_ref"
+
 # ═══════════════════════════════════════════════════════════════════════
 # 4. RPC payload building
 # ═══════════════════════════════════════════════════════════════════════
@@ -724,6 +768,20 @@ class TestBuildCommitTurnRpcPayload:
         base_params["emotional_state"] = None
         result = build_commit_turn_rpc_payload(**base_params)
         assert result["p_emotional_state"] is None
+
+    def test_account_deletion_user_ref_included_when_present(self, base_params):
+        # #329: the barrier reference is forwarded as p_account_deletion_
+        # user_ref only when provided, so the SQL boundary can race-safe
+        # check the deletion ledger under the same advisory lock.
+        base_params["account_deletion_user_ref"] = "c" * 64
+        result = build_commit_turn_rpc_payload(**base_params)
+        assert result["p_account_deletion_user_ref"] == "c" * 64
+
+    def test_account_deletion_user_ref_omitted_when_absent(self, base_params):
+        # Historical byte-for-byte compatibility: without the reference the
+        # payload keeps exactly the pre-#329 fields.
+        result = build_commit_turn_rpc_payload(**base_params)
+        assert "p_account_deletion_user_ref" not in result
 
     def test_preserves_empty_mapping_as_empty(self, base_params):
         # Empty mappings must be preserved as {} — never converted to NULL.
@@ -864,6 +922,21 @@ class TestParseCommitTurnResult:
         with pytest.raises(ConflictError) as exc:
             parse_commit_turn_result(error_result)
         assert exc.value.code == "lease_conflict"
+
+    def test_parse_error_result_account_deletion_pending(self):
+        # #329: a commit made past the preflight gate against an accepted
+        # tombstone (or after purge/finalize, when user_id is NULL) fails
+        # with this domain code and never writes rows.
+        error_result = {
+            "error": {
+                "code": "account_deletion_pending",
+                "message": "Account deletion is pending.",
+            }
+        }
+        with pytest.raises(ConflictError) as exc:
+            parse_commit_turn_result(error_result)
+        assert exc.value.code == "account_deletion_pending"
+        assert exc.value.message == "Account deletion is pending."
 
     def test_parse_error_result_validation_failed(self):
         error_result = {
@@ -1330,6 +1403,32 @@ class TestAsyncCommitTurn:
         with pytest.raises(ValidationError):
             await commit_turn(rpc_client=recording_rpc_client, **valid_inputs)
         assert len(recording_rpc_client.calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_account_deletion_user_ref_forwarded_to_rpc(self, valid_inputs, recording_rpc_client):
+        # #329: a valid server-derived HMAC reference reaches the RPC as
+        # p_account_deletion_user_ref so the SQL barrier runs inside the
+        # same transaction, under the same advisory lock.
+        valid_inputs["account_deletion_user_ref"] = "d" * 64
+        await commit_turn(rpc_client=recording_rpc_client, **valid_inputs)
+        assert len(recording_rpc_client.calls) == 1
+        _, params = recording_rpc_client.calls[0]
+        assert params["p_account_deletion_user_ref"] == "d" * 64
+
+    @pytest.mark.asyncio
+    async def test_rpc_not_called_on_invalid_user_ref(self, valid_inputs, recording_rpc_client):
+        # Validation runs BEFORE the RPC: an invalid barrier reference
+        # (including the raw user_id) must never reach the database.
+        valid_inputs["account_deletion_user_ref"] = "user_123"
+        with pytest.raises(ValidationError):
+            await commit_turn(rpc_client=recording_rpc_client, **valid_inputs)
+        assert len(recording_rpc_client.calls) == 0
+
+    @pytest.mark.asyncio
+    async def test_no_barrier_param_when_user_ref_absent(self, valid_inputs, recording_rpc_client):
+        await commit_turn(rpc_client=recording_rpc_client, **valid_inputs)
+        _, params = recording_rpc_client.calls[0]
+        assert "p_account_deletion_user_ref" not in params
 
     @pytest.mark.asyncio
     async def test_validation_before_rpc(self, valid_inputs, recording_rpc_client):

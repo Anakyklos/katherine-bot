@@ -64,6 +64,7 @@ class ChatConversationEngine(ConversationEngine):
         budget: Optional[TurnBudget] = None,
         mode: TurnMode = TurnMode.normal,
         correlation: str,
+        account_deletion_user_ref: Optional[str] = None,
     ):
         active_budget = (
             budget
@@ -72,6 +73,10 @@ class ChatConversationEngine(ConversationEngine):
         )
         if not isinstance(active_budget, TurnBudget):
             raise TypeError("budget must be a TurnBudget")
+        if account_deletion_user_ref is not None and not isinstance(
+            account_deletion_user_ref, str
+        ):
+            raise TypeError("account_deletion_user_ref must be a string or None")
         return await self._run_turn_locked(
             user_id,
             user_message,
@@ -79,9 +84,13 @@ class ChatConversationEngine(ConversationEngine):
             active_budget,
             mode,
             correlation,
+            account_deletion_user_ref=account_deletion_user_ref,
         )
 
-    async def _run_turn_locked(self, user_id, user_message, request_id, budget, mode, correlation):
+    async def _run_turn_locked(
+        self, user_id, user_message, request_id, budget, mode, correlation,
+        account_deletion_user_ref=None,
+    ):
         # Only the lock acquisition is bounded by remaining_before_reserve.
         # Once acquired, the turn runs under budget checks (each stage
         # checks remaining_before_reserve).  This prevents the outer timeout
@@ -102,6 +111,7 @@ class ChatConversationEngine(ConversationEngine):
                 budget=budget,
                 correlation=correlation,
                 mode=mode,
+                account_deletion_user_ref=account_deletion_user_ref,
             )
             return await self._process_turn.execute(inp)
         finally:
