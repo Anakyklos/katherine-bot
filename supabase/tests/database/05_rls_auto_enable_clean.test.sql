@@ -341,7 +341,7 @@ SELECT ok(
 SELECT ok(
     has_function_privilege(
         'service_role',
-        'public.commit_turn(text, uuid, bigint, text, text, text, jsonb, jsonb, text, jsonb, jsonb, text)',
+        'public.commit_turn(text, uuid, bigint, text, text, text, jsonb, jsonb, text, jsonb, jsonb, text, text)',
         'EXECUTE'
     ),
     'service_role has EXECUTE on commit_turn'
@@ -349,7 +349,7 @@ SELECT ok(
 SELECT ok(
     NOT has_function_privilege(
         'anon',
-        'public.commit_turn(text, uuid, bigint, text, text, text, jsonb, jsonb, text, jsonb, jsonb, text)',
+        'public.commit_turn(text, uuid, bigint, text, text, text, jsonb, jsonb, text, jsonb, jsonb, text, text)',
         'EXECUTE'
     ),
     'anon has no EXECUTE on commit_turn'
@@ -357,7 +357,7 @@ SELECT ok(
 SELECT ok(
     NOT has_function_privilege(
         'authenticated',
-        'public.commit_turn(text, uuid, bigint, text, text, text, jsonb, jsonb, text, jsonb, jsonb, text)',
+        'public.commit_turn(text, uuid, bigint, text, text, text, jsonb, jsonb, text, jsonb, jsonb, text, text)',
         'EXECUTE'
     ),
     'authenticated has no EXECUTE on commit_turn'
@@ -365,7 +365,7 @@ SELECT ok(
 SELECT ok(
     NOT has_function_privilege(
         'public',
-        'public.commit_turn(text, uuid, bigint, text, text, text, jsonb, jsonb, text, jsonb, jsonb, text)',
+        'public.commit_turn(text, uuid, bigint, text, text, text, jsonb, jsonb, text, jsonb, jsonb, text, text)',
         'EXECUTE'
     ),
     'PUBLIC has no EXECUTE on commit_turn'
