@@ -147,12 +147,20 @@ GRANT EXECUTE ON FUNCTION public.account_deletion_commit_barrier(text)
 -- =================================================================
 -- 2. commit_turn: optional commit-side deletion barrier
 -- =================================================================
--- Aditive change to the existing commit_turn RPC via a new optional
--- parameter (p_account_deletion_user_ref text DEFAULT NULL). The function
--- body, validation, write order, CAS, reclaim and failure semantics are
--- copied byte-for-byte from the historical contract so existing callers
--- keep identical behavior and the existing grants stay valid (grants are
--- re-applied against the new signature).
+-- The historical commit_turn (12 parameters, migration 05) is REPLACED by
+-- a single 13-parameter signature with an optional
+-- p_account_deletion_user_ref text DEFAULT NULL. One signature ONLY: an
+-- overload (12 + 13 params) makes every positional call ambiguous
+-- (`function ... is not unique`), because PostgreSQL cannot prefer one
+-- default-trailing signature over the other — even explicit casts on the
+-- first 11/12 arguments leave both candidates equally good. Keeping a
+-- single signature also means existing callers (including the #326 worker)
+-- invoke the same function, and the existing grants simply move to the
+-- new signature.
+--
+-- The function body, validation, write order, CAS, reclaim and failure
+-- semantics are copied byte-for-byte from the historical contract so
+-- existing callers keep identical behavior.
 --
 -- When the derivation parameter is provided, the barrier runs inside the
 -- SAME transaction, immediately after the per-user advisory lock is
@@ -162,6 +170,10 @@ GRANT EXECUTE ON FUNCTION public.account_deletion_commit_barrier(text)
 -- is created or updated, no chat_logs, turn_requests or outbox_events are
 -- written, and the transaction ends via the normal RETURN path (no
 -- exception), keeping the commit contract unchanged.
+DROP FUNCTION IF EXISTS public.commit_turn(
+    text, uuid, bigint, text, text, text, jsonb, jsonb, text, jsonb,
+    jsonb, text
+);
 CREATE OR REPLACE FUNCTION public.commit_turn(
     p_authenticated_user_id text,
     p_request_id uuid,
