@@ -84,7 +84,7 @@ class FakeEngine:
         self.result = _turn_result()
 
     async def process_turn(
-        self, user_id, message, request_id, *, budget=None, mode=None, correlation=None
+        self, user_id, message, request_id, *, budget=None, mode=None, correlation=None, account_deletion_user_ref=None
     ):
         self.calls.append(
             {

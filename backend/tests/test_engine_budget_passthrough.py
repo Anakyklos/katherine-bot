@@ -15,7 +15,7 @@ def test_process_turn_uses_explicit_budget_object():
     provided = TurnBudget(deadline=100.0, reserve=10.0, now_provider=lambda: 0.0)
     captured = {}
 
-    async def fake_run(user_id, message, request_id, budget, mode, correlation):
+    async def fake_run(user_id, message, request_id, budget, mode, correlation, account_deletion_user_ref=None):
         captured.update(
             user_id=user_id,
             message=message,
@@ -50,7 +50,7 @@ def test_process_turn_still_creates_budget_for_internal_callers():
     engine._monotonic = lambda: 10.0
     captured = {}
 
-    async def fake_run(_user_id, _message, _request_id, budget, _mode, correlation):
+    async def fake_run(_user_id, _message, _request_id, budget, _mode, correlation, account_deletion_user_ref=None):
         captured["budget"] = budget
         captured["correlation"] = correlation
         return "ok"

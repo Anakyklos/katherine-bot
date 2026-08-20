@@ -42,6 +42,9 @@ from pydantic import BaseModel, ConfigDict, StrictStr, field_validator
 from pydantic_core import PydanticCustomError
 from supabase_auth.errors import AuthApiError, AuthRetryableError
 
+from .account_deletion import (
+    compute_account_deletion_user_ref,
+)
 from .admission import (
     ADMITTED,
     APPLICATION_RATE_LIMITED,
@@ -448,6 +451,15 @@ _PROCESS_TURN_CONFLICT_HTTP = {
         409,
         {"code": "request_replay_unavailable", "message": "Request was already received but its response is unavailable."},
     ),
+    # Authoritative transactional commit barrier (#329): raised inside
+    # commit_turn when the deletion ledger holds a tombstone for the
+    # server-derived HMAC reference (request made post tombstone acceptance
+    # but past any preflight gate, or post purge/finalize). HTTP 423
+    # matches the deletion gate detail contract.
+    "account_deletion_pending": (
+        423,
+        {"code": "account_deletion_pending", "message": "Account deletion is pending."},
+    ),
 }
 
 
@@ -729,7 +741,14 @@ async def chat_endpoint(
                 correlation=correlation,
             )
             raise http_exc
-
+        # Authoritative transactional commit barrier (#329): the server-
+        # derived HMAC reference is forwarded to the commit boundary under
+        # the SAME advisory lock used by account deletion. Only the HMAC
+        # is derived here (never logged); lookup works post purge/finalize
+        # when user_id is minimized to NULL.
+        deletion_user_ref = compute_account_deletion_user_ref(
+            admission_config.secret_bytes, user_id
+        )
         result = await engine.process_turn(
             user_id,
             input_data.message,
@@ -737,6 +756,7 @@ async def chat_endpoint(
             budget=budget,
             mode=mode,
             correlation=correlation,
+            account_deletion_user_ref=deletion_user_ref,
         )
         duration_ms = (time.monotonic() - started_at) * 1000
         emit_event(
