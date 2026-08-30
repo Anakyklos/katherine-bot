@@ -18,25 +18,36 @@ loopback. O único canal entre a página e o Python é a bridge
 
 ## Dependências de sistema (Linux)
 
-O backend GTK do pywebview precisa do stack GObject/WebKit via PyGObject:
+O backend GTK do pywebview precisa do stack GObject/WebKit via PyGObject.
+O ambiente validado usa o PyGObject do **sistema**, não do pip:
 
-- **PyGObject ≥ 3.48** (o venv usa `--system-site-packages` no Ubuntu
-  24.04; o PyGObject do sistema é usado, ele não é instalável via pip
-  sem build deps nativos)
-- WebKit2GTK 4.1 (`libwebkit2gtk-4.1-0`, `libwebkit2gtk-4.1-dev` ao
-  construir PyGObject)
-- GTK 3 e GLib (`libgtk-3-0`, `libglib2.0-0`)
+- **PyGObject ≥ 3.48** — no Ubuntu 24.04 vem do pacote `python3-gi`
+  (validado com 3.48.2). Ele não é instalável via pip sem build deps
+  nativos e **não** faz parte do `requirements.in`/lock: a venv é
+  criada com `--system-site-packages` e o importa de
+  `/usr/lib/python3/dist-packages`.
+- WebKit2GTK 4.1 (`libwebkit2gtk-4.1-0`; validado com 2.52.3 no
+  Ubuntu 24.04) — typelib `gir1.2-webkit2-4.1`.
+- GTK 3 e GLib (`libgtk-3-0`, `libglib2.0-0`).
 - Xvfb para execução headless (apenas validação/CI):
-  `xvfb-run -a -s "-screen 0 1280x800x24"`
+  `xvfb-run -a -s "-screen 0 1280x800x24"`.
 
-Instalação recomendada do lado Python (requirements.in já inclui):
+Instalação do lado Python: o `requirements.in` trava `pywebview==6.2.1`
+(**sem** o extra `[gtk]`). O backend GTK é selecionado automaticamente
+pelo pywebview no Linux quando o PyGObject do sistema e o WebKitGTK
+estão disponíveis; o extra `[gtk]` do pip (que traria
+`PyGObject==3.50.0` do PyPI) **não** é usado nem validado. Instalação
+reproduzível do ambiente validado:
 
+```bash
+sudo apt install python3-gi gir1.2-webkit2-4.1 libgtk-3-0 xvfb
+# venv com acesso aos pacotes Python do sistema (python3-gi):
+python3 -m venv .venv --system-site-packages
+source .venv/bin/activate
+pip install -r backend/requirements.txt   # instala pywebview==6.2.1 (sem extra)
 ```
-pywebview[gtk]
-```
 
-O extra `[gtk]` garante a seleção do backend GTK no Linux. Sem
-display (`$DISPLAY` vazio) o shell não sobe — esse é um erro
+Sem display (`$DISPLAY` vazio) o shell não sobe — esse é um erro
 explícito, não um fallback silencioso.
 
 ## Reproduzir a validação (smoke)
@@ -93,8 +104,12 @@ da máquina de estados same-URL (todas as transições do trust) está em
 
 - Startup até página carregada: ~550-650ms (do início do processo,
   incluindo resolução do build; janela do webview apenas: ~260-450ms)
-- RSS idle: ~180-184MB; pico (VmHWM): ~183MB
-- CPU: 1-2% durante o load; 0% em steady state (10s de amostragem)
+- RSS idle: ~190MB estável (190148-190528 kB em amostragem de 2s por
+  14s de janela viva); pico (VmHWM): ~190.5MB idle, ~195MB no smoke
+  completo (194832-195316 kB em 4 runs, inclui a fase de navegação
+  remota)
+- CPU: 1-2% durante o load; **0% em steady state** (5 amostras de 2s
+  consecutivas a 0% com a janela viva)
 - Processos: 1 (nenhum servidor/worker extra)
 
 ## Modelo de confiança da bridge (resumo)
