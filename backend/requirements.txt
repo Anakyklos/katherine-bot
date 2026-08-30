@@ -17,6 +17,8 @@ anyio==4.14.1
     #   groq
     #   httpx
     #   starlette
+bottle==0.13.4
+    # via pywebview
 certifi==2026.6.17
     # via
     #   httpcore
@@ -113,6 +115,8 @@ postgrest==2.31.0
     # via supabase
 propcache==0.5.2
     # via yarl
+proxy-tools==0.1.0
+    # via pywebview
 pycparser==3.0
     # via cffi
 pydantic==2.13.4
@@ -131,6 +135,8 @@ pygments==2.20.0
 pyjwt[crypto]==2.13.0
     # via supabase-auth
 python-dotenv==1.2.2
+    # via -r backend/requirements.in
+pywebview==6.2.1
     # via -r backend/requirements.in
 pyyaml==6.0.3
     # via
@@ -195,6 +201,7 @@ typing-extensions==4.16.0
     #   huggingface-hub
     #   pydantic
     #   pydantic-core
+    #   pywebview
     #   realtime
     #   sentence-transformers
     #   starlette

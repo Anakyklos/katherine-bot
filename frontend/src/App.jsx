@@ -7,6 +7,14 @@ function App() {
     const [session, setSession] = useState(null);
 
     useEffect(() => {
+        // Without a Supabase client (e.g. desktop shell build without
+        // web credentials, #334) there is no session to observe: show
+        // the auth screen instead of crashing on null.auth.
+        if (!supabase) {
+            setSession(null);
+            return;
+        }
+
         supabase.auth.getSession().then(({ data: { session } }) => {
             setSession(session);
         });
