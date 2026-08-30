@@ -267,10 +267,55 @@ def run_smoke() -> tuple[bool, list[str]]:
 
     original_create = webview.create_window
 
+    # Evidence captured by the loaded handler itself (the same event
+    # the revert logic runs on — it ALWAYS sees the remote URL, while
+    # polling get_current_url() can miss the whole remote window when
+    # the network is fast: the revert completes before the first poll).
+    remote_urls_seen: list[str] = []  # URLs captured on loaded events
+    remote_direct_ref: list[object] = []  # js_api.health() called in-handler while remote
+    in_vivo_ref: list[object] = []  # probe result collected inside the remote doc
+
     def create_and_record(**kwargs):
         window = original_create(**kwargs)
         window_holder.append(window)
-        window.events.loaded += loaded.set
+
+        def _record_loaded():
+            try:
+                url = window.get_current_url() or ""
+            except Exception:  # noqa: BLE001 (evidence only)
+                url = ""
+            if url.startswith("https://"):
+                remote_urls_seen.append(url)
+                # Deterministic direct refusal, executed at the exact
+                # moment the window is provably remote: invoke the same
+                # js_api object a JS call from this remote page would
+                # reach. Fail-closed must refuse it here.
+                try:
+                    js_api_obj = _get_js_api(window)
+                    if js_api_obj is not None:
+                        remote_direct_ref.append(js_api_obj.health())
+                except Exception:  # noqa: BLE001 (evidence only)
+                    pass
+                # Arm the in-vivo probe INSIDE the live remote document
+                # and immediately collect what it stores: this is the
+                # only moment the remote doc is guaranteed alive. If
+                # pywebview is (re)injected there, the listener calls
+                # health() as remote content; otherwise the value
+                # stays 'pending'/absent (no payload delivered).
+                try:
+                    in_vivo_ref.append(
+                        window.evaluate_js(_PROBE_ARM_IN_REMOTE_DOC)
+                    )
+                    in_vivo_ref.append(
+                        window.evaluate_js(
+                            "(() => window.__smokeRemoteHealth)()"
+                        )
+                    )
+                except Exception:  # noqa: BLE001 (doc may already be dying)
+                    pass
+            loaded.set()
+
+        window.events.loaded += _record_loaded
         return window
 
     webview.create_window = create_and_record  # type: ignore[assignment]
@@ -360,85 +405,50 @@ def run_smoke() -> tuple[bool, list[str]]:
             # 5. Remote navigation: the bridge must fail closed for the
             #    remote document AND the shell must revert to the build.
             #
-            #    This block is timing-sensitive (the remote document
-            #    lives briefly before the revert destroys it), so it
-            #    tolerates jitter and accepts the safe outcomes:
+            #    Evidence strategy (deterministic): polling
+            #    get_current_url() can miss the ENTIRE remote window —
+            #    the revert (triggered by the loaded event) sometimes
+            #    completes before the first poll when the network is
+            #    fast. So the evidence comes from the loaded handler
+            #    itself (registered in create_and_record): it sees the
+            #    remote URL, arms the in-vivo probe inside the live
+            #    remote document, and the direct refusal is executed in
+            #    that same handler — the exact moment the window is
+            #    provably remote.
             #
+            #    Safe outcomes (all fail-closed):
             #    (i)  in-vivo refusal: the remote doc obtained a
             #         working bridge and health() returned the
             #         sanitized bridge_unavailable payload;
-            #    (ii) never-bridged: the remote doc was destroyed
-            #         before pywebview was usable there (no call ever
-            #         reached Python) — no result, or a throw caused
-            #         by the document dying mid-call;
-            #    (iii) direct refusal: with the window observed at a
-            #         remote URL, the exact js_api object a JS call
-            #         would reach refuses (deterministic JS→Python
-            #         path).
+            #    (ii) never-bridged: the remote doc died before
+            #         pywebview was usable there — probe never fired
+            #         or the call died with the doc (no payload
+            #         delivered);
+            #    (iii) direct refusal: js_api.health() invoked while
+            #          the window is remote (from the loaded handler)
+            #          returned bridge_unavailable.
             #
             #    The ONLY failing outcome is a successful health()
             #    payload delivered to remote content.
             remote_in_vivo = None
             remote_direct = None
-            remote_alive = False
 
-            for _attempt in range(3):
-                window.evaluate_js(_PROBE_NAVIGATE_REMOTE)
+            window.evaluate_js(_PROBE_NAVIGATE_REMOTE)
 
-                # Deterministic direct probe: while the window shows
-                # the remote URL, invoke the SAME js_api object the
-                # remote page would use (the exact JS→Python path).
-                # NOTE: get_current_url() can still show the local
-                # file:// URL for a few ms after location.assign():
-                # only treat the window as remote once https:// is
-                # actually visible.
-                deadline = time.time() + 15
-                remote_alive = False
-                while time.time() < deadline:
-                    current = window.get_current_url() or ""
-                    if current.startswith("https://"):
-                        remote_alive = True
-                        js_api_obj = _get_js_api(window)
-                        if js_api_obj is not None:
-                            remote_direct = js_api_obj.health()
-                        break
-                    time.sleep(0.05)
-
-                if remote_alive:
+            # The revert is triggered by the shell's loaded handler;
+            # give it time to fire and then settle back on the build.
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                current = window.get_current_url() or ""
+                if current.startswith("file://") and remote_urls_seen:
                     break
-                # Navigation did not make a remote URL observable in
-                # time (slow network / GTK scheduling): wait for the
-                # revert to settle and retry the navigation.
-                time.sleep(1.0)
+                time.sleep(0.2)
 
-            # In-vivo probe: arm the listener INSIDE the remote
-            # document while it is alive. If the shell re-injects
-            # pywebview there, the listener calls health() as remote
-            # content and stores the outcome on the remote window
-            # object (which dies with the document — collect fast).
-            if remote_alive:
-                try:
-                    window.evaluate_js(_PROBE_ARM_IN_REMOTE_DOC)
-                except Exception:  # noqa: BLE001 (doc may already be gone)
-                    pass
-                sub_deadline = time.time() + 3
-                while time.time() < sub_deadline:
-                    try:
-                        remote_in_vivo = window.evaluate_js(
-                            "(() => window.__smokeRemoteHealth)()"
-                        )
-                    except Exception:  # noqa: BLE001 (doc died mid-call)
-                        remote_in_vivo = None
-                        break
-                    if remote_in_vivo and remote_in_vivo != "pending":
-                        break
-                    # Only stop early once the remote doc is truly
-                    # gone (URL changed away from https): the revert
-                    # destroyed it before the probe could fire.
-                    current = window.get_current_url() or ""
-                    if not current.startswith("https://"):
-                        break
-                    time.sleep(0.1)
+            # Direct refusal: the loaded handler recorded that the
+            # window really showed a remote URL (remote_urls_seen is
+            # the authoritative witness — same event the revert used)
+            # and executed js_api.health() while the window was
+            # provably remote; remote_direct_ref holds that result.
 
             # Wait for the revert to land back on the local build.
             deadline = time.time() + 20
@@ -455,6 +465,18 @@ def run_smoke() -> tuple[bool, list[str]]:
                 f"current_url={str(window.get_current_url())[:80]!r}",
             )
 
+            # The remote window was provably alive: the loaded handler
+            # (the same event the revert logic uses) witnessed it.
+            report.check(
+                "remote navigation reached a remote document (witnessed by loaded handler)",
+                bool(remote_urls_seen),
+                f"urls_seen={[u[:60] for u in remote_urls_seen[:3]]}",
+            )
+
+            # Direct refusal: the in-handler call executes with the
+            # window provably remote. The result is stored in
+            # remote_direct_ref (list filled by the handler).
+            remote_direct = remote_direct_ref[-1] if remote_direct_ref else None
             direct_ok = bool(
                 remote_direct
                 and remote_direct.get("ok") is False
@@ -465,6 +487,20 @@ def run_smoke() -> tuple[bool, list[str]]:
                 direct_ok,
                 json.dumps(remote_direct)[:200] if remote_direct else "no result",
             )
+
+            # In-vivo: the probe armed inside the remote document. If
+            # pywebview was injected there, health() was called as
+            # remote content; the outcome was collected by the loaded
+            # handler itself (the doc dies with its window object, so
+            # it had to be read before the doc died). The arm call
+            # returns {armed: true}; the collect returns the stored
+            # outcome — take the LAST collected value, skipping the
+            # arm result dicts.
+            remote_in_vivo = None
+            for value in reversed(in_vivo_ref):
+                if isinstance(value, dict) and "armed" not in value:
+                    remote_in_vivo = value
+                    break
 
             in_vivo_ok = bool(
                 remote_in_vivo
