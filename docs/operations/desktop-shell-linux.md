@@ -40,15 +40,20 @@ estão disponíveis; o extra `[gtk]` do pip (que traria
 reproduzível do ambiente validado:
 
 ```bash
-sudo apt install python3-gi gir1.2-webkit2-4.1 libgtk-3-0 xvfb
+sudo apt install python3-gi gir1.2-webkit2-4.1 libgtk-3-0 xvfb python3.12-venv
 # venv com acesso aos pacotes Python do sistema (python3-gi):
 python3 -m venv .venv --system-site-packages
 source .venv/bin/activate
 pip install -r backend/requirements.txt   # instala pywebview==6.2.1 (sem extra)
+# alternativa com uv (reproduzida): 
+#   uv venv .venv --system-site-packages --python /usr/bin/python3.12
+#   uv pip install -r backend/requirements.txt --index-strategy unsafe-best-match
+#   (--index-strategy por causa do --extra-index-url do torch no lock)
 ```
 
-Sem display (`$DISPLAY` vazio) o shell não sobe — esse é um erro
-explícito, não um fallback silencioso.
+Sem display (`$DISPLAY` vazio) o shell termina com exit code 1 e um
+`Gtk-WARNING: cannot open display` no stderr — sem fallback
+silencioso; a mensagem vem do GTK, não do shell.
 
 ## Reproduzir a validação (smoke)
 
