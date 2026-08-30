@@ -28,18 +28,31 @@ would hand ``window.pywebview.api`` to remote content.
 This module enforces two independent, local layers:
 
 1. **Revert navigation** — a ``loaded`` event handler checks the window
-   URL; if it is no longer the local build, it navigates back
-   immediately. The remote document may exist transiently, but cannot
-   be interacted with and does not persist.
+   URL; if it is no longer the local build, it *revokes the trust
+   first* (:meth:`BuildTrust.revoke`) and then navigates back to the
+   entry. The remote document may exist transiently, but cannot be
+   interacted with and does not persist.
 2. **Fail-closed bridge** — the ``js_api`` object checks the URL on
-   *every* call. If the current window URL is not the local build,
-   calls return a sanitized ``bridge_unavailable`` payload instead of
-   executing. Even in the race window before the revert completes,
+   *every* call. A call is served only when the current URL is exactly
+   the URL of the last *completed and committed* local load. Any
+   in-flight navigation — remote, or the revert itself, even when
+   ``get_uri()`` already shows the local entry URL again — leaves the
+   bridge closed. Even in the race window before the revert completes,
    remote code cannot invoke Python through the bridge.
 
 Both layers are simple and local (no proxy, no HTTP server, no extra
 process) and covered by ``backend/tests/test_desktop_navigation.py``
 plus the reproducible smoke in ``scripts/desktop_smoke.py``.
+
+Why the trust must be *revoked* before the revert navigation
+(reviewer follow-up on the same-URL window): WebKitGTK's ``get_uri()``
+reflects the load that *started*. When the revert navigates back to
+the very same ``entry_html`` the window opened with, ``get_uri()``
+returns the previously committed URL while the **remote document is
+still the live document**. URL equality therefore proves neither
+document identity nor load completion; the only thing that may
+re-open the bridge is the ``loaded`` event of the *new* local load
+committing again.
 """
 
 from __future__ import annotations
@@ -137,8 +150,18 @@ class BuildTrust:
     The trust model closes it: only a URL whose load *completed* as a
     local build page (committed by the ``loaded`` handler, which also
     reverts non-local pages) may serve bridge calls, and the current
-    URL must still equal that committed URL. Any in-flight navigation
-    (remote or back) leaves the two out of sync, so the bridge refuses.
+    URL must still equal that committed URL.
+
+    **The same-URL window** (reviewer follow-up): the revert navigates
+    back to the very ``entry_html`` the window opened with. Because
+    ``get_uri()`` flips as soon as that load starts, ``current_url ==
+    committed`` is TRUE again while the remote document is still the
+    live document. URL equality proves neither identity nor
+    completion, so the trust is *revoked* (:meth:`revoke`) the moment
+    a non-local load is reported — BEFORE the revert navigation is
+    issued — and only the ``loaded`` event of the new local load
+    (a fresh commit) may re-open the bridge. There is no state in
+    which an in-flight navigation (remote or revert) serves a call.
 
     Thread-safety: ``loaded`` handlers run on the GUI thread; bridge
     calls arrive on worker threads (WebKit dispatch). A simple lock
@@ -166,12 +189,27 @@ class BuildTrust:
             self._committed = url
         return True
 
+    def revoke(self) -> None:
+        """Drop the committed trust immediately.
+
+        Called the moment a non-local load is reported, BEFORE any
+        revert ``load_url()`` is issued: from that instant until the
+        new local load completes and is committed again, every bridge
+        call fails closed — including calls that arrive while
+        ``get_uri()`` already reads the local entry URL (the revert
+        load started, the remote document may still be alive).
+        """
+        with self._lock:
+            self._committed = None
+
     def is_trusted(self, current_url: str | None) -> bool:
         """True iff ``current_url`` is exactly the committed local URL.
 
-        Any in-flight navigation (remote page alive while a revert load
-        already started, or a local page still loading) fails this
-        check, so the bridge fails closed.
+        The commit only exists between a *completed* local load and
+        the next revocation, so any in-flight navigation (remote page
+        alive while a revert load already started — even to the same
+        URL — or a local page still loading) fails this check and the
+        bridge fails closed.
         """
         with self._lock:
             committed = self._committed
@@ -233,6 +271,71 @@ class LocalBuildBridge:
         return result
 
 
+class NavigationPolicy:
+    """The ``loaded``-handler logic, extracted to be testable (#334).
+
+    Contract (all transitions explicit, no timing assumptions):
+
+    * local load completed → commit the URL as trusted;
+    * non-local load reported → revoke the trust FIRST, then issue the
+      revert ``load_url`` to the entry page;
+    * while the revert is in flight (``get_uri()`` may already read the
+      same entry URL) → the trust stays revoked, so the bridge stays
+      closed;
+    * new local load completed → the ``loaded`` event commits again and
+      the bridge re-opens.
+
+    The object is deliberately passive: no polling, no threads, no
+    timers. It acts only when the window fires ``loaded``.
+    """
+
+    def __init__(
+        self, window: Any, build: ResolvedBuild, entry_uri: str, trust: BuildTrust
+    ) -> None:
+        self._window = window
+        self._build = build
+        self._entry_uri = entry_uri
+        self._trust = trust
+
+    def on_loaded(self) -> None:
+        """Handle one ``loaded`` event (a load completed in the window)."""
+        url = _get_url_safely(self._window.get_current_url)
+        if is_local_build_url(url, self._build):
+            self._trust.commit_if_local(url)
+        else:
+            # Non-local document reported: drop the trust BEFORE the
+            # revert navigation starts. From this instant the bridge is
+            # closed for every caller, including one that arrives while
+            # get_uri() already reads the same entry URL again (the
+            # revert load started, the remote document may still be
+            # the live document).
+            self._trust.revoke()
+            self._window.load_url(self._entry_uri)
+
+
+def make_navigation_policy(
+    window: Any,
+    build: ResolvedBuild,
+    *,
+    entry_uri: str | None = None,
+    trust: BuildTrust | None = None,
+) -> NavigationPolicy:
+    """Build the :class:`NavigationPolicy` for a shell window.
+
+    ``entry_uri`` defaults to ``build.index_html.as_uri()`` (the shell
+    entry; production passes the page it opened, e.g. the smoke page).
+    ``trust`` defaults to a fresh :class:`BuildTrust`; production
+    passes the one the bridge shares so both layers stay in sync.
+    """
+    resolved_entry = entry_uri if entry_uri is not None else build.index_html.as_uri()
+    return NavigationPolicy(
+        window=window,
+        build=build,
+        entry_uri=resolved_entry,
+        trust=trust if trust is not None else BuildTrust(build),
+    )
+
+
 def run_desktop_shell(
     frontend_root: Path | None = None,
     *,
@@ -285,20 +388,18 @@ def run_desktop_shell(
     window_holder.append(window)
 
     # Policy layer 1: on every completed load, commit local pages as
-    # trusted and revert non-local navigation back to the build. The
-    # commit happens after the revert decision: a remote page never
-    # becomes trusted, and the bridge (which requires the committed
-    # URL to match the current one) stays closed during the revert.
-    def _on_loaded() -> None:
-        url = _get_url_safely(window.get_current_url)
-        if is_local_build_url(url, build):
-            trust.commit_if_local(url)
-        else:
-            # Navigate back to the local build; the remote page is
-            # transient and the fail-closed bridge covered the race.
-            window.load_url(entry_html.as_uri())
-
-    window.events.loaded += _on_loaded
+    # trusted and revert non-local navigation back to the build. A
+    # non-local load REVOKES the trust before the revert ``load_url``
+    # is issued, so the bridge stays closed for the whole revert —
+    # including the window where get_uri() already reads the same
+    # entry URL while the remote document is still the live one.
+    policy = make_navigation_policy(
+        window=window,
+        build=build,
+        entry_uri=entry_html.as_uri(),
+        trust=trust,
+    )
+    window.events.loaded += policy.on_loaded
 
     webview.start()
     return 0

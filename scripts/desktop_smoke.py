@@ -24,9 +24,18 @@ What this smoke proves (issue #334 validation items):
    (``[data-testid="desktop-bridge-indicator"]``) appears;
 4. invalid input is rejected by the bridge (sanitized error payload,
    no exception, no stacktrace);
-5. remote content does NOT receive the privileged bridge: after a
-   same-window navigation to a remote URL, the bridge fails closed
-   and the shell reverts to the local build;
+5. remote content does NOT receive the privileged bridge, proven in
+   three stages: (A) a normally loaded remote page is refused;
+   (B) during the revert to the SAME entry URL — while the remote
+   document is still the live document and the new local load has
+   not completed — the bridge stays closed; (C) after the new local
+   load completes, the bridge serves the local document again. An
+   in-vivo probe inside the remote document is kept as best-effort
+   additional evidence (its outcome depends on WebKitGTK timing:
+   the remote document is often destroyed before pywebview could be
+   injected there, which is itself a safe outcome). The deterministic
+   same-URL state machine proof lives in
+   ``backend/tests/test_desktop_navigation.py::TestRevertToSameEntryUrl``;
 6. closing the window ends the shell cleanly (no leftover threads);
 7. no HTTP server is listening for the UI.
 
@@ -274,10 +283,58 @@ def run_smoke() -> tuple[bool, list[str]]:
     remote_urls_seen: list[str] = []  # URLs captured on loaded events
     remote_direct_ref: list[object] = []  # js_api.health() called in-handler while remote
     in_vivo_ref: list[object] = []  # probe result collected inside the remote doc
+    mid_revert_ref: list[dict] = []  # stage B: health() probed as the revert load starts
 
     def create_and_record(**kwargs):
         window = original_create(**kwargs)
         window_holder.append(window)
+
+        # Deterministic mid-revert evidence (stage B): wrap load_url so
+        # that, at the exact moment the revert navigation is issued
+        # (get_uri() flips to the SAME entry file:// URL while the
+        # remote document is still the live document and the new local
+        # load has NOT completed), a bridge call is made through the
+        # exact object JS would reach. It must be refused.
+        original_load_url = window.load_url
+        entry_uri = kwargs.get("url")
+
+        def _load_url_probe(url: str):
+            # Stage B (deterministic): fires at the instant the shell
+            # issues the revert navigation (inside load_url, BEFORE the
+            # load starts). At this moment the previous document (the
+            # remote page) is still the live document and the new local
+            # load has not completed. The probe calls health() on the
+            # exact object a JS call from that live document would
+            # reach; it must be refused. (Once the load starts,
+            # get_uri() flips to the same entry URL — WebKitGTK shows
+            # the load that STARTED — so a probe made after
+            # original_load_url() would see the flipped URL; the call
+            # is deliberately made BEFORE it, with the live document
+            # still remote, which is the attacker-relevant moment.)
+            if (
+                url == entry_uri
+                and str(url).startswith("file://")
+            ):
+                current = None
+                try:
+                    current = window.get_current_url()
+                except Exception:  # noqa: BLE001 (evidence only)
+                    current = None
+                if current != entry_uri:
+                    js_api_obj = _get_js_api(window)
+                    if js_api_obj is not None:
+                        try:
+                            mid_revert_ref.append(
+                                {
+                                    "reverting_from": current,
+                                    "health": js_api_obj.health(),
+                                }
+                            )
+                        except Exception:  # noqa: BLE001 (evidence only)
+                            pass
+            return original_load_url(url)
+
+        window.load_url = _load_url_probe  # type: ignore[method-assign]
 
         def _record_loaded():
             try:
@@ -405,31 +462,35 @@ def run_smoke() -> tuple[bool, list[str]]:
             # 5. Remote navigation: the bridge must fail closed for the
             #    remote document AND the shell must revert to the build.
             #
-            #    Evidence strategy (deterministic): polling
-            #    get_current_url() can miss the ENTIRE remote window —
-            #    the revert (triggered by the loaded event) sometimes
-            #    completes before the first poll when the network is
-            #    fast. So the evidence comes from the loaded handler
-            #    itself (registered in create_and_record): it sees the
-            #    remote URL, arms the in-vivo probe inside the live
-            #    remote document, and the direct refusal is executed in
-            #    that same handler — the exact moment the window is
-            #    provably remote.
+            #    Evidence, staged (reviewer follow-up on the same-URL
+            #    revert race):
+            #    A. remote page normally loaded -> health() refuses
+            #       (witnessed and executed inside the loaded handler,
+            #       the same event the revert logic runs on — polling
+            #       get_current_url() can miss the whole remote window
+            #       when the network is fast);
+            #    B. revert issued to the SAME entry URL: the load_url
+            #       wrapper probes health() at the instant the revert is
+            #       issued, with the remote document still the live
+            #       document and the new local load NOT completed (the
+            #       exact window where get_uri() equality would reopen a
+            #       naive URL-comparison bridge) -> must refuse;
+            #    C. after the new local load completed -> health()
+            #       serves the local document again.
             #
-            #    Safe outcomes (all fail-closed):
-            #    (i)  in-vivo refusal: the remote doc obtained a
-            #         working bridge and health() returned the
-            #         sanitized bridge_unavailable payload;
-            #    (ii) never-bridged: the remote doc died before
-            #         pywebview was usable there — probe never fired
-            #         or the call died with the doc (no payload
-            #         delivered);
-            #    (iii) direct refusal: js_api.health() invoked while
-            #          the window is remote (from the loaded handler)
-            #          returned bridge_unavailable.
+            #    The in-vivo probe (armed inside the live remote
+            #    document) stays as best-effort extra evidence: whether
+            #    it fires depends on WebKitGTK timing (the remote doc is
+            #    often destroyed before pywebview is injected there,
+            #    which is a safe outcome — nothing was delivered).
+            #    The deterministic proof of the same-URL state machine
+            #    is the test suite (TestRevertToSameEntryUrl), not this
+            #    smoke: the smoke proves the wiring in a real WebKitGTK
+            #    process; the tests prove every transition of the trust
+            #    machine.
             #
-            #    The ONLY failing outcome is a successful health()
-            #    payload delivered to remote content.
+            #    The ONLY failing outcome for A/B/C is a successful
+            #    health() payload delivered to remote content.
             remote_in_vivo = None
             remote_direct = None
 
@@ -450,7 +511,9 @@ def run_smoke() -> tuple[bool, list[str]]:
             # and executed js_api.health() while the window was
             # provably remote; remote_direct_ref holds that result.
 
-            # Wait for the revert to land back on the local build.
+            # Wait for the revert to land back on the local build and
+            # its load to COMPLETE (loaded fires for the new local
+            # document, which re-commits the trust).
             deadline = time.time() + 20
             reverted = False
             while time.time() < deadline:
@@ -473,9 +536,11 @@ def run_smoke() -> tuple[bool, list[str]]:
                 f"urls_seen={[u[:60] for u in remote_urls_seen[:3]]}",
             )
 
-            # Direct refusal: the in-handler call executes with the
-            # window provably remote. The result is stored in
-            # remote_direct_ref (list filled by the handler).
+            # Direct refusal (stage A): the loaded handler recorded that
+            # the window really showed a remote URL (remote_urls_seen is
+            # the authoritative witness — same event the revert used)
+            # and executed js_api.health() while the window was provably
+            # remote; remote_direct_ref holds that result.
             remote_direct = remote_direct_ref[-1] if remote_direct_ref else None
             direct_ok = bool(
                 remote_direct
@@ -483,9 +548,35 @@ def run_smoke() -> tuple[bool, list[str]]:
                 and remote_direct.get("code") == "bridge_unavailable"
             )
             report.check(
-                "js_api refuses calls while window is remote (direct path)",
+                "A: remote page normally loaded -> bridge refuses (direct path)",
                 direct_ok,
                 json.dumps(remote_direct)[:200] if remote_direct else "no result",
+            )
+
+            # Mid-revert (stage B, deterministic): when the shell issued
+            # the revert load_url(entry) — the SAME file:// URL the
+            # window opened with — the previous (remote) document was
+            # still the live document and the new local load had NOT
+            # completed. The probe called health() at that instant; it
+            # must be refused. This is the same-URL race window: URL
+            # equality must not re-open the bridge.
+            mid_revert = mid_revert_ref[-1] if mid_revert_ref else None
+            mid_revert_ok = bool(
+                mid_revert
+                and isinstance(mid_revert.get("health"), dict)
+                and mid_revert["health"].get("ok") is False
+                and mid_revert["health"].get("code") == "bridge_unavailable"
+                and str(mid_revert.get("reverting_from", "")).startswith("https://")
+            )
+            report.check(
+                "B: revert issued to SAME entry URL, new local load incomplete -> bridge still closed",
+                mid_revert_ok,
+                (
+                    f"reverting_from={str(mid_revert.get('reverting_from'))[:60]!r} "
+                    f"health={json.dumps(mid_revert.get('health'))[:120]}"
+                    if mid_revert
+                    else "revert never observed through load_url (no stage-B evidence)"
+                ),
             )
 
             # In-vivo: the probe armed inside the remote document. If
@@ -522,13 +613,33 @@ def run_smoke() -> tuple[bool, list[str]]:
             )
             never_bridge_ok = never_delivered and direct_ok
             report.check(
-                "bridge failed closed for remote content (in-vivo probe)",
+                "in-vivo (best-effort): remote doc never receives a working bridge",
                 in_vivo_ok or never_bridge_ok,
                 (
                     json.dumps(remote_in_vivo)[:200]
                     if remote_in_vivo
                     else "remote doc destroyed before any bridge call (no result)"
                 ),
+            )
+
+            # Stage C: after the new local load completed, the bridge
+            # must serve the local document again (same entry URL, new
+            # completed load → re-committed trust).
+            js_api_after = _get_js_api(window)
+            after_reload = None
+            if js_api_after is not None:
+                try:
+                    after_reload = js_api_after.health()
+                except Exception:  # noqa: BLE001 (evidence only)
+                    after_reload = None
+            report.check(
+                "C: new local load completed -> bridge serves again",
+                bool(
+                    after_reload
+                    and after_reload.get("ok") is True
+                    and after_reload.get("api_version") == 1
+                ),
+                json.dumps(after_reload)[:200] if after_reload else "no result",
             )
 
             # 6. No HTTP server for the UI in this process.

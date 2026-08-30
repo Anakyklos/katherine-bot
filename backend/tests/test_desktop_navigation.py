@@ -149,15 +149,13 @@ class TestBridgeFailsClosedOutsideLocalBuild:
         assert wrapper.health()["code"] == ERROR_BRIDGE_UNAVAILABLE
 
     def test_revert_race_local_uri_remote_doc_is_refused(self, tmp_path: Path) -> None:
-        # The exact race found during validation: get_uri() already
-        # returned the local file:// URL (revert load started) while the
-        # remote document is still alive. The committed URL is still the
-        # previous local page — but the URL CHANGED (same path is fine
-        # here: identical URL means no in-flight navigation is visible;
-        # a revert to the same entry URL is indistinguishable from the
-        # committed page, which is safe: the remote doc died when the
-        # revert completed and the local page re-commits on loaded).
-        # The dangerous case is a DIFFERENT local URL racing: refused.
+        # The race found during validation: get_uri() already returned a
+        # local file:// URL (revert load started) while the remote document
+        # is still alive. The committed URL is the previous local page and
+        # the current URL is a DIFFERENT local one, so they disagree — the
+        # mismatch alone refuses. (The harder variant — same URL — is
+        # covered by TestRevertToSameEntryUrl: URL equality must not be
+        # trusted as proof that the local load completed.)
         build = _make_build(tmp_path)
         index_uri = build.index_html.as_uri()
         asset_uri = "file://" + build.dist_dir.as_posix() + "/other.html"
@@ -319,3 +317,318 @@ class TestLoadedHandlerRevertsNavigation:
         _, recorded = self._run_with_stubbed_webview(monkeypatch, tmp_path, "https://example.com/")
         js_api = recorded["create_window_kwargs"]["js_api"]
         assert js_api.health()["code"] == ERROR_BRIDGE_UNAVAILABLE
+
+
+class TestRevertToSameEntryUrl:
+    """The REAL revert race: same entry URL, not a different local one.
+
+    WebKitGTK's ``get_uri()`` reflects the load that *started*. During
+    the revert (remote detected → ``load_url(entry_html)``), the URL can
+    already read the SAME ``file://`` entry while the **remote document
+    is still alive** and the new local load has NOT completed. URL
+    equality between ``current_url`` and the previously committed URL
+    proves neither document identity nor load completion, so a trust
+    model based only on that equality serves the bridge to the remote
+    document. These tests model the machine of states directly:
+
+    * entry local committed → navigation to remote detected → trust
+      REVOKED (before any revert load_url);
+    * revert started, ``get_uri()`` flipped back to the SAME entry URL,
+      new local load NOT completed → bridge still refused;
+    * new local load completed (loaded event, new commit) → bridge
+      serves again.
+
+    Each state is driven through the same functions the real wiring
+    uses; nothing here depends on WebKitGTK timing.
+    """
+
+    # ---- State machine modeled exactly (same entry URL) --------------
+
+    def test_remote_detected_revokes_trust_before_revert_starts(
+        self, tmp_path: Path
+    ) -> None:
+        # Immediately when a loaded event reports a non-local URL, the
+        # trust must be revoked — BEFORE any load_url() navigation back
+        # begins (the old handler kept the commit alive across the
+        # revert, which is what made the same-URL window dangerous).
+        build = _make_build(tmp_path)
+        entry_uri = build.index_html.as_uri()
+        trust = BuildTrust(build)
+        assert trust.commit_if_local(entry_uri) is True
+
+        # Records the trust state at the exact moment the revert
+        # navigation is issued (inside load_url).
+        trust_at_revert: list[bool] = []
+
+        class _Window(_FakeWindowForPolicy):
+            def load_url(self, url: str) -> None:
+                trust_at_revert.append(trust.is_trusted(entry_uri))
+                super().load_url(url)
+
+        window = _Window(entry_uri)
+        window.show("https://example.com/")  # loaded event: remote URL
+        machine = desktop_app_module.make_navigation_policy(
+            window=window, build=build, entry_uri=entry_uri, trust=trust
+        )
+        machine.on_loaded()
+
+        # Revoked BEFORE the revert navigation was issued...
+        assert trust_at_revert == [False]
+        # ...and stays revoked for every URL, including the entry.
+        assert trust.is_trusted(entry_uri) is False
+        assert trust.is_trusted("https://example.com/") is False
+        assert window.load_url_calls == [entry_uri]
+
+    def test_same_url_while_new_local_load_incomplete_keeps_bridge_refused(
+        self, tmp_path: Path
+    ) -> None:
+        # The heart of the race: after the revert load_url() to the SAME
+        # entry_html, get_uri() already returns that same file:// URL
+        # while the remote document is still alive and the new local
+        # load has not completed. A trust model that only compares URLs
+        # would reopen the bridge here — health() must still refuse.
+        build = _make_build(tmp_path)
+        entry_uri = build.index_html.as_uri()
+        trust = BuildTrust(build)
+        assert trust.commit_if_local(entry_uri) is True
+
+        # The loaded event reports the REMOTE document; the policy
+        # revokes and issues the revert.
+        window = _FakeWindowForPolicy("https://example.com/")
+        machine = desktop_app_module.make_navigation_policy(
+            window=window, build=build, entry_uri=entry_uri, trust=trust
+        )
+        machine.on_loaded()
+        assert window.load_url_calls == [entry_uri]
+
+        # Revert started: get_uri() has flipped back to the SAME entry
+        # URL while the remote document is still alive and the new
+        # local load has NOT fired its loaded event yet.
+        window.show(entry_uri)
+        assert window.get_current_url() == entry_uri
+        bridge = LocalBuildBridge(
+            make_js_api(), build, window.get_current_url, trust
+        )
+        assert bridge.health()["code"] == ERROR_BRIDGE_UNAVAILABLE
+
+        # Only after the new local load completes (loaded event → new
+        # commit) may the bridge serve again — same URL, new state.
+        machine.on_loaded()
+        assert bridge.health() == {"ok": True, "api_version": 1}
+
+    def test_bridge_reopens_only_after_new_local_load_completes(
+        self, tmp_path: Path
+    ) -> None:
+        # Full loop: commit → remote detected (revoke) → revert to the
+        # same entry URL (URL already flipped, still refused) → new
+        # local load COMPLETES (loaded event) → bridge serves again.
+        build = _make_build(tmp_path)
+        entry_uri = build.index_html.as_uri()
+        trust = BuildTrust(build)
+        assert trust.commit_if_local(entry_uri) is True
+
+        window = _FakeWindowForPolicy(entry_uri)
+        machine = desktop_app_module.make_navigation_policy(
+            window=window, build=build, entry_uri=entry_uri, trust=trust
+        )
+
+        # 1) Remote detected: trust revoked before the revert.
+        window.show("https://example.com/")
+        machine.on_loaded()
+        assert trust.is_trusted(entry_uri) is False
+
+        # 2) Revert started: URL flipped back to the same entry while the
+        #    remote document is still alive; the bridge keeps refusing.
+        window.show(entry_uri)
+        bridge = LocalBuildBridge(make_js_api(), build, window.get_current_url, trust)
+        assert bridge.health()["code"] == ERROR_BRIDGE_UNAVAILABLE
+
+        # 3) New local load completes: the loaded event re-commits and
+        #    the bridge serves again.
+        machine.on_loaded()
+        assert bridge.health() == {"ok": True, "api_version": 1}
+
+    def test_revert_navigates_to_the_entry_url(self, tmp_path: Path) -> None:
+        # The revert load goes back to the same entry_html the shell
+        # opened (as_uri()), never anywhere else.
+        build = _make_build(tmp_path)
+        entry_uri = build.index_html.as_uri()
+        window = _FakeWindowForPolicy(entry_uri)
+        machine = desktop_app_module.make_navigation_policy(
+            window=window, build=build, entry_uri=entry_uri
+        )
+        window.show("https://example.com/")
+        machine.on_loaded()
+        assert window.load_url_calls == [entry_uri]
+
+    # ---- Handler wiring (stubbed webview, real run_desktop_shell) ----
+
+    def test_run_desktop_shell_wires_policy_with_revoke(self, monkeypatch, tmp_path: Path) -> None:
+        # run_desktop_shell must install a loaded handler that (a) serves
+        # the committed local page, (b) revokes the trust the moment a
+        # remote load is reported and reverts, (c) keeps the bridge
+        # closed while the revert load has flipped get_uri() back to the
+        # SAME entry URL but the new local load has not completed, and
+        # (d) re-opens only after the new local load completed.
+        recorded = _run_shell_with_scripted_urls(monkeypatch, tmp_path)
+        # (a) initial local load: bridge serves.
+        assert recorded["health_after_first_load"]["ok"] is True
+        # (b) remote loaded event: revert issued to the entry URL...
+        assert recorded["load_url_calls"] == [
+            (tmp_path / "dist" / "index.html").resolve().as_uri()
+        ]
+        # ...and the bridge refuses the remote document.
+        assert (
+            recorded["health_after_remote_loaded"]["code"] == ERROR_BRIDGE_UNAVAILABLE
+        )
+        # (c) mid-revert: SAME entry URL visible, new load incomplete —
+        # the bridge must STILL refuse (this is the race being closed).
+        assert recorded["health_mid_revert"]["code"] == ERROR_BRIDGE_UNAVAILABLE
+        # (d) new local load completed: bridge serves again.
+        assert recorded["health_after_reload"]["ok"] is True
+
+
+class _FakeWindowForPolicy:
+    """Minimal window double for the policy machine tests.
+
+    ``show(url)`` scripts what ``get_current_url()`` returns (modeling
+    WebKitGTK's get_uri flipping as loads start), and records
+    ``load_url`` calls.
+    """
+
+    def __init__(self, initial_url: str) -> None:
+        self._current = initial_url
+        self.load_url_calls: list[str] = []
+
+    def get_current_url(self) -> str | None:
+        return self._current
+
+    def show(self, url: str) -> None:
+        self._current = url
+
+    def load_url(self, url: str) -> None:
+        self.load_url_calls.append(url)
+
+
+def _run_shell_with_scripted_urls(monkeypatch, tmp_path: Path) -> dict:
+    """Drive ``run_desktop_shell`` through the same-URL revert race.
+
+    The stubbed window scripts the exact WebKitGTK behavior of the race:
+    (1) initial local load completes; (2) a remote document loads;
+    (3) the shell reverts and get_uri() flips to the SAME entry URL
+    while the new local load is still incomplete — a bridge call made
+    at that moment must be refused; (4) the new local load completes
+    and the bridge serves again.
+
+    ``webview.start()`` plays the role of the GTK main loop: it fires
+    the registered ``loaded`` handlers at each scripted step (the real
+    GTK backend fires them from ``load_changed``/FINISHED).
+    """
+    dist = tmp_path / "dist"
+    dist.mkdir(exist_ok=True)
+    (dist / "index.html").write_text("<html></html>", encoding="utf-8")
+    entry_uri = (dist / "index.html").resolve().as_uri()
+    remote_uri = "https://example.com/"
+
+    recorded: dict = {
+        "health_after_first_load": None,
+        "health_mid_revert": None,
+        "health_after_remote_loaded": None,
+        "health_after_reload": None,
+        "load_url_calls": [],
+    }
+
+    class FakeLoadedEvent:
+        def __init__(self) -> None:
+            self.handlers: list = []
+
+        def __iadd__(self, handler):
+            self.handlers.append(handler)
+            return self
+
+    class FakeEvents:
+        def __init__(self) -> None:
+            self.loaded = FakeLoadedEvent()
+
+    class FakeWindow:
+        """Scripts get_current_url() as WebKitGTK does during the race.
+
+        State machine: the window shows one document at a time;
+        ``load_url`` starts a navigation whose URL is visible
+        immediately (get_uri reflects the load that STARTED) but whose
+        ``loaded`` event only fires later, when the harness lets the
+        main loop run (``finish_loads()``).
+        """
+
+        def __init__(self, **kwargs) -> None:
+            self._kwargs = kwargs
+            self.events = FakeEvents()
+            self._current: str | None = None
+            self._pending_load: str | None = None
+            self.js_api = kwargs.get("js_api")
+
+        def get_current_url(self) -> str | None:
+            return self._current
+
+        def load_url(self, url: str) -> None:
+            recorded["load_url_calls"].append(url)
+            self._pending_load = url
+            # WebKitGTK: get_uri() flips as soon as the load starts,
+            # even though the previous (remote) document is still the
+            # live document until the new load completes.
+            self._current = url
+
+        def fire_loaded(self) -> None:
+            for handler in list(self.events.loaded.handlers):
+                handler()
+
+        def finish_loads(self) -> None:
+            if self._pending_load is not None:
+                self._pending_load = None
+                self.fire_loaded()
+
+        def navigate(self, url: str) -> None:
+            # A same-window navigation not issued by the shell (e.g. a
+            # link click or location assignment in the page).
+            self._current = url
+            self.fire_loaded()
+
+        def health(self) -> dict:
+            return self.js_api.health()
+
+    window_holder: list = []
+
+    def _create_window(**kwargs):
+        window = FakeWindow(**kwargs)
+        window_holder.append(window)
+        return window
+
+    def _start():
+        win = window_holder[0]
+        # 1) The initial local load completes (loaded fires, commit).
+        win._current = entry_uri
+        win.fire_loaded()
+        recorded["health_after_first_load"] = win.health()
+        # 2) Same-window navigation to a remote document; its load
+        #    completes (loaded fires with the remote URL) → the shell
+        #    must revoke the trust and issue the revert.
+        win.navigate(remote_uri)
+        recorded["health_after_remote_loaded"] = win.health()
+        # 3) Mid-revert: load_url(entry) already flipped get_uri() to
+        #    the SAME entry URL while the remote document is still the
+        #    live document and the new local load has NOT completed.
+        #    A bridge call made right now must be refused.
+        recorded["health_mid_revert"] = win.health()
+        # 4) The new local load completes (loaded fires) → commit →
+        #    the bridge serves the local document again.
+        win.finish_loads()
+        recorded["health_after_reload"] = win.health()
+
+    fake_webview = types.SimpleNamespace(
+        create_window=_create_window,
+        start=_start,
+    )
+    monkeypatch.setattr(desktop_app_module, "webview", fake_webview)
+
+    desktop_app_module.run_desktop_shell(frontend_root=tmp_path)
+    return recorded

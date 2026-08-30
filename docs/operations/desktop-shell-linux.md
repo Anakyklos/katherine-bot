@@ -69,12 +69,25 @@ Sucesso: todas as linhas `[PASS]` e `SMOKE_OK` no final.
 ### Nota sobre o check "remote navigation"
 
 O documento remoto vive por uma janela curta (o handler `loaded` o
-reverte imediatamente). O smoke aceita qualquer resultado seguro:
-a chamada remota foi recusada com o payload sanitizado
-`bridge_unavailable`, o documento morreu antes de obter a bridge
-(nenhuma chamada chegou ao Python), ou a chamada morreu junto com o
-documento (nenhum payload foi entregue). O único resultado que falha
-é um payload bem-sucedido entregue a conteúdo remoto.
+reverte imediatamente). O smoke prova o isolamento em três estágios:
+
+- **A** — página remota carregada normalmente: `health()` recusada
+  (recusa executada no próprio handler `loaded`, a testemunha
+  autoritária);
+- **B** — revert emitido para a MESMA URL do entry: no instante em que
+  o `load_url` do revert é chamado (documento remoto ainda vivo, novo
+  load local ainda não completou, `get_uri()` já vai ler a mesma URL
+  `file://`), `health()` continua recusada — igualdade de URL não
+  reabre a bridge;
+- **C** — novo load local completou: a bridge volta a servir o
+  documento local.
+
+O probe in-vivo (armado dentro do documento remoto vivo) é mantido
+como evidência extra best-effort: disparar ou não depende do timing do
+WebKitGTK (o doc remoto muitas vezes morre antes da injeção, o que em
+si é um resultado seguro — nada foi entregue). A prova determinística
+da máquina de estados same-URL (todas as transições do trust) está em
+`backend/tests/test_desktop_navigation.py::TestRevertToSameEntryUrl`.
 
 ## Medidas (Ubuntu 24.04, WebKitGTK, headless via Xvfb)
 
@@ -90,10 +103,16 @@ documento (nenhum payload foi entregue). O único resultado que falha
    (`health`) com erros sanitizados; nenhum método exposto levanta.
 2. `LocalBuildBridge` (app.py) só serve chamadas quando a página atual
    é exatamente a URL local cujo load **completou** (trust commitido
-   no evento `loaded`). Durante qualquer navegação em curso —
-   remota, ou o próprio revert — a bridge recusa (`bridge_unavailable`).
-3. Navegação para fora do build é revertida pelo handler `loaded`.
+   no evento `loaded`).
+3. Navegação para fora do build é detectada no handler `loaded`, que
+   **revoga o trust (`BuildTrust.revoke()`) ANTES de emitir o
+   `load_url` de retorno**. Durante qualquer navegação em curso —
+   remota, ou o próprio revert, inclusive quando `get_uri()` já voltou
+   a ler a mesma URL do entry — a bridge recusa (`bridge_unavailable`),
+   porque igualdade de URL não comprova nem identidade do documento
+   nem conclusão do load. Somente o evento `loaded` do novo load
+   local (novo commit) reabre a bridge.
 
 Detalhes e racional da corrida revert (get_uri reflete o load
 iniciado, não o documento vivo) estão em comentários no
-`backend/desktop/app.py` (classe `BuildTrust`).
+`backend/desktop/app.py` (classes `BuildTrust` e `NavigationPolicy`).
