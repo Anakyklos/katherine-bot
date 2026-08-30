@@ -5,12 +5,17 @@ reached by remote content and that the shell adds no servers/processes:
 
 * the window URL is always a local ``file://`` URI derived from the
   resolved build — never an arbitrary caller-supplied URL;
-* the module exposes no generic navigation to the JS side (the API
-  allowlist stays the only surface);
+* the object delivered to ``js_api`` is the sanitized facade and its
+  exposed surface is exactly the allowlist (no generic dispatch, no
+  extra attributes pywebview would expose);
 * no ``http(s)`` hosting is introduced: the entrypoint imports FastAPI
   nowhere and binds no sockets (import purity + grep-level evidence);
 * banned capabilities (eval/exec/subprocess/shell/webbrowser/open) are
   absent from the desktop package.
+
+Behavioral sanitization/fail-closed tests live in
+``test_desktop_api.py`` and ``test_desktop_navigation.py``; this module
+keeps the structural (AST/source-level) guarantees.
 """
 
 from __future__ import annotations
@@ -19,7 +24,7 @@ import ast
 from pathlib import Path
 
 import backend.desktop.app as desktop_app_module
-from backend.desktop.api import DESKTOP_API_METHODS, DesktopApi, safe_call
+from backend.desktop.api import DESKTOP_API_METHODS, make_js_api
 
 _DESKTOP_DIR = Path(desktop_app_module.__file__).parent
 _PY_SOURCES = sorted(_DESKTOP_DIR.glob("*.py"))
@@ -51,19 +56,29 @@ class TestLocalOnlyWindowUrl:
 class TestNoBridgeForRemoteContent:
     def test_allowlist_remains_the_only_js_surface(self) -> None:
         # Any future navigation feature must go through review: today the
-        # exposed surface is exactly health, and safe_call refuses anything
-        # else with a sanitized error.
+        # exposed surface is exactly health, and the real boundary object
+        # (make_js_api()) exposes nothing else. There is no generic
+        # dispatch: calling a non-allowlisted name is structurally
+        # impossible (pywebview only proxies real attributes).
         assert DESKTOP_API_METHODS == ("health",)
-        assert safe_call(DesktopApi(), "navigate", "https://example.com") == {
-            "ok": False,
-            "code": "invalid_input",
-            "message": "Unknown method.",
-        }
-        assert safe_call(DesktopApi(), "eval", "1+1")["code"] == "invalid_input"
+        bridge = make_js_api()
+        public = sorted(name for name in dir(bridge) if not name.startswith("_"))
+        assert public == ["health"]
+
+    def test_bridge_has_no_generic_dispatch_or_passthrough(self) -> None:
+        # The facade must not add __getattr__/__call__/passthrough that
+        # could turn attribute access into generic execution.
+        bridge = make_js_api()
+        assert "__getattr__" not in vars(type(bridge))
+        assert "__call__" not in vars(type(bridge))
+        # And no dynamic attribute exposure beyond the allowlist.
+        assert not hasattr(bridge, "navigate")
+        assert not hasattr(bridge, "eval")
+        assert not hasattr(bridge, "api")
 
     def test_desktop_api_has_no_file_or_shell_capabilities(self) -> None:
-        # The API object handed to JS has no file/shell/process surface.
-        api = DesktopApi()
+        # The object handed to JS has no file/shell/process surface.
+        bridge = make_js_api()
         for banned in (
             "open",
             "read",
@@ -76,7 +91,7 @@ class TestNoBridgeForRemoteContent:
             "env",
             "navigate",
         ):
-            assert not hasattr(api, banned), f"bridge must not expose {banned!r}"
+            assert not hasattr(bridge, banned), f"bridge must not expose {banned!r}"
 
 
 class TestNoHttpHosting:
