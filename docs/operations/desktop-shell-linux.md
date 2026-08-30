@@ -78,9 +78,10 @@ documento (nenhum payload foi entregue). O único resultado que falha
 
 ## Medidas (Ubuntu 24.04, WebKitGTK, headless via Xvfb)
 
-- Startup até página carregada: ~550-650ms
-- RSS idle: ~175MB (pico durante load: ~200MB)
-- CPU idle: 1-2% (0% em steady state)
+- Startup até página carregada: ~550-650ms (do início do processo,
+  incluindo resolução do build; janela do webview apenas: ~260-450ms)
+- RSS idle: ~180-184MB; pico (VmHWM): ~183MB
+- CPU: 1-2% durante o load; 0% em steady state (10s de amostragem)
 - Processos: 1 (nenhum servidor/worker extra)
 
 ## Modelo de confiança da bridge (resumo)
