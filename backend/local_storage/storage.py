@@ -164,6 +164,53 @@ def _time_now_unix() -> float:
     return _time.time()
 
 
+def _split_sql_statements(sql: str) -> list[str]:
+    """Split a migration into individual statements.
+
+    Handles ``BEGIN ... END`` blocks (trigger bodies) by tracking block
+    depth, plus single/double-quoted strings. Statements are stripped;
+    empty fragments are dropped. A future migration may therefore
+    include triggers with embedded semicolons safely.
+    """
+    statements: list[str] = []
+    current: list[str] = []
+    in_single = False
+    in_double = False
+    depth = 0
+    word: list[str] = []
+    i = 0
+    while i < len(sql):
+        ch = sql[i]
+        if ch == "'" and not in_double:
+            in_single = not in_single
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+        if not in_single and not in_double:
+            # track BEGIN/END keywords for trigger bodies
+            if ch.isalpha():
+                word.append(ch)
+            else:
+                joined = "".join(word).upper()
+                if joined == "BEGIN":
+                    depth += 1
+                elif joined == "END" and depth > 0:
+                    depth -= 1
+                word = []
+            if ch == ";" and depth == 0:
+                fragment = "".join(current).strip()
+                if fragment:
+                    statements.append(fragment)
+                current = []
+                i += 1
+                continue
+        current.append(ch)
+        i += 1
+    tail = "".join(current).strip()
+    if tail:
+        statements.append(tail)
+    return statements
+
+
 class LocalStorage:
     """Single-process SQLite store for the Katherine desktop app."""
 
@@ -224,30 +271,36 @@ class LocalStorage:
             raise PersistenceError("storage_unavailable", "persistence error") from None
 
     def _run_migrations(self, conn: sqlite3.Connection) -> None:
+        """Apply pending migrations atomically, version row included.
+
+        ``executescript`` is deliberately avoided: it issues an implicit
+        COMMIT before running, which would let a migration's DDL land
+        without its version row (the failure mode of issue #335 test 8).
+        Instead each migration is split into statements executed one by
+        one inside the same transaction that inserts its version row:
+        either the whole migration + its record commit, or nothing does.
+        """
         with self._lock:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                conn.executescript(migrations_module.BOOTSTRAP_SQL)
-                # executescript commits; re-open the transaction explicitly
+            conn.executescript(migrations_module.BOOTSTRAP_SQL)
+            applied_rows = conn.execute(
+                "select version from schema_migrations"
+            ).fetchall()
+            applied = {row[0] for row in applied_rows}
+            for version in migrations_module.pending_versions(applied):
+                sql = migrations_module.migration_sql(version)
                 conn.execute("BEGIN IMMEDIATE")
-                applied_rows = conn.execute(
-                    "select version from schema_migrations"
-                ).fetchall()
-                applied = {row[0] for row in applied_rows}
-                for version in migrations_module.pending_versions(applied):
-                    sql = migrations_module.migration_sql(version)
-                    conn.executescript(sql)
-                    conn.execute(
-                        "BEGIN IMMEDIATE"
-                    )  # executescript auto-committed again
+                try:
+                    for statement in _split_sql_statements(sql):
+                        conn.execute(statement)
                     conn.execute(
                         "insert into schema_migrations (version) values (?)",
                         (version,),
                     )
-                conn.execute("COMMIT")
-            except Exception:
-                conn.execute("ROLLBACK")
-                raise
+                    conn.execute("COMMIT")
+                except Exception:
+                    if conn.in_transaction:
+                        conn.execute("ROLLBACK")
+                    raise
 
     def _recover_interrupted_turns(self, conn: sqlite3.Connection) -> None:
         """Fail-close pending rows left by a crash: never auto-recompute."""
@@ -389,21 +442,20 @@ class LocalStorage:
 
         with self._lock:
             conn = self._connection()
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                existing = conn.execute(
-                    "select status, committed_revision, user_message_chat_log_id, "
-                    "assistant_message_chat_log_id, replay_payload "
-                    "from turn_requests where request_id = ?",
-                    (request_id,),
-                ).fetchone()
-                if existing is not None and existing[0] == "completed":
-                    committed = self._committed_from_row(
-                        request_id, existing[1], existing[2], existing[3], existing[4]
-                    )
-                    conn.execute("COMMIT")
-                    return committed
+            # Idempotency first, without opening a write transaction.
+            existing = conn.execute(
+                "select status, committed_revision, user_message_chat_log_id, "
+                "assistant_message_chat_log_id, replay_payload "
+                "from turn_requests where request_id = ?",
+                (request_id,),
+            ).fetchone()
+            if existing is not None and existing[0] == "completed":
+                return self._committed_from_row(
+                    request_id, existing[1], existing[2], existing[3], existing[4]
+                )
 
+            try:
+                conn.execute("BEGIN IMMEDIATE")
                 profile_row = conn.execute(
                     "select revision from profiles where id = 1"
                 ).fetchone()
@@ -420,7 +472,6 @@ class LocalStorage:
                         )
                     expected = expected_revision
                 if expected != current_revision:
-                    conn.execute("ROLLBACK")
                     raise ConflictError(
                         "revision_mismatch",
                         "Profile revision changed concurrently.",
@@ -495,16 +546,10 @@ class LocalStorage:
                     )
 
                 conn.execute("COMMIT")
-            except ConflictError:
-                raise
-            except ValidationError:
+            except (ConflictError, ValidationError):
                 if conn.in_transaction:
                     conn.execute("ROLLBACK")
                 raise
-            except sqlite3.IntegrityError:
-                if conn.in_transaction:
-                    conn.execute("ROLLBACK")
-                raise PersistenceError("database_error", "persistence error") from None
             except sqlite3.Error:
                 if conn.in_transaction:
                     conn.execute("ROLLBACK")
@@ -514,14 +559,14 @@ class LocalStorage:
                     conn.execute("ROLLBACK")
                 raise
 
-        return CommittedTurn(
-            request_id=request_id,
-            revision=new_revision,
-            user_message_id=user_message_id,
-            assistant_message_id=assistant_message_id,
-            response=replay_payload.get("response", ""),
-            emotion_state=replay_payload.get("emotion_state", {}),
-        )
+            return CommittedTurn(
+                request_id=request_id,
+                revision=new_revision,
+                user_message_id=user_message_id,
+                assistant_message_id=assistant_message_id,
+                response=replay_payload.get("response", ""),
+                emotion_state=replay_payload.get("emotion_state", {}),
+            )
 
     def _committed_from_row(
         self,

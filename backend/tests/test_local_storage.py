@@ -96,8 +96,10 @@ class TestMigrations:
         second.close()
 
     def test_partial_migration_failure_never_marks_schema(self, tmp_path: Path) -> None:
-        # Inject a failing migration (DDL that raises) into the migration list
-        # of a fresh store; the version must NOT be recorded.
+        # A migration whose LAST statement fails (trigger aborts the
+        # insert): the earlier DDL inside the same migration must roll
+        # back too — neither the broken table nor the version row may
+        # survive. This is the real mid-migration atomicity case.
         from backend.local_storage import migrations as migrations_module
 
         original = migrations_module.MIGRATIONS
@@ -107,14 +109,11 @@ class TestMigrations:
                 "create table broken_table (id integer primary key);\n"
                 "create trigger boom before insert on broken_table begin "
                 "select raise(ABORT,'boom'); end;\n"
-                "create table this_will_fail (id integer primary key, "
-                "check (1 = 0));\n"
                 "insert into broken_table values (1);",
             )
         ]
-        monkeyver = original
         try:
-            migrations_module.MIGRATIONS = broken
+            migrations_module.MIGRATIONS = tuple(broken)
             path = tmp_path / "partial.db"
             with pytest.raises(Exception):
                 open_local_storage(path)
@@ -122,10 +121,14 @@ class TestMigrations:
             marked = conn.execute(
                 "select count(*) from schema_migrations where version = 99999"
             ).fetchone()[0]
+            table_left = conn.execute(
+                "select count(*) from sqlite_master where name='broken_table'"
+            ).fetchone()[0]
             conn.close()
             assert marked == 0
+            assert table_left == 0, "mid-migration DDL must roll back with the version row"
         finally:
-            migrations_module.MIGRATIONS = monkeyver
+            migrations_module.MIGRATIONS = original
 
 
 class TestRestartAndRecovery:
