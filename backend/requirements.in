@@ -7,3 +7,4 @@ supabase==2.31.0
 sentence-transformers==5.6.0
 pydantic==2.13.4
 torch==2.13.0+cpu
+pywebview==6.2.1

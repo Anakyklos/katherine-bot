@@ -1,11 +1,27 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Eraser, Check, X } from 'lucide-react';
+import { checkDesktopHealth } from '../../../lib/desktopBridge';
 
 const ChatHeader = ({ clearScreen }) => {
     const [showConfirm, setShowConfirm] = useState(false);
     const clearButtonRef = useRef(null);
     const prevShowConfirm = useRef(showConfirm);
     const [shouldFocusClearButton, setShouldFocusClearButton] = useState(false);
+    const [desktopBridge, setDesktopBridge] = useState(null);
+
+    useEffect(() => {
+        // Desktop shell probe (#334): shows the JS->Python->JS round trip.
+        // Stays null (hidden) in web mode; never blocks the UI.
+        let active = true;
+        checkDesktopHealth().then((health) => {
+            if (active) {
+                setDesktopBridge(health);
+            }
+        });
+        return () => {
+            active = false;
+        };
+    }, []);
 
     useEffect(() => {
         // Focus restoration when confirmation closes
@@ -41,8 +57,19 @@ const ChatHeader = ({ clearScreen }) => {
 
     return (
         <header className="flex-shrink-0 h-16 border-b border-gray-800 flex items-center justify-between px-4 md:px-8 bg-gray-900 z-10">
-            <div className="font-semibold text-lg tracking-tight text-white">
-                Katherine <span className="text-gray-500 font-normal">– SoulMate</span>
+            <div className="flex items-center gap-3">
+                <div className="font-semibold text-lg tracking-tight text-white">
+                    Katherine <span className="text-gray-500 font-normal">– SoulMate</span>
+                </div>
+                {desktopBridge && (
+                    <span
+                        data-testid="desktop-bridge-indicator"
+                        title="Desktop bridge (pywebview) round trip: OK"
+                        className="text-xs text-green-400/80 border border-green-400/30 rounded-full px-2 py-0.5"
+                    >
+                        desktop v{desktopBridge.api_version}
+                    </span>
+                )}
             </div>
 
             {showConfirm ? (

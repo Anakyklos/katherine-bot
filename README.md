@@ -37,6 +37,16 @@ The project is divided into two main components:
    > **Production:** Use `python -m backend.serve` instead.
    > See [Production Containment](docs/operations/production-containment.md).
 
+### Desktop Shell (Linux)
+
+```bash
+python -m backend.desktop.app
+```
+
+Opens the production frontend build in a native GTK window (WebKitGTK)
+via `file://` — no HTTP server. See
+[Desktop Shell no Linux](docs/operations/desktop-shell-linux.md).
+
 ### Frontend
 
 1. Navigate to the `frontend` directory:
