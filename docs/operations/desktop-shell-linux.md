@@ -77,7 +77,7 @@ cd frontend && npm ci && npm run build && cd ..
 
 # smoke headless
 xvfb-run -a -s "-screen 0 1280x800x24" \
-  ../.venv/bin/python scripts/desktop_smoke.py
+  .venv/bin/python scripts/desktop_smoke.py
 ```
 
 Sucesso: todas as linhas `[PASS]` e `SMOKE_OK` no final.
