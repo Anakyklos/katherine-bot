@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 
 from backend.local_storage import (
+    ConflictError,
     LocalStorage,
     StorageCorruptError,
     default_database_path,
@@ -663,3 +664,144 @@ def test_turn_request_row_shape_matches_transactional_contract(tmp_path: Path) -
     assert row[4] != row[5]
     payload = json.loads(row[6])
     assert payload["response"] == "r-shape"
+
+
+class TestRealDomainTurnCycle:
+    """The store supports the operations the real turn flow uses, exercised
+    with the production domain modules (no mocks, no synthetic copies).
+
+    This mirrors the use-case sequence of ``process_turn``:
+    load state + revision → real domain transition → commit_turn with
+    expected_revision → public result parsed back from the persisted
+    payload → replay returns the same persisted result idempotently.
+    """
+
+    def test_full_turn_cycle_with_real_domain_transitions(self, tmp_path: Path) -> None:
+        from backend.emotional_domain import AppraisalV1, EmotionalStateV1
+        from backend.emotional_domain.transition import TransitionConfig, transition
+        from backend.relationship import (
+            RelationshipStateV1,
+            RelationshipTransitionConfig,
+            transition_relationship,
+        )
+
+        store = open_local_storage(tmp_path / "katherine.db")
+
+        # ── turn 1: fresh state, real domain transitions ──────────────────
+        user_state = store.load_user_state()
+        prev_emotional = EmotionalStateV1.from_dict(user_state.emotional_state)
+        prev_relationship = RelationshipStateV1.from_dict(
+            user_state.relationship_state
+        )
+        revision = user_state.revision
+
+        appraisal = AppraisalV1.create(
+            valence_shift=0.3, arousal_shift=0.2, dominance_shift=0.0
+        )
+        t1 = max(prev_emotional.timestamp, prev_relationship.timestamp) + 100.0
+        t2 = t1 + 100.0
+        emotional_result = transition(
+            prev_emotional, appraisal, t1, TransitionConfig.defaults()
+        )
+        new_relationship = transition_relationship(
+            prev_relationship,
+            appraisal,
+            t2,
+            RelationshipTransitionConfig.defaults(),
+        )
+
+        committed = store.commit_turn(
+            request_id="req-cycle-1",
+            user_message="oi Katherine",
+            assistant_message="olá!",
+            emotional_state=emotional_result.state.to_dict(),
+            relationship_state=new_relationship.to_dict(),
+            public_response="olá!",
+            replay_payload={
+                "response": "olá!",
+                "emotion_state": {"v": 1, "valence": 0.1},
+            },
+            outbox_events=[],
+            expected_revision=revision,
+        )
+
+        # Public result is parsed back from the persisted payload — never
+        # from pre-commit variables (process_turn contract).
+        assert committed.response == "olá!"
+        assert committed.revision == revision + 1
+        replayed = store.replay("req-cycle-1")
+        assert replayed.status == "completed"
+        assert replayed.committed.revision == committed.revision
+        assert replayed.committed.response == committed.response
+
+        # ── turn 2: loads turn 1's persisted snapshots, CAS advances ──────
+        user_state_2 = store.load_user_state()
+        assert user_state_2.revision == committed.revision
+        roundtrip_emotional = EmotionalStateV1.from_dict(
+            user_state_2.emotional_state
+        )
+        assert roundtrip_emotional.to_dict() == emotional_result.state.to_dict()
+        roundtrip_relationship = RelationshipStateV1.from_dict(
+            user_state_2.relationship_state
+        )
+        assert roundtrip_relationship.to_dict() == new_relationship.to_dict()
+
+        appraisal_2 = AppraisalV1.create(
+            valence_shift=-0.2, arousal_shift=0.1, dominance_shift=0.0
+        )
+        emotional_result_2 = transition(
+            roundtrip_emotional, appraisal_2, t2, TransitionConfig.defaults()
+        )
+        committed_2 = store.commit_turn(
+            request_id="req-cycle-2",
+            user_message="tudo bem?",
+            assistant_message="tudo ótimo",
+            emotional_state=emotional_result_2.state.to_dict(),
+            relationship_state=roundtrip_relationship.to_dict(),
+            public_response="tudo ótimo",
+            replay_payload={
+                "response": "tudo ótimo",
+                "emotion_state": {"v": 1, "valence": -0.05},
+            },
+            outbox_events=[],
+            expected_revision=user_state_2.revision,
+        )
+        assert committed_2.revision == committed.revision + 1
+
+        # ── stale CAS from turn 1 must be rejected with the real error ──
+        with pytest.raises(ConflictError) as excinfo:
+            store.commit_turn(
+                request_id="req-cycle-stale",
+                user_message="x",
+                assistant_message="y",
+                emotional_state=emotional_result.state.to_dict(),
+                relationship_state=roundtrip_relationship.to_dict(),
+                public_response="y",
+                replay_payload={"response": "y", "emotion_state": {}},
+                outbox_events=[],
+                expected_revision=revision,
+            )
+        assert excinfo.value.code == "revision_mismatch"
+        # actual_revision is the real profile revision at CAS time (both
+        # turns committed), expected is the stale value the caller sent.
+        assert excinfo.value.actual_revision == committed_2.revision
+        assert excinfo.value.expected_revision == revision
+
+        # ── history carries both turns in order ─────────────────────────
+        history = store.load_recent_history(limit=10)
+        assert [m["role"] for m in history] == [
+            "user",
+            "assistant",
+            "user",
+            "assistant",
+        ]
+        assert history[1]["content"] == "olá!"
+
+        # ── backup mid-life is consistent and restorable ────────────────
+        backup_path = tmp_path / "backup.db"
+        store.backup_to(backup_path)
+        store.close()
+        restored = open_local_storage(backup_path)
+        assert restored.load_user_state().revision == committed_2.revision
+        assert len(restored.load_recent_history(limit=10)) == 4
+        restored.close()
