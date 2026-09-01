@@ -87,6 +87,24 @@ O smoke abre a janela real em `file://` e verifica, com probes
     verdade (0 linhas em `chat_logs` depois, verificação
     independente).
 
+**Caminho de aceitação do usuário (#336, mesmo smoke):**
+
+16. envio REAL pela UI: digitar no textarea → clicar em enviar →
+    ChatWindow renderiza a resposta (useChat → transport → bridge →
+    runtime → SQLite, sem chamar a bridge diretamente);
+17. privacidade REAL pela UI: clicar "Apagar histórico" → confirmação
+    explícita → status "Operação concluída" renderizado (o painel
+    real, não chamadas diretas de bridge).
+
+**Prova do provider real (bloqueio registrado):** o smoke usa provider
+scriptado porque a rede Groq não é determinística nem gratuita. A perna
+de rede real com chave Groq não é executada neste ambiente (nenhuma
+chave configurada — `runtime_state().provider_configured == false`); o
+comportamento sem chave foi verificado no caminho de produção: o app
+abre, lê histórico, e o primeiro turno retorna o erro sanitizado
+`configuration` ("O provedor remoto não está configurado neste
+ambiente.") sem traceback, path ou segredo.
+
 ```bash
 # build do frontend (produz dist/index.html e dist/desktop-smoke.html)
 cd frontend && npm ci && npm run build && cd ..

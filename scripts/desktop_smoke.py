@@ -46,14 +46,23 @@ runtime persistence):
 8. runtime_state() through the real bridge reports local storage
    ready with no cloud dependency;
 9. a full turn driven through send_message() (scripted offline
-   provider — no Groq quota, no network) commits locally;
+   provider — no Groq quota, no network) commits locally — AND the
+   same turn is first driven through the REAL UI (textarea, send
+   button, ChatWindow rendering the reply), the exact end-user
+   acceptance path;
 10. the turn is durable in SQLite, proven by an independent
     read-only stdlib sqlite3 connection (not the runtime's read
     path);
 11. a FRESH runtime over the same file (what a relaunch is)
     recovers the conversation and the stored revision;
 12. the local privacy op delete_history() really erases (0 message
-    rows in chat_logs afterwards, verified independently).
+    rows in chat_logs afterwards, verified independently);
+13. USER ACCEPTANCE: a turn driven through the REAL UI (textarea,
+    send button, ChatWindow rendering the reply) — the exact path a
+    user takes, not a direct bridge call;
+14. USER ACCEPTANCE: the privacy panel driven through the REAL UI
+    (click Apagar histórico -> explicit Confirmar -> success status
+    rendered).
 
 Threading model: pywebview requires the GTK main loop on the main
 thread, so ``webview.start()`` runs on the main thread and the probes
@@ -133,6 +142,93 @@ _PROBE_INVALID_INPUT = """
 """
 
 _PROBE_COLLECT_INVALID = "(() => window.__smokeInvalid)()"
+
+#: #336: drive a real turn through the REAL UI (ChatInput -> useChat ->
+#: transport -> bridge), not by calling the bridge directly. The probe
+#: types into the textarea, clicks send, and collects the rendered
+#: assistant message. This proves the whole user acceptance path.
+_PROBE_UI_SEND = """
+(() => {
+  window.__smokeUiSend = 'pending';
+  (async () => {
+    try {
+      const input = document.querySelector('textarea[aria-label="Sua mensagem"]');
+      if (!input) { window.__smokeUiSend = { error: 'no textarea' }; return; }
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+      setter.call(input, 'Mensagem real do smoke #336 via UI');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      const send = document.querySelector('button[aria-label="Enviar mensagem (Enter)"]');
+      if (!send) { window.__smokeUiSend = { error: 'no send button' }; return; }
+      send.click();
+      // Wait for the assistant reply to render. The bubbles carry no
+      // stable class names, so observe the whole page text — the
+      // scripted reply string is unique to this run.
+      const deadline = Date.now() + 30000;
+      while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 500));
+        const text = document.body.innerText || '';
+        if (text.includes('Resposta de teste do smoke local')) {
+          window.__smokeUiSend = { sent: true, replied: true };
+          return;
+        }
+      }
+      window.__smokeUiSend = { sent: true, replied: false, bodySample: (document.body.innerText || '').slice(0, 300) };
+    } catch (e) {
+      window.__smokeUiSend = { threw: true, message: String(e).slice(0, 200) };
+    }
+  })();
+  return 'started';
+})()
+"""
+
+_PROBE_COLLECT_UI_SEND = "(() => window.__smokeUiSend)()"
+
+#: #336: exercise the PRIVACY PANEL through the real UI. Clicks the
+#: button, confirms the explicit confirmation dialog, and collects the
+#: rendered success status. This is the destructive-op acceptance path
+#: (user-initiated local erase), driven exactly as a user would.
+_PROBE_UI_PRIVACY = """
+(() => {
+  window.__smokeUiPrivacy = 'pending';
+  (async () => {
+    try {
+      const panel = document.querySelector('[data-testid="privacy-panel"]');
+      if (!panel) { window.__smokeUiPrivacy = { error: 'no privacy panel' }; return; }
+      const byText = (t) => Array.from(panel.querySelectorAll('button'))
+        .find(b => (b.innerText || '').trim() === t);
+      const start = byText('Apagar histórico');
+      if (!start) { window.__smokeUiPrivacy = { error: 'no Apagar histórico button' }; return; }
+      start.click();
+      // The confirmation renders through React state; give it time and
+      // retry the click (a disabled/pending op blocks the re-render).
+      const cDeadline = Date.now() + 15000;
+      let confirmBtn = null;
+      while (Date.now() < cDeadline && !confirmBtn) {
+        await new Promise(r => setTimeout(r, 400));
+        confirmBtn = byText('Confirmar');
+        if (!confirmBtn && !start.disabled) start.click();
+      }
+      if (!confirmBtn) { window.__smokeUiPrivacy = { error: 'no confirmation shown' }; return; }
+      confirmBtn.click();
+      const deadline = Date.now() + 30000;
+      while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 400));
+        const status = panel.querySelector('[role="status"]');
+        if (status && (status.innerText || '').includes('Operação concluída')) {
+          window.__smokeUiPrivacy = { confirmed: true, status: status.innerText };
+          return;
+        }
+      }
+      window.__smokeUiPrivacy = { confirmed: true, status: 'timeout waiting for status' };
+    } catch (e) {
+      window.__smokeUiPrivacy = { threw: true, message: String(e).slice(0, 200) };
+    }
+  })();
+  return 'started';
+})()
+"""
+
+_PROBE_COLLECT_UI_PRIVACY = "(() => window.__smokeUiPrivacy)()"
 
 _PROBE_NAVIGATE_REMOTE = """
 (() => {
@@ -512,6 +608,41 @@ def run_smoke() -> tuple[bool, list[str]]:
                 "ChatHeader desktop badge (round trip visible in chat UI)",
                 bool(badge and "desktop" in str(badge.get("text", ""))),
                 json.dumps(badge)[:120] if badge else "badge not found",
+            )
+
+            # 3b. #336: user acceptance path. Drive a REAL turn through
+            #     the actual UI (textarea -> send button -> useChat ->
+            #     transport -> bridge -> runtime -> SQLite) — not by
+            #     calling the bridge directly. The scripted reply
+            #     rendering in the ChatWindow is the end-user-visible
+            #     outcome.
+            window.evaluate_js(_PROBE_UI_SEND)
+            ui_send = _poll_probe(window, _PROBE_COLLECT_UI_SEND, timeout=45)
+            report.check(
+                "real UI send: user message -> bridge turn -> reply renders",
+                bool(
+                    ui_send
+                    and isinstance(ui_send, dict)
+                    and ui_send.get("sent") is True
+                    and ui_send.get("replied") is True
+                ),
+                json.dumps(ui_send)[:300] if ui_send else "no result",
+            )
+
+            # 3c. #336: destructive-op acceptance path through the REAL
+            #     privacy panel: click -> explicit confirmation -> real
+            #     local delete -> success status rendered.
+            window.evaluate_js(_PROBE_UI_PRIVACY)
+            ui_privacy = _poll_probe(window, _PROBE_COLLECT_UI_PRIVACY, timeout=45)
+            report.check(
+                "privacy panel UI: Apagar histórico -> confirmar -> deleted",
+                bool(
+                    ui_privacy
+                    and isinstance(ui_privacy, dict)
+                    and ui_privacy.get("confirmed") is True
+                    and "Operação concluída" in str(ui_privacy.get("status", ""))
+                ),
+                json.dumps(ui_privacy)[:300] if ui_privacy else "no result",
             )
 
             # 4. Invalid input rejected with sanitized error.
