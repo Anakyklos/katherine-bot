@@ -53,6 +53,10 @@ Design invariants (mirrors the PostgreSQL contract, local-first):
 10. **Terminal lifecycle.** After ``close()`` no new connection is
     created and no operation proceeds on any thread; every later call
     fails with the stable sanitized ``PersistenceError("storage_closed")``.
+    Connections stay per-thread (never shared), but are opened with
+    ``check_same_thread=False`` so ``close()`` deterministically closes
+    (no GC reliance) connections other threads created; ``backup_to()``
+    on a closed store fails before creating any file or directory.
 11. **Sanitized errors.** Public errors are stable code+message pairs.
     SQL text, paths, raw content and driver details never cross the API.
 12. **No cloud imports.** The package imports only stdlib sqlite3/JSON —

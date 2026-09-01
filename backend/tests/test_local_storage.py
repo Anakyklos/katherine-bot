@@ -1273,6 +1273,67 @@ class TestClosedLifecycle:
         assert reopened.load_user_state().revision == 1
         reopened.close()
 
+    def test_cross_thread_connection_really_closed_by_close(self, tmp_path: Path) -> None:
+        """Prove close() deterministically closes other threads' connections.
+
+        A worker thread creates and retains its own connection through
+        the store; the main thread then calls close(). The retained
+        connection object must be genuinely closed — any use raises
+        ProgrammingError, and it must no longer be a functional shortcut
+        past the closed store (no GC reliance, no leaked live handle).
+        """
+        from backend.local_storage import PersistenceError
+
+        store = open_local_storage(tmp_path / "katherine.db")
+        store.commit_turn(**_commit_kwargs(store, "req-close-5", "r5"))
+        barrier = threading.Barrier(2, timeout=10)
+        captured: dict[str, sqlite3.Connection] = {}
+
+        def worker() -> None:
+            captured["conn"] = store._connection_for_tests_only()
+            barrier.wait()  # main thread may close() now
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        barrier.wait()
+        thread.join(timeout=10)
+        worker_conn = captured["conn"]
+        store.close()
+        # The worker's connection was created by another thread, yet
+        # close() shut it down deterministically (not via GC).
+        with pytest.raises(sqlite3.ProgrammingError):
+            worker_conn.execute("select 1")
+        # It is not a functional shortcut: every operation still fails
+        # with the sanitized storage_closed error.
+        with pytest.raises(PersistenceError) as excinfo:
+            store.load_user_state()
+        assert excinfo.value.code == "storage_closed"
+        with pytest.raises(PersistenceError) as excinfo:
+            store.commit_turn(**_commit_kwargs(store, "req-close-6", "r6"))
+        assert excinfo.value.code == "storage_closed"
+
+    def test_backup_after_close_leaves_no_filesystem_artifacts(
+        self, tmp_path: Path
+    ) -> None:
+        """backup_to() on a closed store must not create anything.
+
+        The lifecycle gate runs before any target creation: no backup.db
+        file, no parent directory, no empty side-effect left behind.
+        """
+        from backend.local_storage import PersistenceError
+
+        store = open_local_storage(tmp_path / "katherine.db")
+        store.commit_turn(**_commit_kwargs(store, "req-close-7", "r7"))
+        store.close()
+        backup_dir = tmp_path / "backups"
+        backup_file = backup_dir / "backup.db"
+        with pytest.raises(PersistenceError) as excinfo:
+            store.backup_to(backup_file)
+        assert excinfo.value.code == "storage_closed"
+        assert excinfo.value.message == "storage is closed"
+        assert not backup_file.exists()
+        assert not backup_dir.exists()
+
     def test_close_is_idempotent_and_safe(self, tmp_path: Path) -> None:
         store = open_local_storage(tmp_path / "katherine.db")
         store.close()

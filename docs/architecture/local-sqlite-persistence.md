@@ -60,9 +60,24 @@ o gate de conexão lê, e a partir daí:
 - nenhuma leitura/escrita continua silenciosamente;
 - toda chamada posterior falha com o erro sanitizado estável
   `PersistenceError("storage_closed")` — mesma thread ou outra thread;
+- `backup_to()` numa store fechada falha com `storage_closed` **antes
+  de qualquer efeito no filesystem**: nenhum diretório e nenhum
+  `backup.db` vazio é criado após `close()`;
 - `close()` é idempotente; o arquivo do banco permanece intacto e uma
   **nova** instância pode abri-lo normalmente (o dado não é destruído,
   apenas esta store é encerrada).
+
+**Política de threads das conexões.** As conexões continuam
+estritamente por thread (uma chave de thread → uma conexão, nunca
+compartilhada entre operações/threads), mas são abertas com
+`check_same_thread=False` para que o `close()` — que roda na thread
+que chamou — possa fechar deterministicamente, sem depender de GC, as
+conexões criadas por outras threads. Sem isso, o sqlite3 padrão
+levantaria `ProgrammingError` no fechamento cross-thread e as
+conexões permaneceriam abertas. O teste
+`test_cross_thread_connection_really_closed_by_close` retém a conexão
+da worker thread e prova que ela está de fato fechada/inutilizável
+após `store.close()`.
 
 Sem daemon, sem pool pesado, sem framework: um dict de conexões por
 thread ID e um gate sob o lock existente.
@@ -254,7 +269,9 @@ mocks.
   escrita), outbox, delete_history completo (mensagens + ledger +
   outbox, replay indisponível, atomicidade sob falha), resets neutros
   canônicos com revision e commit obsoleto rejeitado, lifecycle fechado
-  (mesma thread, outra thread, nenhuma reconexão silenciosa), backup,
+  (mesma thread, outra thread, nenhuma reconexão silenciosa, conexão da
+  worker thread de fato fechada por `close()`, `backup_to()` após
+  `close()` sem nenhum artefato no filesystem), backup,
   XDG, sanitized, no-cloud-imports, recovery de pending, ciclo de turno
   completo com os módulos reais do domínio.
 - ``backend/tests/test_local_storage_contracts.py`` — testes

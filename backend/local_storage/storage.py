@@ -227,11 +227,19 @@ class LocalStorage:
     # ── Connection management ────────────────────────────────────────────
 
     def _new_connection(self) -> sqlite3.Connection:
+        # check_same_thread=False: connections stay strictly per-thread
+        # (one thread key -> one connection, never shared), but close()
+        # — which runs on the closing thread — may call conn.close() on
+        # connections other threads created. sqlite3's default thread
+        # affinity would turn that deterministic shutdown into a
+        # ProgrammingError, and swallowing it would leave connections
+        # open (relying on GC) while the docs claim they are closed.
         try:
             conn = sqlite3.connect(
                 str(self._path),
                 timeout=_BUSY_TIMEOUT_MS / 1000.0,
                 isolation_level=None,  # explicit transaction control
+                check_same_thread=False,
             )
         except sqlite3.Error:
             raise PersistenceError("storage_unavailable", "persistence error") from None
@@ -973,22 +981,32 @@ class LocalStorage:
     # ── Backup and metrics ──────────────────────────────────────────────
 
     def backup_to(self, target: Path | str) -> None:
-        """Consistent online backup (never captures half-written state)."""
-        target_path = Path(target)
-        if target_path.exists():
-            raise ValidationError("backup_target_exists", "backup target already exists")
-        try:
-            target_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            dest = sqlite3.connect(str(target_path))
+        """Consistent online backup (never captures half-written state).
+
+        The closed-store lifecycle gate runs **before** any filesystem
+        effect: a closed store fails with ``storage_closed`` without
+        creating the target directory or an empty ``backup.db``.
+        """
+        with self._lock:
+            if self._closed:
+                raise PersistenceError("storage_closed", "storage is closed")
+            src = self._connection()
+            target_path = Path(target)
+            if target_path.exists():
+                raise ValidationError(
+                    "backup_target_exists", "backup target already exists"
+                )
             try:
-                with self._lock:
-                    self._connection().backup(dest)
-            finally:
-                dest.close()
-        except sqlite3.Error:
-            raise PersistenceError("backup_failed", "persistence error") from None
-        except OSError:
-            raise PersistenceError("backup_failed", "persistence error") from None
+                target_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                dest = sqlite3.connect(str(target_path))
+                try:
+                    src.backup(dest)
+                finally:
+                    dest.close()
+            except sqlite3.Error:
+                raise PersistenceError("backup_failed", "persistence error") from None
+            except OSError:
+                raise PersistenceError("backup_failed", "persistence error") from None
 
     def storage_metrics(self) -> dict[str, Any]:
         conn = self._connection()
