@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { sendMessage, ChatError } from '../services/chatService';
-import api from '../../../shared/services/apiClient';
+import { ChatError } from '../services/chatService';
+import { createDefaultTransport } from '../services/chatTransport';
 import { SYSTEM_MESSAGES } from '../constants';
 import { validateEmotionState } from '../../../shared/utils/formatters';
 
@@ -10,8 +10,20 @@ import { validateEmotionState } from '../../../shared/utils/formatters';
  * Each accepted logical send creates exactly one Web Crypto UUID and one
  * request. Single-flight, ownership, history, timeout, and unmount guards are
  * preserved.
+ *
+ * #336: history and sends are routed through an injected transport
+ * (default: the mode-aware `chatTransport`). Web mode delegates to the
+ * Axios-based chatService exactly as before; desktop mode goes through
+ * the pywebview bridge. The invariants (single-flight, request token,
+ * unmount guard, 50s guard timer cleared on resolve) apply to both
+ * branches identically.
  */
-export const useChat = () => {
+export const useChat = ({ transport: injectedTransport } = {}) => {
+    const transportRef = useRef(null);
+    if (transportRef.current === null) {
+        transportRef.current = injectedTransport ?? createDefaultTransport();
+    }
+    const transport = transportRef.current;
     const [messages, setMessages] = useState([]);
     const [input, setInput] = useState('');
     const [isLoading, setIsLoading] = useState(false);
@@ -63,7 +75,7 @@ export const useChat = () => {
 
         const fetchHistory = async () => {
             try {
-                const response = await api.get('/history', {
+                const response = await transport.fetchHistory({
                     signal: controller.signal,
                 });
 
@@ -98,7 +110,10 @@ export const useChat = () => {
             active = false;
             controller.abort();
         };
-    }, []);
+        // transport is a stable per-mount reference (constructed once in
+        // the ref above); listing it satisfies the rule without changing
+        // when the effect runs.
+    }, [transport]);
 
     useEffect(() => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -152,10 +167,17 @@ export const useChat = () => {
         timerIdRef.current = timerId;
 
         try {
-            const data = await sendMessage(userMessageText, {
-                signal: controller.signal,
-                timeout: timeoutMs,
-            }, requestId);
+            // #336: the transport decides web (Axios, honors the abort
+            // signal) vs desktop (bridge, guarded by the same 50s timer
+            // which clears on resolve below).
+            const data = await transport.sendMessage(
+                userMessageText,
+                {
+                    signal: controller.signal,
+                    timeout: timeoutMs,
+                },
+                requestId,
+            );
 
             if (!mountedRef.current || token !== requestTokenRef.current) return;
 
@@ -196,7 +218,7 @@ export const useChat = () => {
                 focusTimerRef.current = setTimeout(() => inputRef.current?.focus(), 100);
             }
         }
-    }, [input, isLoading, cleanupRequest, cleanupFocusTimer]);
+    }, [input, isLoading, transport, cleanupRequest, cleanupFocusTimer]);
 
     /**
      * Clears the local chat screen only.

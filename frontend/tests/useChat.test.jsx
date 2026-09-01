@@ -28,6 +28,7 @@ const mockSendMessage = vi.fn();
 
 vi.mock('../src/features/chat/services/chatService', () => ({
     sendMessage: (...args) => mockSendMessage(...args),
+    fetchHistory: async (...args) => mockApiGet(...args),
     ChatError: class ChatError extends Error {
         constructor(type, message) {
             super(message);
