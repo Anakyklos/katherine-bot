@@ -179,6 +179,13 @@ def validate_replay_payload(payload: Any) -> Mapping[str, Any]:
     - no forbidden key at any depth (prompts, raw messages, meta-cognition,
       internal instructions, hidden ``content``);
     - ``response`` is required and must be a string;
+    - ``message_id`` is required (web parity: the replay payload always
+      identifies the committed assistant message). Locally the message id
+      is a SQLite rowid, so an integer or a bounded identifier string is
+      accepted (the web UUID requirement assumes uuid PKs, which the
+      local schema does not use);
+    - ``request_id``, when present, must be a bounded identifier string
+      and callers cross-check it against the enclosing turn request;
     - finite JSON within the explicit byte bound.
     """
     if not isinstance(payload, Mapping):
@@ -193,6 +200,25 @@ def validate_replay_payload(payload: Any) -> Mapping[str, Any]:
         raise ValidationError(
             "invalid_replay_payload", "replay payload requires a string response field"
         )
+    message_id = payload.get("message_id")
+    if isinstance(message_id, bool) or not (
+        isinstance(message_id, int)
+        or (isinstance(message_id, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", message_id))
+    ):
+        raise ValidationError(
+            "invalid_replay_payload",
+            "replay payload requires a message_id (integer rowid or bounded identifier)",
+        )
+    if "request_id" in payload:
+        request_id = payload["request_id"]
+        if isinstance(request_id, bool) or not (
+            isinstance(request_id, str)
+            and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", request_id)
+        ):
+            raise ValidationError(
+                "invalid_replay_payload",
+                "replay payload request_id must be a bounded identifier string",
+            )
     _require_canonical_bytes(
         payload, "invalid_replay_payload", MAX_REPLAY_PAYLOAD_BYTES
     )

@@ -460,6 +460,15 @@ class LocalStorage:
                 "invalid_public_response",
                 "public_response must equal replay_payload response",
             )
+        # Web parity: a replay payload carrying a request_id must identify
+        # THIS request (the web contract enforces the same cross-check in
+        # _validate_replay_payload; the local id charset differs from the
+        # web UUID, but the consistency rule is identical).
+        if "request_id" in replay_payload and replay_payload["request_id"] != request_id:
+            raise ValidationError(
+                "invalid_replay_payload",
+                "replay payload request_id must equal the enclosing request_id",
+            )
         contracts_module.validate_emotional_snapshot(emotional_state)
         contracts_module.validate_relationship_snapshot(relationship_state)
         validated_outbox = contracts_module.validate_outbox_events(outbox_events)

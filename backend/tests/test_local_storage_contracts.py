@@ -108,6 +108,44 @@ class TestReplayPayloadContract:
             validate_replay_payload(payload)
         assert "exceeds" in excinfo.value.message
 
+    def test_rejects_missing_message_id(self) -> None:
+        # Web parity: _validate_replay_payload requires a message_id
+        # identifying the committed assistant message. Locally the id is a
+        # SQLite rowid (integer) or a bounded identifier string.
+        payload = _valid_replay_payload()
+        del payload["message_id"]
+        with pytest.raises(ValidationError) as excinfo:
+            validate_replay_payload(payload)
+        assert excinfo.value.code == "invalid_replay_payload"
+
+    def test_accepts_rowid_message_id(self) -> None:
+        payload = _valid_replay_payload()
+        payload["message_id"] = 7
+        assert validate_replay_payload(payload) is payload
+
+    def test_rejects_invalid_message_id(self) -> None:
+        payload = _valid_replay_payload()
+        payload["message_id"] = True  # bool is not an int id
+        with pytest.raises(ValidationError) as excinfo:
+            validate_replay_payload(payload)
+        assert excinfo.value.code == "invalid_replay_payload"
+        payload["message_id"] = {"nested": "object"}
+        with pytest.raises(ValidationError):
+            validate_replay_payload(payload)
+
+    def test_rejects_invalid_request_id_reference(self) -> None:
+        # Web parity: request_id, when present, must be a bounded
+        # identifier string; commit_turn additionally cross-checks it
+        # against the enclosing request.
+        payload = _valid_replay_payload()
+        payload["request_id"] = 12345  # not a string
+        with pytest.raises(ValidationError) as excinfo:
+            validate_replay_payload(payload)
+        assert excinfo.value.code == "invalid_replay_payload"
+        payload["request_id"] = "x" * 200  # over the 128-char bound
+        with pytest.raises(ValidationError):
+            validate_replay_payload(payload)
+
 
 class TestOutboxContract:
     def test_accepts_reference_only_payload(self) -> None:

@@ -135,7 +135,12 @@ identidade remota):
   aprovados; nenhuma chave proibida (``prompt``, ``system_prompt``,
   ``meta_cognition``, ``internal_instructions``, ``message``,
   ``content``, …) em **qualquer profundidade**; ``response`` obrigatório
-  como string; JSON finito; limite explícito de 8 KB.
+  como string; ``message_id`` obrigatório (paridade web; local aceita
+  rowid inteiro ou identificador limitado — a web exige UUID porque seus
+  PKs são uuid, o schema local não); ``request_id``, quando presente,
+  deve ser identificador limitado e igual ao request do turno
+  (cross-check em ``commit_turn``, paridade web); JSON finito; limite
+  explícito de 8 KB.
 - **Outbox**: shape do evento, ``event_type`` (``^[a-z0-9_]{1,64}$``),
   ``idempotency_key`` (``^[A-Za-z0-9_.:-]{1,128}$``), allowlist de
   keys do payload, chaves proibidas recursivas, **tipos dos valores**

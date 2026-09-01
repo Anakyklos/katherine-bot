@@ -26,6 +26,7 @@ from backend.local_storage import (
     ConflictError,
     LocalStorage,
     StorageCorruptError,
+    ValidationError as LocalValidationError,
     default_database_path,
     open_local_storage,
 )
@@ -734,6 +735,7 @@ class TestRealDomainTurnCycle:
             replay_payload={
                 "response": "olá!",
                 "emotion_state": {"valence": 0.1, "arousal": 0.2},
+                "message_id": 2,
             },
             outbox_events=[],
             expected_revision=revision,
@@ -776,6 +778,7 @@ class TestRealDomainTurnCycle:
             replay_payload={
                 "response": "tudo ótimo",
                 "emotion_state": {"valence": -0.05, "arousal": 0.1},
+                "message_id": 4,
             },
             outbox_events=[],
             expected_revision=user_state_2.revision,
@@ -791,7 +794,7 @@ class TestRealDomainTurnCycle:
                 emotional_state=emotional_result.state.to_dict(),
                 relationship_state=roundtrip_relationship.to_dict(),
                 public_response="y",
-                replay_payload={"response": "y", "emotion_state": {}},
+                replay_payload={"response": "y", "emotion_state": {}, "message_id": 5},
                 outbox_events=[],
                 expected_revision=revision,
             )
@@ -854,6 +857,27 @@ class TestRequestIdempotencyConflict:
         with pytest.raises(ConflictError) as excinfo:
             store.commit_turn(**kw)
         assert excinfo.value.code == "request_payload_conflict"
+        store.close()
+
+    def test_replay_payload_foreign_request_id_is_rejected(
+        self, tmp_path: Path
+    ) -> None:
+        # Web parity: a replay payload carrying a request_id must identify
+        # THIS request (web _validate_replay_payload cross-check).
+        store = open_local_storage(tmp_path / "katherine.db")
+        kw = _commit_kwargs(store, "req-foreign", "r1")
+        kw["replay_payload"]["request_id"] = "req-someone-else"
+        with pytest.raises(LocalValidationError) as excinfo:
+            store.commit_turn(**kw)
+        assert excinfo.value.code == "invalid_replay_payload"
+        # Nothing was written by the rejected commit.
+        conn = store._connection_for_tests_only()
+        assert conn.execute("select count(*) from chat_logs").fetchone()[0] == 0
+        assert conn.execute("select count(*) from turn_requests").fetchone()[0] == 0
+        # The matching request_id commits normally.
+        kw["replay_payload"]["request_id"] = "req-foreign"
+        committed = store.commit_turn(**kw)
+        assert committed.request_id == "req-foreign"
         store.close()
 
     def test_same_request_different_snapshot_conflicts(self, tmp_path: Path) -> None:
