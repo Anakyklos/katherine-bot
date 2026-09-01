@@ -100,17 +100,70 @@ def make_runtime(tmp_path: Path, provider: ScriptedProvider | None = None) -> Co
     )
 
 
-def commit_turn(runtime: CompanionRuntime, message: str, request_id: str) -> TurnResult:
-    return asyncio.run(runtime.commit_turn(request_id=request_id, message=message))
-
-
 def history(runtime: CompanionRuntime) -> list[dict]:
     return asyncio.run(runtime.load_history(limit=50))
 
 
 # ─────────────────────────────────────────────────────────────────
-# Lifecycle / restart
+# runtime_state probe (T005: storage status + provider-configured flag,
+# no env echo)
 # ─────────────────────────────────────────────────────────────────
+
+
+def test_runtime_state_reports_storage_and_provider_flags(tmp_path, monkeypatch):
+    runtime = make_runtime(tmp_path)
+
+    # Provider probe must not instantiate Groq: key env is irrelevant here
+    # because the injected provider is already built.
+    state = runtime.runtime_state()
+
+    assert state["ok"] is True
+    assert state["storage"] is True
+    assert state["provider_configured"] is True
+    assert state["revision"] == 0
+    # No env echo: the payload contains no key material.
+    assert "GROQ_API_KEY" not in json.dumps(state)
+
+
+def test_runtime_state_unconfigured_provider_still_opens_storage(tmp_path, monkeypatch):
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("GROQ_API_KEY_2", raising=False)
+
+    runtime = CompanionRuntime(
+        storage_path=tmp_path / "katherine.db",
+        provider=None,
+        provider_factory=None,
+        provider_configured_probe=lambda: False,
+        now_provider=_test_clock,
+    )
+
+    state = runtime.runtime_state()
+    assert state["ok"] is True
+    assert state["storage"] is True
+    assert state["provider_configured"] is False
+
+    # History still loads: unconfigured provider never blocks reads.
+    assert runtime.load_history(limit=10) == []
+
+
+def test_runtime_state_storage_failure_is_sanitized(tmp_path):
+    runtime = CompanionRuntime(
+        storage_path=tmp_path / "katherine.db",
+        provider=ScriptedProvider(),
+        now_provider=_test_clock,
+    )
+
+    def _fail_open():
+        raise StorageCorruptError("corrupt", "database disk image is malformed")
+
+    runtime._ensure_storage = _fail_open
+    state = runtime.runtime_state()
+
+    assert state["ok"] is False
+    assert state["storage"] is False
+    # Constant message only: no exception text leaks.
+    assert state["error_code"] == "storage"
+    assert "malformed" not in json.dumps(state)
 
 
 async def test_runtime_opens_local_storage_lazily_and_survives_restart(tmp_path):

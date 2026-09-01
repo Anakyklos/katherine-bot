@@ -428,10 +428,17 @@ class CompanionRuntime:
         now_provider: Callable[[], float] | None = None,
         turn_deadline_seconds: float = 50.0,
         storage: Any = None,
+        provider_configured_probe: Callable[[], bool] | None = None,
     ) -> None:
         """``now_provider`` is the *domain clock* (epoch seconds, like the
         web engine's ``time.time`` clock used for snapshot timestamps and
-        transitions); the turn budget uses a real monotonic clock."""
+        transitions); the turn budget uses a real monotonic clock.
+
+        ``provider_configured_probe`` answers "is a remote provider key
+        configured?" without instantiating the client (env keys are read
+        Python-side only and never echoed). Defaults to checking the Groq
+        key env presence via the same loader the real provider uses.
+        """
         if provider is not None and provider_factory is not None:
             raise ValueError("pass provider or provider_factory, not both")
         if history_limit < 1 or history_limit > 500:
@@ -450,12 +457,29 @@ class CompanionRuntime:
         self._relationship_config = RelationshipTransitionConfig.defaults()
         self._presentation = AffectiveEngine()
         self._provider_config = ProviderConfig()
+        self._provider_configured_probe = provider_configured_probe
 
     # ── lifecycle ─────────────────────────────────────────────────────────
 
     @property
     def is_closed(self) -> bool:
         return self._storage is not None and getattr(self._storage, "_closed", False) is True
+
+    def _default_provider_configured_probe(self) -> bool:
+        """True iff a Groq key is configured (presence only, never echoed).
+
+        Deliberately does NOT build the provider: ``runtime_state`` must
+        be cheap and safe before any window interaction, and an
+        unconfigured key must not raise here (that failure belongs to the
+        turn that needs the model).
+        """
+        try:
+            from backend.groq_keys import get_groq_api_keys
+
+            keys = get_groq_api_keys()
+        except Exception:  # noqa: BLE001 (probe must never raise)
+            return False
+        return any(isinstance(k, str) and k.strip() for k in keys)
 
     def _ensure_storage(self):
         if self._injected_storage is not None:
@@ -496,6 +520,50 @@ class CompanionRuntime:
         except Exception:  # noqa: BLE001 (never leak to JS)
             return {"ok": False, "storage": False}
 
+    def runtime_state(self) -> dict[str, Any]:
+        """Readiness + configuration probe for the desktop bridge (T005).
+
+        Shape (stable keys, JSON-serializable):
+
+        * ``ok`` — overall readiness (storage opened and readable);
+        * ``storage`` — local storage opened and answered a query;
+        * ``provider_configured`` — a remote provider key is present
+          (boolean only; the key itself is never read into the payload);
+        * ``revision`` — current state revision (0 on a fresh database);
+        * ``error_code`` — sanitized code when ``ok`` is False.
+
+        Never raises; a storage failure returns ``ok=False`` with the
+        constant storage message (no exception text, no paths). An
+        unconfigured provider does NOT make ``ok`` False: the app still
+        opens and reads local data; the configuration error surfaces
+        only when a turn actually needs the model.
+        """
+        probe = (
+            self._provider_configured_probe
+            if self._provider_configured_probe is not None
+            else self._default_provider_configured_probe
+        )
+        try:
+            configured = bool(probe())
+        except Exception:  # noqa: BLE001 (probe must never raise)
+            configured = False
+        try:
+            revision = self._load_state().revision
+            return {
+                "ok": True,
+                "storage": True,
+                "provider_configured": configured,
+                "revision": revision,
+            }
+        except Exception:  # noqa: BLE001 (never leak to JS)
+            return {
+                "ok": False,
+                "storage": False,
+                "provider_configured": configured,
+                "error_code": LocalErrorCode.STORAGE.value,
+                "error_message": _message_for(LocalErrorCode.STORAGE),
+            }
+
     def get_state(self) -> dict[str, Any]:
         """Read-only public state snapshot (domain v1 snapshots + revision).
 
@@ -529,24 +597,27 @@ class CompanionRuntime:
             for row in rows
         ]
 
-    def send_turn(self, *, request_id: str, message: str) -> TurnResult:
+    def send_turn(self, *, request_id: str, message: str) -> dict[str, Any]:
         """Synchronous bridge entrypoint: run one local turn and commit it.
 
-        Never raises for domain/provider failures: the failure is a
-        sanitized :class:`TurnResult`. (A programming error inside the
-        runtime itself still fails closed through the bridge's generic
-        boundary.)
+        Returns the JSON-serializable turn payload (``TurnResult.to_payload``
+        shape: ``success`` + result fields on success, ``error_code``/
+        ``error_message`` on failure) — never raises for domain/provider
+        failures: the failure is a sanitized payload. (A programming error
+        inside the runtime itself still fails closed through the bridge's
+        generic boundary.)
         """
         try:
-            return asyncio.run(
+            result = asyncio.run(
                 self.commit_turn_async(request_id=request_id, message=message)
             )
+            return result.to_payload()
         except LocalStorageError as err:
-            return TurnResult(
-                success=False,
-                error_code=err.code.value,
-                error_message=err.message,
-            )
+            return {
+                "success": False,
+                "error_code": err.code.value,
+                "error_message": err.message,
+            }
 
     async def commit_turn_async(self, *, request_id: str, message: str) -> TurnResult:
         try:

@@ -424,7 +424,7 @@ def run_smoke() -> tuple[bool, list[str]]:
                     health
                     and isinstance(health, dict)
                     and health.get("ok") is True
-                    and health.get("api_version") == 1
+                    and health.get("api_version") == 2
                 ),
                 json.dumps(health)[:200] if health else "no result",
             )
@@ -637,7 +637,7 @@ def run_smoke() -> tuple[bool, list[str]]:
                 bool(
                     after_reload
                     and after_reload.get("ok") is True
-                    and after_reload.get("api_version") == 1
+                    and after_reload.get("api_version") == 2
                 ),
                 json.dumps(after_reload)[:200] if after_reload else "no result",
             )

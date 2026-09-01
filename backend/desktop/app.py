@@ -81,8 +81,30 @@ _BUILD_HINT = "Run 'npm run build' in the frontend/ directory first."
 #: Public error code used when the bridge refuses to serve a non-local page.
 ERROR_BRIDGE_UNAVAILABLE = "bridge_unavailable"
 
+#: Public error code used when the local runtime cannot start (corrupt DB,
+#: unwritable directory). Sanitized: no path, no traceback.
+ERROR_RUNTIME_STARTUP = "runtime_startup_failed"
+
 _MSG_BRIDGE_UNAVAILABLE = "Desktop bridge is not available for this page."
 _MSG_INTERNAL = "The desktop bridge failed to complete the request."
+_MSG_RUNTIME_STARTUP = (
+    "O armazenamento local não pôde ser aberto. "
+    "Verifique o banco de dados local e tente novamente."
+)
+
+
+def _build_runtime():
+    """Build the production companion runtime (#336).
+
+    Lazy import on purpose: ``backend.desktop.app`` stays import-pure
+    (no domain modules at import time; the runtime pulls only light,
+    pure-domain dependencies — verified by the import-cost budget
+    tests). The runtime opens its storage lazily on first use, so this
+    call never touches SQLite; it just constructs the object.
+    """
+    from backend.companion_runtime import build_companion_runtime
+
+    return build_companion_runtime()
 
 
 def _repo_root() -> Path:
@@ -249,8 +271,8 @@ class LocalBuildBridge:
         self._get_url = get_url
         self._trust = trust if trust is not None else BuildTrust(build)
 
-    def health(self, *args: Any) -> dict[str, Any]:
-        """Allowlisted round-trip, local-build-only; never raises."""
+    def _serve(self, op: str, args: tuple[Any, ...]) -> dict[str, Any]:
+        """Shared fail-closed wrapper for one allowlisted op."""
         url = _get_url_safely(self._get_url)
         if not (
             is_local_build_url(url, self._build) and self._trust.is_trusted(url)
@@ -261,7 +283,7 @@ class LocalBuildBridge:
                 "message": _MSG_BRIDGE_UNAVAILABLE,
             }
         try:
-            result = self._bridge.health(*args)
+            result = getattr(self._bridge, op)(*args)
         except DesktopApiError as err:
             return err.payload
         except Exception:  # noqa: BLE001 (boundary: never leak internals to JS)
@@ -269,6 +291,40 @@ class LocalBuildBridge:
         if not isinstance(result, dict):
             return {"ok": False, "code": "internal_error", "message": _MSG_INTERNAL}
         return result
+
+    # -- allowlisted surface (exactly DESKTOP_API_METHODS) -----------------
+
+    def health(self, *args: Any) -> dict[str, Any]:
+        """Allowlisted round-trip, local-build-only; never raises."""
+        return self._serve("health", args)
+
+    def runtime_state(self, *args: Any) -> dict[str, Any]:
+        """Readiness probe, local-build-only; never raises."""
+        return self._serve("runtime_state", args)
+
+    def load_history(self, *args: Any) -> dict[str, Any]:
+        """Bounded history read, local-build-only; never raises."""
+        return self._serve("load_history", args)
+
+    def send_message(self, *args: Any) -> dict[str, Any]:
+        """One conversation turn, local-build-only; never raises."""
+        return self._serve("send_message", args)
+
+    def delete_history(self, *args: Any) -> dict[str, Any]:
+        """Privacy: erase history, local-build-only; never raises."""
+        return self._serve("delete_history", args)
+
+    def delete_memories(self, *args: Any) -> dict[str, Any]:
+        """Privacy: erase memories, local-build-only; never raises."""
+        return self._serve("delete_memories", args)
+
+    def reset_emotional_state(self, *args: Any) -> dict[str, Any]:
+        """Privacy: reset emotional state, local-build-only; never raises."""
+        return self._serve("reset_emotional_state", args)
+
+    def reset_relationship_state(self, *args: Any) -> dict[str, Any]:
+        """Privacy: reset relationship state, local-build-only; never raises."""
+        return self._serve("reset_relationship_state", args)
 
 
 class NavigationPolicy:
@@ -364,6 +420,11 @@ def run_desktop_shell(
             f"Frontend page {html_name!r} not found in the build. " + _BUILD_HINT
         )
 
+    # Runtime lifecycle (#336): constructed before the window so the
+    # bridge it serves is wired exactly once; closed after the window
+    # loop returns (window close ⇒ clean shutdown, always, via finally).
+    runtime = _build_runtime()
+
     # ``create_window`` returns the Window synchronously, before
     # ``webview.start()``; the holder is populated right after creation so
     # the URL guard can query it. The bridge is delivered at creation time
@@ -376,7 +437,7 @@ def run_desktop_shell(
             return None
         return _get_url_safely(window_holder[0].get_current_url)
 
-    js_api = LocalBuildBridge(make_js_api(), build, _current_url, trust)
+    js_api = LocalBuildBridge(make_js_api(runtime=runtime), build, _current_url, trust)
 
     window = webview.create_window(
         title=_WINDOW_TITLE,
@@ -401,7 +462,12 @@ def run_desktop_shell(
     )
     window.events.loaded += policy.on_loaded
 
-    webview.start()
+    try:
+        webview.start()
+    finally:
+        # Window closed (or the loop raised): shut the runtime down
+        # cleanly. Idempotent and never raises.
+        runtime.close()
     return 0
 
 
@@ -419,6 +485,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except ValueError as err:
         print(f"error: invalid desktop configuration: {err}", file=sys.stderr)
+        return 2
+    except Exception:  # noqa: BLE001 (startup boundary: sanitized output only)
+        # Any unexpected startup failure (corrupt local database,
+        # unwritable storage): print the constant, sanitized message —
+        # never a path, traceback or internal detail — and exit 2.
+        print(f"error: {_MSG_RUNTIME_STARTUP}", file=sys.stderr)
         return 2
 
 
