@@ -14,7 +14,10 @@ version. Migrations are:
 Migrations live in code (a frozen list), not in loose SQL files: no new
 dependency, deterministic ordering, and the exact text is reviewable in
 one place. New schema changes append a new tuple — existing migrations
-are never edited.
+are never edited **after merge**. Migration 0001 is still pre-merge on
+this branch, so it is amended in place here (the FKs and the outbox
+uniqueness contract changed for the delete-history privacy semantics
+of issue #335); post-merge, migrations become append-only.
 """
 
 from __future__ import annotations
@@ -63,23 +66,28 @@ create table turn_requests (
     updated_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
     completed_at text,
     foreign key (user_message_chat_log_id) references chat_logs (id)
-        on delete set null,
+        on delete cascade,
     foreign key (assistant_message_chat_log_id) references chat_logs (id)
-        on delete set null
+        on delete cascade
 );
 create index turn_requests_status_idx on turn_requests (status);
 
 create table outbox_events (
     id text primary key,
     event_type text not null,
-    idempotency_key text not null unique,
+    idempotency_key text not null,
     status text not null default 'pending'
         check (status in ('pending', 'completed', 'dead_letter')),
     turn_request_id text not null
-        references turn_requests (request_id),
+        references turn_requests (request_id)
+        on delete cascade,
     payload text not null check (json_valid(payload)),
     created_at text not null default (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    processed_at text
+    processed_at text,
+    -- Uniqueness is per (idempotency_key, event_type): the same key may
+    -- label distinct event kinds of one turn, while redelivering the
+    -- same event is rejected (matching the commit conflict target).
+    unique (idempotency_key, event_type)
 );
 create index outbox_events_status_idx on outbox_events (status);
 

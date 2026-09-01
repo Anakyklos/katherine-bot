@@ -46,13 +46,27 @@ def _emotion_payload(response: str) -> dict:
     }
 
 
+def _neutral_emotional() -> dict:
+    """Real domain neutral v1 emotional snapshot."""
+    from backend.emotional_domain import EmotionalStateV1
+
+    return EmotionalStateV1.neutral(timestamp=1000.0).to_dict()
+
+
+def _neutral_relationship() -> dict:
+    """Real domain neutral v1 relationship snapshot."""
+    from backend.relationship import RelationshipStateV1
+
+    return RelationshipStateV1.neutral(timestamp=1000.0).to_dict()
+
+
 def _commit_kwargs(store: LocalStorage, request_id: str, response: str = "ok") -> dict:
     return {
         "request_id": request_id,
         "user_message": "oi",
         "assistant_message": response,
-        "emotional_state": {"v": 1, "valence": 0.1},
-        "relationship_state": {"v": 1, "trust": 0.5},
+        "emotional_state": _neutral_emotional(),
+        "relationship_state": _neutral_relationship(),
         "public_response": response,
         "replay_payload": _emotion_payload(response),
         "outbox_events": [],
@@ -719,7 +733,7 @@ class TestRealDomainTurnCycle:
             public_response="olá!",
             replay_payload={
                 "response": "olá!",
-                "emotion_state": {"v": 1, "valence": 0.1},
+                "emotion_state": {"valence": 0.1, "arousal": 0.2},
             },
             outbox_events=[],
             expected_revision=revision,
@@ -761,7 +775,7 @@ class TestRealDomainTurnCycle:
             public_response="tudo ótimo",
             replay_payload={
                 "response": "tudo ótimo",
-                "emotion_state": {"v": 1, "valence": -0.05},
+                "emotion_state": {"valence": -0.05, "arousal": 0.1},
             },
             outbox_events=[],
             expected_revision=user_state_2.revision,
@@ -805,3 +819,437 @@ class TestRealDomainTurnCycle:
         assert restored.load_user_state().revision == committed_2.revision
         assert len(restored.load_recent_history(limit=10)) == 4
         restored.close()
+
+
+class TestRequestIdempotencyConflict:
+    """Same request id + divergent determinative payload → deterministic
+    conflict, never a silent replay of the old result, never a write."""
+
+    def test_same_request_same_payload_replays_without_new_writes(
+        self, tmp_path: Path
+    ) -> None:
+        store = open_local_storage(tmp_path / "katherine.db")
+        kw = _commit_kwargs(store, "req-idem", "r1")
+        first = store.commit_turn(**kw)
+        conn = store._connection_for_tests_only()
+        rows_before = conn.execute("select count(*) from chat_logs").fetchone()[0]
+        turns_before = conn.execute("select count(*) from turn_requests").fetchone()[0]
+
+        second = store.commit_turn(**kw)
+
+        assert second.request_id == first.request_id
+        assert second.revision == first.revision
+        assert second.response == first.response
+        assert conn.execute("select count(*) from chat_logs").fetchone()[0] == rows_before
+        assert conn.execute("select count(*) from turn_requests").fetchone()[0] == turns_before
+        store.close()
+
+    def test_same_request_different_user_message_conflicts(
+        self, tmp_path: Path
+    ) -> None:
+        store = open_local_storage(tmp_path / "katherine.db")
+        store.commit_turn(**_commit_kwargs(store, "req-div", "r1"))
+        kw = _commit_kwargs(store, "req-div", "r1")
+        kw["user_message"] = "outra mensagem"
+        with pytest.raises(ConflictError) as excinfo:
+            store.commit_turn(**kw)
+        assert excinfo.value.code == "request_payload_conflict"
+        store.close()
+
+    def test_same_request_different_snapshot_conflicts(self, tmp_path: Path) -> None:
+        from backend.emotional_domain import EmotionalStateV1
+
+        store = open_local_storage(tmp_path / "katherine.db")
+        store.commit_turn(**_commit_kwargs(store, "req-snap", "r1"))
+        kw = _commit_kwargs(store, "req-snap", "r1")
+        snapshot = EmotionalStateV1.neutral(timestamp=2000.0).to_dict()
+        snapshot["pleasure"] = 0.5
+        kw["emotional_state"] = snapshot
+        with pytest.raises(ConflictError) as excinfo:
+            store.commit_turn(**kw)
+        assert excinfo.value.code == "request_payload_conflict"
+        store.close()
+
+    def test_same_request_different_outbox_conflicts(self, tmp_path: Path) -> None:
+        store = open_local_storage(tmp_path / "katherine.db")
+        kw = _commit_kwargs(store, "req-obx", "r1")
+        store.commit_turn(**kw)
+        kw["outbox_events"] = [
+            (
+                "archival_extraction_requested",
+                {"message_id": "req-obx", "kind": "archival", "version": 1},
+                "archival:req-obx:v1",
+            )
+        ]
+        with pytest.raises(ConflictError) as excinfo:
+            store.commit_turn(**kw)
+        assert excinfo.value.code == "request_payload_conflict"
+        store.close()
+
+    def test_conflict_writes_nothing(self, tmp_path: Path) -> None:
+        store = open_local_storage(tmp_path / "katherine.db")
+        store.commit_turn(**_commit_kwargs(store, "req-cw", "r1"))
+        revision_before = store.load_user_state().revision
+        history_before = store.load_recent_history(limit=50)
+        conn = store._connection_for_tests_only()
+        turns_before = conn.execute("select count(*) from turn_requests").fetchone()[0]
+        outbox_before = conn.execute("select count(*) from outbox_events").fetchone()[0]
+
+        kw = _commit_kwargs(store, "req-cw", "DIFFERENT")
+        with pytest.raises(ConflictError):
+            store.commit_turn(**kw)
+
+        assert store.load_user_state().revision == revision_before
+        assert store.load_recent_history(limit=50) == history_before
+        assert conn.execute("select count(*) from turn_requests").fetchone()[0] == turns_before
+        assert conn.execute("select count(*) from outbox_events").fetchone()[0] == outbox_before
+        store.close()
+
+    def test_error_never_echoes_payload(self, tmp_path: Path) -> None:
+        store = open_local_storage(tmp_path / "katherine.db")
+        secret = "conteúdo privado do usuário"
+        store.commit_turn(**_commit_kwargs(store, "req-leak", "r1"))
+        kw = _commit_kwargs(store, "req-leak", "r1")
+        kw["user_message"] = secret
+        with pytest.raises(ConflictError) as excinfo:
+            store.commit_turn(**kw)
+        rendered = str(excinfo.value)
+        assert secret not in rendered
+        assert excinfo.value.message == (
+            "Request id was already completed with a different payload."
+        )
+        store.close()
+
+
+class TestDeleteHistoryPrivacySemantics:
+    """delete_history removes messages, replay ledger and derived outbox,
+    atomically, in one transaction; replay becomes unavailable afterwards."""
+
+    def _committed_store(self, tmp_path: Path):
+        store = open_local_storage(tmp_path / "katherine.db")
+        kw = _commit_kwargs(store, "req-del", "resposta privada")
+        kw["outbox_events"] = [
+            (
+                "archival_extraction_requested",
+                {"message_id": "req-del", "kind": "archival", "version": 1},
+                "archival:req-del:v1",
+            )
+        ]
+        store.commit_turn(**kw)
+        return store
+
+    def test_delete_history_removes_all_history_data(self, tmp_path: Path) -> None:
+        store = self._committed_store(tmp_path)
+        result = store.delete_history()
+        assert result["status"] == "applied"
+        assert result["deleted_messages"] == 2
+        assert result["deleted_turn_requests"] == 1
+        assert result["deleted_outbox_events"] == 1
+
+        conn = store._connection_for_tests_only()
+        assert conn.execute("select count(*) from chat_logs").fetchone()[0] == 0
+        assert conn.execute("select count(*) from turn_requests").fetchone()[0] == 0
+        assert conn.execute("select count(*) from outbox_events").fetchone()[0] == 0
+        # no replay payload content remains anywhere in the file
+        assert store.load_recent_history(limit=10) == []
+        outcome = store.replay("req-del")
+        assert outcome.status == "request_replay_unavailable"
+        assert outcome.committed is None
+
+        # the audit ledger remains, but carries only aggregate counts
+        rows = conn.execute(
+            "select operation, status, result from privacy_operations"
+        ).fetchall()
+        assert rows[0][0] == "delete_history"
+        assert rows[0][1] == "applied"
+        stored_result = json.loads(rows[0][2])
+        assert "resposta privada" not in rows[0][2]
+        assert stored_result["deleted_messages"] == 2
+        store.close()
+
+    def test_delete_history_is_atomic_under_failure(self, tmp_path: Path) -> None:
+        store = self._committed_store(tmp_path)
+        conn = store._connection_for_tests_only()
+        # A trigger that aborts the outbox delete proves the whole
+        # operation rolls back: nothing may be partially deleted.
+        conn.execute(
+            "create trigger block_outbox_delete before delete on outbox_events "
+            "begin select raise(ABORT, 'boom'); end;"
+        )
+        from backend.local_storage import PersistenceError
+
+        with pytest.raises(PersistenceError):
+            store.delete_history()
+        # nothing was deleted: history intact
+        assert conn.execute("select count(*) from chat_logs").fetchone()[0] == 2
+        assert conn.execute("select count(*) from turn_requests").fetchone()[0] == 1
+        assert conn.execute("select count(*) from outbox_events").fetchone()[0] == 1
+        assert store.replay("req-del").status == "completed"
+        store.close()
+
+    def test_delete_history_then_new_turn_still_works(self, tmp_path: Path) -> None:
+        store = self._committed_store(tmp_path)
+        store.delete_history()
+        committed = store.commit_turn(**_commit_kwargs(store, "req-after", "nova resposta"))
+        assert committed.response == "nova resposta"
+        history = store.load_recent_history(limit=10)
+        assert [m["content"] for m in history] == ["oi", "nova resposta"]
+        store.close()
+
+
+class TestNeutralResets:
+    """Resets produce the domain's canonical neutral v1 snapshot, bump the
+    revision coherently, and reject stale commits afterwards."""
+
+    def _non_neutral_state(self):
+        from backend.emotional_domain import AppraisalV1, EmotionalStateV1
+        from backend.emotional_domain.transition import TransitionConfig, transition
+        from backend.relationship import (
+            RelationshipStateV1,
+            RelationshipTransitionConfig,
+            transition_relationship,
+        )
+
+        emotional = transition(
+            EmotionalStateV1.neutral(timestamp=1000.0),
+            AppraisalV1.create(valence_shift=0.5, arousal_shift=0.4, dominance_shift=0.1),
+            1100.0,
+            TransitionConfig.defaults(),
+        ).state
+        relationship = transition_relationship(
+            RelationshipStateV1.neutral(timestamp=1000.0),
+            AppraisalV1.create(valence_shift=0.5, arousal_shift=0.4, dominance_shift=0.1),
+            1200.0,
+            RelationshipTransitionConfig.defaults(),
+        )
+        return emotional, relationship
+
+    def test_reset_emotional_state_persists_canonical_neutral(self, tmp_path: Path) -> None:
+        from backend.emotional_domain import EmotionalStateV1
+
+        store = open_local_storage(tmp_path / "katherine.db")
+        emotional, relationship = self._non_neutral_state()
+        store.commit_turn(
+            request_id="req-neutral-1",
+            user_message="oi",
+            assistant_message="olá",
+            emotional_state=emotional.to_dict(),
+            relationship_state=relationship.to_dict(),
+            public_response="olá",
+            replay_payload=_emotion_payload("olá"),
+            outbox_events=[],
+            expected_revision=0,
+        )
+        revision_before = store.load_user_state().revision
+        assert store.load_user_state().emotional_state != EmotionalStateV1.neutral(
+            timestamp=store.load_user_state().emotional_state["timestamp"]
+        ).to_dict()
+
+        result = store.reset_emotional_state()
+        assert result["status"] == "applied"
+
+        state = store.load_user_state()
+        assert state.revision == revision_before + 1
+        loaded = EmotionalStateV1.from_dict(state.emotional_state)
+        canonical = EmotionalStateV1.neutral(timestamp=loaded.timestamp)
+        assert loaded.to_dict() == canonical.to_dict()
+        # relationship snapshot untouched by the emotional reset
+        assert state.relationship_state == relationship.to_dict()
+        store.close()
+
+    def test_reset_relationship_state_persists_canonical_neutral(
+        self, tmp_path: Path
+    ) -> None:
+        from backend.relationship import RelationshipStateV1
+
+        store = open_local_storage(tmp_path / "katherine.db")
+        emotional, relationship = self._non_neutral_state()
+        store.commit_turn(
+            request_id="req-neutral-2",
+            user_message="oi",
+            assistant_message="olá",
+            emotional_state=emotional.to_dict(),
+            relationship_state=relationship.to_dict(),
+            public_response="olá",
+            replay_payload=_emotion_payload("olá"),
+            outbox_events=[],
+            expected_revision=0,
+        )
+        revision_before = store.load_user_state().revision
+
+        result = store.reset_relationship_state()
+        assert result["status"] == "applied"
+
+        state = store.load_user_state()
+        assert state.revision == revision_before + 1
+        loaded = RelationshipStateV1.from_dict(state.relationship_state)
+        canonical = RelationshipStateV1.neutral(timestamp=loaded.timestamp)
+        assert loaded.to_dict() == canonical.to_dict()
+        assert state.emotional_state == emotional.to_dict()
+        store.close()
+
+    def test_reset_rejects_non_canonical_neutral_argument(self, tmp_path: Path) -> None:
+        from backend.local_storage import ValidationError as LocalValidationError
+
+        store = open_local_storage(tmp_path / "katherine.db")
+        emotional, relationship = self._non_neutral_state()
+        store.commit_turn(
+            request_id="req-neutral-3",
+            user_message="oi",
+            assistant_message="olá",
+            emotional_state=emotional.to_dict(),
+            relationship_state=relationship.to_dict(),
+            public_response="olá",
+            replay_payload=_emotion_payload("olá"),
+            outbox_events=[],
+            expected_revision=0,
+        )
+        forged = emotional.to_dict()  # structurally valid v1, NOT neutral
+        with pytest.raises(LocalValidationError) as excinfo:
+            store.reset_emotional_state(neutral=forged)
+        assert excinfo.value.code == "invalid_reset_payload"
+        with pytest.raises(LocalValidationError):
+            store.reset_emotional_state(neutral={})
+        with pytest.raises(LocalValidationError):
+            store.reset_relationship_state(neutral={"v": 1})
+        store.close()
+
+    def test_stale_commit_after_reset_hits_revision_mismatch(self, tmp_path: Path) -> None:
+        store = open_local_storage(tmp_path / "katherine.db")
+        emotional, relationship = self._non_neutral_state()
+        committed = store.commit_turn(
+            request_id="req-neutral-4",
+            user_message="oi",
+            assistant_message="olá",
+            emotional_state=emotional.to_dict(),
+            relationship_state=relationship.to_dict(),
+            public_response="olá",
+            replay_payload=_emotion_payload("olá"),
+            outbox_events=[],
+            expected_revision=0,
+        )
+        stale_revision = committed.revision
+
+        store.reset_emotional_state()
+
+        # A commit prepared on the pre-reset revision must not overwrite
+        # the reset: CAS rejects it deterministically.
+        with pytest.raises(ConflictError) as excinfo:
+            store.commit_turn(
+                request_id="req-neutral-5",
+                user_message="de novo",
+                assistant_message="resposta",
+                emotional_state=emotional.to_dict(),
+                relationship_state=relationship.to_dict(),
+                public_response="resposta",
+                replay_payload=_emotion_payload("resposta"),
+                outbox_events=[],
+                expected_revision=stale_revision,
+            )
+        assert excinfo.value.code == "revision_mismatch"
+        state = store.load_user_state()
+        from backend.emotional_domain import EmotionalStateV1
+
+        loaded = EmotionalStateV1.from_dict(state.emotional_state)
+        assert loaded.to_dict() == EmotionalStateV1.neutral(
+            timestamp=loaded.timestamp
+        ).to_dict()
+        store.close()
+
+    def test_reset_on_fresh_database_creates_profile_with_neutral(
+        self, tmp_path: Path
+    ) -> None:
+        from backend.emotional_domain import EmotionalStateV1
+        from backend.relationship import RelationshipStateV1
+
+        store = open_local_storage(tmp_path / "katherine.db")
+        result = store.reset_emotional_state()
+        assert result["status"] == "applied"
+        state = store.load_user_state()
+        assert state.revision == 1
+        loaded = EmotionalStateV1.from_dict(state.emotional_state)
+        assert loaded.to_dict() == EmotionalStateV1.neutral(
+            timestamp=loaded.timestamp
+        ).to_dict()
+        rel = RelationshipStateV1.from_dict(state.relationship_state)
+        assert rel.to_dict() == RelationshipStateV1.neutral(
+            timestamp=rel.timestamp
+        ).to_dict()
+        store.close()
+
+
+class TestClosedLifecycle:
+    """close() is terminal: same thread, other threads, no reconnection."""
+
+    def test_operation_on_same_thread_after_close_fails(self, tmp_path: Path) -> None:
+        from backend.local_storage import PersistenceError
+
+        store = open_local_storage(tmp_path / "katherine.db")
+        store.commit_turn(**_commit_kwargs(store, "req-close-1", "r1"))
+        store.close()
+        with pytest.raises(PersistenceError) as excinfo:
+            store.load_user_state()
+        assert excinfo.value.code == "storage_closed"
+        assert excinfo.value.message == "storage is closed"
+        with pytest.raises(PersistenceError):
+            store.commit_turn(**_commit_kwargs(store, "req-close-2", "r2"))
+        with pytest.raises(PersistenceError):
+            store.replay("req-close-1")
+        with pytest.raises(PersistenceError):
+            store.delete_history()
+        with pytest.raises(PersistenceError):
+            store.storage_metrics()
+        with pytest.raises(PersistenceError):
+            store.backup_to(tmp_path / "backup.db")
+        store.close()  # idempotent
+
+    def test_operation_from_other_thread_after_close_fails(
+        self, tmp_path: Path
+    ) -> None:
+        from backend.local_storage import PersistenceError
+
+        store = open_local_storage(tmp_path / "katherine.db")
+        store.commit_turn(**_commit_kwargs(store, "req-close-3", "r3"))
+        # A second thread opens (and registers) its own connection first.
+        barrier = threading.Barrier(2, timeout=10)
+        errors: list[Exception] = []
+
+        def other_thread_op() -> None:
+            try:
+                store._connection_for_tests_only()
+                barrier.wait()
+                barrier.wait()
+                store.load_user_state()
+                errors.append(AssertionError("operation after close must fail"))
+            except PersistenceError as exc:
+                if exc.code != "storage_closed":
+                    errors.append(exc)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        worker = threading.Thread(target=other_thread_op)
+        worker.start()
+        barrier.wait()  # worker opened its connection
+        store.close()  # closes every registered connection
+        barrier.wait()  # worker proceeds to attempt the operation
+        worker.join(timeout=10)
+        assert errors == []
+
+    def test_no_silent_reconnection_after_close(self, tmp_path: Path) -> None:
+        from backend.local_storage import PersistenceError
+
+        store = open_local_storage(tmp_path / "katherine.db")
+        store.commit_turn(**_commit_kwargs(store, "req-close-4", "r4"))
+        store.close()
+        with pytest.raises(PersistenceError):
+            store._connection_for_tests_only()
+        # The database file still exists and holds the committed data; only
+        # this store instance is closed. A NEW instance may open it normally.
+        reopened = open_local_storage(tmp_path / "katherine.db")
+        assert reopened.load_user_state().revision == 1
+        reopened.close()
+
+    def test_close_is_idempotent_and_safe(self, tmp_path: Path) -> None:
+        store = open_local_storage(tmp_path / "katherine.db")
+        store.close()
+        store.close()

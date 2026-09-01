@@ -20,6 +20,12 @@ Concurrency policy (single process, no daemon):
   busy-timeout still avoids transient reader/writer contention inside
   the process.
 
+Lifecycle policy (the lifecycle belongs to the application): after
+``close()`` the store is terminal. No new connection is ever created, no
+operation reads or writes silently, and every call — including from
+other threads — fails with the stable sanitized
+``PersistenceError("storage_closed")``.
+
 Recovery policy: a ``pending`` turn with no live in-process writer can
 only exist after a crash. On open, every ``pending`` row is moved to
 ``failed`` with ``error_code='interrupted'`` inside one transaction:
@@ -29,7 +35,6 @@ replays of an interrupted request return ``request_replay_unavailable``
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import sqlite3
@@ -38,6 +43,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
+from . import contracts as contracts_module
 from . import migrations as migrations_module
 from .errors import (
     ConflictError,
@@ -46,7 +52,7 @@ from .errors import (
     ValidationError,
 )
 
-#: Application directory name under XDG data home.
+#: Application Directory name under XDG data home.
 APP_DIR_NAME = "katherine"
 
 #: Database file name.
@@ -145,13 +151,6 @@ def _validate_message(value: Any, field: str) -> str:
     return value
 
 
-def _canonical_payload_hash(payload: Mapping[str, Any]) -> str:
-    canonical = json.dumps(
-        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    )
-    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-
-
 def _now_iso() -> str:
     import datetime as _dt
 
@@ -217,7 +216,11 @@ class LocalStorage:
     def __init__(self, path: Path | str) -> None:
         self._path = Path(path)
         self._lock = threading.RLock()
-        self._local = threading.local()
+        # Connections are per-thread, but tracked in one registry so
+        # ``close()`` can close every open connection, not only the
+        # caller thread's (the store is a single application-owned
+        # object; its lifecycle is the application's).
+        self._connections: dict[int, sqlite3.Connection] = {}
         self._closed = False
         self._open_and_migrate()
 
@@ -239,11 +242,18 @@ class LocalStorage:
         return conn
 
     def _connection(self) -> sqlite3.Connection:
-        conn = getattr(self._local, "conn", None)
-        if conn is None:
-            conn = self._new_connection()
-            self._local.conn = conn
-        return conn
+        # Lifecycle gate: a closed store never creates or reuses a
+        # connection, on any thread. The check runs inside the same lock
+        # close() takes, so close-then-use races cannot slip through.
+        with self._lock:
+            if self._closed:
+                raise PersistenceError("storage_closed", "storage is closed")
+            thread_key = threading.get_ident()
+            conn = self._connections.get(thread_key)
+            if conn is None:
+                conn = self._new_connection()
+                self._connections[thread_key] = conn
+            return conn
 
     def _connection_for_tests_only(self) -> sqlite3.Connection:
         """Direct connection accessor for tests (never used by the app)."""
@@ -419,15 +429,18 @@ class LocalStorage:
     ) -> CommittedTurn:
         """Commit one conversation turn as a single atomic unit.
 
-        Steps (all inside ``BEGIN IMMEDIATE`` … ``COMMIT``):
+        Steps:
 
-        1. idempotency: an existing **completed** request replays
-           without writing anything;
-        2. insert both chat messages;
-        3. upsert the single profile row with a revision CAS
-           (``WHERE revision = expected``), bumping the revision;
-        4. insert the turn ledger row with the replay payload;
-        5. insert outbox events (unique idempotency keys).
+        1. validate every input against the payload contracts (before any
+           write; ``public_response`` must equal ``replay_payload``
+           [``response``], the single authoritative source);
+        2. idempotency: an existing **completed** request with the SAME
+           canonical payload replays without writing anything; the same
+           ``request_id`` with ANY divergent determinative input raises
+           ``ConflictError("request_payload_conflict")`` without writing;
+        3. inside ``BEGIN IMMEDIATE`` … ``COMMIT``: insert both chat
+           messages, upsert the single profile row with a revision CAS,
+           insert the turn ledger row, insert the outbox events.
 
         Any failure between steps rolls the entire turn back: messages
         and snapshots can never diverge (issue #335, tests 3 and 4).
@@ -435,27 +448,142 @@ class LocalStorage:
         request_id = _validate_request_id(request_id)
         user_message = _validate_message(user_message, "user_message")
         assistant_message = _validate_message(assistant_message, "assistant_message")
-        if not isinstance(replay_payload, Mapping):
-            raise ValidationError("invalid_replay_payload", "replay payload must be a mapping")
-        payload_hash = _canonical_payload_hash(replay_payload)
+        if not isinstance(public_response, str) or not public_response:
+            raise ValidationError(
+                "invalid_public_response", "public_response must be a non-empty string"
+            )
+        if len(public_response) > MAX_MESSAGE_LENGTH:
+            raise ValidationError("message_too_long", "message exceeds the maximum length")
+        replay_payload = contracts_module.validate_replay_payload(replay_payload)
+        if replay_payload.get("response") != public_response:
+            raise ValidationError(
+                "invalid_public_response",
+                "public_response must equal replay_payload response",
+            )
+        contracts_module.validate_emotional_snapshot(emotional_state)
+        contracts_module.validate_relationship_snapshot(relationship_state)
+        validated_outbox = contracts_module.validate_outbox_events(outbox_events)
+        if expected_revision is not None and (
+            isinstance(expected_revision, bool)
+            or not isinstance(expected_revision, int)
+            or expected_revision < 0
+        ):
+            raise ValidationError(
+                "invalid_expected_revision",
+                "expected_revision must be a non-negative integer",
+            )
+
+        canonical_payload = contracts_module.build_canonical_commit_payload(
+            request_id=request_id,
+            expected_revision=expected_revision,
+            user_message=user_message,
+            assistant_message=assistant_message,
+            emotional_state=emotional_state,
+            relationship_state=relationship_state,
+            public_response=public_response,
+            replay_payload=replay_payload,
+            outbox_events=validated_outbox,
+        )
+        payload_hash = contracts_module.canonical_payload_hash(canonical_payload)
         now = _now_iso()
 
         with self._lock:
             conn = self._connection()
             # Idempotency first, without opening a write transaction.
             existing = conn.execute(
-                "select status, committed_revision, user_message_chat_log_id, "
-                "assistant_message_chat_log_id, replay_payload "
+                "select status, payload_hash_sha256, committed_revision, "
+                "user_message_chat_log_id, assistant_message_chat_log_id, "
+                "replay_payload "
                 "from turn_requests where request_id = ?",
                 (request_id,),
             ).fetchone()
-            if existing is not None and existing[0] == "completed":
-                return self._committed_from_row(
-                    request_id, existing[1], existing[2], existing[3], existing[4]
-                )
+            if existing is not None:
+                status, stored_hash = existing[0], existing[1]
+                if status == "completed":
+                    # Same request + same canonical payload → replay the
+                    # committed result. Any divergent determinative input
+                    # is a conflict: the stored hash is compared BEFORE
+                    # replaying, and nothing is ever written on this path.
+                    if stored_hash != payload_hash:
+                        raise ConflictError(
+                            "request_payload_conflict",
+                            "Request id was already completed with a different payload.",
+                            expected_revision=(
+                                expected_revision if expected_revision is not None else 0
+                            ),
+                            actual_revision=None,
+                            request_id=request_id,
+                        )
+                    return self._committed_from_row(
+                        request_id, existing[2], existing[3], existing[4], existing[5]
+                    )
+                if status == "pending":
+                    raise ConflictError(
+                        "request_in_progress",
+                        "Request is already in progress.",
+                        expected_revision=(
+                            expected_revision if expected_revision is not None else 0
+                        ),
+                        actual_revision=None,
+                        request_id=request_id,
+                    )
+                # failed: replay is unavailable, but a retry with the same
+                # canonical payload may proceed as a fresh attempt; a
+                # divergent payload for the same request id is still a
+                # conflict (deterministic rejection, no silent reuse).
+                if stored_hash != payload_hash:
+                    raise ConflictError(
+                        "request_payload_conflict",
+                        "Request id already exists with a different payload.",
+                        expected_revision=(
+                            expected_revision if expected_revision is not None else 0
+                        ),
+                        actual_revision=None,
+                        request_id=request_id,
+                    )
 
             try:
                 conn.execute("BEGIN IMMEDIATE")
+                # Re-read the ledger row inside the write transaction: the
+                # first read ran outside it, and only the writer lock plus
+                # BEGIN IMMEDIATE make the check-then-act atomic.
+                existing = conn.execute(
+                    "select status, payload_hash_sha256, committed_revision, "
+                    "user_message_chat_log_id, assistant_message_chat_log_id, "
+                    "replay_payload "
+                    "from turn_requests where request_id = ?",
+                    (request_id,),
+                ).fetchone()
+                if existing is not None:
+                    status, stored_hash = existing[0], existing[1]
+                    if stored_hash != payload_hash:
+                        conn.execute("ROLLBACK")
+                        raise ConflictError(
+                            "request_payload_conflict",
+                            "Request id was already committed with a different payload.",
+                            expected_revision=(
+                                expected_revision if expected_revision is not None else 0
+                            ),
+                            actual_revision=None,
+                            request_id=request_id,
+                        )
+                    if status == "completed":
+                        conn.execute("ROLLBACK")
+                        return self._committed_from_row(
+                            request_id, existing[2], existing[3], existing[4], existing[5]
+                        )
+                    if status == "pending":
+                        conn.execute("ROLLBACK")
+                        raise ConflictError(
+                            "request_in_progress",
+                            "Request is already in progress.",
+                            expected_revision=(
+                                expected_revision if expected_revision is not None else 0
+                            ),
+                            actual_revision=None,
+                            request_id=request_id,
+                        )
+
                 profile_row = conn.execute(
                     "select revision from profiles where id = 1"
                 ).fetchone()
@@ -463,13 +591,6 @@ class LocalStorage:
                 if expected_revision is None:
                     expected = current_revision
                 else:
-                    if isinstance(expected_revision, bool) or not isinstance(
-                        expected_revision, int
-                    ) or expected_revision < 0:
-                        raise ValidationError(
-                            "invalid_expected_revision",
-                            "expected_revision must be a non-negative integer",
-                        )
                     expected = expected_revision
                 if expected != current_revision:
                     raise ConflictError(
@@ -529,12 +650,12 @@ class LocalStorage:
                     ),
                 )
 
-                for event_type, payload, idempotency_key in outbox_events or []:
+                for event_type, payload, idempotency_key in validated_outbox:
                     conn.execute(
                         "insert into outbox_events (id, event_type, "
                         "idempotency_key, status, turn_request_id, payload, "
                         "created_at) values (?, ?, ?, 'pending', ?, ?, ?) "
-                        "on conflict (idempotency_key) do nothing",
+                        "on conflict (idempotency_key, event_type) do nothing",
                         (
                             f"{idempotency_key}:{event_type}",
                             event_type,
@@ -643,12 +764,61 @@ class LocalStorage:
     # ── Privacy operations ──────────────────────────────────────────────
 
     def delete_history(self) -> dict[str, Any]:
-        return self._privacy_delete(
-            "delete_history",
-            "delete from chat_logs",
-            "deleted_messages",
-            "select count(*) from chat_logs",
-        )
+        """Make the local conversation history unrecoverable, atomically.
+
+        The local history is everything the turn flow persists for those
+        turns: ``chat_logs`` (messages), ``turn_requests`` (the replay
+        ledger, including ``replay_payload``) and the ``outbox_events``
+        derived from them. All three are removed in **one** transaction;
+        the cascade is explicit (outbox → turn request), and the ledger
+        rows are removed together with their messages (no orphaned
+        replay data may survive the user's "delete history").
+
+        The ``privacy_operations`` ledger row is kept for audit, carrying
+        only aggregate counts — no private content.
+        """
+        with self._lock:
+            conn = self._connection()
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                chat_count = conn.execute(
+                    "select count(*) from chat_logs"
+                ).fetchone()[0]
+                turn_count = conn.execute(
+                    "select count(*) from turn_requests"
+                ).fetchone()[0]
+                # Outbox rows cascade with their turn request; count first
+                # because the FK cascade removes them as part of the same
+                # transaction.
+                outbox_count = conn.execute(
+                    "select count(*) from outbox_events"
+                ).fetchone()[0]
+                conn.execute(
+                    "delete from turn_requests"
+                )  # cascades to outbox_events, nulls chat log refs are moot
+                conn.execute("delete from chat_logs")
+                remaining = conn.execute(
+                    "select count(*) from chat_logs"
+                ).fetchone()[0]
+                if remaining != 0:
+                    raise PersistenceError("database_error", "persistence error")
+                result = {
+                    "status": "applied",
+                    "deleted_messages": int(chat_count),
+                    "deleted_turn_requests": int(turn_count),
+                    "deleted_outbox_events": int(outbox_count),
+                }
+                conn.execute(
+                    "insert into privacy_operations (operation, status, result) "
+                    "values ('delete_history', 'applied', ?)",
+                    (_json_dumps(result),),
+                )
+                conn.execute("COMMIT")
+            except sqlite3.Error:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise PersistenceError("database_error", "persistence error") from None
+        return result
 
     def delete_memories(self) -> dict[str, Any]:
         return self._privacy_delete(
@@ -681,27 +851,81 @@ class LocalStorage:
         return result
 
     def reset_emotional_state(self, neutral: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
+        """Replace the emotional snapshot with the canonical neutral v1 state.
+
+        The resulting snapshot is the neutral state **produced by the
+        domain** (``EmotionalStateV1.neutral``). When ``neutral`` is
+        supplied it must BE that canonical snapshot (validated by
+        reconstruction through the domain constructor); there is exactly
+        one definition of "neutral". The reset bumps ``profiles.revision``
+        coherently (CAS): a commit prepared on the previous revision
+        fails with ``revision_mismatch`` instead of silently overwriting
+        the reset.
+        """
+        timestamp = _time_now_unix()
+        canonical = contracts_module.neutral_emotional_snapshot(timestamp)
+        if neutral is not None:
+            contracts_module.validate_neutral_emotional_snapshot(neutral)
         return self._reset_state_field(
-            "reset_emotional_state", "emotional_state", neutral or {}
+            "reset_emotional_state", "emotional_state", canonical
         )
 
     def reset_relationship_state(self, neutral: Optional[Mapping[str, Any]] = None) -> dict[str, Any]:
+        """Replace the relationship snapshot with the canonical neutral v1 state.
+
+        Same semantics as ``reset_emotional_state`` with the domain's
+        ``RelationshipStateV1.neutral`` as the single neutral definition.
+        """
+        timestamp = _time_now_unix()
+        canonical = contracts_module.neutral_relationship_snapshot(timestamp)
+        if neutral is not None:
+            contracts_module.validate_neutral_relationship_snapshot(neutral)
         return self._reset_state_field(
-            "reset_relationship_state", "relationship_state", neutral or {}
+            "reset_relationship_state", "relationship_state", canonical
         )
 
     def _reset_state_field(
-        self, operation: str, field: str, neutral: Mapping[str, Any]
+        self, operation: str, field: str, canonical_neutral: Mapping[str, Any]
     ) -> dict[str, Any]:
         with self._lock:
             conn = self._connection()
             conn.execute("BEGIN IMMEDIATE")
             try:
-                conn.execute(
-                    f"update profiles set {field} = ?, updated_at = ? where id = 1",
-                    (_json_dumps(neutral), _now_iso()),
+                row = conn.execute(
+                    "select revision from profiles where id = 1"
+                ).fetchone()
+                current_revision = row[0] if row else 0
+                new_revision = current_revision + 1
+                updated = conn.execute(
+                    f"update profiles set {field} = ?, revision = ?, "
+                    "updated_at = ? where id = 1",
+                    (_json_dumps(canonical_neutral), new_revision, _now_iso()),
                 )
-                result = {"status": "applied"}
+                if updated.rowcount == 0:
+                    # No profile row yet: create it carrying BOTH canonical
+                    # neutral v1 snapshots, so no column is ever NULL and
+                    # the untouched side is valid from the start.
+                    if field == "emotional_state":
+                        emotional_json = _json_dumps(canonical_neutral)
+                        relationship_json = _json_dumps(
+                            contracts_module.neutral_relationship_snapshot(
+                                _time_now_unix()
+                            )
+                        )
+                    else:
+                        emotional_json = _json_dumps(
+                            contracts_module.neutral_emotional_snapshot(
+                                _time_now_unix()
+                            )
+                        )
+                        relationship_json = _json_dumps(canonical_neutral)
+                    conn.execute(
+                        "insert into profiles (id, emotional_state, "
+                        "relationship_state, revision, updated_at) "
+                        "values (1, ?, ?, ?, ?)",
+                        (emotional_json, relationship_json, new_revision, _now_iso()),
+                    )
+                result = {"status": "applied", "revision": new_revision}
                 conn.execute(
                     "insert into privacy_operations (operation, status, result) "
                     "values (?, 'applied', ?)",
@@ -780,17 +1004,25 @@ class LocalStorage:
     # ── Lifecycle ────────────────────────────────────────────────────────
 
     def close(self) -> None:
+        """Close the store terminally: no later operation may proceed.
+
+        Every thread's connection is closed (connections are per-thread,
+        so each open connection is tracked and closed here), the store is
+        marked closed under the same lock the gate reads, and any later
+        call — on any thread — fails with the stable sanitized
+        ``PersistenceError("storage_closed")`` instead of silently
+        reconnecting.
+        """
         with self._lock:
             if self._closed:
                 return
             self._closed = True
-            conn = getattr(self._local, "conn", None)
-            if conn is not None:
+            for conn in list(self._connections.values()):
                 try:
                     conn.close()
                 except sqlite3.Error:
                     pass
-                self._local.conn = None
+            self._connections.clear()
 
 
 def _json_dumps(value: Any) -> str:
