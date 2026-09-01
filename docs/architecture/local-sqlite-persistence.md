@@ -259,9 +259,12 @@ mocks.
   completo com os módulos reais do domínio.
 - ``backend/tests/test_local_storage_contracts.py`` — testes
   adversariais dos contratos de payload: chaves ``content``/``prompt``
-  aninhadas a qualquer profundidade, payload acima do limite, NaN/
-  Infinity, snapshot inválido/sintético, identidade dentro do snapshot,
-  public_response divergente, tipos de valor de outbox.
+  aninhadas a qualquer profundidade, payload acima do limite (paridade
+  web de 8192 bytes), NaN/Infinity, snapshot inválido/sintético,
+  identidade dentro do snapshot, public_response divergente, tipos de
+  valor de outbox, ``message_id`` ausente/inválido, ``request_id``
+  estranho ao turno, snapshot no máximo do domínio (32 triggers x 128
+  chars) aceito.
 
 Nenhum teste exige Supabase/Postgres/rede; o teste de import
 verifica por subprocess que o pacote não puxa `supabase`/`postgrest`/
