@@ -143,13 +143,9 @@ function createDesktopTransport(targetWindow, historyLimit) {
     });
 }
 
-/**
- * True iff the transport is the desktop (bridge) branch.
- * Callers use this to gate desktop-only UI (privacy panel).
- */
-export function isDesktopTransport(transport) {
-    return transport?.mode === 'desktop';
-}
+// Re-exported for backward compatibility; the dependency-free home is
+// transportMode.js (desktop-gated UI must not pull the web graph).
+export { isDesktopTransport } from './transportMode.js';
 
 /**
  * Build the default transport for the current runtime.

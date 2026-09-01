@@ -242,6 +242,9 @@ export const useChat = ({ transport: injectedTransport } = {}) => {
         messagesEndRef,
         inputRef,
         handleSend,
-        clearScreen
+        clearScreen,
+        // #336: the mode-aware transport, consumed by desktop-only UI
+        // (privacy panel). A web transport makes that panel inert.
+        transport
     };
 };
