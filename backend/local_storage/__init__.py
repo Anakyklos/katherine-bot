@@ -21,22 +21,42 @@ Design invariants (mirrors the PostgreSQL contract, local-first):
 2. **Revision CAS.** ``profiles.revision`` is the optimistic-concurrency
    token: a commit with a stale ``expected_revision`` raises
    ``ConflictError("revision_mismatch")`` and persists nothing.
-3. **Versioned, ordered, idempotent migrations** recorded in
+3. **Request idempotency with payload conflict.** The canonical payload
+   hash covers every determinative input (request id, expected revision,
+   both messages, both snapshots, public response, replay payload,
+   outbox events). The same request id with the same canonical payload
+   replays the committed result without writing; any divergent input
+   raises ``ConflictError("request_payload_conflict")`` without writing
+   anything, and never echoes the payload.
+4. **Validated payloads.** Replay payloads, outbox events and snapshots
+   are validated at the store boundary (``local_storage.contracts``):
+   public allowlists, forbidden keys at any depth, finite canonical JSON,
+   explicit byte bounds, real domain v1 snapshot structure, and the
+   domain-produced neutral v1 snapshot as the only reset payload.
+5. **Real delete_history semantics.** One transaction removes
+   ``chat_logs``, ``turn_requests`` (replay ledger included) and the
+   derived ``outbox_events``; afterwards replay is unavailable. The
+   privacy audit row keeps aggregate counts only.
+6. **Versioned, ordered, idempotent migrations** recorded in
    ``schema_migrations``. A migration that fails partially leaves no
    trace of completion (each migration runs in its own transaction and
    its version row is only inserted after its DDL succeeds).
-4. **Foreign keys enforced** on every connection; integrity is real,
-   not advisory.
-5. **Explicit durability policy**: WAL journaling + ``synchronous=FULL``
+7. **Foreign keys enforced** on every connection; integrity is real,
+   not advisory. Ledger rows cascade to their derived outbox events;
+   turn ledger messages cascade with the ledger on deletion.
+8. **Explicit durability policy**: WAL journaling + ``synchronous=FULL``
    (documented in ``docs/architecture/local-sqlite-persistence.md``).
-6. **Serialization policy for the single process**: one writer lock per
+9. **Serialization policy for the single process**: one writer lock per
    store; writers take ``BEGIN IMMEDIATE`` before the first write so
    lock upgrades cannot fail mid-transaction; readers use per-thread
    connections and WAL gives them a consistent committed snapshot.
-7. **Sanitized errors.** Public errors are stable code+message pairs.
-   SQL text, paths, raw content and driver details never cross the API.
-8. **No cloud imports.** The package imports only stdlib sqlite3/JSON —
-   importing it never pulls Supabase/PostgREST/HTTP stacks.
+10. **Terminal lifecycle.** After ``close()`` no new connection is
+    created and no operation proceeds on any thread; every later call
+    fails with the stable sanitized ``PersistenceError("storage_closed")``.
+11. **Sanitized errors.** Public errors are stable code+message pairs.
+    SQL text, paths, raw content and driver details never cross the API.
+12. **No cloud imports.** The package imports only stdlib sqlite3/JSON —
+    importing it never pulls Supabase/PostgREST/HTTP stacks.
 
 Removed versus the web schema (each removal documented in the issue
 #335 invariant table): multi-user ``user_id`` columns, RLS, service-role

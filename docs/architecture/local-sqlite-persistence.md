@@ -50,6 +50,23 @@ primeira escrita.**
   "coordenação" é garantido pela posse única da conexão escrevente, e
   não por lock distribuído.
 
+### Lifecycle da store (pertence à aplicação)
+
+`close()` é **terminal**. Ele fecha todas as conexões registradas (uma
+por thread que usou a store), marca a store fechada sob o mesmo lock que
+o gate de conexão lê, e a partir daí:
+
+- nenhuma nova conexão é criada pela store, em nenhuma thread;
+- nenhuma leitura/escrita continua silenciosamente;
+- toda chamada posterior falha com o erro sanitizado estável
+  `PersistenceError("storage_closed")` — mesma thread ou outra thread;
+- `close()` é idempotente; o arquivo do banco permanece intacto e uma
+  **nova** instância pode abri-lo normalmente (o dado não é destruído,
+  apenas esta store é encerrada).
+
+Sem daemon, sem pool pesado, sem framework: um dict de conexões por
+thread ID e um gate sob o lock existente.
+
 ### Recovery
 
 Na abertura, todo ``turn_requests`` com ``status='pending'`` é marcado
@@ -72,30 +89,85 @@ presente no disco é recuperado pelo próprio SQLite.
 
 Uma única transação ``BEGIN IMMEDIATE`` … ``COMMIT`` executa, nesta ordem:
 
-1. **Idempotência**: request_id já ``completed`` → retorna o turn
-   commitado original sem escrever nada (replay idempotente);
-2. **CAS**: lê ``profiles.revision``; se ``expected_revision`` difere →
+1. **Validação de payload** (antes de qualquer escrita): replay payload,
+   snapshots e outbox são validados contra os contratos de payload
+   locais (``backend/local_storage/contracts.py``); ``public_response``
+   deve ser igual a ``replay_payload["response"]`` (fonte única
+   autoritativa do resultado público);
+2. **Idempotência**: request_id já ``completed`` **com o mesmo payload
+   canônico** → retorna o turn commitado original sem escrever nada;
+   o hash canônico cobre **todos** os inputs determinantes do turno
+   (request_id, expected_revision, mensagens, snapshots,
+   public_response, replay_payload, outbox_events). O mesmo request_id
+   com qualquer input divergente → ``ConflictError`` código estável
+   ``request_payload_conflict``, determinístico, **sem nenhuma
+   escrita** (mensagens, snapshots, revision, ledger, outbox) e sem
+   expor payload/hash no erro. A checagem roda fora da transação
+   (fast path) e é refeita dentro de ``BEGIN IMMEDIATE`` (a leitura
+   inicial não é parte da transação de escrita);
+3. **CAS**: lê ``profiles.revision``; se ``expected_revision`` difere →
    ``ConflictError("revision_mismatch")`` com rollback integral;
-3. INSERT mensagem do usuário (``chat_logs``);
-4. INSERT mensagem da assistente (``chat_logs``);
-5. UPSERT do perfil com ``revision = expected + 1`` e os snapshots
+4. INSERT mensagem do usuário (``chat_logs``);
+5. INSERT mensagem da assistente (``chat_logs``);
+6. UPSERT do perfil com ``revision = expected + 1`` e os snapshots
    emocional/relacional do turno;
-6. INSERT do ledger ``turn_requests`` (``status='completed'``,
-   ``replay_payload`` canônico);
-7. INSERT dos ``outbox_events`` (``ON CONFLICT (idempotency_key) DO
-   NOTHING``).
+7. INSERT do ledger ``turn_requests`` (``status='completed'``,
+   ``replay_payload`` canônico, hash canônico do payload completo);
+8. INSERT dos ``outbox_events`` (``ON CONFLICT (idempotency_key,
+   event_type) DO NOTHING``).
 
-Qualquer falha entre 2 e 7 → rollback do turno inteiro: mensagens e
+Qualquer falha entre 2 e 8 → rollback do turno inteiro: mensagens e
 snapshots jamais divergem (testes 3 e 4 da issue). O CAS substitui o
 lock transacional per-user do PostgreSQL: o invariante "uma escrita
 obsoleta nunca sobrescreve estado novo" é preservado pelo mesmo mecanismo
 lógico (version token), agora guardado por transação serializada.
 
+## Contratos de payload (validados em código, testados adversarialmente)
+
+Os contratos que a arquitetura web garante no PostgreSQL são aplicados
+localmente pela store, sem copiar complexidade cloud (sem campos de
+identidade remota):
+
+- **Serialização canônica**: JSON determinístico (keys ordenadas,
+  separadores compactos, UTF-8, ``allow_nan=False``) — a mesma
+  serialização usada para hash e para armazenar payloads.
+- **Replay payload**: deve ser ``Mapping``; apenas campos públicos
+  aprovados; nenhuma chave proibida (``prompt``, ``system_prompt``,
+  ``meta_cognition``, ``internal_instructions``, ``message``,
+  ``content``, …) em **qualquer profundidade**; ``response`` obrigatório
+  como string; JSON finito; limite explícito de 8 KB.
+- **Outbox**: shape do evento, ``event_type`` (``^[a-z0-9_]{1,64}$``),
+  ``idempotency_key`` (``^[A-Za-z0-9_.:-]{1,128}$``), allowlist de
+  keys do payload, chaves proibidas recursivas, **tipos dos valores**
+  (campos de referência são strings ASCII limitadas; ``version`` é
+  inteiro em [1, 1000]), JSON finito, limite de 256 B por payload e
+  no máximo 32 eventos por turno. Mensagens, prompts e conteúdo
+  conversacional não podem ser duplicados no outbox — o código
+  garante o que a documentação afirma.
+- **Snapshots**: não são documentos arbitrários. São validados pelos
+  **modelos reais do domínio** (``EmotionalStateV1`` /
+  ``RelationshipStateV1``), que já rejeitam keys desconhecidas, campos
+  faltantes, identidade/conteúdo interno, valores fora de range,
+  não finitos e bool como numérico; limite de 4 KB por snapshot.
+- **Resets**: o único payload aceito é o **snapshot neutro canônico
+  v1 produzido pelos construtores do domínio** (``EmotionalStateV1.neutral``
+  / ``RelationshipStateV1.neutral``), verificado por reconstrução.
+  Não existem duas definições de "neutro".
+- **Unicidade de outbox**: ``(idempotency_key, event_type)`` único — o
+  mesmo contrato em schema (``UNIQUE``), código (``ON CONFLICT``) e
+  testes. A mesma key pode rotular tipos distintos de evento de um
+  turno; reentregar o mesmo evento é rejeitado.
+
 ## Migrations
 
 - Em código: lista frozen ``(version, sql)`` em
-  ``backend/local_storage/migrations.py`` — ordenadas, append-only,
-  reprodutíveis, sem dependência nova e sem arquivos soltos.
+  ``backend/local_storage/migrations.py`` — ordenadas, reprodutíveis,
+  sem dependência nova e sem arquivos soltos. **Append-only após o
+  merge**: a migration inicial 0001 ainda não está na `main`, então é
+  ela própria que carrega as FKs `ON DELETE CASCADE` e a unicidade
+  composta do outbox exigidas pela semântica de privacidade do
+  `delete_history`; após o merge, mudanças de schema entram como novas
+  migrations, e migrations aplicadas nunca são editadas.
 - ``schema_migrations(version PK, applied_at)`` registra as aplicadas;
   reabrir pula as existentes (idempotente).
 - **Atomicidade por migration**: cada migration roda em sua própria
@@ -109,8 +181,8 @@ lógico (version token), agora guardado por transação serializada.
 |---|---|---|
 | `profiles` (persona, user_profile, emocional, relacional, revision) | `profiles` (1 linha, `id=1`) | Snapshots como JSON canônico; `revision` mantém o CAS |
 | `chat_logs` | `chat_logs` | Sem `user_id` (single-user); índice `(created_at, id)` para recência |
-| `turn_requests` | `turn_requests` | Ledger de idempotência/replay; FKs para `chat_logs` `ON DELETE SET NULL` (privacidade nunca é bloqueada pelo ledger, paridade com o trigger do PostgreSQL) |
-| `outbox_events` | `outbox_events` | Idempotency key única; payload estrito de referências (sem conteúdo) |
+| `turn_requests` | `turn_requests` | Ledger de idempotência/replay com hash canônico do payload completo; FKs para `chat_logs` `ON DELETE CASCADE` (o ledger morre com as mensagens — nada de replay sobrevive ao delete_history) |
+| `outbox_events` | `outbox_events` | Unicidade `(idempotency_key, event_type)`; payload estrito de referências (sem conteúdo), validado em código; FK para `turn_requests` `ON DELETE CASCADE` (eventos derivados são removidos com o turno) |
 | `memories` | `memories` | Metadados JSON com o mesmo contrato de versão/aprovação |
 | `privacy_operations` | `privacy_operations` | Auditoria local (operação, status, result) sem conteúdo privado |
 | `account_deletion_jobs` / worker | **removido nesta fundação** | Destruição de conta é o equivalente local a apagar o arquivo do banco; a operação é documentada, o worker distribuído não se aplica |
@@ -123,12 +195,15 @@ lógico (version token), agora guardado por transação serializada.
 | Commit do turno como unidade atômica | **Preservado** | `BEGIN IMMEDIATE` + rollback integral |
 | Mensagens e snapshots não divergem após crash | **Preservado** | Transação única + WAL + `synchronous=FULL` |
 | Schema versionado, migrations reproduzíveis | **Preservado** | Lista em código + `schema_migrations` |
-| Integridade referencial | **Preservado** | `PRAGMA foreign_keys=ON` + FKs com ON DELETE coerentes |
-| Revision para detectar estado obsoleto | **Preservado** | CAS em `profiles.revision` |
-| Idempotência/replay | **Preservado** | `turn_requests` PK + replay do commitado |
+| Integridade referencial | **Preservado** | `PRAGMA foreign_keys=ON` + FKs `ON DELETE CASCADE` coerentes com a semântica de privacidade |
+| Revision para detectar estado obsoleto | **Preservado** | CAS em `profiles.revision` (commits e resets) |
+| Idempotência/replay com rejeição de payload divergente | **Preservado** | `turn_requests` PK + hash canônico cobrindo todos os inputs determinantes; divergência → `request_payload_conflict` sem escrita |
+| Contratos de payload (allowlists, chaves proibidas, limites, JSON finito) | **Preservado** | `backend/local_storage/contracts.py` + testes adversariais |
 | Recuperação previsível pós-interrupção | **Preservado** | WAL auto-recovery + pending→failed fail-closed |
-| Retenção e exclusão reais | **Preservado** | `delete_history`/`delete_memories`/`trim_history` + auditoria |
-| Limites de tamanho/crescimento | **Preservado** | `MAX_MESSAGE_LENGTH`, trim por contagem, métricas |
+| Retenção e exclusão reais | **Preservado** | `delete_history` remove `chat_logs` + `turn_requests` (replay incluso) + outbox derivado numa única transação; `delete_memories`/`trim_history` + auditoria sem conteúdo privado |
+| Reset neutro canônico v1 | **Preservado** | Snapshot neutro produzido por `EmotionalStateV1.neutral` / `RelationshipStateV1.neutral`; revision incrementada coerentemente |
+| Lifecycle da store | **Preservado** | `close()` terminal: nenhuma nova conexão, nenhuma operação silenciosa, erro estável `storage_closed` em qualquer thread |
+| Limites de tamanho/crescimento | **Preservado** | `MAX_MESSAGE_LENGTH`, limites de bytes por payload (replay 8 KB, outbox 256 B, snapshot 4 KB), trim por contagem, métricas |
 | Erros sanitizados | **Preservado** | code+message constantes; sem SQL/path/conteúdo |
 | Nada importante só em RAM | **Preservado** | Toda escrita de turno é transação commitada |
 | RLS multiusuário | **Removido** | Single-user local; o arquivo é a fronteira de confiança |
@@ -161,12 +236,25 @@ folha futura:
 
 ## Testes
 
-``backend/tests/test_local_storage.py`` — 35 testes, todos contra
-arquivos SQLite **reais temporários** (um banco isolado por teste,
-``tmp_path``). Falhas são produzidas por mecânica SQLite real (triggers
-de abort, CHECK, CAS), nunca por mocks. Mapeamento direto dos 12
-testes obrigatórios da issue + extras (CAS, replay, outbox, backup,
-XDG, sanitized, no-cloud-imports, recovery de pending).
+Duas suítes, todas contra arquivos SQLite **reais temporários** (um
+banco isolado por teste, ``tmp_path``). Falhas são produzidas por
+mecânica SQLite real (triggers de abort, CHECK, CAS, FK), nunca por
+mocks.
+
+- ``backend/tests/test_local_storage.py`` — mapeamento direto dos 12
+  testes obrigatórios da issue + extras: CAS, replay, idempotência com
+  rejeição de payload divergente (``request_payload_conflict`` sem
+  escrita), outbox, delete_history completo (mensagens + ledger +
+  outbox, replay indisponível, atomicidade sob falha), resets neutros
+  canônicos com revision e commit obsoleto rejeitado, lifecycle fechado
+  (mesma thread, outra thread, nenhuma reconexão silenciosa), backup,
+  XDG, sanitized, no-cloud-imports, recovery de pending, ciclo de turno
+  completo com os módulos reais do domínio.
+- ``backend/tests/test_local_storage_contracts.py`` — testes
+  adversariais dos contratos de payload: chaves ``content``/``prompt``
+  aninhadas a qualquer profundidade, payload acima do limite, NaN/
+  Infinity, snapshot inválido/sintético, identidade dentro do snapshot,
+  public_response divergente, tipos de valor de outbox.
 
 Nenhum teste exige Supabase/Postgres/rede; o teste de import
 verifica por subprocess que o pacote não puxa `supabase`/`postgrest`/
