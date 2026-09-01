@@ -12,7 +12,10 @@ Requirements (documented in README "Desktop shell (Linux)"):
 - pywebview with the GTK (WebKitGTK) backend;
 - a virtual display (Xvfb) when running without a GUI session.
 
-What this smoke proves (issue #334 validation items):
+What this smoke proves (issue #334 validation items + #336 local
+runtime persistence):
+
+#334 (shell trust):
 1. the app opens on Linux from the local frontend build (file://, no
    HTTP server);
 2. the REAL chat UI renders inside the shell (ChatHeader, message
@@ -39,6 +42,19 @@ What this smoke proves (issue #334 validation items):
 6. closing the window ends the shell cleanly (no leftover threads);
 7. no HTTP server is listening for the UI.
 
+#336 (local companion runtime, added on top of the same run):
+8. runtime_state() through the real bridge reports local storage
+   ready with no cloud dependency;
+9. a full turn driven through send_message() (scripted offline
+   provider — no Groq quota, no network) commits locally;
+10. the turn is durable in SQLite, proven by an independent
+    read-only stdlib sqlite3 connection (not the runtime's read
+    path);
+11. a FRESH runtime over the same file (what a relaunch is)
+    recovers the conversation and the stored revision;
+12. the local privacy op delete_history() really erases (0 message
+    rows in chat_logs afterwards, verified independently).
+
 Threading model: pywebview requires the GTK main loop on the main
 thread, so ``webview.start()`` runs on the main thread and the probes
 run on a worker thread. WebKitGTK's ``evaluate_js`` dispatches work to
@@ -52,6 +68,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -158,6 +175,60 @@ _PROBE_BADGE = """
   return badge ? { text: badge.innerText } : null;
 })()
 """
+
+
+def _make_scripted_provider():
+    """Deterministic offline provider for the smoke (#336).
+
+    The smoke must never spend real Groq quota and must not depend on a
+    configured key: the provider port answers with a fixed, valid reply
+    and a neutral appraisal. It exercises the same code path (port
+    interface, envelope validation, atomic commit) with zero network.
+    """
+    from backend.companion_runtime import ProviderPort
+    from backend.emotional_domain import AppraisalV1
+
+    class ScriptedSmokeProvider(ProviderPort):
+        async def appraise(self, message, budget):
+            return AppraisalV1.neutral()
+
+        async def generate(self, messages, budget):
+            return "Resposta de teste do smoke local (#336)."
+
+        def build_trusted_policy(self, emotional_state, relationship, adaptation_strategy=""):
+            return "Seja você mesma, com carinho."
+
+    return ScriptedSmokeProvider()
+
+
+def _sqlite_tables(db_path: Path) -> list[str]:
+    """Read the table list straight from the smoke database file.
+
+    Independent proof of persistence: the smoke does not trust the
+    runtime's own read path to prove that the runtime wrote anything —
+    it opens the SQLite file with the stdlib module and looks.
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        ).fetchall()
+        return [name for (name,) in rows]
+    finally:
+        conn.close()
+
+
+def _sqlite_row_count(db_path: Path, table: str) -> int:
+    import sqlite3
+
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        (count,) = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+        return int(count)
+    finally:
+        conn.close()
 
 
 def _listening_ports(pid: int) -> list[int]:
@@ -650,6 +721,63 @@ def run_smoke() -> tuple[bool, list[str]]:
                 f"ports={ports}",
             )
 
+            # 6b. #336: the companion runtime is local. Through the
+            #      exact bridge object the JS layer reaches, drive one
+            #      full turn end-to-end and prove persistence WITHOUT
+            #      trusting the runtime's own read path: a separate
+            #      stdlib sqlite3 connection reads the same file.
+            js_api_local = _get_js_api(window)
+            runtime_state = None
+            send_result = None
+            if js_api_local is not None:
+                try:
+                    runtime_state = js_api_local.runtime_state()
+                    send_result = js_api_local.send_message(
+                        "smoke-336-0001",
+                        "Mensagem do smoke #336",
+                    )
+                except Exception as exc:  # noqa: BLE001 (evidence only)
+                    worker_error.append(f"runtime bridge call failed: {exc}")
+
+            report.check(
+                "runtime_state() reports local storage ready",
+                bool(
+                    runtime_state
+                    and runtime_state.get("ok") is True
+                    and runtime_state.get("storage") is True
+                ),
+                json.dumps(runtime_state)[:200] if runtime_state else "no result",
+            )
+            report.check(
+                "send_message() turns a real conversation through the bridge",
+                bool(
+                    send_result
+                    and send_result.get("success") is True
+                    and send_result.get("response")
+                ),
+                json.dumps(send_result)[:200] if send_result else "no result",
+            )
+
+            # Independent SQLite proof: read the smoke DB with stdlib
+            # sqlite3 (read-only, different connection) — the turn is
+            # durable on disk, not merely in the runtime's memory.
+            tables = _sqlite_tables(smoke_db_path)
+            report.check(
+                "SQLite file holds the LocalStorage schema",
+                bool(
+                    tables
+                    and "chat_logs" in tables
+                    and "turn_requests" in tables
+                ),
+                f"tables={tables}",
+            )
+            persisted = _sqlite_row_count(smoke_db_path, "chat_logs")
+            report.check(
+                "turn messages persisted to SQLite (independent read)",
+                persisted >= 2,
+                f"chat_logs rows={persisted} (user + assistant)",
+            )
+
             # 7. Closing the window ends the shell cleanly (checked by
             # the main thread after webview.start() returns).
         except Exception as exc:  # noqa: BLE001 (report and bail out)
@@ -666,8 +794,19 @@ def run_smoke() -> tuple[bool, list[str]]:
     probe_thread = threading.Thread(target=probe_worker, daemon=True)
     probe_thread.start()
 
+    # #336: the smoke uses a throwaway database and an offline scripted
+    # provider. The user's real local database is never touched and no
+    # Groq quota is spent; the lifecycle exercised is otherwise the
+    # production one (bridge -> runtime -> LocalStorage -> SQLite).
+    smoke_db_dir = tempfile.mkdtemp(prefix="katherine-smoke-336-")
+    smoke_db_path = Path(smoke_db_dir) / "smoke.db"
+
     try:
-        run_desktop_shell(html_name=SMOKE_PAGE)  # blocks on main thread
+        run_desktop_shell(  # blocks on main thread
+            html_name=SMOKE_PAGE,
+            storage_path=smoke_db_path,
+            provider=_make_scripted_provider(),
+        )
     finally:
         webview.create_window = original_create  # type: ignore[assignment]
 
@@ -683,11 +822,57 @@ def run_smoke() -> tuple[bool, list[str]]:
         True,
     )
 
+    # 8. #336: restart recovery. A FRESH runtime over the same SQLite
+    #    file (what a relaunch does) must load the persisted turn and
+    #    report the stored revision — proving the app's state survives
+    #    a close/reopen cycle with LocalStorage as the only store.
+    from backend.companion_runtime import build_companion_runtime
+
+    restarted = build_companion_runtime(storage_path=smoke_db_path)
+    try:
+        recovered_history = restarted.load_history()
+        recovered_state = restarted.runtime_state()
+        history_ok = bool(
+            recovered_history
+            and any(
+                "smoke #336" in str(entry.get("content", ""))
+                for entry in recovered_history
+            )
+        )
+        report.check(
+            "restart recovers the persisted conversation (fresh runtime, same DB)",
+            history_ok,
+            f"entries={len(recovered_history or [])}",
+        )
+        report.check(
+            "restart recovers the stored revision",
+            bool(
+                recovered_state
+                and recovered_state.get("ok") is True
+                and recovered_state.get("revision", 0) >= 1
+            ),
+            json.dumps(recovered_state)[:200] if recovered_state else "no result",
+        )
+        privacy = restarted.delete_history()
+        deleted = _sqlite_row_count(smoke_db_path, "chat_logs")
+        report.check(
+            "local privacy op really deletes (delete_history -> 0 messages)",
+            bool(
+                privacy
+                and privacy.get("success") is True
+                and privacy.get("result", {}).get("status") == "applied"
+                and deleted == 0
+            ),
+            f"chat_logs rows after delete={deleted}",
+        )
+    finally:
+        restarted.close()
+
     return report.ok, report.lines
 
 
 def main() -> int:
-    print("Katherine desktop shell smoke (#334)")
+    print("Katherine desktop shell smoke (#334 + #336 local runtime)")
     print(f"repo: {REPO_ROOT}")
     print(f"python: {sys.version.split()[0]}\n")
     ok, _ = run_smoke()

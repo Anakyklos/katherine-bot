@@ -56,22 +56,39 @@ def _stub_webview(monkeypatch, *, start_raises: bool = False) -> dict:
     class FakeWindow:
         def __init__(self, **kwargs) -> None:
             self.events = FakeEvents()
+            self._url = kwargs.get("url")
 
         def get_current_url(self) -> str | None:
-            return None
+            # The real window reports the URL of the COMPLETED load;
+            # for the stub, the load completes immediately with the
+            # creation URL (the local build entry). Bridge calls must
+            # therefore be served — this is the smoke's steady state.
+            return self._url
 
         def load_url(self, url: str) -> None:
             pass
 
+
+    windows: list = []
+
     def _create_window(**kwargs):
         recorded["create_window_calls"].append(kwargs)
-        return FakeWindow(**kwargs)
+        window = FakeWindow(**kwargs)
+        windows.append(window)
+        return window
 
     def _start():
         recorded["start_called"] = True
         if start_raises:
             recorded["start_raised"] = True
             raise RuntimeError("window loop crashed /tmp/secret")
+        # The stub's load completes when the loop runs: fire the
+        # registered loaded handlers so the navigation policy commits
+        # the local page as trusted (mirrors the real window's first
+        # completed load of the entry page).
+        for window in windows:
+            for handler in list(window.events.loaded.handlers):
+                handler()
 
     monkeypatch.setattr(
         desktop_app_module, "webview", types.SimpleNamespace(
@@ -338,3 +355,87 @@ class TestBridgeRuntimeIntegration:
         assert bridge.delete_memories()["ok"] is True
 
         runtime.close()
+
+
+class TestSmokeSeams:
+    """#336: the smoke-test seams of ``run_desktop_shell``.
+
+    ``storage_path`` / ``provider`` let the reproducible smoke run the
+    production lifecycle against a throwaway database and an offline
+    provider (no user data, no Groq quota). The seam must bypass the
+    production ``_build_runtime`` completely and build a REAL
+    CompanionRuntime over the injected path — so the smoke exercises
+    the true bridge → runtime → LocalStorage path.
+    """
+
+    def test_seams_bypass_production_runtime_builder(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        _make_dist(tmp_path)
+        recorded = _stub_webview(monkeypatch)
+
+        def _forbidden():
+            raise AssertionError(
+                "production runtime builder must not run when seams are injected"
+            )
+
+        monkeypatch.setattr(desktop_app_module, "_build_runtime", _forbidden)
+
+        class OfflineProvider:
+            async def appraise(self, message, budget):
+                from backend.emotional_domain import AppraisalV1
+
+                return AppraisalV1.neutral()
+
+            async def generate(self, messages, budget):
+                return "offline reply"
+
+            def build_trusted_policy(self, emotional_state, relationship, adaptation_strategy=""):
+                return "policy"
+
+        db_path = tmp_path / "smoke.db"
+        exit_code = desktop_app_module.run_desktop_shell(
+            frontend_root=tmp_path,
+            storage_path=db_path,
+            provider=OfflineProvider(),
+        )
+        assert exit_code == 0
+        # The window received a bridge over the SEAM runtime (the
+        # production builder never ran — the monkeypatched _forbidden
+        # would have raised).
+        js_api = recorded["create_window_calls"][0]["js_api"]
+        turn = js_api.send_message("smoke-req-1", "olá do smoke")
+        assert turn["ok"] is True
+        assert turn["success"] is True
+
+        # Independent proof: the injected path holds the data.
+        import sqlite3
+
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            (count,) = conn.execute(
+                "SELECT COUNT(*) FROM chat_logs"
+            ).fetchone()
+        finally:
+            conn.close()
+        assert count == 2  # user + assistant
+
+    def test_no_seams_uses_production_builder(self, monkeypatch, tmp_path: Path) -> None:
+        _make_dist(tmp_path)
+        recorded = _stub_webview(monkeypatch)
+
+        calls: list[str] = []
+        monkeypatch.setattr(
+            desktop_app_module,
+            "_build_runtime",
+            lambda: calls.append("production") or _FakeLifecycleRuntime(),
+        )
+
+        class _FakeLifecycleRuntime:
+            def close(self):
+                calls.append("close")
+
+        exit_code = desktop_app_module.run_desktop_shell(frontend_root=tmp_path)
+        assert exit_code == 0
+        assert recorded["start_called"] is True
+        assert "production" in calls

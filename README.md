@@ -44,7 +44,12 @@ python -m backend.desktop.app
 ```
 
 Opens the production frontend build in a native GTK window (WebKitGTK)
-via `file://` — no HTTP server. See
+via `file://` — no HTTP server. The companion conversation runs fully
+local (#336): no login, no Supabase, LocalStorage SQLite as the only
+persistence (`~/.local/share/katherine/`), and the remote LLM (Groq)
+as the only network dependency. Local privacy operations (delete
+history/memories, reset emotional/relationship state) are available in
+the desktop sidebar. See
 [Desktop Shell no Linux](docs/operations/desktop-shell-linux.md).
 
 ### Frontend

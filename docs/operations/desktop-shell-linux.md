@@ -60,16 +60,32 @@ silencioso; a mensagem vem do GTK, não do shell.
 O smoke abre a janela real em `file://` e verifica, com probes
 `evaluate_js`:
 
+**Confiança do shell (#334):**
+
 1. resolução do build (dist + página de smoke);
 2. janela carrega o build local via `file://`;
 3. a **chat UI real** renderiza (header, input, send, empty state);
-4. round-trip JS→Python→JS (`health()`);
-5. o badge "desktop v1" do ChatHeader (round-trip visível na UI);
+4. round-trip JS→Python→JS (`health()`, api_version 2);
+5. o badge "desktop v2" do ChatHeader (round-trip visível na UI);
 6. input inválido é rejeitado com erro sanitizado;
 7. navegação remota (`https://example.com/`) é revertida para o build;
 8. a bridge recusa chamadas com a janela em URL remota (fail-closed);
 9. nenhum servidor HTTP escuta no processo (nenhuma porta);
 10. fechar a janela encerra o shell (recursos liberados).
+
+**Runtime local #336 (mesma execução):**
+
+11. `runtime_state()` pela bridge reporta armazenamento local pronto;
+12. um turno completo via `send_message()` (provider scriptado offline,
+    sem cota Groq, sem rede) comita localmente;
+13. o turno está durável no SQLite — provado por uma conexão
+    `sqlite3` **independente e read-only** (não o caminho de leitura
+    do runtime);
+14. um runtime **novo** sobre o mesmo arquivo (o que um relançamento
+    é) recupera a conversa e a revisão persistida;
+15. a operação local de privacidade `delete_history()` apaga de
+    verdade (0 linhas em `chat_logs` depois, verificação
+    independente).
 
 ```bash
 # build do frontend (produz dist/index.html e dist/desktop-smoke.html)
@@ -81,6 +97,15 @@ xvfb-run -a -s "-screen 0 1280x800x24" \
 ```
 
 Sucesso: todas as linhas `[PASS]` e `SMOKE_OK` no final.
+
+### Nota sobre o runtime do smoke (#336)
+
+O smoke usa um banco descartável (`katherine-smoke-336-*`) e um
+provider scriptado offline: o banco real do usuário nunca é tocado e
+nenhuma cota Groq é gasta. O ciclo de vida exercitado é o de produção
+(bridge → runtime → LocalStorage → SQLite). A prova de persistência
+não confia na leitura do próprio runtime: uma conexão `sqlite3`
+independente (read-only) inspeciona o arquivo.
 
 ### Nota sobre o check "remote navigation"
 

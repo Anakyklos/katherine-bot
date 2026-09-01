@@ -396,6 +396,8 @@ def run_desktop_shell(
     frontend_root: Path | None = None,
     *,
     html_name: str = "index.html",
+    storage_path: Path | str | None = None,
+    provider: Any = None,
 ) -> int:
     """Open the desktop window and block until it is closed.
 
@@ -409,6 +411,12 @@ def run_desktop_shell(
     the real ChatWindow. The page must exist inside ``dist`` (the
     resolver still validates the build root), and the navigation
     policy treats every page inside ``dist`` as local build content.
+
+    ``storage_path`` / ``provider`` are smoke-test seams only (#336):
+    the reproducible smoke must not touch the user's real database or
+    spend real provider quota. Production callers never pass them —
+    the default path and the real Groq provider factory stay exactly
+    as they are.
     """
     root = frontend_root if frontend_root is not None else _repo_root() / "frontend"
     config = DesktopBuildConfig(frontend_root=root)
@@ -423,7 +431,15 @@ def run_desktop_shell(
     # Runtime lifecycle (#336): constructed before the window so the
     # bridge it serves is wired exactly once; closed after the window
     # loop returns (window close ⇒ clean shutdown, always, via finally).
-    runtime = _build_runtime()
+    if storage_path is None and provider is None:
+        runtime = _build_runtime()
+    else:
+        from backend.companion_runtime import CompanionRuntime
+
+        runtime = CompanionRuntime(
+            storage_path=storage_path,
+            provider=provider,
+        )
 
     # ``create_window`` returns the Window synchronously, before
     # ``webview.start()``; the holder is populated right after creation so
