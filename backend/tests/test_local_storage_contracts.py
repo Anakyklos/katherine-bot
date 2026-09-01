@@ -100,6 +100,8 @@ class TestReplayPayloadContract:
         assert excinfo.value.code == "invalid_replay_payload"
 
     def test_rejects_oversized_payload(self) -> None:
+        # Web parity: the SQL CHECK and atomic_turn_commit bound the replay
+        # payload at 8192 bytes; the local contract enforces the same bound.
         payload = _valid_replay_payload()
         payload["response"] = "x" * 9000
         with pytest.raises(ValidationError) as excinfo:
@@ -206,22 +208,13 @@ class TestOutboxContract:
             validate_outbox_events(events)
 
     def test_rejects_oversized_payload(self) -> None:
-        # Every field value is individually valid (bounded ASCII reference
-        # strings), but together the document crosses the 256 B outbox cap.
-        events = [
-            (
-                "archival_extraction_requested",
-                {
-                    "ref": "r" * 128,
-                    "request_id": "q" * 128,
-                    "turn_id": "t" * 128,
-                },
-                "k1",
-            )
-        ]
+        # Web parity (test_atomic_turn_commit.py::test_outbox_payload_byte_limit):
+        # a reference field above the 8192 B bound is rejected with the same
+        # stable code the web contract uses.
+        events = [("turn_completed", {"ref": "x" * 8200}, "key")]
         with pytest.raises(ValidationError) as excinfo:
             validate_outbox_events(events)
-        assert "exceeds" in excinfo.value.message
+        assert excinfo.value.code == "invalid_outbox_events"
 
     def test_accepts_typical_reference_payload(self) -> None:
         # A real archival event payload fits comfortably in the bound.
@@ -286,13 +279,30 @@ class TestSnapshotContract:
 
     def test_rejects_oversized_snapshot(self) -> None:
         # The domain bounds each trigger to 128 chars and the list to 32
-        # entries, but the whole document is still capped. Triggers at the
-        # domain maximum cross the local 4 KB snapshot budget.
+        # entries, but the document is still capped at the 8192 B bound
+        # shared with the web replay/outbox payload limits. Oversized
+        # triggers (invalid for the domain) still cross the byte cap.
         rel = _valid_relationship_snapshot()
-        rel["triggers"] = [f"t{i:03d}-" + "x" * 122 for i in range(32)]
+        rel["triggers"] = ["t" * 300 for _ in range(32)]
         with pytest.raises(ValidationError) as excinfo:
             validate_relationship_snapshot(rel)
         assert "exceeds" in excinfo.value.message
+
+    def test_accepts_domain_maximum_snapshot(self) -> None:
+        # Parity guard: the largest domain-VALID relationship snapshot
+        # (32 distinct triggers x 128 chars, ~4.3 KB canonical) must be
+        # accepted locally. The web contract has no snapshot byte bound;
+        # the local bound (8192) matches its replay/outbox bounds and
+        # never rejects a snapshot the domain itself considers valid.
+        from backend.relationship import RelationshipStateV1
+
+        triggers = [f"{i:03d}-" + "t" * 123 for i in range(32)]
+        state = RelationshipStateV1.create(
+            trust=0.5, affection=0.5, tension=0.5,
+            triggers=triggers, timestamp=1790000000.123456,
+        )
+        validated = validate_relationship_snapshot(state.to_dict())
+        assert validated == state.to_dict()
 
 
 class TestNeutralSnapshotContract:

@@ -43,9 +43,14 @@ from .errors import ValidationError
 
 # Maximum serialized payload size in bytes (UTF-8), applied to the replay
 # payload, each outbox event payload, and each snapshot.
+# The web contract bounds replay_payload and outbox payloads at 8192 bytes
+# (``atomic_turn_commit`` / SQL CHECK). Snapshots have no web byte bound;
+# locally they are bounded at the same 8192 bytes. This comfortably admits
+# every domain-valid snapshot: the largest possible relationship snapshot
+# (32 triggers x 128 chars, ~4.3 KB canonical) validates.
 MAX_REPLAY_PAYLOAD_BYTES = 8192
-MAX_OUTBOX_PAYLOAD_BYTES = 256
-MAX_SNAPSHOT_BYTES = 4096
+MAX_OUTBOX_PAYLOAD_BYTES = 8192
+MAX_SNAPSHOT_BYTES = 8192
 
 # Outbox event identifiers.
 MAX_IDEMPOTENCY_KEY_LENGTH = 128

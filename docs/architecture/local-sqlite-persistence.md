@@ -140,15 +140,17 @@ identidade remota):
   ``idempotency_key`` (``^[A-Za-z0-9_.:-]{1,128}$``), allowlist de
   keys do payload, chaves proibidas recursivas, **tipos dos valores**
   (campos de referência são strings ASCII limitadas; ``version`` é
-  inteiro em [1, 1000]), JSON finito, limite de 256 B por payload e
-  no máximo 32 eventos por turno. Mensagens, prompts e conteúdo
+  inteiro em [1, 1000]), JSON finito, limite de 8 KB por payload
+  (paridade com o contrato web) e no máximo 32 eventos por turno. Mensagens, prompts e conteúdo
   conversacional não podem ser duplicados no outbox — o código
   garante o que a documentação afirma.
 - **Snapshots**: não são documentos arbitrários. São validados pelos
   **modelos reais do domínio** (``EmotionalStateV1`` /
   ``RelationshipStateV1``), que já rejeitam keys desconhecidas, campos
   faltantes, identidade/conteúdo interno, valores fora de range,
-  não finitos e bool como numérico; limite de 4 KB por snapshot.
+  não finitos e bool como numérico; limite de 8 KB por snapshot
+  (paridade com os limites web de replay/outbox; admite o maior
+  snapshot válido do domínio, ~4,3 KB com 32 triggers de 128 chars).
 - **Resets**: o único payload aceito é o **snapshot neutro canônico
   v1 produzido pelos construtores do domínio** (``EmotionalStateV1.neutral``
   / ``RelationshipStateV1.neutral``), verificado por reconstrução.
@@ -203,7 +205,7 @@ identidade remota):
 | Retenção e exclusão reais | **Preservado** | `delete_history` remove `chat_logs` + `turn_requests` (replay incluso) + outbox derivado numa única transação; `delete_memories`/`trim_history` + auditoria sem conteúdo privado |
 | Reset neutro canônico v1 | **Preservado** | Snapshot neutro produzido por `EmotionalStateV1.neutral` / `RelationshipStateV1.neutral`; revision incrementada coerentemente |
 | Lifecycle da store | **Preservado** | `close()` terminal: nenhuma nova conexão, nenhuma operação silenciosa, erro estável `storage_closed` em qualquer thread |
-| Limites de tamanho/crescimento | **Preservado** | `MAX_MESSAGE_LENGTH`, limites de bytes por payload (replay 8 KB, outbox 256 B, snapshot 4 KB), trim por contagem, métricas |
+| Limites de tamanho/crescimento | **Preservado** | `MAX_MESSAGE_LENGTH`, limites de bytes por payload (replay/outbox/snapshot 8 KB, paridade web), trim por contagem, métricas |
 | Erros sanitizados | **Preservado** | code+message constantes; sem SQL/path/conteúdo |
 | Nada importante só em RAM | **Preservado** | Toda escrita de turno é transação commitada |
 | RLS multiusuário | **Removido** | Single-user local; o arquivo é a fronteira de confiança |
