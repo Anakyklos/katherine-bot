@@ -331,6 +331,27 @@ class TestPrivacyAndRetention:
         assert ops == [("delete_history", "applied")]
         store.close()
 
+    def test_load_recent_memories_returns_newest_last_bounded(
+        self, tmp_path: Path
+    ) -> None:
+        store = open_local_storage(tmp_path / "katherine.db")
+        for i in range(3):
+            store.store_memory(
+                content=f"memória {i}",
+                metadata={"schema_version": 1, "tags": [], "approved": True},
+            )
+        rows = store.load_recent_memories(limit=2)
+        assert len(rows) == 2
+        assert rows[0][0] == "memória 1"  # newest-last (chronological)
+        assert rows[1][0] == "memória 2"
+        # metadata comes back as a parsed dict
+        assert rows[0][1]["schema_version"] == 1
+        with pytest.raises(LocalValidationError):
+            store.load_recent_memories(limit=0)
+        with pytest.raises(LocalValidationError):
+            store.load_recent_memories(limit=501)
+        store.close()
+
     def test_delete_memories_removes_only_memories(self, tmp_path: Path) -> None:
         store = open_local_storage(tmp_path / "katherine.db")
         store.store_memory(
@@ -595,6 +616,47 @@ class TestReplayContract:
         outcome = store.replay("does-not-exist")
         assert outcome.status == "request_replay_unavailable"
         assert outcome.committed is None
+        store.close()
+
+    def test_check_request_fresh_when_unknown(self, tmp_path: Path) -> None:
+        store = open_local_storage(tmp_path / "katherine.db")
+        outcome = store.check_request("req-new", "hello")
+        assert outcome.status == "fresh"
+        assert outcome.committed is None
+        store.close()
+
+    def test_check_request_replays_same_message_without_write(
+        self, tmp_path: Path
+    ) -> None:
+        store = open_local_storage(tmp_path / "katherine.db")
+        store.commit_turn(**_commit_kwargs(store, "req-1", "r1"))
+        outcome = store.check_request("req-1", "oi")
+        assert outcome.status == "replay"
+        assert outcome.committed is not None
+        assert outcome.committed.response == "r1"
+        store.close()
+
+    def test_check_request_conflicts_on_divergent_message(
+        self, tmp_path: Path
+    ) -> None:
+        store = open_local_storage(tmp_path / "katherine.db")
+        store.commit_turn(**_commit_kwargs(store, "req-1", "r1"))
+        outcome = store.check_request("req-1", "different message")
+        assert outcome.status == "conflict"
+        assert outcome.committed is None
+        store.close()
+
+    def test_check_request_in_progress_is_conflict(self, tmp_path: Path) -> None:
+        store = open_local_storage(tmp_path / "katherine.db")
+        conn = store._connection_for_tests_only()
+        conn.execute(
+            "insert into turn_requests (request_id, payload_hash_sha256, status, "
+            "expected_revision, created_at, updated_at) values "
+            "('req-pending', 'deadbeef', 'pending', 0, '2026-01-01T00:00:00Z', "
+            "'2026-01-01T00:00:00Z')"
+        )
+        outcome = store.check_request("req-pending", "oi")
+        assert outcome.status == "conflict"
         store.close()
 
     def test_pending_request_reports_in_progress_not_recomputed(self, tmp_path: Path) -> None:

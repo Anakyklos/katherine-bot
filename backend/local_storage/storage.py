@@ -115,7 +115,12 @@ class LoadedUserState:
 
 @dataclass(frozen=True)
 class CommittedTurn:
-    """Public result of one successful atomic turn commit."""
+    """Public result of one successful atomic turn commit.
+
+    ``message_id`` is the public assistant message UUID from the replay
+    payload (web parity: the runtime surfaces it to the UI); it is the
+    same value on commit and replay.
+    """
 
     request_id: str
     revision: int
@@ -123,6 +128,7 @@ class CommittedTurn:
     assistant_message_id: int
     response: str
     emotion_state: Mapping[str, Any]
+    message_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -420,6 +426,40 @@ class LocalStorage:
         history.reverse()
         return history
 
+    def load_recent_memories(self, limit: int = 5) -> list[tuple[str, dict[str, Any]]]:
+        """Read the most recent local memories (oldest-first, bounded).
+
+        Returns ``(content, metadata)`` tuples for the newest *limit*
+        memories, ordered chronologically (newest last) so callers build
+        context windows the same way as history. Metadata is the parsed
+        JSON object stored by :meth:`store_memory` (validated as JSON at
+        write time; a corrupt row surfaces as ``PersistenceError`` — it
+        is never silently dropped).
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 500:
+            raise ValidationError("invalid_limit", "limit must be an int in [1, 500]")
+        try:
+            rows = self._connection().execute(
+                "select content, metadata from memories "
+                "order by created_at desc, id desc limit ?",
+                (limit,),
+            ).fetchall()
+        except sqlite3.Error:
+            raise PersistenceError("database_error", "persistence error") from None
+        memories: list[tuple[str, dict[str, Any]]] = []
+        for content, metadata_text in rows:
+            if not isinstance(content, str) or len(content) > MAX_MESSAGE_LENGTH:
+                raise PersistenceError("invalid_state", "persistence error")
+            try:
+                metadata = json.loads(metadata_text) if metadata_text else {}
+            except (json.JSONDecodeError, TypeError):
+                raise PersistenceError("invalid_state", "persistence error") from None
+            if not isinstance(metadata, dict):
+                raise PersistenceError("invalid_state", "persistence error")
+            memories.append((content, metadata))
+        memories.reverse()
+        return memories
+
     # ── Atomic turn commit ───────────────────────────────────────────────
 
     def commit_turn(
@@ -704,6 +744,7 @@ class LocalStorage:
                 assistant_message_id=assistant_message_id,
                 response=replay_payload.get("response", ""),
                 emotion_state=replay_payload.get("emotion_state", {}),
+                message_id=str(replay_payload.get("message_id", "")),
             )
 
     def _committed_from_row(
@@ -727,6 +768,7 @@ class LocalStorage:
             assistant_message_id=int(assistant_message_id or 0),
             response=payload.get("response", ""),
             emotion_state=payload.get("emotion_state", {}),
+            message_id=str(payload.get("message_id", "")),
         )
 
     # ── Replay ───────────────────────────────────────────────────────────
@@ -755,6 +797,56 @@ class LocalStorage:
         if status == "pending":
             return ReplayOutcome(status="request_in_progress", committed=None)
         return ReplayOutcome(status="request_replay_unavailable", committed=None)
+
+    def check_request(self, request_id: str, user_message: str) -> ReplayOutcome:
+        """Pre-flight idempotency check for the local turn flow (#336).
+
+        Mirrors the web admission semantics *before any provider call*:
+
+        * ``fresh`` — no ledger row for this request id: proceed with the
+          turn flow;
+        * ``replay`` — a completed request whose persisted user message is
+          byte-identical: return the committed result, no provider call,
+          no write;
+        * ``conflict`` — the request id exists with a divergent user
+          message (or is pending): the caller must surface a request
+          conflict, never recompute.
+
+        The comparison uses the persisted ``chat_logs`` row linked to the
+        ledger entry (the local equivalent of the web admission HMAC: the
+        same request id with a different message is always a conflict).
+        """
+        request_id = _validate_request_id(request_id)
+        user_message = _validate_message(user_message, "user_message")
+        try:
+            row = self._connection().execute(
+                "select status, user_message_chat_log_id, committed_revision, "
+                "assistant_message_chat_log_id, replay_payload "
+                "from turn_requests where request_id = ?",
+                (request_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            raise PersistenceError("database_error", "persistence error") from None
+        if row is None:
+            return ReplayOutcome(status="fresh", committed=None)
+        status, user_msg_id, revision, assistant_msg_id, payload_text = row
+        if status != "completed":
+            return ReplayOutcome(status="conflict", committed=None)
+        try:
+            stored = self._connection().execute(
+                "select content from chat_logs where id = ?",
+                (user_msg_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            raise PersistenceError("database_error", "persistence error") from None
+        if stored is None or stored[0] != user_message:
+            return ReplayOutcome(status="conflict", committed=None)
+        return ReplayOutcome(
+            status="replay",
+            committed=self._committed_from_row(
+                request_id, revision, user_msg_id, assistant_msg_id, payload_text
+            ),
+        )
 
     # ── Memory ──────────────────────────────────────────────────────────
 
