@@ -268,5 +268,17 @@ at send time.
   (#340). This feature only removes cloud dependencies from the *desktop
   runtime path*.
 - Data migration/import from existing Supabase installs is a separate,
-  explicit future operation; this feature preserves the legacy path that
-  makes it possible and deletes no source data.
+  explicit operation (never an automatic sync). Per issue #336's
+  mandatory test 12 ("importação de fixture legado não duplica dados"),
+  this feature SHIPS the idempotent legacy fixture import:
+  `backend/local_storage/legacy_import.py` imports a validated
+  structural Supabase export into the local SQLite store in ONE
+  transaction — re-importing the same fixture never duplicates rows
+  (stable legacy request ids skip as duplicates), invalid/forbidden
+  fixtures fail closed with no partial writes, the source is never
+  modified, and the desktop runtime reads the imported history and
+  replays imported turns without recomputation
+  (`backend/tests/test_legacy_import.py`). The full UI-facing
+  export/import UX (file picker, progress) remains a maintainer
+  decision (#340); the storage-level contract and its proofs are in
+  scope and delivered here.

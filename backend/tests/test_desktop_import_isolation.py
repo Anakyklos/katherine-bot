@@ -35,6 +35,7 @@ import sys
 import backend.companion_runtime  # noqa: F401
 import backend.desktop.api  # noqa: F401
 import backend.desktop.app  # noqa: F401
+import backend.local_storage.legacy_import  # noqa: F401
 
 # First-use lazy path: the provider factory's own lazy import target
 # (module only, no client construction, no network).
