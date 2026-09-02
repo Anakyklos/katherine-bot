@@ -659,6 +659,95 @@ class TestReplayContract:
         assert outcome.status == "conflict"
         store.close()
 
+    # ── reserve_request: atomic admission (#336 review blocker 4) ──────
+
+    def test_reserve_request_fresh_creates_pending_reservation(
+        self, tmp_path: Path
+    ) -> None:
+        store = open_local_storage(tmp_path / "katherine.db")
+        outcome = store.reserve_request("req-new", "hello")
+        assert outcome.status == "reserved"
+        assert outcome.committed is None
+        # The ledger row exists and is pending — visible atomically to
+        # any concurrent caller BEFORE the provider call runs.
+        row = store._connection_for_tests_only().execute(
+            "select status from turn_requests where request_id = 'req-new'"
+        ).fetchone()
+        assert row is not None and row[0] == "pending"
+        store.close()
+
+    def test_reserve_request_second_concurrent_call_is_conflict(
+        self, tmp_path: Path
+    ) -> None:
+        """The core #336 admission invariant: two concurrent turns
+        with the same request id — exactly one wins the reservation,
+        the loser gets a deterministic conflict, never a second
+        provider call."""
+        store = open_local_storage(tmp_path / "katherine.db")
+        first = store.reserve_request("req-1", "oi")
+        second = store.reserve_request("req-1", "oi")
+        assert first.status == "reserved"
+        assert second.status == "conflict"
+        store.close()
+
+    def test_reserve_request_replays_completed_same_message(
+        self, tmp_path: Path
+    ) -> None:
+        store = open_local_storage(tmp_path / "katherine.db")
+        store.commit_turn(**_commit_kwargs(store, "req-1", "r1"))
+        outcome = store.reserve_request("req-1", "oi")
+        assert outcome.status == "replay"
+        assert outcome.committed is not None
+        assert outcome.committed.response == "r1"
+        store.close()
+
+    def test_reserve_request_conflicts_on_divergent_message(
+        self, tmp_path: Path
+    ) -> None:
+        store = open_local_storage(tmp_path / "katherine.db")
+        store.commit_turn(**_commit_kwargs(store, "req-1", "r1"))
+        outcome = store.reserve_request("req-1", "different message")
+        assert outcome.status == "conflict"
+        store.close()
+
+    def test_reserve_then_commit_upserts_reservation_to_completed(
+        self, tmp_path: Path
+    ) -> None:
+        """The reservation row is flipped to completed by the very
+        commit_turn that owns it (placeholder hash replaced by the
+        canonical payload hash)."""
+        store = open_local_storage(tmp_path / "katherine.db")
+        assert store.reserve_request("req-1", "oi").status == "reserved"
+        committed = store.commit_turn(**_commit_kwargs(store, "req-1", "r1"))
+        assert committed.revision == 1
+        row = store._connection_for_tests_only().execute(
+            "select status, payload_hash_sha256 from turn_requests "
+            "where request_id = 'req-1'"
+        ).fetchone()
+        assert row[0] == "completed"
+        assert not row[1].startswith("reserved:")
+        # follow-up admission with the same message replays
+        outcome = store.reserve_request("req-1", "oi")
+        assert outcome.status == "replay"
+        store.close()
+
+    def test_reserve_request_failed_row_is_conflict_fail_closed(
+        self, tmp_path: Path
+    ) -> None:
+        """Crash-recovered failed rows never re-execute: admission
+        fail-closes to conflict so the surface reconciles."""
+        store = open_local_storage(tmp_path / "katherine.db")
+        conn = store._connection_for_tests_only()
+        conn.execute(
+            "insert into turn_requests (request_id, payload_hash_sha256, status, "
+            "expected_revision, error_code, created_at, updated_at) values "
+            "('req-failed', 'deadbeef', 'failed', 0, 'interrupted', "
+            "'2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')"
+        )
+        outcome = store.reserve_request("req-failed", "oi")
+        assert outcome.status == "conflict"
+        store.close()
+
     def test_pending_request_reports_in_progress_not_recomputed(self, tmp_path: Path) -> None:
         store = open_local_storage(tmp_path / "katherine.db")
         conn = store._connection_for_tests_only()

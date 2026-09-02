@@ -661,11 +661,15 @@ class CompanionRuntime:
 
         storage = self._ensure_storage()
 
-        # Pre-flight idempotency (web admission parity, before any
-        # provider call): a completed request with the SAME message
-        # replays the persisted result; a divergent message or an
-        # in-flight request is a conflict; unknown ids proceed fresh.
-        pre = storage.check_request(request_id, message)
+        # Atomic admission BEFORE any provider call (#336 review
+        # blocker 4): reserve_request is an atomic insert-or-classify,
+        # so two concurrent turns with the same request id cannot BOTH
+        # observe fresh and spend provider calls — exactly one wins
+        # the reservation, the loser learns about it deterministically.
+        # A completed request with the SAME message replays the
+        # persisted result; a divergent message or an in-flight
+        # request is a conflict.
+        pre = storage.reserve_request(request_id, message)
         if pre.status == "replay" and pre.committed is not None:
             committed = pre.committed
             return TurnResult(
@@ -683,7 +687,34 @@ class CompanionRuntime:
                 expected_revision=0,
                 request_id=request_id,
             )
+        if pre.status != "reserved":
+            # reserve_request only returns reserved/replay/conflict.
+            raise StorageValidationError("invalid_request_id", "admission invalid")
 
+        try:
+            return await self._execute_reserved_turn(
+                storage=storage,
+                request_id=request_id,
+                message=message,
+            )
+        except BaseException:
+            # The turn failed AFTER admission: release the pending
+            # reservation so the same request id can be retried in
+            # this live session (crash recovery only runs at open
+            # time). Completed rows are never touched — only pending.
+            try:
+                storage.release_request(request_id)
+            except Exception:  # noqa: BLE001 (best-effort release)
+                pass
+            raise
+
+    async def _execute_reserved_turn(
+        self,
+        *,
+        storage,
+        request_id: str,
+        message: str,
+    ) -> TurnResult:
         budget = TurnBudget(
             deadline=_time.monotonic() + self._turn_deadline,
             reserve=10.0,

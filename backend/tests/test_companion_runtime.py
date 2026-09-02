@@ -228,6 +228,90 @@ async def test_commit_turn_is_idempotent_for_the_same_request_id(tmp_path):
     runtime.close()
 
 
+async def test_concurrent_same_request_id_executes_provider_exactly_once(
+    tmp_path,
+):
+    """#336 review blocker 4 — atomic admission under CONCURRENCY.
+
+    Two turns with the same request id in flight at the same time:
+    exactly one spends provider calls and commits; the other is
+    rejected deterministically (conflict) BEFORE any provider call.
+    reserve_request's BEGIN IMMEDIATE insert-or-classify is the
+    admission — there is no check-then-act window.
+    """
+    provider = ScriptedProvider()
+    # Make the provider slow so both turns really overlap.
+    import asyncio as _asyncio
+
+    class SlowProvider(ScriptedProvider):
+        async def generate(self, messages, budget):
+            await _asyncio.sleep(0.05)
+            return await super().generate(messages, budget)
+
+    provider = SlowProvider()
+    runtime = make_runtime(tmp_path, provider)
+
+    results = await _asyncio.gather(
+        runtime.commit_turn_async(request_id="r-1", message="hello"),
+        runtime.commit_turn_async(request_id="r-1", message="hello"),
+        return_exceptions=True,
+    )
+    outcomes = [r for r in results if not isinstance(r, BaseException)]
+    errors = [r for r in results if isinstance(r, BaseException)]
+
+    # One success + one deterministic conflict — never two successes,
+    # never two provider executions.
+    assert not errors, errors
+    assert len(outcomes) == 2
+    success_results = [r for r in outcomes if r.success]
+    failed_results = [r for r in outcomes if not r.success]
+    assert len(success_results) == 1
+    assert len(failed_results) == 1
+    assert failed_results[0].error_code == LocalErrorCode.REQUEST_CONFLICT
+    # Exactly one provider generation — the loser never reached it.
+    assert provider.calls == 1
+    # The ledger has exactly one row, completed.
+    row = runtime._ensure_storage()._connection_for_tests_only().execute(
+        "select status from turn_requests where request_id = 'r-1'"
+    ).fetchone()
+    assert row is not None and row[0] == "completed"
+    # Durable replay for the losing caller: after the winner commits,
+    # re-sending the same request id replays the persisted result
+    # (the review-required "replay durável para o segundo caller").
+    retry = await runtime.commit_turn_async(request_id="r-1", message="hello")
+    assert retry.success is True
+    assert retry.replayed is True
+    assert retry.message_id == success_results[0].message_id
+    assert provider.calls == 1  # still exactly one remote execution
+    runtime.close()
+
+
+async def test_provider_failure_releases_reservation_for_retry(tmp_path):
+    """A live-session provider failure must not poison the request id:
+    the pending reservation is released, so the user can retry the
+    same send without a permanent conflict."""
+    provider = ScriptedProvider()
+    provider.fail_with = RuntimeError("provider down")
+    runtime = make_runtime(tmp_path, provider)
+
+    first = await runtime.commit_turn_async(request_id="r-1", message="hello")
+    assert first.success is False
+
+    # The failed reservation was released — the ledger has no stuck
+    # pending row for this request id (crash recovery owns that case).
+    row = runtime._ensure_storage()._connection_for_tests_only().execute(
+        "select status from turn_requests where request_id = 'r-1'"
+    ).fetchone()
+    assert row is None or row[0] != "pending"
+
+    # Retry with the SAME request id succeeds once the provider is up.
+    provider.fail_with = None
+    second = await runtime.commit_turn_async(request_id="r-1", message="hello")
+    assert second.success is True
+    assert provider.calls == 1
+    runtime.close()
+
+
 async def test_commit_turn_validates_input(tmp_path):
     runtime = make_runtime(tmp_path)
     bad = await runtime.commit_turn_async(request_id="", message="hello")
