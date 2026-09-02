@@ -167,10 +167,22 @@ function createDesktopTransport(targetWindow, historyLimit) {
         },
 
         async sendMessage(message, _options, requestId) {
-            // The 50s guard timer lives in useChat; the bridge call has
-            // its own provider-side deadline. `signal`/`timeout` are
-            // web-contract arguments, ignored here deliberately.
-            return sendMessageViaBridge(requestId, message, targetWindow);
+            // #336 review blocker 2: real timeout/cancel semantics.
+            // The bridge call itself is raced against the caller's
+            // AbortSignal: when the signal aborts (the useChat 50s guard
+            // timer or an unmount), this branch settles as a timeout
+            // ChatError instead of hanging forever. The underlying
+            // bridge promise is NOT cancelled — the runtime keeps its
+            // own deadline and, if it still completes, the request is
+            // durably committed under the same request id, so a later
+            // replay of that id reconciles to the persisted result
+            // (never a silent duplicate).
+            return sendMessageViaBridge(
+                requestId,
+                message,
+                targetWindow,
+                { signal: _options?.signal },
+            );
         },
 
         async runPrivacyOp(op) {

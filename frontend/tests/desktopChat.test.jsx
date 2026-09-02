@@ -173,4 +173,53 @@ describe('useChat with desktop transport', () => {
         const bot = result.current.messages.filter(m => m.role === 'assistant');
         expect(bot.length).toBe(1);
     });
+
+    it('50s timeout on a hung bridge settles the UI with a timeout error (never-resolving call)', async () => {
+        // Review blocker 2: the desktop transport must give the caller
+        // a BOUNDED result even when the bridge call never resolves.
+        // The real desktop transport is used (createTransport with
+        // mode 'desktop' + a hung window.pywebview.api.send_message),
+        // so this exercises the actual raceAbort wiring — not a stub
+        // transport. vi.useFakeTimers drives the 50s guard timer.
+        vi.useFakeTimers();
+        const { createTransport } = await import(
+            '../src/features/chat/services/chatTransport'
+        );
+
+        // A shell window whose send_message hangs FOREVER (the
+        // deterministic worst case: a stuck bridge).
+        const hungWindow = {
+            addEventListener: () => {},
+            pywebview: {
+                api: {
+                    load_history: async () => ({ ok: true, messages: [] }),
+                    send_message: () => new Promise(() => {}),
+                },
+            },
+        };
+        const transport = createTransport({
+            mode: 'desktop',
+            targetWindow: hungWindow,
+        });
+
+        const { result } = renderHook(() => useChat({ transport }));
+        // No waitFor under fake timers: setInput is synchronous state,
+        // so assert directly after the act() wrapper.
+        await act(async () => { result.current.setInput('mensagem'); });
+        expect(result.current.input).toBe('mensagem');
+
+        let p;
+        await act(async () => { p = result.current.handleSend(); });
+        expect(result.current.isLoading).toBe(true);
+
+        // 50s: the guard aborts; the transport race must reject with a
+        // timeout ChatError; the UI must settle (error + not loading).
+        await act(async () => { vi.advanceTimersByTime(50000); });
+        await act(async () => { await p; });
+
+        expect(result.current.isLoading).toBe(false);
+        const system = result.current.messages.filter(m => m.role === 'system');
+        expect(system.length).toBe(1);
+        expect(system[0].content).toContain('tempo limite');
+    });
 });

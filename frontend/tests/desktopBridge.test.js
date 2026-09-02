@@ -223,6 +223,61 @@ test('sendMessageViaBridge rejects a non-dict success payload', async () => {
     );
 });
 
+// =========================================================================
+// #336 review blocker 2: real timeout/cancel semantics on the bridge path
+// =========================================================================
+
+test('sendMessageViaBridge settles as timeout when the signal aborts (bridge never resolves)', async () => {
+    // Deterministic hung bridge: the underlying promise NEVER settles.
+    // The aborted signal must race it and reject with ChatError timeout.
+    const window = apiWindow({
+        send_message: () => new Promise(() => {}), // hangs forever
+    });
+    const controller = new AbortController();
+    const pending = sendMessageViaBridge('req-1', 'olá', window, {
+        signal: controller.signal,
+    });
+    controller.abort();
+    await assert.rejects(
+        () => pending,
+        (err) => err.name === 'ChatError' && err.type === 'timeout',
+    );
+});
+
+test('sendMessageViaBridge timeout rejects immediately on an already-aborted signal', async () => {
+    let bridgeCalled = false;
+    const window = apiWindow({
+        send_message: async () => {
+            bridgeCalled = true;
+            return { ok: true, success: true, response: 'x', emotion_state: {} };
+        },
+    });
+    const controller = new AbortController();
+    controller.abort();
+    await assert.rejects(
+        () => sendMessageViaBridge('req-1', 'olá', window, { signal: controller.signal }),
+        (err) => err.name === 'ChatError' && err.type === 'timeout',
+    );
+    assert.equal(bridgeCalled, false, 'aborted-before-call must not hit the bridge');
+});
+
+test('sendMessageViaBridge passes through when the bridge settles before the signal aborts', async () => {
+    const window = apiWindow({
+        send_message: async () => ({
+            ok: true, success: true, response: 'pronto',
+            emotion_state: { mood: 'ok' },
+        }),
+    });
+    const controller = new AbortController();
+    const result = await sendMessageViaBridge('req-1', 'olá', window, {
+        signal: controller.signal,
+    });
+    assert.equal(result.response, 'pronto');
+    // A late abort must NOT change the already-settled result.
+    controller.abort();
+    assert.equal(result.response, 'pronto');
+});
+
 test('runPrivacyOpViaBridge calls the right op and returns the result', async () => {
     const calls = [];
     const api = {};

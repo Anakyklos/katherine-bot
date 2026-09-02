@@ -212,19 +212,36 @@ export async function loadHistory(targetWindow, limit = 50) {
 /**
  * Send one conversation turn through the bridge (#336).
  *
+ * `options.signal` (AbortSignal) gives the call REAL bounded-time
+ * semantics (#336, review blocker 2): an aborted signal races the
+ * bridge promise and settles it as a timeout ChatError. The bridge
+ * promise itself is never cancelled — the runtime owns the provider
+ * deadline and the atomic commit — but the CALLER is never left
+ * waiting on a hung bridge.
+ *
  * @returns {Promise<{response: string, emotion_state: object,
  *   message_id?: string, revision?: number, replayed?: boolean}>}
  * @throws {ChatError} with the stable bridge code mapping.
  */
-export async function sendMessageViaBridge(requestId, message, targetWindow) {
+export async function sendMessageViaBridge(requestId, message, targetWindow, options = {}) {
     const api = await resolveBridge(targetWindow);
     if (!api || typeof api.send_message !== 'function') {
         throw new ChatError('unknown', CHAT_ERROR_MESSAGES.unknown);
     }
+    const signal = options.signal ?? null;
+    if (signal?.aborted) {
+        throw new ChatError('timeout', CHAT_ERROR_MESSAGES.timeout);
+    }
     let payload;
     try {
-        payload = await api.send_message(requestId, message);
-    } catch {
+        payload = await raceAbort(api.send_message(requestId, message), signal);
+    } catch (error) {
+        // raceAbort rejects as ChatError('timeout'): pass it through so
+        // the timeout type survives. Anything else from the bridge
+        // stays the sanitized unknown mapping.
+        if (error instanceof ChatError) {
+            throw error;
+        }
         throw new ChatError('unknown', CHAT_ERROR_MESSAGES.unknown);
     }
     if (
@@ -244,6 +261,40 @@ export async function sendMessageViaBridge(requestId, message, targetWindow) {
         throw bridgeCodeToChatError(payload);
     }
     throw new ChatError('unknown', CHAT_ERROR_MESSAGES.unknown);
+}
+
+/**
+ * Race a promise against an AbortSignal (#336, review blocker 2).
+ *
+ * When the signal aborts first, the returned promise rejects with
+ * `ChatError('timeout')` and the original promise is left to settle on
+ * its own (never cancelled: the runtime may still commit the turn; a
+ * replay with the same request id reconciles to it). When the promise
+ * settles first, the abort listener is removed and the result is
+ * passed through unchanged.
+ */
+function raceAbort(promise, signal) {
+    if (!signal) {
+        return promise;
+    }
+    return new Promise((resolve, reject) => {
+        const onAbort = () => {
+            cleanup();
+            reject(new ChatError('timeout', CHAT_ERROR_MESSAGES.timeout));
+        };
+        const cleanup = () => signal.removeEventListener('abort', onAbort);
+        signal.addEventListener('abort', onAbort, { once: true });
+        promise.then(
+            (value) => {
+                cleanup();
+                resolve(value);
+            },
+            (error) => {
+                cleanup();
+                reject(error);
+            },
+        );
+    });
 }
 
 /** The allowlisted privacy ops reachable through this helper. */
