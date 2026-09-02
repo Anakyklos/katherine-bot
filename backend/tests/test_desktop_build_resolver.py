@@ -28,6 +28,7 @@ def _make_valid_build(root: Path) -> Path:
     dist = root / "frontend" / "dist"
     dist.mkdir(parents=True)
     (dist / "index.html").write_text("<html><body>build</body></html>", encoding="utf-8")
+    (dist / "desktop.html").write_text("<html><body>build</body></html>", encoding="utf-8")
     (dist / "assets").mkdir()
     (dist / "assets" / "index.js").write_text("console.log('build')", encoding="utf-8")
     return dist
@@ -40,16 +41,18 @@ class TestValidBuildResolution:
         resolved = resolve_frontend_build(config)
         assert resolved.index_html == tmp_path / "frontend" / "dist" / "index.html"
         assert resolved.index_html.is_file()
+        assert resolved.desktop_html == tmp_path / "frontend" / "dist" / "desktop.html"
+        assert resolved.desktop_html.is_file()
         assert resolved.dist_dir.is_dir()
 
     def test_resolution_is_pure_no_filesystem_writes(self, tmp_path: Path) -> None:
-        before = sorted(str(p) for p in tmp_path.rglob("*"))
         _make_valid_build(tmp_path)
+        before = sorted(str(p) for p in tmp_path.rglob("*"))
         config = DesktopBuildConfig(frontend_root=tmp_path / "frontend")
         resolve_frontend_build(config)
         after = sorted(str(p) for p in tmp_path.rglob("*"))
         assert before or after  # sanity
-        assert not any("desktop" in p for p in after if p not in before)
+        assert before == after  # resolution wrote nothing
 
 
 class TestMissingBuildFailsExplicitly:

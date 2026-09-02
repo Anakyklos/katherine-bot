@@ -44,7 +44,12 @@ def _make_build(tmp_path: Path) -> ResolvedBuild:
     dist = tmp_path / "dist"
     dist.mkdir()
     (dist / "index.html").write_text("<html></html>", encoding="utf-8")
-    return ResolvedBuild(dist_dir=dist, index_html=dist / "index.html")
+    (dist / "desktop.html").write_text("<html></html>", encoding="utf-8")
+    return ResolvedBuild(
+        dist_dir=dist,
+        index_html=dist / "index.html",
+        desktop_html=dist / "desktop.html",
+    )
 
 
 class TestIsLocalBuildUrl:
@@ -221,6 +226,7 @@ class TestLoadedHandlerRevertsNavigation:
         dist = tmp_path / "dist"
         dist.mkdir(exist_ok=True)
         (dist / "index.html").write_text("<html></html>", encoding="utf-8")
+        (dist / "desktop.html").write_text("<html></html>", encoding="utf-8")
 
         recorded: dict = {
             "create_window_kwargs": None,
@@ -288,26 +294,31 @@ class TestLoadedHandlerRevertsNavigation:
     def test_window_url_is_the_local_build(self, monkeypatch, tmp_path: Path) -> None:
         _, recorded = self._run_with_stubbed_webview(monkeypatch, tmp_path, None)
         dist = (tmp_path / "dist").resolve()
-        assert recorded["create_window_kwargs"]["url"] == (dist / "index.html").as_uri()
+        # #336 review blocker 1: the shell opens the DESKTOP entry
+        # (desktop.html -> main-desktop.jsx -> AppDesktop), never the
+        # web app page (index.html -> AppWeb -> Supabase/AuthPage).
+        assert recorded["create_window_kwargs"]["url"] == (dist / "desktop.html").as_uri()
 
     def test_loaded_navigation_to_remote_is_reverted(self, monkeypatch, tmp_path: Path) -> None:
         # Simulate the window having navigated away when ``loaded`` fires:
         # the handler must call load_url back to the local build.
         dist = (tmp_path / "dist").resolve()
-        expected_uri = (dist / "index.html").as_uri()
+        # The revert target is the shell entry (desktop.html, #336
+        # review blocker 1) — never the web page.
+        expected_uri = (dist / "desktop.html").as_uri()
         # Two runs to cover the wiring: one navigation to remote (revert)
         _, recorded = self._run_with_stubbed_webview(monkeypatch, tmp_path, "https://example.com/")
         assert recorded["load_url_calls"] == [expected_uri]
 
     def test_loaded_navigation_staying_local_is_not_reverted(self, monkeypatch, tmp_path: Path) -> None:
         dist = (tmp_path / "dist").resolve()
-        local_uri = (dist / "index.html").as_uri()
+        local_uri = (dist / "desktop.html").as_uri()
         _, recorded = self._run_with_stubbed_webview(monkeypatch, tmp_path, local_uri)
         assert recorded["load_url_calls"] == []
 
     def test_js_api_health_local_roundtrip_via_wrapper(self, monkeypatch, tmp_path: Path) -> None:
         dist = (tmp_path / "dist").resolve()
-        local_uri = (dist / "index.html").as_uri()
+        local_uri = (dist / "desktop.html").as_uri()
         _, recorded = self._run_with_stubbed_webview(monkeypatch, tmp_path, local_uri)
         js_api = recorded["create_window_kwargs"]["js_api"]
         assert js_api.health() == {"ok": True, "api_version": 2}
@@ -474,8 +485,10 @@ class TestRevertToSameEntryUrl:
         # (a) initial local load: bridge serves.
         assert recorded["health_after_first_load"]["ok"] is True
         # (b) remote loaded event: revert issued to the entry URL...
+        # (the entry is desktop.html — the desktop companion page, #336
+        # review blocker 1)
         assert recorded["load_url_calls"] == [
-            (tmp_path / "dist" / "index.html").resolve().as_uri()
+            (tmp_path / "dist" / "desktop.html").resolve().as_uri()
         ]
         # ...and the bridge refuses the remote document.
         assert (
@@ -527,7 +540,8 @@ def _run_shell_with_scripted_urls(monkeypatch, tmp_path: Path) -> dict:
     dist = tmp_path / "dist"
     dist.mkdir(exist_ok=True)
     (dist / "index.html").write_text("<html></html>", encoding="utf-8")
-    entry_uri = (dist / "index.html").resolve().as_uri()
+    (dist / "desktop.html").write_text("<html></html>", encoding="utf-8")
+    entry_uri = (dist / "desktop.html").resolve().as_uri()
     remote_uri = "https://example.com/"
 
     recorded: dict = {

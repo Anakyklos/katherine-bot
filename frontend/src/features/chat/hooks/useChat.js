@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { ChatError } from '../services/chatService';
+import { ChatError } from '../services/chatError.js';
 import { createDefaultTransport } from '../services/chatTransport';
 import { SYSTEM_MESSAGES } from '../constants';
 import { validateEmotionState } from '../../../shared/utils/formatters';

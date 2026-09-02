@@ -21,10 +21,16 @@
  *   `isDesktopTransport` first.
  * - The mode is explicit (`createTransport({ mode })`), never sniffed
  *   from "credentials are missing".
+ *
+ * Graph isolation (#336, review blocker 1): the web branch's
+ * `chatService` (which statically imports Axios + apiClient +
+ * supabaseClient) is behind a DYNAMIC import that only the web
+ * branch awaits. The desktop bundle's module graph therefore never
+ * contains chatService or anything it pulls in — mechanically proven
+ * by `tests/desktopGraph.test.js` against the built bundle.
  */
 
 import { ChatError } from './chatError.js';
-import * as chatService from './chatService.js';
 import {
     getRuntimeState,
     loadHistory,
@@ -47,15 +53,15 @@ const PRIVACY_OP_NAMES = Object.freeze([
  * @param {'web'|'desktop'} options.mode — explicit, detected once at
  *   the app boundary via `detectRuntimeMode`, not guessed here.
  * @param {object} [options.chatService] — web branch implementation
- *   (injectable for tests; the production caller passes the chatService
- *   module — see createDefaultTransport).
+ *   (injectable for tests; the production web branch loads the real
+ *   module lazily — see `_loadChatService`).
  * @param {Window} [options.targetWindow] — desktop branch (injectable
  *   for tests; defaults to the global window).
  * @param {number} [options.historyLimit=50]
  */
 export function createTransport({
     mode,
-    chatService: webService = chatService,
+    chatService: webService,
     targetWindow,
     historyLimit = 50,
 } = {}) {
@@ -64,23 +70,46 @@ export function createTransport({
     }
 
     if (mode === 'web') {
-        return createWebTransport(webService);
+        return createWebTransport(webService ?? _loadChatService());
     }
     return createDesktopTransport(targetWindow, historyLimit);
 }
 
+/**
+ * Lazily load the web chatService.
+ *
+ * Static-import-free on purpose (review blocker 1): a static import
+ * would place chatService — and its Axios/apiClient/supabaseClient
+ * graph — inside every bundle that includes this module, including
+ * the desktop bundle. A dynamic import keeps it in the web chunk
+ * only. It is awaited at each web call site, so a module that is
+ * still initializing is handled correctly (the web interface is
+ * async regardless).
+ */
+function _loadChatService() {
+    return _chatServicePromise ?? (_chatServicePromise = import('./chatService.js'));
+}
+
+let _chatServicePromise = null;
+
 /** Web branch: pure delegation to chatService (Axios), unchanged. */
 function createWebTransport(webService) {
+    // If a live module was injected (tests), use it directly; otherwise
+    // the lazy module (possibly still initializing) is awaited per call
+    // — the web branch is async either way.
+    const service = _isChatServiceModule(webService) ? webService : null;
     return Object.freeze({
         mode: 'web',
 
         /** @param {{signal?: AbortSignal}} [options] */
         async fetchHistory(options = {}) {
-            return webService.fetchHistory(options);
+            const impl = service ?? (await _loadChatService());
+            return impl.fetchHistory(options);
         },
 
         async sendMessage(message, options, requestId) {
-            return webService.sendMessage(message, options, requestId);
+            const impl = service ?? (await _loadChatService());
+            return impl.sendMessage(message, options, requestId);
         },
 
         async runPrivacyOp() {
@@ -97,6 +126,20 @@ function createWebTransport(webService) {
             return null;
         },
     });
+}
+
+/**
+ * True when `candidate` is a live chatService module (or facsimile):
+ * an object exposing the async operations the web branch delegates to.
+ * A dynamic-import Promise must NOT take this path: awaiting per call
+ * keeps a still-initializing module correct.
+ */
+function _isChatServiceModule(candidate) {
+    return Boolean(
+        candidate
+        && typeof candidate.fetchHistory === 'function'
+        && typeof candidate.sendMessage === 'function',
+    );
 }
 
 /** Desktop branch: bridge callers only, never Axios. */
@@ -159,6 +202,7 @@ export function createDefaultTransport(targetWindow) {
     return createTransport({
         mode: isDesktopShell(scope) ? 'desktop' : 'web',
         targetWindow: scope,
-        chatService,
+        // chatService intentionally NOT passed: the web branch loads it
+        // lazily so the desktop graph stays free of the web modules.
     });
 }

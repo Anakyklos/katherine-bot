@@ -45,6 +45,7 @@ class TestLocalOnlyWindowUrl:
         dist = tmp_path / "frontend" / "dist"
         dist.mkdir(parents=True)
         (dist / "index.html").write_text("<html></html>", encoding="utf-8")
+        (dist / "desktop.html").write_text("<html></html>", encoding="utf-8")
         from backend.desktop.build_resolver import DesktopBuildConfig, resolve_frontend_build
 
         build = resolve_frontend_build(DesktopBuildConfig(frontend_root=tmp_path / "frontend"))

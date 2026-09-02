@@ -43,7 +43,12 @@ def _make_build(tmp_path: Path) -> ResolvedBuild:
     dist = tmp_path / "dist"
     dist.mkdir()
     (dist / "index.html").write_text("<html></html>", encoding="utf-8")
-    return ResolvedBuild(dist_dir=dist, index_html=dist / "index.html")
+    (dist / "desktop.html").write_text("<html></html>", encoding="utf-8")
+    return ResolvedBuild(
+        dist_dir=dist,
+        index_html=dist / "index.html",
+        desktop_html=dist / "desktop.html",
+    )
 
 
 def _pywebview_exposed_names(obj: object) -> set[str]:

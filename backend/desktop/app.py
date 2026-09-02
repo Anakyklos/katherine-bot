@@ -378,12 +378,13 @@ def make_navigation_policy(
 ) -> NavigationPolicy:
     """Build the :class:`NavigationPolicy` for a shell window.
 
-    ``entry_uri`` defaults to ``build.index_html.as_uri()`` (the shell
-    entry; production passes the page it opened, e.g. the smoke page).
+    ``entry_uri`` defaults to ``build.desktop_html.as_uri()`` (the
+    desktop companion entry; production passes the page it opened,
+    e.g. the smoke page).
     ``trust`` defaults to a fresh :class:`BuildTrust`; production
     passes the one the bridge shares so both layers stay in sync.
     """
-    resolved_entry = entry_uri if entry_uri is not None else build.index_html.as_uri()
+    resolved_entry = entry_uri if entry_uri is not None else build.desktop_html.as_uri()
     return NavigationPolicy(
         window=window,
         build=build,
@@ -395,7 +396,7 @@ def make_navigation_policy(
 def run_desktop_shell(
     frontend_root: Path | None = None,
     *,
-    html_name: str = "index.html",
+    html_name: str = "desktop.html",
     storage_path: Path | str | None = None,
     provider: Any = None,
 ) -> int:
@@ -406,11 +407,14 @@ def run_desktop_shell(
     so startup failures are explicit and safe to print.
 
     ``html_name`` selects which page inside the resolved build opens
-    first. Production uses the default ``index.html``; the reproducible
-    smoke (#334, review B3) opens ``desktop-smoke.html`` which mounts
-    the real ChatWindow. The page must exist inside ``dist`` (the
-    resolver still validates the build root), and the navigation
-    policy treats every page inside ``dist`` as local build content.
+    first. Production uses the default ``desktop.html`` — the desktop
+    companion entry whose module graph contains no web modules (#336,
+    review blocker 1; web entry is index.html and is never loaded by
+    the shell). The reproducible smoke (#334, review B3) opens
+    ``desktop-smoke.html`` which mounts the real ChatWindow. The page
+    must exist inside ``dist`` (the resolver still validates the build
+    root), and the navigation policy treats every page inside ``dist``
+    as local build content.
 
     ``storage_path`` / ``provider`` are smoke-test seams only (#336):
     the reproducible smoke must not touch the user's real database or

@@ -30,6 +30,7 @@ def _make_dist(tmp_path: Path) -> Path:
     dist = tmp_path / "dist"
     dist.mkdir(exist_ok=True)
     (dist / "index.html").write_text("<html></html>", encoding="utf-8")
+    (dist / "desktop.html").write_text("<html></html>", encoding="utf-8")
     return dist
 
 
