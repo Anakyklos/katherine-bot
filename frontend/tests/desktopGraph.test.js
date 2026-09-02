@@ -20,10 +20,21 @@ import assert from 'node:assert/strict';
 import { readFileSync, existsSync, readdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { execFileSync } from 'node:child_process';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FRONTEND_ROOT = join(__dirname, '..');
 const DIST = join(FRONTEND_ROOT, 'dist');
+
+// Self-contained CI: this suite needs the built dist. When it is
+// absent (fresh checkout, tests run before `npm run build`), build
+// once here — deterministic, same vite config as the Build step.
+if (!existsSync(join(DIST, 'desktop.html'))) {
+    execFileSync('npm', ['run', 'build'], {
+        cwd: FRONTEND_ROOT,
+        stdio: 'inherit',
+    });
+}
 
 /**
  * Filenames of web-only chunks that must never be referenced (static
