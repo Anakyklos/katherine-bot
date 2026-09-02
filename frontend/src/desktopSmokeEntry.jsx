@@ -8,8 +8,11 @@
  *
  * This is a smoke-only entry: it is NOT part of the web application
  * (index.html does not reference it), never reaches production users,
- * and mounts no fake auth state. The web app keeps its own App/Chat flow
- * untouched; the shell's production entry stays index.html.
+ * and mounts no fake auth state. The web app keeps its own App/Chat
+ * flow untouched (AppWeb via main-web.jsx); the shell's production
+ * entry is desktop.html -> main-desktop.jsx -> AppDesktop (#336,
+ * review blocker 1) — this smoke entry mirrors that graph (ChatWindow
+ * only, no web modules).
  *
  * Why a separate entry: the production shell build intentionally has no
  * Supabase credentials, so `App` shows the (expected) DesktopNotice.

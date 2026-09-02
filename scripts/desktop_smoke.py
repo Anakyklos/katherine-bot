@@ -327,6 +327,22 @@ def _sqlite_row_count(db_path: Path, table: str) -> int:
         conn.close()
 
 
+def _sqlite_fetch_all(db_path: Path, query: str, params: tuple = ()) -> list[tuple]:
+    """Run a read-only SELECT against the smoke database (stdlib).
+
+    Generic companion to the fixed-shape helpers so the smoke can
+    verify CONTENT (not only row counts) — e.g. that the message the
+    real UI sent is the one persisted (#336, review blocker 3).
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        return conn.execute(query, params).fetchall()
+    finally:
+        conn.close()
+
+
 def _listening_ports(pid: int) -> list[int]:
     """Return TCP ports listening for this PID (empty on failure)."""
     try:
@@ -433,6 +449,17 @@ def run_smoke() -> tuple[bool, list[str]]:
         bool(display),
         f"DISPLAY={display!r} (use xvfb-run for headless runs)",
     )
+
+    # #336: the smoke uses a throwaway database and an offline scripted
+    # provider. The user's real local database is never touched and no
+    # Groq quota is spent; the lifecycle exercised is otherwise the
+    # production one (bridge -> runtime -> LocalStorage -> SQLite).
+    # Created BEFORE the probe worker is defined: the worker inspects
+    # this file at specific moments (immediately after the UI send and
+    # the UI privacy op — review blocker 3), so the path must be in
+    # scope from the start.
+    smoke_db_dir = tempfile.mkdtemp(prefix="katherine-smoke-336-")
+    smoke_db_path = Path(smoke_db_dir) / "smoke.db"
 
     window_holder: list = []
     loaded = threading.Event()
@@ -629,6 +656,53 @@ def run_smoke() -> tuple[bool, list[str]]:
                 json.dumps(ui_send)[:300] if ui_send else "no result",
             )
 
+            # 3b-i. #336 review blocker 3: inspect SQLite IMMEDIATELY
+            #     after the UI send — BEFORE any direct bridge call —
+            #     so the persistence evidence is attributable to the
+            #     UI path alone. Verify CONTENT, not just counts: the
+            #     exact message the UI sent must be the one on disk,
+            #     with its assistant reply, and the turn ledger must
+            #     hold exactly one COMPLETED request for it.
+            ui_send_user_rows = _sqlite_fetch_all(
+                smoke_db_path,
+                "select role, content from chat_logs "
+                "where content like ? order by id",
+                ("%Mensagem real do smoke #336 via UI%",),
+            )
+            report.check(
+                "UI send persisted to SQLite BEFORE any direct op (user message on disk)",
+                bool(
+                    ui_send
+                    and ui_send.get("sent") is True
+                    and len(ui_send_user_rows) == 1
+                    and ui_send_user_rows[0][0] == "user"
+                    and ui_send_user_rows[0][1]
+                    == "Mensagem real do smoke #336 via UI"
+                ),
+                f"user_rows={ui_send_user_rows!r}",
+            )
+            ui_send_rows = _sqlite_row_count(smoke_db_path, "chat_logs")
+            report.check(
+                "UI send persisted to SQLite (chat_logs >= 2: user + assistant)",
+                bool(
+                    ui_send
+                    and ui_send.get("replied") is True
+                    and ui_send_rows >= 2
+                ),
+                f"chat_logs rows after UI send={ui_send_rows} "
+                "(inspected before any direct bridge op)",
+            )
+            ui_send_ledger = _sqlite_fetch_all(
+                smoke_db_path,
+                "select status, count(*) from turn_requests "
+                "group by status",
+            )
+            report.check(
+                "UI send turn ledger holds exactly one completed request",
+                bool(ui_send_ledger == [("completed", 1)]),
+                f"turn_requests by status={ui_send_ledger!r}",
+            )
+
             # 3c. #336: destructive-op acceptance path through the REAL
             #     privacy panel: click -> explicit confirmation -> real
             #     local delete -> success status rendered.
@@ -643,6 +717,31 @@ def run_smoke() -> tuple[bool, list[str]]:
                     and "Operação concluída" in str(ui_privacy.get("status", ""))
                 ),
                 json.dumps(ui_privacy)[:300] if ui_privacy else "no result",
+            )
+
+            # 3c-i. #336 review blocker 3: inspect SQLite IMMEDIATELY
+            #     after the UI privacy op — BEFORE the direct bridge
+            #     operations below — so the zero-row evidence is
+            #     attributable to the UI button click alone.
+            #     delete_history wipes messages AND the turn ledger
+            #     (its contract), so both tables must read zero.
+            after_ui_privacy_chat = _sqlite_row_count(smoke_db_path, "chat_logs")
+            after_ui_privacy_turns = _sqlite_row_count(smoke_db_path, "turn_requests")
+            report.check(
+                "UI privacy op wiped SQLite BEFORE any direct op (chat_logs == 0)",
+                bool(
+                    ui_privacy
+                    and ui_privacy.get("confirmed") is True
+                    and after_ui_privacy_chat == 0
+                ),
+                f"chat_logs rows after UI privacy={after_ui_privacy_chat} "
+                "(inspected before any direct bridge op)",
+            )
+            report.check(
+                "UI privacy op wiped the turn ledger (turn_requests == 0)",
+                after_ui_privacy_turns == 0,
+                f"turn_requests rows after UI privacy={after_ui_privacy_turns} "
+                "(inspected before any direct bridge op)",
             )
 
             # 4. Invalid input rejected with sanitized error.
@@ -857,6 +956,11 @@ def run_smoke() -> tuple[bool, list[str]]:
             #      full turn end-to-end and prove persistence WITHOUT
             #      trusting the runtime's own read path: a separate
             #      stdlib sqlite3 connection reads the same file.
+            #      NOTE (#336 review blocker 3): the UI-attributable
+            #      persistence/privacy checks already ran above
+            #      (3b-i, 3c-i) BEFORE these direct calls; everything
+            #      from here on is SEPARATE evidence for the direct
+            #      bridge surface, not the UI path proof.
             js_api_local = _get_js_api(window)
             runtime_state = None
             send_result = None
@@ -925,13 +1029,6 @@ def run_smoke() -> tuple[bool, list[str]]:
     probe_thread = threading.Thread(target=probe_worker, daemon=True)
     probe_thread.start()
 
-    # #336: the smoke uses a throwaway database and an offline scripted
-    # provider. The user's real local database is never touched and no
-    # Groq quota is spent; the lifecycle exercised is otherwise the
-    # production one (bridge -> runtime -> LocalStorage -> SQLite).
-    smoke_db_dir = tempfile.mkdtemp(prefix="katherine-smoke-336-")
-    smoke_db_path = Path(smoke_db_dir) / "smoke.db"
-
     try:
         run_desktop_shell(  # blocks on main thread
             html_name=SMOKE_PAGE,
@@ -986,15 +1083,18 @@ def run_smoke() -> tuple[bool, list[str]]:
         )
         privacy = restarted.delete_history()
         deleted = _sqlite_row_count(smoke_db_path, "chat_logs")
+        deleted_turns = _sqlite_row_count(smoke_db_path, "turn_requests")
         report.check(
-            "local privacy op really deletes (delete_history -> 0 messages)",
+            "local privacy op really deletes (direct delete_history -> 0 messages AND 0 requests)",
             bool(
                 privacy
                 and privacy.get("success") is True
                 and privacy.get("result", {}).get("status") == "applied"
                 and deleted == 0
+                and deleted_turns == 0
             ),
-            f"chat_logs rows after delete={deleted}",
+            f"chat_logs rows after delete={deleted}, "
+            f"turn_requests rows after delete={deleted_turns}",
         )
     finally:
         restarted.close()
