@@ -45,6 +45,7 @@ class TestLocalOnlyWindowUrl:
         dist = tmp_path / "frontend" / "dist"
         dist.mkdir(parents=True)
         (dist / "index.html").write_text("<html></html>", encoding="utf-8")
+        (dist / "desktop.html").write_text("<html></html>", encoding="utf-8")
         from backend.desktop.build_resolver import DesktopBuildConfig, resolve_frontend_build
 
         build = resolve_frontend_build(DesktopBuildConfig(frontend_root=tmp_path / "frontend"))
@@ -55,15 +56,33 @@ class TestLocalOnlyWindowUrl:
 
 class TestNoBridgeForRemoteContent:
     def test_allowlist_remains_the_only_js_surface(self) -> None:
-        # Any future navigation feature must go through review: today the
-        # exposed surface is exactly health, and the real boundary object
+        # Any future surface growth must go through review: the exposed
+        # surface is exactly the allowlist, and the real boundary object
         # (make_js_api()) exposes nothing else. There is no generic
         # dispatch: calling a non-allowlisted name is structurally
         # impossible (pywebview only proxies real attributes).
-        assert DESKTOP_API_METHODS == ("health",)
+        assert DESKTOP_API_METHODS == (
+            "health",
+            "runtime_state",
+            "load_history",
+            "send_message",
+            "delete_history",
+            "delete_memories",
+            "reset_emotional_state",
+            "reset_relationship_state",
+        )
         bridge = make_js_api()
         public = sorted(name for name in dir(bridge) if not name.startswith("_"))
-        assert public == ["health"]
+        assert public == [
+            "delete_history",
+            "delete_memories",
+            "health",
+            "load_history",
+            "reset_emotional_state",
+            "reset_relationship_state",
+            "runtime_state",
+            "send_message",
+        ]
 
     def test_bridge_has_no_generic_dispatch_or_passthrough(self) -> None:
         # The facade must not add __getattr__/__call__/passthrough that

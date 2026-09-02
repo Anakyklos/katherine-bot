@@ -48,6 +48,7 @@ class ResolvedBuild:
 
     dist_dir: Path
     index_html: Path
+    desktop_html: Path
 
 
 def resolve_frontend_build(config: DesktopBuildConfig) -> ResolvedBuild:
@@ -59,6 +60,7 @@ def resolve_frontend_build(config: DesktopBuildConfig) -> ResolvedBuild:
     """
     dist_dir = config.frontend_root / "dist"
     index_html = dist_dir / "index.html"
+    desktop_html = dist_dir / "desktop.html"
 
     if not dist_dir.is_dir():
         raise BuildResolutionError(
@@ -68,5 +70,9 @@ def resolve_frontend_build(config: DesktopBuildConfig) -> ResolvedBuild:
         raise BuildResolutionError(
             "Frontend build is incomplete (index.html missing). " + _BUILD_HINT
         )
+    if not desktop_html.is_file():
+        raise BuildResolutionError(
+            "Frontend build is incomplete (desktop.html missing). " + _BUILD_HINT
+        )
 
-    return ResolvedBuild(dist_dir=dist_dir, index_html=index_html)
+    return ResolvedBuild(dist_dir=dist_dir, index_html=index_html, desktop_html=desktop_html)

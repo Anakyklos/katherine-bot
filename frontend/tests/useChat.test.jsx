@@ -28,6 +28,7 @@ const mockSendMessage = vi.fn();
 
 vi.mock('../src/features/chat/services/chatService', () => ({
     sendMessage: (...args) => mockSendMessage(...args),
+    fetchHistory: async (...args) => mockApiGet(...args),
     ChatError: class ChatError extends Error {
         constructor(type, message) {
             super(message);
@@ -296,7 +297,10 @@ describe('useChat', () => {
 
         const { unmount } = renderHook(() => useChat());
 
-        expect(mockApiGet).toHaveBeenCalled();
+        // The web transport loads chatService lazily (review blocker 1:
+        // the desktop graph must not contain it), so the call is one
+        // microtask later than it was with a static import.
+        await waitFor(() => expect(mockApiGet).toHaveBeenCalled());
 
         // Unmount before history resolves
         act(() => { unmount(); });
@@ -367,7 +371,9 @@ describe('useChat', () => {
 
         const { result } = renderHook(() => useChat());
 
-        expect(mockApiGet).toHaveBeenCalled();
+        // Lazy web branch (review blocker 1): the history call fires one
+        // microtask after mount; wait for it instead of asserting sync.
+        await waitFor(() => expect(mockApiGet).toHaveBeenCalled());
 
         // Clear the screen while /history is pending
         await act(async () => {
@@ -409,7 +415,9 @@ describe('useChat', () => {
 
         const { unmount } = renderHook(() => useChat());
 
-        expect(mockApiGet).toHaveBeenCalled();
+        // Lazy web branch (review blocker 1): see the note in the
+        // clearScreen test above — the call is async, not sync.
+        await waitFor(() => expect(mockApiGet).toHaveBeenCalled());
 
         // Unmount — triggers abort signal and sets active=false
         await act(async () => {

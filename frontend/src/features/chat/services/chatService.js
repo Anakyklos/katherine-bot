@@ -6,17 +6,11 @@ import api from '../../../shared/services/apiClient.js';
  * Never contains: raw Axios error objects, headers, tokens, config, request IDs,
  * or request data.
  */
-export class ChatError extends Error {
-    /**
-     * @param {'timeout'|'rate_limited'|'service_unavailable'|'validation'|'request_replay'|'request_conflict'|'unknown'} type
-     * @param {string} message
-     */
-    constructor(type, message) {
-        super(message);
-        this.name = 'ChatError';
-        this.type = type;
-    }
-}
+import { ChatError } from './chatError.js';
+
+// Re-exported for the existing web-mode consumers (#267 tests import it
+// from this module); the class itself is dependency-free (see chatError.js).
+export { ChatError };
 
 /**
  * Classify an HTTP status and allowlisted public code into a stable ChatError type.
@@ -69,6 +63,21 @@ export function createChatError(error) {
 
     return new ChatError(type, messages[type] || messages.unknown);
 }
+
+/**
+ * Fetch the persisted conversation history (web branch).
+ *
+ * Kept here (not in the hook) since #336 so the transport boundary can
+ * delegate both branches uniformly. Returns the Axios response shape
+ * `{ data: [...] }` the hook always consumed.
+ *
+ * @param {object} [options]
+ * @param {AbortSignal} [options.signal]
+ */
+export const fetchHistory = async (options = {}) => {
+    const { signal } = options;
+    return api.get('/history', { signal });
+};
 
 /**
  * Send a message to the chat API with an explicit logical request ID.

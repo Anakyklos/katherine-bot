@@ -30,7 +30,7 @@ import types
 from pathlib import Path
 
 import backend.desktop.app as desktop_app_module
-from backend.desktop.api import make_js_api
+from backend.desktop.api import DESKTOP_API_METHODS, make_js_api
 from backend.desktop.app import (
     ERROR_BRIDGE_UNAVAILABLE,
     BuildTrust,
@@ -44,7 +44,12 @@ def _make_build(tmp_path: Path) -> ResolvedBuild:
     dist = tmp_path / "dist"
     dist.mkdir()
     (dist / "index.html").write_text("<html></html>", encoding="utf-8")
-    return ResolvedBuild(dist_dir=dist, index_html=dist / "index.html")
+    (dist / "desktop.html").write_text("<html></html>", encoding="utf-8")
+    return ResolvedBuild(
+        dist_dir=dist,
+        index_html=dist / "index.html",
+        desktop_html=dist / "desktop.html",
+    )
 
 
 class TestIsLocalBuildUrl:
@@ -118,7 +123,7 @@ class TestBridgeFailsClosedOutsideLocalBuild:
         url = build.index_html.as_uri()
         # The loaded handler committed this local page as trusted.
         wrapper = self._bridge_for(build, url, trusted=True)
-        assert wrapper.health() == {"ok": True, "api_version": 1}
+        assert wrapper.health() == {"ok": True, "api_version": 2}
 
     def test_local_url_before_commit_is_refused(self, tmp_path: Path) -> None:
         # Trust is only granted after the loaded handler commits the
@@ -221,6 +226,7 @@ class TestLoadedHandlerRevertsNavigation:
         dist = tmp_path / "dist"
         dist.mkdir(exist_ok=True)
         (dist / "index.html").write_text("<html></html>", encoding="utf-8")
+        (dist / "desktop.html").write_text("<html></html>", encoding="utf-8")
 
         recorded: dict = {
             "create_window_kwargs": None,
@@ -283,34 +289,39 @@ class TestLoadedHandlerRevertsNavigation:
         assert isinstance(js_api, LocalBuildBridge)
         # Wrapper exposes exactly the allowlisted surface.
         public = [name for name in dir(js_api) if not name.startswith("_")]
-        assert public == ["health"]
+        assert sorted(public) == sorted(DESKTOP_API_METHODS)
 
     def test_window_url_is_the_local_build(self, monkeypatch, tmp_path: Path) -> None:
         _, recorded = self._run_with_stubbed_webview(monkeypatch, tmp_path, None)
         dist = (tmp_path / "dist").resolve()
-        assert recorded["create_window_kwargs"]["url"] == (dist / "index.html").as_uri()
+        # #336 review blocker 1: the shell opens the DESKTOP entry
+        # (desktop.html -> main-desktop.jsx -> AppDesktop), never the
+        # web app page (index.html -> AppWeb -> Supabase/AuthPage).
+        assert recorded["create_window_kwargs"]["url"] == (dist / "desktop.html").as_uri()
 
     def test_loaded_navigation_to_remote_is_reverted(self, monkeypatch, tmp_path: Path) -> None:
         # Simulate the window having navigated away when ``loaded`` fires:
         # the handler must call load_url back to the local build.
         dist = (tmp_path / "dist").resolve()
-        expected_uri = (dist / "index.html").as_uri()
+        # The revert target is the shell entry (desktop.html, #336
+        # review blocker 1) — never the web page.
+        expected_uri = (dist / "desktop.html").as_uri()
         # Two runs to cover the wiring: one navigation to remote (revert)
         _, recorded = self._run_with_stubbed_webview(monkeypatch, tmp_path, "https://example.com/")
         assert recorded["load_url_calls"] == [expected_uri]
 
     def test_loaded_navigation_staying_local_is_not_reverted(self, monkeypatch, tmp_path: Path) -> None:
         dist = (tmp_path / "dist").resolve()
-        local_uri = (dist / "index.html").as_uri()
+        local_uri = (dist / "desktop.html").as_uri()
         _, recorded = self._run_with_stubbed_webview(monkeypatch, tmp_path, local_uri)
         assert recorded["load_url_calls"] == []
 
     def test_js_api_health_local_roundtrip_via_wrapper(self, monkeypatch, tmp_path: Path) -> None:
         dist = (tmp_path / "dist").resolve()
-        local_uri = (dist / "index.html").as_uri()
+        local_uri = (dist / "desktop.html").as_uri()
         _, recorded = self._run_with_stubbed_webview(monkeypatch, tmp_path, local_uri)
         js_api = recorded["create_window_kwargs"]["js_api"]
-        assert js_api.health() == {"ok": True, "api_version": 1}
+        assert js_api.health() == {"ok": True, "api_version": 2}
 
     def test_js_api_health_remote_via_wrapper(self, monkeypatch, tmp_path: Path) -> None:
         self._run_with_stubbed_webview(monkeypatch, tmp_path, "https://example.com/")
@@ -414,7 +425,7 @@ class TestRevertToSameEntryUrl:
         # Only after the new local load completes (loaded event → new
         # commit) may the bridge serve again — same URL, new state.
         machine.on_loaded()
-        assert bridge.health() == {"ok": True, "api_version": 1}
+        assert bridge.health() == {"ok": True, "api_version": 2}
 
     def test_bridge_reopens_only_after_new_local_load_completes(
         self, tmp_path: Path
@@ -446,7 +457,7 @@ class TestRevertToSameEntryUrl:
         # 3) New local load completes: the loaded event re-commits and
         #    the bridge serves again.
         machine.on_loaded()
-        assert bridge.health() == {"ok": True, "api_version": 1}
+        assert bridge.health() == {"ok": True, "api_version": 2}
 
     def test_revert_navigates_to_the_entry_url(self, tmp_path: Path) -> None:
         # The revert load goes back to the same entry_html the shell
@@ -474,8 +485,10 @@ class TestRevertToSameEntryUrl:
         # (a) initial local load: bridge serves.
         assert recorded["health_after_first_load"]["ok"] is True
         # (b) remote loaded event: revert issued to the entry URL...
+        # (the entry is desktop.html — the desktop companion page, #336
+        # review blocker 1)
         assert recorded["load_url_calls"] == [
-            (tmp_path / "dist" / "index.html").resolve().as_uri()
+            (tmp_path / "dist" / "desktop.html").resolve().as_uri()
         ]
         # ...and the bridge refuses the remote document.
         assert (
@@ -527,7 +540,8 @@ def _run_shell_with_scripted_urls(monkeypatch, tmp_path: Path) -> dict:
     dist = tmp_path / "dist"
     dist.mkdir(exist_ok=True)
     (dist / "index.html").write_text("<html></html>", encoding="utf-8")
-    entry_uri = (dist / "index.html").resolve().as_uri()
+    (dist / "desktop.html").write_text("<html></html>", encoding="utf-8")
+    entry_uri = (dist / "desktop.html").resolve().as_uri()
     remote_uri = "https://example.com/"
 
     recorded: dict = {
@@ -632,3 +646,115 @@ def _run_shell_with_scripted_urls(monkeypatch, tmp_path: Path) -> dict:
 
     desktop_app_module.run_desktop_shell(frontend_root=tmp_path)
     return recorded
+
+
+# =========================================================================
+# #336 extension: every companion op fails closed (T007)
+# =========================================================================
+
+class TestCompanionOpsFailClosed:
+    """The full allowlist (not just health) refuses non-local pages.
+
+    Parameterized over every op so a new allowlist entry cannot ship
+    without a fail-closed test of its own.
+    """
+
+    # (op name, args to call it with)
+    _OPS = [
+        ("health", ()),
+        ("runtime_state", ()),
+        ("load_history", ()),
+        ("send_message", ("req-1", "hello")),
+        ("delete_history", ()),
+        ("delete_memories", ()),
+        ("reset_emotional_state", ()),
+        ("reset_relationship_state", ()),
+    ]
+
+    def _wrapper_for(self, build: ResolvedBuild, url: str | None):
+        trust = BuildTrust(build)
+        return LocalBuildBridge(make_js_api(runtime=_NoopRuntime()), build, lambda: url, trust)
+
+    def test_every_op_refuses_remote_url(self, tmp_path: Path) -> None:
+        import json
+
+        build = _make_build(tmp_path)
+        wrapper = self._wrapper_for(build, "https://evil.example/")
+        for op, args in self._OPS:
+            result = getattr(wrapper, op)(*args)
+            assert result["ok"] is False, op
+            assert result["code"] == ERROR_BRIDGE_UNAVAILABLE, op
+            serialized = json.dumps(result)
+            assert "evil" not in serialized, op
+            assert "Traceback" not in serialized, op
+
+    def test_every_op_refuses_mid_revert(self, tmp_path: Path) -> None:
+        # Committed local page, window navigated remote, then the revert
+        # load started (get_uri reads local again) — trust was revoked, so
+        # every op must still refuse.
+        build = _make_build(tmp_path)
+        trust = BuildTrust(build)
+        local = build.index_html.as_uri()
+        trust.commit_if_local(local)
+        trust.revoke()  # the non-local load report dropped the trust
+        wrapper = LocalBuildBridge(
+            make_js_api(runtime=_NoopRuntime()), build, lambda: local, trust
+        )
+        for op, args in self._OPS:
+            assert getattr(wrapper, op)(*args)["code"] == ERROR_BRIDGE_UNAVAILABLE, op
+
+    def test_every_op_serves_the_trusted_local_page(self, tmp_path: Path) -> None:
+        # Happy path: a committed local page is served.
+        build = _make_build(tmp_path)
+        trust = BuildTrust(build)
+        local = build.index_html.as_uri()
+        trust.commit_if_local(local)
+        wrapper = LocalBuildBridge(
+            make_js_api(runtime=_NoopRuntime()), build, lambda: local, trust
+        )
+        for op, args in self._OPS:
+            result = getattr(wrapper, op)(*args)
+            assert result.get("ok") is True or result.get("success") is True, op
+
+    def test_every_op_refuses_uncommitted_local_page(self, tmp_path: Path) -> None:
+        build = _make_build(tmp_path)
+        wrapper = self._wrapper_for(build, build.index_html.as_uri())
+        for op, args in self._OPS:
+            assert getattr(wrapper, op)(*args)["code"] == ERROR_BRIDGE_UNAVAILABLE, op
+
+    def test_url_lookup_failure_fails_closed_for_every_op(self, tmp_path: Path) -> None:
+        build = _make_build(tmp_path)
+
+        def _raising() -> str | None:
+            raise RuntimeError("boom")
+
+        wrapper = LocalBuildBridge(
+            make_js_api(runtime=_NoopRuntime()), build, _raising
+        )
+        for op, args in self._OPS:
+            assert getattr(wrapper, op)(*args)["code"] == ERROR_BRIDGE_UNAVAILABLE, op
+
+
+class _NoopRuntime:
+    """Runtime double whose every method returns an ``ok`` payload."""
+
+    def runtime_state(self) -> dict:
+        return {"ok": True, "storage": True, "provider_configured": True, "revision": 0}
+
+    def load_history(self, limit: int = 50) -> list:
+        return []
+
+    def send_turn(self, *, request_id: str, message: str) -> dict:
+        return {"success": True, "response": "ok"}
+
+    def delete_history(self) -> dict:
+        return {"success": True, "result": {"status": "applied"}}
+
+    def delete_memories(self) -> dict:
+        return {"success": True, "result": {"status": "applied"}}
+
+    def reset_emotional_state(self) -> dict:
+        return {"success": True, "result": {"status": "applied"}}
+
+    def reset_relationship_state(self) -> dict:
+        return {"success": True, "result": {"status": "applied"}}

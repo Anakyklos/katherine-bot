@@ -115,7 +115,12 @@ class LoadedUserState:
 
 @dataclass(frozen=True)
 class CommittedTurn:
-    """Public result of one successful atomic turn commit."""
+    """Public result of one successful atomic turn commit.
+
+    ``message_id`` is the public assistant message UUID from the replay
+    payload (web parity: the runtime surfaces it to the UI); it is the
+    same value on commit and replay.
+    """
 
     request_id: str
     revision: int
@@ -123,6 +128,7 @@ class CommittedTurn:
     assistant_message_id: int
     response: str
     emotion_state: Mapping[str, Any]
+    message_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -420,6 +426,40 @@ class LocalStorage:
         history.reverse()
         return history
 
+    def load_recent_memories(self, limit: int = 5) -> list[tuple[str, dict[str, Any]]]:
+        """Read the most recent local memories (oldest-first, bounded).
+
+        Returns ``(content, metadata)`` tuples for the newest *limit*
+        memories, ordered chronologically (newest last) so callers build
+        context windows the same way as history. Metadata is the parsed
+        JSON object stored by :meth:`store_memory` (validated as JSON at
+        write time; a corrupt row surfaces as ``PersistenceError`` — it
+        is never silently dropped).
+        """
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 500:
+            raise ValidationError("invalid_limit", "limit must be an int in [1, 500]")
+        try:
+            rows = self._connection().execute(
+                "select content, metadata from memories "
+                "order by created_at desc, id desc limit ?",
+                (limit,),
+            ).fetchall()
+        except sqlite3.Error:
+            raise PersistenceError("database_error", "persistence error") from None
+        memories: list[tuple[str, dict[str, Any]]] = []
+        for content, metadata_text in rows:
+            if not isinstance(content, str) or len(content) > MAX_MESSAGE_LENGTH:
+                raise PersistenceError("invalid_state", "persistence error")
+            try:
+                metadata = json.loads(metadata_text) if metadata_text else {}
+            except (json.JSONDecodeError, TypeError):
+                raise PersistenceError("invalid_state", "persistence error") from None
+            if not isinstance(metadata, dict):
+                raise PersistenceError("invalid_state", "persistence error")
+            memories.append((content, metadata))
+        memories.reverse()
+        return memories
+
     # ── Atomic turn commit ───────────────────────────────────────────────
 
     def commit_turn(
@@ -516,6 +556,14 @@ class LocalStorage:
             ).fetchone()
             if existing is not None:
                 status, stored_hash = existing[0], existing[1]
+                if status == "pending":
+                    # #336 review blocker 4: pending = the caller's own
+                    # atomic reservation (reserve_request), not another
+                    # writer's turn. Proceed: the transactional commit
+                    # upserts this exact row to completed. Concurrent
+                    # DUPLICATE callers never reach commit_turn at all —
+                    # reserve_request already classified them.
+                    pass
                 if status == "completed":
                     # Same request + same canonical payload → replay the
                     # committed result. Any divergent determinative input
@@ -534,30 +582,21 @@ class LocalStorage:
                     return self._committed_from_row(
                         request_id, existing[2], existing[3], existing[4], existing[5]
                     )
-                if status == "pending":
-                    raise ConflictError(
-                        "request_in_progress",
-                        "Request is already in progress.",
-                        expected_revision=(
-                            expected_revision if expected_revision is not None else 0
-                        ),
-                        actual_revision=None,
-                        request_id=request_id,
-                    )
-                # failed: replay is unavailable, but a retry with the same
-                # canonical payload may proceed as a fresh attempt; a
-                # divergent payload for the same request id is still a
-                # conflict (deterministic rejection, no silent reuse).
-                if stored_hash != payload_hash:
-                    raise ConflictError(
-                        "request_payload_conflict",
-                        "Request id already exists with a different payload.",
-                        expected_revision=(
-                            expected_revision if expected_revision is not None else 0
-                        ),
-                        actual_revision=None,
-                        request_id=request_id,
-                    )
+                if status == "failed":
+                    # failed: replay is unavailable, but a retry with the same
+                    # canonical payload may proceed as a fresh attempt; a
+                    # divergent payload for the same request id is still a
+                    # conflict (deterministic rejection, no silent reuse).
+                    if stored_hash != payload_hash:
+                        raise ConflictError(
+                            "request_payload_conflict",
+                            "Request id already exists with a different payload.",
+                            expected_revision=(
+                                expected_revision if expected_revision is not None else 0
+                            ),
+                            actual_revision=None,
+                            request_id=request_id,
+                        )
 
             try:
                 conn.execute("BEGIN IMMEDIATE")
@@ -573,7 +612,7 @@ class LocalStorage:
                 ).fetchone()
                 if existing is not None:
                     status, stored_hash = existing[0], existing[1]
-                    if stored_hash != payload_hash:
+                    if status != "pending" and stored_hash != payload_hash:
                         conn.execute("ROLLBACK")
                         raise ConflictError(
                             "request_payload_conflict",
@@ -590,16 +629,14 @@ class LocalStorage:
                             request_id, existing[2], existing[3], existing[4], existing[5]
                         )
                     if status == "pending":
-                        conn.execute("ROLLBACK")
-                        raise ConflictError(
-                            "request_in_progress",
-                            "Request is already in progress.",
-                            expected_revision=(
-                                expected_revision if expected_revision is not None else 0
-                            ),
-                            actual_revision=None,
-                            request_id=request_id,
-                        )
+                        # #336 review blocker 4: a pending row is the
+                        # CALLER'S OWN reservation (reserve_request
+                        # inserted it atomically before the provider
+                        # call). The completed-commit below flips it to
+                        # completed with the real payload hash inside
+                        # this same write transaction — the upsert
+                        # targets the reserved row instead of failing.
+                        pass
 
                 profile_row = conn.execute(
                     "select revision from profiles where id = 1"
@@ -653,7 +690,17 @@ class LocalStorage:
                     "status, expected_revision, committed_revision, "
                     "user_message_chat_log_id, assistant_message_chat_log_id, "
                     "replay_payload, completed_at, updated_at) "
-                    "values (?, ?, 'completed', ?, ?, ?, ?, ?, ?, ?)",
+                    "values (?, ?, 'completed', ?, ?, ?, ?, ?, ?, ?) "
+                    "on conflict (request_id) do update set "
+                    "payload_hash_sha256 = excluded.payload_hash_sha256, "
+                    "status = 'completed', "
+                    "expected_revision = excluded.expected_revision, "
+                    "committed_revision = excluded.committed_revision, "
+                    "user_message_chat_log_id = excluded.user_message_chat_log_id, "
+                    "assistant_message_chat_log_id = excluded.assistant_message_chat_log_id, "
+                    "replay_payload = excluded.replay_payload, "
+                    "completed_at = excluded.completed_at, "
+                    "updated_at = excluded.updated_at",
                     (
                         request_id,
                         payload_hash,
@@ -704,6 +751,7 @@ class LocalStorage:
                 assistant_message_id=assistant_message_id,
                 response=replay_payload.get("response", ""),
                 emotion_state=replay_payload.get("emotion_state", {}),
+                message_id=str(replay_payload.get("message_id", "")),
             )
 
     def _committed_from_row(
@@ -727,6 +775,7 @@ class LocalStorage:
             assistant_message_id=int(assistant_message_id or 0),
             response=payload.get("response", ""),
             emotion_state=payload.get("emotion_state", {}),
+            message_id=str(payload.get("message_id", "")),
         )
 
     # ── Replay ───────────────────────────────────────────────────────────
@@ -755,6 +804,178 @@ class LocalStorage:
         if status == "pending":
             return ReplayOutcome(status="request_in_progress", committed=None)
         return ReplayOutcome(status="request_replay_unavailable", committed=None)
+
+    def check_request(self, request_id: str, user_message: str) -> ReplayOutcome:
+        """Pre-flight idempotency check for the local turn flow (#336).
+
+        Mirrors the web admission semantics *before any provider call*:
+
+        * ``fresh`` — no ledger row for this request id: proceed with the
+          turn flow;
+        * ``replay`` — a completed request whose persisted user message is
+          byte-identical: return the committed result, no provider call,
+          no write;
+        * ``conflict`` — the request id exists with a divergent user
+          message (or is pending): the caller must surface a request
+          conflict, never recompute.
+
+        The comparison uses the persisted ``chat_logs`` row linked to the
+        ledger entry (the local equivalent of the web admission HMAC: the
+        same request id with a different message is always a conflict).
+        """
+        request_id = _validate_request_id(request_id)
+        user_message = _validate_message(user_message, "user_message")
+        try:
+            row = self._connection().execute(
+                "select status, user_message_chat_log_id, committed_revision, "
+                "assistant_message_chat_log_id, replay_payload "
+                "from turn_requests where request_id = ?",
+                (request_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            raise PersistenceError("database_error", "persistence error") from None
+        if row is None:
+            return ReplayOutcome(status="fresh", committed=None)
+        status, user_msg_id, revision, assistant_msg_id, payload_text = row
+        if status != "completed":
+            return ReplayOutcome(status="conflict", committed=None)
+        try:
+            stored = self._connection().execute(
+                "select content from chat_logs where id = ?",
+                (user_msg_id,),
+            ).fetchone()
+        except sqlite3.Error:
+            raise PersistenceError("database_error", "persistence error") from None
+        if stored is None or stored[0] != user_message:
+            return ReplayOutcome(status="conflict", committed=None)
+        return ReplayOutcome(
+            status="replay",
+            committed=self._committed_from_row(
+                request_id, revision, user_msg_id, assistant_msg_id, payload_text
+            ),
+        )
+
+    def release_request(self, request_id: str) -> None:
+        """Release a pending reservation after a live failure.
+
+        The counterpart of ``reserve_request`` for the ERROR path of a
+        live session: when the provider fails AFTER admission but
+        BEFORE the atomic commit, the pending reservation would
+        otherwise block every retry of the same request id until
+        restart (crash recovery only runs at open time). Deleting the
+        pending row releases the id so the user can retry the same
+        send; concurrency is not weakened because the release happens
+        strictly after the winner already failed — no second live
+        writer can be admitted for a row that still exists.
+
+        Only ``pending`` rows are ever deleted: completed replays and
+        crash-recovered ``failed`` rows are durable history and stay.
+        """
+        request_id = _validate_request_id(request_id)
+        with self._lock:
+            conn = self._connection()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "delete from turn_requests "
+                    "where request_id = ? and status = 'pending'",
+                    (request_id,),
+                )
+                conn.execute("COMMIT")
+            except sqlite3.Error:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise PersistenceError("database_error", "persistence error") from None
+
+    def reserve_request(self, request_id: str, user_message: str) -> ReplayOutcome:
+        """Atomically reserve one request id BEFORE any provider call.
+
+        #336 review blocker 4 (web admission parity for the local
+        runtime): ``check_request`` is a plain read, so two concurrent
+        turns with the same request id could BOTH observe ``fresh``
+        and both spend provider calls. This method closes that window:
+
+        * inside ``BEGIN IMMEDIATE`` … ``COMMIT``, an existing
+          completed request with the same persisted user message is a
+          durable replay (returned as-is — no write, no provider call);
+        * any existing row with a DIFFERENT user message for the same
+          request id is a conflict (deterministic rejection);
+        * an existing ``pending`` row is a conflict
+          (``request_in_progress``) — the concurrent duplicate caller
+          learns about the winner without a second remote effect;
+        * otherwise a ``pending`` reservation row is INSERTED and
+          committed. From this instant on, a concurrent
+          ``reserve_request`` for the same id sees the reservation and
+          conflicts; a crash leaves the row ``pending``, which the
+          open-time recovery fail-closes to ``failed`` (replays stay
+          unavailable — same as the web contract for interrupted
+          turns).
+        """
+        request_id = _validate_request_id(request_id)
+        user_message = _validate_message(user_message, "user_message")
+        with self._lock:
+            conn = self._connection()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                # The reservation insert's uniqueness (request_id is
+                # the primary key) IS the admission: the writer lock
+                # plus BEGIN IMMEDIATE make check-then-insert atomic.
+                inserted = conn.execute(
+                    "insert into turn_requests "
+                    "(request_id, payload_hash_sha256, status) "
+                    "values (?, ?, 'pending') "
+                    "on conflict (request_id) do nothing",
+                    # Placeholder hash: the completed commit below
+                    # overwrites it with the canonical payload hash
+                    # inside the same transaction. A pending row never
+                    # advertises a real hash (it is not comparable —
+                    # the payload does not exist yet).
+                    (request_id, "reserved:" + request_id),
+                )
+                # rowcount 1 → this call created the reservation (we
+                # own it). rowcount 0 → a row already existed: every
+                # path below must decide by ITS state, never ours.
+                if inserted.rowcount == 1:
+                    conn.execute("COMMIT")
+                    return ReplayOutcome(status="reserved", committed=None)
+                row = conn.execute(
+                    "select status, user_message_chat_log_id, "
+                    "committed_revision, assistant_message_chat_log_id, "
+                    "replay_payload from turn_requests where request_id = ?",
+                    (request_id,),
+                ).fetchone()
+                assert row is not None  # insert-or-read above guarantees it
+                status, user_msg_id, revision, assistant_msg_id, payload_text = row
+                if status == "pending":
+                    # Another writer's live reservation (or a legacy
+                    # pending row): the request is already being
+                    # executed elsewhere — never a second remote call.
+                    conn.execute("COMMIT")
+                    return ReplayOutcome(status="conflict", committed=None)
+                if status == "completed":
+                    conn.execute("ROLLBACK")
+                    stored = conn.execute(
+                        "select content from chat_logs where id = ?",
+                        (user_msg_id,),
+                    ).fetchone()
+                    if stored is None or stored[0] != user_message:
+                        return ReplayOutcome(status="conflict", committed=None)
+                    return ReplayOutcome(
+                        status="replay",
+                        committed=self._committed_from_row(
+                            request_id, revision, user_msg_id, assistant_msg_id,
+                            payload_text,
+                        ),
+                    )
+                # failed (crash-recovered): the request cannot be
+                # retried as a replay; fail-closed deterministic
+                # conflict so the caller surfaces reconciliation.
+                conn.execute("ROLLBACK")
+                return ReplayOutcome(status="conflict", committed=None)
+            except sqlite3.Error:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise PersistenceError("database_error", "persistence error") from None
 
     # ── Memory ──────────────────────────────────────────────────────────
 

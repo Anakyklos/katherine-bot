@@ -3,6 +3,7 @@ import EmotionPanel from './EmotionPanel';
 import ChatHeader from './ChatHeader';
 import MessageList from './MessageList';
 import ChatInput from './ChatInput';
+import PrivacyPanel from '../../privacy/PrivacyPanel';
 import { useChat } from '../hooks/useChat';
 
 const ChatWindow = () => {
@@ -15,7 +16,8 @@ const ChatWindow = () => {
         messagesEndRef,
         inputRef,
         handleSend,
-        clearScreen
+        clearScreen,
+        transport
     } = useChat();
 
     return (
@@ -50,6 +52,15 @@ const ChatWindow = () => {
                         <EmotionPanel emotionState={emotionState} />
                     </aside>
                 )}
+
+                {/* #336: local privacy ops — desktop shell only. The panel
+                     itself renders nothing under a web transport, so the
+                     web app never sees this surface. Kept visible even
+                     before the first turn so the user can always erase
+                     local data. */}
+                <aside className="hidden md:block border-l border-gray-800 bg-gray-900 p-4 overflow-y-auto">
+                    <PrivacyPanel transport={transport} />
+                </aside>
             </div>
 
             {/* Mobile Emotion Panel */}

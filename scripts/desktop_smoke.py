@@ -12,7 +12,10 @@ Requirements (documented in README "Desktop shell (Linux)"):
 - pywebview with the GTK (WebKitGTK) backend;
 - a virtual display (Xvfb) when running without a GUI session.
 
-What this smoke proves (issue #334 validation items):
+What this smoke proves (issue #334 validation items + #336 local
+runtime persistence):
+
+#334 (shell trust):
 1. the app opens on Linux from the local frontend build (file://, no
    HTTP server);
 2. the REAL chat UI renders inside the shell (ChatHeader, message
@@ -39,6 +42,28 @@ What this smoke proves (issue #334 validation items):
 6. closing the window ends the shell cleanly (no leftover threads);
 7. no HTTP server is listening for the UI.
 
+#336 (local companion runtime, added on top of the same run):
+8. runtime_state() through the real bridge reports local storage
+   ready with no cloud dependency;
+9. a full turn driven through send_message() (scripted offline
+   provider — no Groq quota, no network) commits locally — AND the
+   same turn is first driven through the REAL UI (textarea, send
+   button, ChatWindow rendering the reply), the exact end-user
+   acceptance path;
+10. the turn is durable in SQLite, proven by an independent
+    read-only stdlib sqlite3 connection (not the runtime's read
+    path);
+11. a FRESH runtime over the same file (what a relaunch is)
+    recovers the conversation and the stored revision;
+12. the local privacy op delete_history() really erases (0 message
+    rows in chat_logs afterwards, verified independently);
+13. USER ACCEPTANCE: a turn driven through the REAL UI (textarea,
+    send button, ChatWindow rendering the reply) — the exact path a
+    user takes, not a direct bridge call;
+14. USER ACCEPTANCE: the privacy panel driven through the REAL UI
+    (click Apagar histórico -> explicit Confirmar -> success status
+    rendered).
+
 Threading model: pywebview requires the GTK main loop on the main
 thread, so ``webview.start()`` runs on the main thread and the probes
 run on a worker thread. WebKitGTK's ``evaluate_js`` dispatches work to
@@ -52,6 +77,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -117,6 +143,93 @@ _PROBE_INVALID_INPUT = """
 
 _PROBE_COLLECT_INVALID = "(() => window.__smokeInvalid)()"
 
+#: #336: drive a real turn through the REAL UI (ChatInput -> useChat ->
+#: transport -> bridge), not by calling the bridge directly. The probe
+#: types into the textarea, clicks send, and collects the rendered
+#: assistant message. This proves the whole user acceptance path.
+_PROBE_UI_SEND = """
+(() => {
+  window.__smokeUiSend = 'pending';
+  (async () => {
+    try {
+      const input = document.querySelector('textarea[aria-label="Sua mensagem"]');
+      if (!input) { window.__smokeUiSend = { error: 'no textarea' }; return; }
+      const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+      setter.call(input, 'Mensagem real do smoke #336 via UI');
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      const send = document.querySelector('button[aria-label="Enviar mensagem (Enter)"]');
+      if (!send) { window.__smokeUiSend = { error: 'no send button' }; return; }
+      send.click();
+      // Wait for the assistant reply to render. The bubbles carry no
+      // stable class names, so observe the whole page text — the
+      // scripted reply string is unique to this run.
+      const deadline = Date.now() + 30000;
+      while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 500));
+        const text = document.body.innerText || '';
+        if (text.includes('Resposta de teste do smoke local')) {
+          window.__smokeUiSend = { sent: true, replied: true };
+          return;
+        }
+      }
+      window.__smokeUiSend = { sent: true, replied: false, bodySample: (document.body.innerText || '').slice(0, 300) };
+    } catch (e) {
+      window.__smokeUiSend = { threw: true, message: String(e).slice(0, 200) };
+    }
+  })();
+  return 'started';
+})()
+"""
+
+_PROBE_COLLECT_UI_SEND = "(() => window.__smokeUiSend)()"
+
+#: #336: exercise the PRIVACY PANEL through the real UI. Clicks the
+#: button, confirms the explicit confirmation dialog, and collects the
+#: rendered success status. This is the destructive-op acceptance path
+#: (user-initiated local erase), driven exactly as a user would.
+_PROBE_UI_PRIVACY = """
+(() => {
+  window.__smokeUiPrivacy = 'pending';
+  (async () => {
+    try {
+      const panel = document.querySelector('[data-testid="privacy-panel"]');
+      if (!panel) { window.__smokeUiPrivacy = { error: 'no privacy panel' }; return; }
+      const byText = (t) => Array.from(panel.querySelectorAll('button'))
+        .find(b => (b.innerText || '').trim() === t);
+      const start = byText('Apagar histórico');
+      if (!start) { window.__smokeUiPrivacy = { error: 'no Apagar histórico button' }; return; }
+      start.click();
+      // The confirmation renders through React state; give it time and
+      // retry the click (a disabled/pending op blocks the re-render).
+      const cDeadline = Date.now() + 15000;
+      let confirmBtn = null;
+      while (Date.now() < cDeadline && !confirmBtn) {
+        await new Promise(r => setTimeout(r, 400));
+        confirmBtn = byText('Confirmar');
+        if (!confirmBtn && !start.disabled) start.click();
+      }
+      if (!confirmBtn) { window.__smokeUiPrivacy = { error: 'no confirmation shown' }; return; }
+      confirmBtn.click();
+      const deadline = Date.now() + 30000;
+      while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 400));
+        const status = panel.querySelector('[role="status"]');
+        if (status && (status.innerText || '').includes('Operação concluída')) {
+          window.__smokeUiPrivacy = { confirmed: true, status: status.innerText };
+          return;
+        }
+      }
+      window.__smokeUiPrivacy = { confirmed: true, status: 'timeout waiting for status' };
+    } catch (e) {
+      window.__smokeUiPrivacy = { threw: true, message: String(e).slice(0, 200) };
+    }
+  })();
+  return 'started';
+})()
+"""
+
+_PROBE_COLLECT_UI_PRIVACY = "(() => window.__smokeUiPrivacy)()"
+
 _PROBE_NAVIGATE_REMOTE = """
 (() => {
   // Same-window navigation to remote content, exactly like a link
@@ -158,6 +271,76 @@ _PROBE_BADGE = """
   return badge ? { text: badge.innerText } : null;
 })()
 """
+
+
+def _make_scripted_provider():
+    """Deterministic offline provider for the smoke (#336).
+
+    The smoke must never spend real Groq quota and must not depend on a
+    configured key: the provider port answers with a fixed, valid reply
+    and a neutral appraisal. It exercises the same code path (port
+    interface, envelope validation, atomic commit) with zero network.
+    """
+    from backend.companion_runtime import ProviderPort
+    from backend.emotional_domain import AppraisalV1
+
+    class ScriptedSmokeProvider(ProviderPort):
+        async def appraise(self, message, budget):
+            return AppraisalV1.neutral()
+
+        async def generate(self, messages, budget):
+            return "Resposta de teste do smoke local (#336)."
+
+        def build_trusted_policy(self, emotional_state, relationship, adaptation_strategy=""):
+            return "Seja você mesma, com carinho."
+
+    return ScriptedSmokeProvider()
+
+
+def _sqlite_tables(db_path: Path) -> list[str]:
+    """Read the table list straight from the smoke database file.
+
+    Independent proof of persistence: the smoke does not trust the
+    runtime's own read path to prove that the runtime wrote anything —
+    it opens the SQLite file with the stdlib module and looks.
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        rows = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        ).fetchall()
+        return [name for (name,) in rows]
+    finally:
+        conn.close()
+
+
+def _sqlite_row_count(db_path: Path, table: str) -> int:
+    import sqlite3
+
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        (count,) = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+        return int(count)
+    finally:
+        conn.close()
+
+
+def _sqlite_fetch_all(db_path: Path, query: str, params: tuple = ()) -> list[tuple]:
+    """Run a read-only SELECT against the smoke database (stdlib).
+
+    Generic companion to the fixed-shape helpers so the smoke can
+    verify CONTENT (not only row counts) — e.g. that the message the
+    real UI sent is the one persisted (#336, review blocker 3).
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        return conn.execute(query, params).fetchall()
+    finally:
+        conn.close()
 
 
 def _listening_ports(pid: int) -> list[int]:
@@ -266,6 +449,17 @@ def run_smoke() -> tuple[bool, list[str]]:
         bool(display),
         f"DISPLAY={display!r} (use xvfb-run for headless runs)",
     )
+
+    # #336: the smoke uses a throwaway database and an offline scripted
+    # provider. The user's real local database is never touched and no
+    # Groq quota is spent; the lifecycle exercised is otherwise the
+    # production one (bridge -> runtime -> LocalStorage -> SQLite).
+    # Created BEFORE the probe worker is defined: the worker inspects
+    # this file at specific moments (immediately after the UI send and
+    # the UI privacy op — review blocker 3), so the path must be in
+    # scope from the start.
+    smoke_db_dir = tempfile.mkdtemp(prefix="katherine-smoke-336-")
+    smoke_db_path = Path(smoke_db_dir) / "smoke.db"
 
     window_holder: list = []
     loaded = threading.Event()
@@ -424,7 +618,7 @@ def run_smoke() -> tuple[bool, list[str]]:
                     health
                     and isinstance(health, dict)
                     and health.get("ok") is True
-                    and health.get("api_version") == 1
+                    and health.get("api_version") == 2
                 ),
                 json.dumps(health)[:200] if health else "no result",
             )
@@ -441,6 +635,113 @@ def run_smoke() -> tuple[bool, list[str]]:
                 "ChatHeader desktop badge (round trip visible in chat UI)",
                 bool(badge and "desktop" in str(badge.get("text", ""))),
                 json.dumps(badge)[:120] if badge else "badge not found",
+            )
+
+            # 3b. #336: user acceptance path. Drive a REAL turn through
+            #     the actual UI (textarea -> send button -> useChat ->
+            #     transport -> bridge -> runtime -> SQLite) — not by
+            #     calling the bridge directly. The scripted reply
+            #     rendering in the ChatWindow is the end-user-visible
+            #     outcome.
+            window.evaluate_js(_PROBE_UI_SEND)
+            ui_send = _poll_probe(window, _PROBE_COLLECT_UI_SEND, timeout=45)
+            report.check(
+                "real UI send: user message -> bridge turn -> reply renders",
+                bool(
+                    ui_send
+                    and isinstance(ui_send, dict)
+                    and ui_send.get("sent") is True
+                    and ui_send.get("replied") is True
+                ),
+                json.dumps(ui_send)[:300] if ui_send else "no result",
+            )
+
+            # 3b-i. #336 review blocker 3: inspect SQLite IMMEDIATELY
+            #     after the UI send — BEFORE any direct bridge call —
+            #     so the persistence evidence is attributable to the
+            #     UI path alone. Verify CONTENT, not just counts: the
+            #     exact message the UI sent must be the one on disk,
+            #     with its assistant reply, and the turn ledger must
+            #     hold exactly one COMPLETED request for it.
+            ui_send_user_rows = _sqlite_fetch_all(
+                smoke_db_path,
+                "select role, content from chat_logs "
+                "where content like ? order by id",
+                ("%Mensagem real do smoke #336 via UI%",),
+            )
+            report.check(
+                "UI send persisted to SQLite BEFORE any direct op (user message on disk)",
+                bool(
+                    ui_send
+                    and ui_send.get("sent") is True
+                    and len(ui_send_user_rows) == 1
+                    and ui_send_user_rows[0][0] == "user"
+                    and ui_send_user_rows[0][1]
+                    == "Mensagem real do smoke #336 via UI"
+                ),
+                f"user_rows={ui_send_user_rows!r}",
+            )
+            ui_send_rows = _sqlite_row_count(smoke_db_path, "chat_logs")
+            report.check(
+                "UI send persisted to SQLite (chat_logs >= 2: user + assistant)",
+                bool(
+                    ui_send
+                    and ui_send.get("replied") is True
+                    and ui_send_rows >= 2
+                ),
+                f"chat_logs rows after UI send={ui_send_rows} "
+                "(inspected before any direct bridge op)",
+            )
+            ui_send_ledger = _sqlite_fetch_all(
+                smoke_db_path,
+                "select status, count(*) from turn_requests "
+                "group by status",
+            )
+            report.check(
+                "UI send turn ledger holds exactly one completed request",
+                bool(ui_send_ledger == [("completed", 1)]),
+                f"turn_requests by status={ui_send_ledger!r}",
+            )
+
+            # 3c. #336: destructive-op acceptance path through the REAL
+            #     privacy panel: click -> explicit confirmation -> real
+            #     local delete -> success status rendered.
+            window.evaluate_js(_PROBE_UI_PRIVACY)
+            ui_privacy = _poll_probe(window, _PROBE_COLLECT_UI_PRIVACY, timeout=45)
+            report.check(
+                "privacy panel UI: Apagar histórico -> confirmar -> deleted",
+                bool(
+                    ui_privacy
+                    and isinstance(ui_privacy, dict)
+                    and ui_privacy.get("confirmed") is True
+                    and "Operação concluída" in str(ui_privacy.get("status", ""))
+                ),
+                json.dumps(ui_privacy)[:300] if ui_privacy else "no result",
+            )
+
+            # 3c-i. #336 review blocker 3: inspect SQLite IMMEDIATELY
+            #     after the UI privacy op — BEFORE the direct bridge
+            #     operations below — so the zero-row evidence is
+            #     attributable to the UI button click alone.
+            #     delete_history wipes messages AND the turn ledger
+            #     (its contract), so both tables must read zero.
+            after_ui_privacy_chat = _sqlite_row_count(smoke_db_path, "chat_logs")
+            after_ui_privacy_turns = _sqlite_row_count(smoke_db_path, "turn_requests")
+            report.check(
+                "UI privacy op wiped SQLite BEFORE any direct op (chat_logs == 0)",
+                bool(
+                    ui_privacy
+                    and ui_privacy.get("confirmed") is True
+                    and after_ui_privacy_chat == 0
+                ),
+                f"chat_logs rows after UI privacy={after_ui_privacy_chat} "
+                "(inspected before any direct bridge op)",
+            )
+            report.check(
+                "UI privacy op wiped the turn ledger (turn_requests == 0)",
+                after_ui_privacy_turns == 0,
+                f"turn_requests rows after UI privacy={after_ui_privacy_turns} "
+                "(inspected before any direct bridge op)",
             )
 
             # 4. Invalid input rejected with sanitized error.
@@ -637,7 +938,7 @@ def run_smoke() -> tuple[bool, list[str]]:
                 bool(
                     after_reload
                     and after_reload.get("ok") is True
-                    and after_reload.get("api_version") == 1
+                    and after_reload.get("api_version") == 2
                 ),
                 json.dumps(after_reload)[:200] if after_reload else "no result",
             )
@@ -648,6 +949,68 @@ def run_smoke() -> tuple[bool, list[str]]:
                 "no HTTP server listening for the UI",
                 not ports,
                 f"ports={ports}",
+            )
+
+            # 6b. #336: the companion runtime is local. Through the
+            #      exact bridge object the JS layer reaches, drive one
+            #      full turn end-to-end and prove persistence WITHOUT
+            #      trusting the runtime's own read path: a separate
+            #      stdlib sqlite3 connection reads the same file.
+            #      NOTE (#336 review blocker 3): the UI-attributable
+            #      persistence/privacy checks already ran above
+            #      (3b-i, 3c-i) BEFORE these direct calls; everything
+            #      from here on is SEPARATE evidence for the direct
+            #      bridge surface, not the UI path proof.
+            js_api_local = _get_js_api(window)
+            runtime_state = None
+            send_result = None
+            if js_api_local is not None:
+                try:
+                    runtime_state = js_api_local.runtime_state()
+                    send_result = js_api_local.send_message(
+                        "smoke-336-0001",
+                        "Mensagem do smoke #336",
+                    )
+                except Exception as exc:  # noqa: BLE001 (evidence only)
+                    worker_error.append(f"runtime bridge call failed: {exc}")
+
+            report.check(
+                "runtime_state() reports local storage ready",
+                bool(
+                    runtime_state
+                    and runtime_state.get("ok") is True
+                    and runtime_state.get("storage") is True
+                ),
+                json.dumps(runtime_state)[:200] if runtime_state else "no result",
+            )
+            report.check(
+                "send_message() turns a real conversation through the bridge",
+                bool(
+                    send_result
+                    and send_result.get("success") is True
+                    and send_result.get("response")
+                ),
+                json.dumps(send_result)[:200] if send_result else "no result",
+            )
+
+            # Independent SQLite proof: read the smoke DB with stdlib
+            # sqlite3 (read-only, different connection) — the turn is
+            # durable on disk, not merely in the runtime's memory.
+            tables = _sqlite_tables(smoke_db_path)
+            report.check(
+                "SQLite file holds the LocalStorage schema",
+                bool(
+                    tables
+                    and "chat_logs" in tables
+                    and "turn_requests" in tables
+                ),
+                f"tables={tables}",
+            )
+            persisted = _sqlite_row_count(smoke_db_path, "chat_logs")
+            report.check(
+                "turn messages persisted to SQLite (independent read)",
+                persisted >= 2,
+                f"chat_logs rows={persisted} (user + assistant)",
             )
 
             # 7. Closing the window ends the shell cleanly (checked by
@@ -667,7 +1030,11 @@ def run_smoke() -> tuple[bool, list[str]]:
     probe_thread.start()
 
     try:
-        run_desktop_shell(html_name=SMOKE_PAGE)  # blocks on main thread
+        run_desktop_shell(  # blocks on main thread
+            html_name=SMOKE_PAGE,
+            storage_path=smoke_db_path,
+            provider=_make_scripted_provider(),
+        )
     finally:
         webview.create_window = original_create  # type: ignore[assignment]
 
@@ -683,11 +1050,60 @@ def run_smoke() -> tuple[bool, list[str]]:
         True,
     )
 
+    # 8. #336: restart recovery. A FRESH runtime over the same SQLite
+    #    file (what a relaunch does) must load the persisted turn and
+    #    report the stored revision — proving the app's state survives
+    #    a close/reopen cycle with LocalStorage as the only store.
+    from backend.companion_runtime import build_companion_runtime
+
+    restarted = build_companion_runtime(storage_path=smoke_db_path)
+    try:
+        recovered_history = restarted.load_history()
+        recovered_state = restarted.runtime_state()
+        history_ok = bool(
+            recovered_history
+            and any(
+                "smoke #336" in str(entry.get("content", ""))
+                for entry in recovered_history
+            )
+        )
+        report.check(
+            "restart recovers the persisted conversation (fresh runtime, same DB)",
+            history_ok,
+            f"entries={len(recovered_history or [])}",
+        )
+        report.check(
+            "restart recovers the stored revision",
+            bool(
+                recovered_state
+                and recovered_state.get("ok") is True
+                and recovered_state.get("revision", 0) >= 1
+            ),
+            json.dumps(recovered_state)[:200] if recovered_state else "no result",
+        )
+        privacy = restarted.delete_history()
+        deleted = _sqlite_row_count(smoke_db_path, "chat_logs")
+        deleted_turns = _sqlite_row_count(smoke_db_path, "turn_requests")
+        report.check(
+            "local privacy op really deletes (direct delete_history -> 0 messages AND 0 requests)",
+            bool(
+                privacy
+                and privacy.get("success") is True
+                and privacy.get("result", {}).get("status") == "applied"
+                and deleted == 0
+                and deleted_turns == 0
+            ),
+            f"chat_logs rows after delete={deleted}, "
+            f"turn_requests rows after delete={deleted_turns}",
+        )
+    finally:
+        restarted.close()
+
     return report.ok, report.lines
 
 
 def main() -> int:
-    print("Katherine desktop shell smoke (#334)")
+    print("Katherine desktop shell smoke (#334 + #336 local runtime)")
     print(f"repo: {REPO_ROOT}")
     print(f"python: {sys.version.split()[0]}\n")
     ok, _ = run_smoke()
