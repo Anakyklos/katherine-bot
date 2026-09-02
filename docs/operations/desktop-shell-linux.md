@@ -163,7 +163,15 @@ da máquina de estados same-URL (todas as transições do trust) está em
 ## Modelo de confiança da bridge (resumo)
 
 1. `make_js_api()` (api.py) entrega só a allowlist `DESKTOP_API_METHODS`
-   (`health`) com erros sanitizados; nenhum método exposto levanta.
+   — o contrato v2 (`DESKTOP_API_VERSION = 2`) com **8 métodos**:
+   `health`, `runtime_state`, `load_history`, `send_message` e as
+   quatro operações de privacidade (`delete_history`,
+   `delete_memories`, `reset_emotional_state`,
+   `reset_relationship_state`) — todos com erros sanitizados; nenhum
+   método exposto levanta. O frontend faz feature-check pelo número
+   `api_version` (não fareja métodos); todo método valida seus
+   argumentos antes de tocar o runtime e devolve payloads estruturados
+   sem traceback, path, SQL ou conteúdo ecoado.
 2. `LocalBuildBridge` (app.py) só serve chamadas quando a página atual
    é exatamente a URL local cujo load **completou** (trust commitido
    no evento `loaded`).
