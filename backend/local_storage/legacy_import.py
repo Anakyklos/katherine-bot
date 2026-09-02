@@ -166,9 +166,21 @@ def import_legacy_fixture(
 
     Idempotent by construction: each legacy turn is written under its
     stable legacy request id; re-importing the same fixture hits the
-    same primary keys and skips (counted as duplicates) instead of
-    duplicating rows. The import is one transaction — a failure
-    leaves the store untouched.
+    same primary keys, verifies the persisted turn is IDENTICAL, and
+    skips (counted as duplicates) instead of duplicating rows.
+
+    #336 review blocker 2 (divergent collision ≠ duplicate): a
+    request id that already exists with DIFFERENT content is NOT
+    idempotent replay — it is an undetected collision that would
+    silently preserve state diverging from the source. For an
+    existing key the importer now compares the canonical content
+    hash (the same structural hash persisted at import time):
+    identical fixture → idempotent skip; divergent content →
+    ``ValidationError`` and the whole import rolls back, leaving
+    the store bit-identical to its previous state.
+
+    The import is one transaction — a failure leaves the store
+    untouched.
     """
     f = validate_legacy_fixture(fixture)
     turns = f["turns"]
@@ -183,12 +195,23 @@ def import_legacy_fixture(
                 t = dict(turn)
                 request_id = t["request_id"]
                 existing = conn.execute(
-                    "select 1 from turn_requests where request_id = ?",
+                    "select payload_hash_sha256 from turn_requests "
+                    "where request_id = ?",
                     (request_id,),
                 ).fetchone()
                 if existing is not None:
-                    # Idempotency: the stable legacy id already lives
-                    # here — skip, never duplicate.
+                    if existing[0] != _legacy_hash(t):
+                        # Divergent content under the same stable
+                        # legacy id: an ambiguous collision, never a
+                        # duplicate. Fail-closed — the store keeps the
+                        # state it already had (rollback below).
+                        raise ValidationError(
+                            "legacy_request_id_conflict",
+                            "fixture request id conflicts with a different "
+                            "already-imported turn",
+                        )
+                    # Idempotency: byte-identical re-import — skip,
+                    # never duplicate.
                     skipped += 1
                     continue
                 created_at = t.get("created_at") or _now_iso()

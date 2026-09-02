@@ -878,19 +878,40 @@ def _new_message_id() -> str:
 
 
 def _load_local_memories(storage) -> list[_LocalContextMemory]:
-    """Load approved local memories (bounded, sanitized) for context."""
-    try:
-        rows = storage.load_recent_memories(limit=5)
-    except AttributeError:
-        return []
-    except Exception:  # noqa: BLE001 (memories are optional context)
-        return []
+    """Load approved local memories (bounded, sanitized) for context.
+
+    #336 review blocker 1 (fail-closed memory storage): the store's
+    contract says corrupt memory metadata raises ``PersistenceError``
+    and must never be silently dropped (#335). This loader used to
+    swallow every exception into ``[]``, turning corruption into
+    "no memories" and letting the turn proceed to the provider as if
+    nothing happened. Contract errors (``PersistenceError`` and the
+    store's ``ValidationError`` for invalid limits/rows) now
+    propagate to the runtime's sanitized boundary, where they map to
+    the stable ``storage``/``validation`` codes and block the turn —
+    no reset, no silent degradation.
+
+    The only tolerated failure is a missing optional field inside an
+    otherwise valid metadata object (``KeyError``/``TypeError``/
+    ``ValueError`` from the adapter's own projection): the row was
+    structurally persisted and readable, the adapter defaults cover
+    every optional key, and dropping that single projection is not a
+    storage failure. Any such drop is still counted in the sanitized
+    log (code only, no content) so it stays observable.
+    """
+    rows = storage.load_recent_memories(limit=5)
     memories: list[_LocalContextMemory] = []
+    dropped_rows = 0
     for content, metadata in rows:
         try:
             memories.append(_LocalContextMemory(content=content, metadata=metadata))
-        except Exception:  # noqa: BLE001 (single bad row never breaks a turn)
+        except (KeyError, TypeError, ValueError):
+            # Optional-field projection failure ONLY — a valid row the
+            # adapter cannot project. Never a storage contract error.
+            dropped_rows += 1
             continue
+    if dropped_rows:
+        logger.error("event=memory_row_dropped count=%d", dropped_rows)
     return memories
 
 

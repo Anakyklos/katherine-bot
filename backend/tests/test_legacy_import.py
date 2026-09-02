@@ -247,6 +247,103 @@ class TestLegacyFixtureImport:
         # and the local turn still replays cleanly afterwards
         store.close()
 
+    # ─────────────────────────────────────────────────────────────
+    # #336 review blocker 2: divergent collision under the same
+    # request id is a conflict, never a silent duplicate-skip.
+    # ─────────────────────────────────────────────────────────────
+
+    def test_divergent_fixture_same_request_id_fails_and_rolls_back(
+        self, tmp_path: Path
+    ) -> None:
+        """Fixture B reusing a request id with DIFFERENT content must
+        fail-closed: ``ValidationError``, no partial import, and the
+        store bit-identical to its previous state (counts and content)."""
+        store = open_local_storage(tmp_path / "katherine.db")
+        first = import_legacy_fixture(store, _fixture())
+        assert first.imported_turns == 2
+
+        conn = store._connection_for_tests_only()
+        # Full structural snapshot of the previous state.
+        turn_rows_before = conn.execute(
+            "select request_id, payload_hash_sha256, status, created_at "
+            "from turn_requests order by request_id"
+        ).fetchall()
+        log_rows_before = conn.execute(
+            "select role, content, created_at from chat_logs order by id"
+        ).fetchall()
+        counts_before = (
+            conn.execute("select count(*) from turn_requests").fetchone()[0],
+            conn.execute("select count(*) from chat_logs").fetchone()[0],
+        )
+
+        # Fixture B: same stable request ids, DIVERGENT content.
+        divergent = _fixture()
+        divergent["turns"][0]["user_message"] = "oi, lembra de mim?"
+        divergent["turns"][0]["assistant_message"] = "RESPOSTA DIFERENTE"
+        divergent["turns"][1]["request_id"] = "legacy-turn-3"  # a genuinely new id
+        divergent["turns"][1]["user_message"] = "nova conversa"
+        divergent["turns"][1]["assistant_message"] = "novo turno"
+
+        with pytest.raises(ValidationError) as excinfo:
+            import_legacy_fixture(store, divergent)
+        assert excinfo.value.code == "legacy_request_id_conflict"
+
+        # Bit-identical rollback: every table and row unchanged.
+        assert (
+            conn.execute("select count(*) from turn_requests").fetchone()[0]
+            == counts_before[0]
+        )
+        assert (
+            conn.execute("select count(*) from chat_logs").fetchone()[0]
+            == counts_before[1]
+        )
+        assert conn.execute(
+            "select request_id, payload_hash_sha256, status, created_at "
+            "from turn_requests order by request_id"
+        ).fetchall() == turn_rows_before
+        assert conn.execute(
+            "select role, content, created_at from chat_logs order by id"
+        ).fetchall() == log_rows_before
+        # The genuinely-new id from the divergent fixture was NOT written.
+        assert (
+            conn.execute(
+                "select count(*) from turn_requests "
+                "where request_id = 'legacy-turn-3'"
+            ).fetchone()[0]
+            == 0
+        )
+        store.close()
+
+    def test_identical_reimport_is_idempotent_skip_not_conflict(
+        self, tmp_path: Path
+    ) -> None:
+        """Non-regression: the SAME fixture re-imported stays a pure
+        idempotent skip (duplicates counted, nothing written, no
+        conflict raised)."""
+        store = open_local_storage(tmp_path / "katherine.db")
+        fixture = _fixture()
+        first = import_legacy_fixture(store, fixture)
+        second = import_legacy_fixture(store, fixture)
+        assert second.imported_turns == 0
+        assert second.skipped_duplicates == 2
+        assert second.total_turns_after == first.total_turns_after
+        store.close()
+
+    def test_divergent_assistant_message_only_also_conflicts(
+        self, tmp_path: Path
+    ) -> None:
+        """The collision check covers the assistant side too: same
+        request id, same user message, different answer = conflict."""
+        store = open_local_storage(tmp_path / "katherine.db")
+        import_legacy_fixture(store, _fixture())
+        divergent = _fixture()
+        divergent["turns"] = [dict(divergent["turns"][0])]
+        divergent["turns"][0]["assistant_message"] = "outra resposta"
+        with pytest.raises(ValidationError) as excinfo:
+            import_legacy_fixture(store, divergent)
+        assert excinfo.value.code == "legacy_request_id_conflict"
+        store.close()
+
 
 def _neutral_emotional() -> dict:
     from backend.emotional_domain import EmotionalStateV1

@@ -439,6 +439,107 @@ async def test_storage_corrupt_error_is_sanitized(tmp_path):
     runtime2.close()
 
 
+# ─────────────────────────────────────────────────────────────────
+# #336 review blocker 1: memory-storage failure is fail-closed
+# ─────────────────────────────────────────────────────────────────
+
+
+async def test_corrupt_memory_metadata_blocks_turn_and_provider(tmp_path):
+    """Corrupt memory metadata must never degrade into "no memories".
+
+    #335/#336 fail-closed contract: ``load_recent_memories`` raises
+    ``PersistenceError`` on corrupt metadata; the runtime used to
+    swallow it and let the turn proceed to the provider as if nothing
+    happened. Now the corruption surfaces as a sanitized ``storage``
+    error, the provider is NEVER called, and nothing is reset or
+    silently removed.
+    """
+    provider = ScriptedProvider()
+    runtime = make_runtime(tmp_path, provider)
+    # Healthy turn first so the database is fully initialized.
+    await runtime.commit_turn_async(request_id="r-1", message="hello")
+    # Persist a valid memory through the real store. The loaded-data
+    # contract requires a canonical-UUID source_id (the trusted-context
+    # boundary validates it) and a legacy provenance from the allowlist.
+    import uuid as _uuid
+
+    storage = runtime._ensure_storage()
+    storage.store_memory(
+        "lembra do café",
+        {"source_id": str(_uuid.uuid4()), "provenance": "legacy_memory"},
+    )
+    runtime.close()
+
+    # Corrupt the memory row directly in the real SQLite file — the
+    # runtime must observe it through the store's contract. The
+    # schema CHECK only enforces json_valid(metadata), but the
+    # store's READ contract requires the parsed value to be a JSON
+    # object; a scalar/string payload therefore passes the schema
+    # and violates the read-side fail-closed contract exactly like
+    # a real corrupted row does.
+    import sqlite3
+
+    conn = sqlite3.connect(tmp_path / "katherine.db")
+    conn.execute("update memories set metadata = '\"corrupted string\"'")
+    conn.commit()
+    conn.close()
+
+    runtime2 = make_runtime(tmp_path, ScriptedProvider())
+    fresh_provider = runtime2._provider_port()
+    calls_before = getattr(fresh_provider, "calls", 0)
+    appraisal_before = getattr(fresh_provider, "appraisal_calls", 0)
+
+    result = await runtime2.commit_turn_async(request_id="r-2", message="again")
+
+    assert result.success is False
+    assert result.error_code == LocalErrorCode.STORAGE.value
+    # The provider was never reached: no provider call was spent.
+    fresh_provider_after = runtime2._provider_port()
+    assert getattr(fresh_provider_after, "calls", 0) == calls_before
+    assert (
+        getattr(fresh_provider_after, "appraisal_calls", 0) == appraisal_before
+    )
+    # Sanitized: no path, no SQL, no traceback crossing.
+    assert "katherine.db" not in (result.error_message or "")
+    assert "sqlite" not in (result.error_message or "").lower()
+
+    # No reset/removal: the corrupt row is still there, untouched.
+    conn = sqlite3.connect(tmp_path / "katherine.db")
+    n_memories = conn.execute("select count(*) from memories").fetchone()[0]
+    conn.close()
+    assert n_memories >= 1
+
+    # The turn ledger has no completed row for r-2 (no silent success).
+    conn = sqlite3.connect(tmp_path / "katherine.db")
+    row = conn.execute(
+        "select status from turn_requests where request_id = 'r-2'"
+    ).fetchone()
+    conn.close()
+    assert row is None or row[0] != "completed"
+
+    runtime2.close()
+
+
+async def test_healthy_memories_still_flow_into_context(tmp_path):
+    """Non-regression: valid memories still load into the context."""
+    import uuid as _uuid
+
+    provider = ScriptedProvider()
+    runtime = make_runtime(tmp_path, provider)
+    await runtime.commit_turn_async(request_id="r-1", message="hello")
+    storage = runtime._ensure_storage()
+    storage.store_memory(
+        "lembra do café",
+        {"source_id": str(_uuid.uuid4()), "provenance": "legacy_memory"},
+    )
+    runtime.close()
+
+    runtime2 = make_runtime(tmp_path, ScriptedProvider())
+    result = await runtime2.commit_turn_async(request_id="r-2", message="again")
+    assert result.success is True
+    runtime2.close()
+
+
 async def test_unconfigured_provider_yields_configuration_error(tmp_path):
     from backend.groq_manager import GroqConfigurationError
 
