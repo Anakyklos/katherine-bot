@@ -257,8 +257,13 @@ class LanguageModel(Protocol):
     Implementations (remote adapters today, a local adapter in the
     future) receive already-validated structured messages and a
     ``TurnBudget`` carrying the deadline. They return plain text and
-    typed appraisal objects — never SDK objects — and raise only the
-    canonical ``LanguageModel*Error`` exceptions. A provider failure is
+    typed appraisal objects — never SDK objects. Provider-side
+    failures surface **only** as the canonical ``LanguageModel*Error``
+    exceptions (constant, sanitized messages). The single exception
+    to that rule is task cancellation: ``asyncio.CancelledError`` is
+    control flow and propagates natively and immediately — never
+    translated, never retried (see the module docstring).
+    A provider failure is
     a turn failure: implementations never fall back to another
     provider or model on their own.
     """
