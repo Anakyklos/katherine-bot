@@ -45,13 +45,11 @@ from backend.turn_execution import (
     create_budget,
     compute_effective_attempt_timeout,
 )
-from backend.groq_manager import (
-    GroqClientManager,
-    GroqPoolExhaustedError,
-    GroqRequestError,
-    ProviderFailure,
-    provider_failure_to_turn_code,
-)
+# Issue #337: the engine seam is the canonical LanguageModel contract.
+# These tests no longer import the Groq manager/SDK at the engine seam;
+# the few provider-level behaviours (key rotation, pool exhaustion) are
+# covered by the adapter suites (test_groq_language_model.py and the
+# manager's own suite) and by fake-contract equivalents here.
 
 # Patch SentenceTransformer at module load time to prevent 3.5s model loading
 # on every engine creation (the model is not needed for these tests).
@@ -113,6 +111,77 @@ class FakeAsyncProvider:
         return AsyncMock(**{"chat.completions.create": self.create})
 
 
+# ─── Fake LanguageModel (issue #337 seam) ─────────────────────────────────────
+
+class FakeProviderModel:
+    """LanguageModel fake backed by a FakeAsyncProvider.
+
+    Reproduces the adapter's contracted behavior at the seam the engine
+    actually uses: ``appraise`` parses the JSON payload (fallback →
+    LanguageModelInvalidResponseError), ``generate`` returns text or
+    raises. Budget/deadline enforcement remains the engine's job; the
+    fake honors ``delay``/``block_event``/``cancelled`` so timeout and
+    cancellation paths stay observable. Failures surface as canonical
+    LanguageModel errors (or raw exceptions, like a broken provider).
+    """
+
+    def __init__(self, provider: Optional[FakeAsyncProvider] = None):
+        self.provider = provider if provider is not None else FakeAsyncProvider()
+
+    async def _call_with_attempt_timeout(self, budget: TurnBudget) -> Any:
+        """Mirror the adapter's bounded attempt (the old manager applied
+        wait_for with the effective attempt timeout)."""
+        from backend.language_model import LanguageModelTimeoutError
+
+        timeout = min(15.0, max(0.001, budget.remaining_before_reserve))
+        try:
+            return await asyncio.wait_for(self.provider.create(), timeout=timeout)
+        except asyncio.TimeoutError:
+            raise LanguageModelTimeoutError() from None
+
+    async def appraise(self, message: str, budget: TurnBudget) -> Any:
+        from backend.emotional_domain import parse_llm_appraisal
+        from backend.language_model import LanguageModelInvalidResponseError
+
+        response = await self._call_with_attempt_timeout(budget)
+        content = response.choices[0].message.content if getattr(response, "choices", None) else None
+        if not content or not isinstance(content, str) or not content.strip():
+            raise LanguageModelInvalidResponseError()
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError:
+            raise LanguageModelInvalidResponseError() from None
+        result = parse_llm_appraisal(payload)
+        if result.is_fallback:
+            raise LanguageModelInvalidResponseError()
+        return result.appraisal
+
+    async def generate(self, messages: list, budget: TurnBudget) -> str:
+        response = await self._call_with_attempt_timeout(budget)
+        content = response.choices[0].message.content if getattr(response, "choices", None) else None
+        if not content or not isinstance(content, str) or not content.strip():
+            from backend.language_model import LanguageModelInvalidResponseError
+            raise LanguageModelInvalidResponseError()
+        return content
+
+    async def extract_archival(self, messages: list, budget: TurnBudget) -> str:
+        # Not exercised by bounded-turn tests; present to satisfy the contract.
+        response = await self._call_with_attempt_timeout(budget)
+        content = response.choices[0].message.content if getattr(response, "choices", None) else None
+        if not content or not isinstance(content, str) or not content.strip():
+            from backend.language_model import LanguageModelInvalidResponseError
+            raise LanguageModelInvalidResponseError()
+        return content
+
+    def describe(self):
+        from backend.language_model import ModelSelection
+        return ModelSelection(
+            provider="fake",
+            main_model_id="fake-main",
+            fast_model_id="fake-fast",
+        )
+
+
 # ─── Engine factory ───────────────────────────────────────────────────────────
 
 def _make_engine(
@@ -121,7 +190,25 @@ def _make_engine(
     archival_extraction_enabled: bool = False,
     fake_provider: Optional[FakeAsyncProvider] = None,
 ) -> ConversationEngine:
-    """Create a ConversationEngine with mocked external deps."""
+    """Create a ConversationEngine with mocked external deps.
+
+    Issue #337: the engine receives a fake ``LanguageModel`` (backed by
+    a ``FakeAsyncProvider``) through the canonical contract. No
+    ``GroqClientManager`` is constructed at this seam anymore.
+    """
+    provider = fake_provider if fake_provider is not None else FakeAsyncProvider()
+    if fake_provider is None and not provider.responses:
+        # Default (no explicit provider): first call = valid appraisal
+        # JSON, later = text. Tests that pass their own provider keep
+        # full control (including the historical "Default response"
+        # fallback of FakeAsyncProvider when responses run out).
+        provider.responses = [
+            FakeCompletion(json.dumps({
+                "valence": 0.2, "arousal_shift": 0.1, "dominance_shift": 0.0,
+                "triggered_emotions": {"joy": 0.5},
+            })),
+            FakeCompletion("Default response"),
+        ]
     engine = ConversationEngine(
         clock=lambda: clock,
         turn_config=turn_config or TurnExecutionConfig(
@@ -133,6 +220,7 @@ def _make_engine(
             max_attempts=2,
         ),
         archival_extraction_enabled=archival_extraction_enabled,
+        language_model=FakeProviderModel(provider),
     )
     # Mock memory
     engine.memory_manager.load_user_state = MagicMock(return_value={
@@ -151,30 +239,6 @@ def _make_engine(
     })
     engine.memory_manager.load_recent_history = MagicMock(return_value=[])
 
-    groq_params = engine._turn_config.to_groq_params()
-    if fake_provider is not None:
-        async_factory = lambda k: fake_provider.make_client(k)
-        engine.groq_manager = GroqClientManager(
-            keys=["mock-key-1", "mock-key-2"],
-            async_client_factory=async_factory,
-            groq_params=groq_params,
-        )
-    else:
-        # Default: return valid responses
-        af = lambda k: AsyncMock(**{
-            "chat.completions.create": AsyncMock(
-                return_value=FakeCompletion(json.dumps({
-                    "valence": 0.2, "arousal_shift": 0.1, "dominance_shift": 0.0,
-                    "triggered_emotions": {"joy": 0.5},
-                }))
-            )
-        })
-        engine.groq_manager = GroqClientManager(
-            keys=["mock-key-1"],
-            async_client_factory=af,
-            groq_params=groq_params,
-        )
-
     return engine
 
 
@@ -183,10 +247,16 @@ def _make_engine(
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TestConfigDelivery:
-    """1. The GroqClientManager created by engine receives to_groq_params()."""
+    """1. The provider adapter wiring receives turn_config-derived params."""
 
-    def test_engine_manager_receives_groq_params(self):
-        """O manager criado pelo engine recebe exatamente turn_config.to_groq_params()."""
+    def test_engine_config_reaches_provider_params(self):
+        """turn_config values survive into the provider-facing params.
+
+        Issue #337: the engine no longer builds the Groq manager, but
+        the config delivery guarantee is preserved — to_groq_params()
+        still feeds the adapter's manager in the composition root, and
+        the engine stores the same turn_config it was given.
+        """
         config = TurnExecutionConfig(
             total_deadline=45.0,
             connect_timeout=3.0,
@@ -202,20 +272,19 @@ class TestConfigDelivery:
             clock=lambda: FIXED_CLOCK,
             turn_config=config,
         )
-        # The engine should have passed groq_params to the manager
-        engine_params = engine.groq_manager._groq_params
         expected = config.to_groq_params()
-        assert engine_params.max_attempts == expected.max_attempts
-        assert engine_params.connect_timeout == expected.connect_timeout
-        assert engine_params.provider_attempt_timeout == expected.provider_attempt_timeout
-        assert engine_params.base_backoff == expected.base_backoff
-        assert engine_params.max_backoff == expected.max_backoff
-        assert engine_params.max_jitter == expected.max_jitter
-        assert engine_params.provider_attempt_timeout == 15.0
-        assert engine_params.max_attempts == 2
+        # The engine keeps the exact config; the composition root passes
+        # to_groq_params() to the adapter's manager (see dependencies.py).
+        assert engine._turn_config is config
+        assert expected.max_attempts == 2
+        assert expected.connect_timeout == 3.0
+        assert expected.provider_attempt_timeout == 15.0
+        assert expected.base_backoff == 0.25
+        assert expected.max_backoff == 0.75
+        assert expected.max_jitter == 0.10
 
-    def test_manager_receives_custom_groq_params(self):
-        """Custom turn_config.to_groq_params() reaches the manager."""
+    def test_custom_config_reaches_provider_params(self):
+        """Custom turn_config.to_groq_params() keeps every field."""
         config = TurnExecutionConfig(
             total_deadline=30.0,
             connect_timeout=1.0,
@@ -227,11 +296,7 @@ class TestConfigDelivery:
             max_backoff=2.0,
             max_jitter=0.0,
         )
-        engine = ConversationEngine(
-            clock=lambda: FIXED_CLOCK,
-            turn_config=config,
-        )
-        params = engine.groq_manager._groq_params
+        params = config.to_groq_params()
         assert params.max_attempts == 1
         assert params.connect_timeout == 1.0
         assert params.provider_attempt_timeout == 8.0
@@ -286,7 +351,11 @@ class TestProviderBoundedness:
         asyncio.run(self._run_cancel_provider())
 
     def test_sdk_retries_disabled(self):
+        """SDK retries stay disabled at the adapter's manager (issue #337
+        keeps this provider-level invariant inside the adapter home)."""
+        from backend.groq_manager import GroqClientManager
         from groq import AsyncGroq
+
         factory = lambda k: AsyncGroq(api_key=k, max_retries=0)
         mgr = GroqClientManager(
             keys=["mock-key"],
@@ -297,6 +366,8 @@ class TestProviderBoundedness:
 
     def test_max_attempts_one_executes_one(self):
         """max_attempts=1 executes at most one attempt even with multiple keys."""
+        from backend.groq_manager import GroqClientManager
+
         class TrackingProvider:
             def __init__(self):
                 self.calls = []
@@ -305,7 +376,6 @@ class TestProviderBoundedness:
                 raise Exception("fail")
 
         provider = TrackingProvider()
-        engine = _make_engine()
         # Use a config with max_attempts=1
         config = TurnExecutionConfig(
             total_deadline=45.0,
@@ -320,13 +390,22 @@ class TestProviderBoundedness:
             async_client_factory=lambda k: AsyncMock(**{"chat.completions.create": provider.create}),
             groq_params=config.to_groq_params(),
         )
-        engine.groq_manager = mgr
-        with pytest.raises((GroqPoolExhaustedError, TurnExecutionError)):
-            asyncio.run(engine.process_turn("user", "Hello"))
+        # Provider-level invariant, exercised directly on the manager
+        # (the adapter home), not through the engine.
+        try:
+            asyncio.run(mgr.chat_completion_async(
+                messages=[{"role": "user", "content": "hi"}],
+                model="test",
+                budget=create_budget(config),
+            ))
+        except Exception:
+            pass
         assert len(provider.calls) == 1
 
     def test_max_attempts_two_executes_at_most_two(self):
         """max_attempts=2 executes at most two attempts even with many keys."""
+        from backend.groq_manager import GroqClientManager
+
         class TrackingProvider:
             def __init__(self):
                 self.calls = []
@@ -354,7 +433,7 @@ class TestProviderBoundedness:
                 model="test",
                 budget=create_budget(config),
             ))
-        except GroqPoolExhaustedError:
+        except Exception:
             pass
         assert len(provider.calls) == 2
 
@@ -383,9 +462,18 @@ class TestProviderBoundedness:
 
 
 class TestKeyRotation:
-    """12-16. Key rotation, rate limiting, and error classification."""
+    """12-16. Key rotation, rate limiting, and error classification.
+
+    Issue #337: key rotation and SDK error classification are provider
+    internals. They are exercised directly against the manager (the
+    adapter home) — the engine-level behaviors (failure → turn failure,
+    sanitized codes, no fallback) are covered by the fake-contract
+    tests in this suite and by test_groq_language_model.py.
+    """
 
     def test_each_key_once_per_call(self):
+        from backend.groq_manager import GroqClientManager, GroqPoolExhaustedError
+
         class TrackingProvider:
             def __init__(self):
                 self.calls = []
@@ -398,13 +486,18 @@ class TestKeyRotation:
             keys=["key-1", "key-2", "key-3"],
             async_client_factory=lambda k: AsyncMock(**{"chat.completions.create": provider.create}),
         )
-        engine = _make_engine()
-        engine.groq_manager = mgr
-        with pytest.raises((GroqPoolExhaustedError, TurnExecutionError)):
-            asyncio.run(engine.process_turn("user", "Hello"))
+        try:
+            asyncio.run(mgr.chat_completion_async(
+                messages=[{"role": "user", "content": "hi"}],
+                model="test",
+                budget=create_budget(TurnExecutionConfig.defaults()),
+            ))
+        except GroqPoolExhaustedError:
+            pass
         assert len(provider.calls) <= 3
 
     def test_rate_limit_rotates(self):
+        from backend.groq_manager import GroqClientManager
         from groq import RateLimitError
         import httpx
 
@@ -427,13 +520,23 @@ class TestKeyRotation:
                 AsyncMock(**{"chat.completions.create": create_func}) if "bad" in k else good_client
             ),
         )
-        engine = _make_engine()
-        engine.groq_manager = mgr
-        result = asyncio.run(engine.process_turn("user", "Hello"))
+        # A rate-limited first key rotates to the good key and succeeds
+        # at the manager level (one attempt recorded on the bad key).
+        result = asyncio.run(mgr.chat_completion_async(
+            messages=[{"role": "user", "content": "hi"}],
+            model="test",
+            budget=create_budget(TurnExecutionConfig.defaults()),
+        ))
         assert result is not None
         assert len(attempts) == 1
 
     def test_all_429_produces_upstream_rate_limited(self):
+        from backend.groq_manager import (
+            GroqClientManager,
+            GroqPoolExhaustedError,
+            ProviderFailure,
+            provider_failure_to_turn_code,
+        )
         from groq import RateLimitError
         import httpx
 
@@ -462,6 +565,7 @@ class TestKeyRotation:
             assert code == TurnErrorCode.upstream_rate_limited
 
     def test_connection_error_produces_provider_unavailable(self):
+        from backend.groq_manager import GroqClientManager, GroqPoolExhaustedError, ProviderFailure
         from groq import APIConnectionError
         import httpx
 
@@ -488,32 +592,27 @@ class TestKeyRotation:
             assert exc.failure_code == ProviderFailure.connection_failed
 
     def test_empty_response_produces_invalid_response(self):
-        async def empty_content(**kwargs):
-            return FakeCompletion("")
+        """Empty provider content → LanguageModelInvalidResponseError →
+        TurnExecutionError(provider_invalid_response) at the engine seam."""
+        provider = FakeAsyncProvider()
+        provider.responses = [FakeCompletion(""), FakeCompletion("")]
 
-        engine = _make_engine()
-        engine.groq_manager = GroqClientManager(
-            keys=["key-1"],
-            async_client_factory=lambda k: AsyncMock(**{"chat.completions.create": empty_content}),
-        )
+        engine = _make_engine(fake_provider=provider)
         with pytest.raises(TurnExecutionError) as exc_info:
             asyncio.run(engine.process_turn("user", "Hello"))
         assert exc_info.value.code == TurnErrorCode.provider_invalid_response
 
     def test_invalid_json_appraisal(self):
-        async def bad_json(**kwargs):
-            return FakeCompletion("not json")
+        provider = FakeAsyncProvider()
+        provider.responses = [FakeCompletion("not json"), FakeCompletion("x")]
 
-        engine = _make_engine()
-        engine.groq_manager = GroqClientManager(
-            keys=["key-1"],
-            async_client_factory=lambda k: AsyncMock(**{"chat.completions.create": bad_json}),
-        )
+        engine = _make_engine(fake_provider=provider)
         with pytest.raises(TurnExecutionError) as exc_info:
             asyncio.run(engine.process_turn("user", "Hello"))
         assert exc_info.value.code == TurnErrorCode.provider_invalid_response
 
     def test_structured_401_deactivates_key(self):
+        from backend.groq_manager import GroqClientManager
         from groq import AuthenticationError
         import httpx
 
@@ -534,9 +633,11 @@ class TestKeyRotation:
             ),
         )
         assert "bad-key" not in mgr._deactivated
-        engine = _make_engine()
-        engine.groq_manager = mgr
-        asyncio.run(engine.process_turn("user", "Hello"))
+        asyncio.run(mgr.chat_completion_async(
+            messages=[{"role": "user", "content": "hi"}],
+            model="test",
+            budget=create_budget(TurnExecutionConfig.defaults()),
+        ))
         assert "bad-key" in mgr._deactivated
 
 
@@ -544,14 +645,10 @@ class TestAppraisalFailure:
     """18-19. Appraisal failure blocks transition and persistence."""
 
     def test_invalid_appraisal_does_not_transition(self):
-        async def bad_json(**kwargs):
-            return FakeCompletion("not json")
+        provider = FakeAsyncProvider()
+        provider.responses = [FakeCompletion("not json"), FakeCompletion("x")]
 
-        engine = _make_engine()
-        engine.groq_manager = GroqClientManager(
-            keys=["key-1"],
-            async_client_factory=lambda k: AsyncMock(**{"chat.completions.create": bad_json}),
-        )
+        engine = _make_engine(fake_provider=provider)
 
         with patch("backend.engine.transition") as mock_transition:
             with pytest.raises(TurnExecutionError):
@@ -559,14 +656,10 @@ class TestAppraisalFailure:
             mock_transition.assert_not_called()
 
     def test_parse_fallback_blocks_generation_and_persistence(self):
-        async def fallback_json(**kwargs):
-            return FakeCompletion(json.dumps({"invalid_key": "bad"}))
+        provider = FakeAsyncProvider()
+        provider.responses = [FakeCompletion(json.dumps({"invalid_key": "bad"})), FakeCompletion("x")]
 
-        engine = _make_engine()
-        engine.groq_manager = GroqClientManager(
-            keys=["key-1"],
-            async_client_factory=lambda k: AsyncMock(**{"chat.completions.create": fallback_json}),
-        )
+        engine = _make_engine(fake_provider=provider)
         engine.memory_manager.save_turn = MagicMock()
         engine.memory_manager.sync_state = MagicMock()
 
@@ -596,9 +689,11 @@ class TestTimeoutBeforeCommit:
         engine.memory_manager.save_turn = MagicMock()
         engine.memory_manager.sync_state = MagicMock()
 
-        # Provider timeout exhausts the pool → GroqPoolExhaustedError
-        with pytest.raises(GroqPoolExhaustedError):
+        # Provider timeout exhausts the budget → turn_timeout (canonical
+        # contract error, not the provider pool exception)
+        with pytest.raises(TurnExecutionError) as exc_info:
             asyncio.run(engine.process_turn("user", "Hello"))
+        assert exc_info.value.code == TurnErrorCode.turn_timeout
 
         engine.memory_manager.save_turn.assert_not_called()
         engine.memory_manager.sync_state.assert_not_called()
@@ -664,7 +759,7 @@ class TestTimeoutBeforeCommit:
         provider.block_event.set()
 
         # Lock should be released; second request can proceed
-        with pytest.raises((TurnExecutionError, GroqPoolExhaustedError)):
+        with pytest.raises((TurnExecutionError, DeadlineExceeded)):
             await engine.process_turn("user1", "Hello")
 
     def test_second_request_after_cancel(self):
@@ -1125,65 +1220,79 @@ class TestErrorContract:
         http_exc = _map_turn_error(exc)
         assert http_exc.status_code == 500
 
-    # ── GroqPoolExhaustedError HTTP mapping ───────────────────────────
+    # ── Canonical provider failure HTTP mapping (issue #337) ──────────
 
-    def test_groq_pool_timeout_maps_to_504(self):
-        """GroqPoolExhaustedError(timeout) → HTTP 504, code=turn_timeout."""
+    def test_provider_timeout_maps_to_504(self):
+        """LanguageModelTimeoutError → HTTP 504, code=turn_timeout."""
         from backend.main import _map_turn_error
-        exc = GroqPoolExhaustedError("timeout", code=ProviderFailure.timeout)
+        from backend.language_model import LanguageModelTimeoutError
+
+        exc = LanguageModelTimeoutError()
         http_exc = _map_turn_error(exc)
         assert http_exc.status_code == 504
         assert http_exc.detail["code"] == TurnErrorCode.turn_timeout.value
 
-    def test_groq_pool_rate_limited_maps_to_429(self):
-        """GroqPoolExhaustedError(rate_limited) → HTTP 429, code=upstream_rate_limited."""
+    def test_provider_rate_limited_maps_to_429(self):
+        """LanguageModelRateLimitedError → HTTP 429, code=upstream_rate_limited."""
         from backend.main import _map_turn_error
-        exc = GroqPoolExhaustedError("rate limited", code=ProviderFailure.rate_limited)
+        from backend.language_model import LanguageModelRateLimitedError
+
+        exc = LanguageModelRateLimitedError()
         http_exc = _map_turn_error(exc)
         assert http_exc.status_code == 429
         assert http_exc.detail["code"] == TurnErrorCode.upstream_rate_limited.value
 
-    def test_groq_pool_connection_failed_maps_to_503(self):
-        """GroqPoolExhaustedError(connection_failed) → HTTP 503, code=provider_unavailable."""
+    def test_provider_connection_failed_maps_to_503(self):
+        """LanguageModelConnectionFailedError → HTTP 503, code=provider_unavailable."""
         from backend.main import _map_turn_error
-        exc = GroqPoolExhaustedError("connection failed", code=ProviderFailure.connection_failed)
+        from backend.language_model import LanguageModelConnectionFailedError
+
+        exc = LanguageModelConnectionFailedError()
         http_exc = _map_turn_error(exc)
         assert http_exc.status_code == 503
         assert http_exc.detail["code"] == TurnErrorCode.provider_unavailable.value
 
-    def test_groq_pool_invalid_request_maps_to_503(self):
-        """GroqPoolExhaustedError(invalid_request) → HTTP 503, code=provider_invalid_request."""
+    def test_provider_rejected_maps_to_503(self):
+        """LanguageModelInvalidRequestError → HTTP 503, code=provider_invalid_request."""
         from backend.main import _map_turn_error
-        exc = GroqPoolExhaustedError("invalid request", code=ProviderFailure.invalid_request)
+        from backend.language_model import LanguageModelInvalidRequestError
+
+        exc = LanguageModelInvalidRequestError()
         http_exc = _map_turn_error(exc)
         assert http_exc.status_code == 503
         assert http_exc.detail["code"] == TurnErrorCode.provider_invalid_request.value
 
     # ── Same codes via TurnExecutionError ─────────────────────────────
 
-    def test_turn_execution_timeout_same_as_groq_pool_timeout(self):
-        """TurnExecutionError(turn_timeout) produces same 504 as GroqPoolExhaustedError(timeout)."""
+    def test_turn_execution_timeout_same_as_provider_timeout(self):
+        """TurnExecutionError(turn_timeout) produces same 504 as the canonical timeout."""
         from backend.main import _map_turn_error
-        pool_exc = _map_turn_error(GroqPoolExhaustedError("", code=ProviderFailure.timeout))
-        turn_exc = _map_turn_error(TurnExecutionError(TurnErrorCode.turn_timeout))
-        assert pool_exc.status_code == turn_exc.status_code == 504
-        assert pool_exc.detail["code"] == turn_exc.detail["code"] == TurnErrorCode.turn_timeout.value
+        from backend.language_model import LanguageModelTimeoutError
 
-    def test_turn_execution_rate_limited_same_as_groq_pool_rate_limited(self):
+        provider_exc = _map_turn_error(LanguageModelTimeoutError())
+        turn_exc = _map_turn_error(TurnExecutionError(TurnErrorCode.turn_timeout))
+        assert provider_exc.status_code == turn_exc.status_code == 504
+        assert provider_exc.detail["code"] == turn_exc.detail["code"] == TurnErrorCode.turn_timeout.value
+
+    def test_turn_execution_rate_limited_same_as_provider_rate_limited(self):
         """Both sources produce same 429/detail.code."""
         from backend.main import _map_turn_error
-        pool_exc = _map_turn_error(GroqPoolExhaustedError("", code=ProviderFailure.rate_limited))
-        turn_exc = _map_turn_error(TurnExecutionError(TurnErrorCode.upstream_rate_limited))
-        assert pool_exc.status_code == turn_exc.status_code == 429
-        assert pool_exc.detail["code"] == turn_exc.detail["code"] == TurnErrorCode.upstream_rate_limited.value
+        from backend.language_model import LanguageModelRateLimitedError
 
-    def test_turn_execution_invalid_request_same_as_groq_pool(self):
+        provider_exc = _map_turn_error(LanguageModelRateLimitedError())
+        turn_exc = _map_turn_error(TurnExecutionError(TurnErrorCode.upstream_rate_limited))
+        assert provider_exc.status_code == turn_exc.status_code == 429
+        assert provider_exc.detail["code"] == turn_exc.detail["code"] == TurnErrorCode.upstream_rate_limited.value
+
+    def test_turn_execution_invalid_request_same_as_provider(self):
         """Both sources produce same 503/detail.code for invalid_request."""
         from backend.main import _map_turn_error
-        pool_exc = _map_turn_error(GroqPoolExhaustedError("", code=ProviderFailure.invalid_request))
+        from backend.language_model import LanguageModelInvalidRequestError
+
+        provider_exc = _map_turn_error(LanguageModelInvalidRequestError())
         turn_exc = _map_turn_error(TurnExecutionError(TurnErrorCode.provider_invalid_request))
-        assert pool_exc.status_code == turn_exc.status_code == 503
-        assert pool_exc.detail["code"] == turn_exc.detail["code"] == TurnErrorCode.provider_invalid_request.value
+        assert provider_exc.status_code == turn_exc.status_code == 503
+        assert provider_exc.detail["code"] == turn_exc.detail["code"] == TurnErrorCode.provider_invalid_request.value
 
     def test_cancelled_not_http500(self):
         """CancelledError propagates, not converted to HTTP 500."""

@@ -183,12 +183,41 @@ def build_default_dependencies(
     """
     created: list[Any] = []
     try:
+        # Explicit provider selection (issue #337): the composition
+        # root closes over the concrete Groq builder directly — the
+        # generic contract (backend.language_model) carries no provider
+        # registry or dynamic import convention (second review). The
+        # selection is explicit and there is no fallback to another
+        # provider. Keys and provider-call parameters are captured from
+        # the validated settings **here, at composition time** — the
+        # factory builds the adapter from exactly these captured values
+        # and the adapter never falls back to the process environment
+        # (Settings is the single source of truth for the web backend).
+        # The import lives inside the builder function, so importing
+        # this module never loads a provider SDK.
+        from .groq_language_model import build_groq_language_model_factory
+
+        language_model_factory = build_groq_language_model_factory(
+            keys=settings.provider_keys(),
+            call_params=settings.turn_config.to_groq_params(),
+        )
+        # Readiness (issue #337 review): the ``/ready`` provider check
+        # must distinguish "a factory exists" from "configuration is
+        # valid". The probe is bound to the same captured settings the
+        # adapter will use — presence-only, never a generation call.
+        provider_readiness_probe = getattr(
+            language_model_factory,
+            "provider_configured_probe",
+            None,
+        )
+
         engine = ChatConversationEngine(
             archival_extraction_enabled=settings.archival_extraction_enabled,
             embeddings_enabled=settings.embeddings_retrieval_enabled,
             turn_config=settings.turn_config,
-            groq_keys=list(settings.provider_keys()),
+            language_model_factory=language_model_factory,
             supabase_factory=_supabase_factory_from_settings(settings),
+            provider_configured_probe=provider_readiness_probe,
         )
         created.append(engine)
 

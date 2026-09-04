@@ -763,18 +763,22 @@ async def test_async_4xx_produces_invalid_request():
         async_client_factory=lambda k: AsyncMock(**{"chat.completions.create": always_400}),
         groq_params=config.to_groq_params(),
     )
-    engine.groq_manager = mgr
+    # Issue #337: the engine seam is the LanguageModel contract; the
+    # Groq adapter wraps the manager, so the canonical taxonomy crosses
+    # the boundary (the old engine leaked GroqPoolExhaustedError).
+    from backend.groq_language_model import GroqLanguageModel
+    from backend.provider_models import ProviderConfig
+    from backend.turn_execution import TurnExecutionError
+    engine._language_model = GroqLanguageModel(
+        manager=mgr, provider_config=ProviderConfig()
+    )
 
-    # The 4xx terminal error is classified as invalid_request and raises
-    # GroqPoolExhaustedError (not TurnExecutionError) because the pool
-    # exhausts all keys with this failure code.
-    from backend.groq_manager import GroqPoolExhaustedError
-    with pytest.raises(GroqPoolExhaustedError) as exc_info:
+    # The 4xx terminal error is classified as invalid_request, the pool
+    # exhausts all keys with this failure code, and the adapter raises
+    # the canonical error; the engine surfaces the typed turn error.
+    with pytest.raises(TurnExecutionError) as exc_info:
         await engine.process_turn("user", "Hello")
-    assert exc_info.value.failure_code is not None
-    from backend.groq_manager import ProviderFailure, provider_failure_to_turn_code
-    turn_code = provider_failure_to_turn_code(exc_info.value.failure_code)
-    assert turn_code == TurnErrorCode.provider_invalid_request
+    assert exc_info.value.code == TurnErrorCode.provider_invalid_request
 
     # Now verify HTTP mapping produces 503
     http_exc = _map_turn_error(exc_info.value)

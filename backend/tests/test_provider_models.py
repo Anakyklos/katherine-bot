@@ -40,7 +40,7 @@ from unittest.mock import MagicMock, AsyncMock, patch
 import pytest
 
 from backend.engine import ConversationEngine
-from backend.groq_manager import GroqRequestError
+from backend.language_model import LanguageModelServerError
 from backend.turn_execution import (
     TurnExecutionConfig,
     TurnErrorCode,
@@ -56,41 +56,131 @@ from backend.turn_execution import (
 FIXED_CLOCK = 1_700_000_000.0
 
 
+class RecordingManager:
+    """Stands in for the Groq manager at the adapter boundary, recording
+    the exact keyword arguments of every completion call (issue #337)."""
+
+    def __init__(self, completion=None):
+        self.calls: list[dict] = []
+        self.completion = completion
+
+    async def chat_completion_async(self, **kwargs):
+        self.calls.append(kwargs)
+        if isinstance(self.completion, Exception):
+            raise self.completion
+        return self.completion
+
+    def call_params(self, index: int = 0) -> dict:
+        assert len(self.calls) > index, f"no call #{index}: {self.calls}"
+        return self.calls[index]
+
+
+def _mock_async_result(content: str):
+    """Create a MagicMock that resembles a Groq async completion response."""
+    mock_resp = MagicMock()
+    mock_resp.choices = [MagicMock()]
+    mock_resp.choices[0].message.content = content
+    return mock_resp
+
+
+class FakeScriptedModel:
+    """LanguageModel fake whose responses are scripted per call.
+
+    Mirrors the adapter: appraise parses JSON (fallback →
+    LanguageModelInvalidResponseError); generate returns text. The fake
+    holds the script list so tests keep the same side_effect ergonomics
+    the old chat_completion_async mocks had.
+    """
+
+    def __init__(self):
+        self.script: list = []
+        self.generate_calls = 0
+        self.appraise_calls = 0
+
+    async def appraise(self, message: str, budget):
+        from backend.emotional_domain import parse_llm_appraisal
+        from backend.language_model import LanguageModelInvalidResponseError
+
+        self.appraise_calls += 1
+        item = self.script.pop(0) if self.script else _mock_async_result("")
+        if isinstance(item, Exception):
+            raise item
+        content = item.choices[0].message.content
+        if not content or not isinstance(content, str) or not content.strip():
+            raise LanguageModelInvalidResponseError()
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError:
+            raise LanguageModelInvalidResponseError() from None
+        result = parse_llm_appraisal(payload)
+        if result.is_fallback:
+            # Mirror the Groq adapter's sanitised fallback event (code
+            # only, never payload) so engine-level sanitisation stays
+            # observable with any LanguageModel implementation.
+            logging.getLogger("backend.engine").info(
+                "event=emotional_appraisal_fallback code=%s",
+                result.error_code.value if result.error_code else "unknown",
+            )
+            raise LanguageModelInvalidResponseError()
+        return result.appraisal
+
+    async def generate(self, messages: list, budget) -> str:
+        from backend.language_model import LanguageModelInvalidResponseError
+
+        self.generate_calls += 1
+        item = self.script.pop(0) if self.script else _mock_async_result("")
+        if isinstance(item, Exception):
+            raise item
+        content = item.choices[0].message.content
+        if not content or not isinstance(content, str) or not content.strip():
+            raise LanguageModelInvalidResponseError()
+        return content
+
+    async def extract_archival(self, messages: list, budget) -> str:
+        from backend.language_model import LanguageModelInvalidResponseError
+
+        item = self.script.pop(0) if self.script else _mock_async_result("")
+        if isinstance(item, Exception):
+            raise item
+        content = item.choices[0].message.content
+        if not content or not isinstance(content, str) or not content.strip():
+            raise LanguageModelInvalidResponseError()
+        return content
+
+    def describe(self):
+        from backend.language_model import ModelSelection
+        return ModelSelection(
+            provider="fake", main_model_id="fake-main", fast_model_id="fake-fast"
+        )
+
+
 def _make_engine(archival_extraction_enabled=False, clock=FIXED_CLOCK):
     """Create a ConversationEngine with fully mocked dependencies.
 
-    Patches ``__init__`` on ``GroqClientManager`` and ``MemoryManager``
-    **before** construction so no real Groq client, Supabase client, or
-    SentenceTransformer model is ever instantiated.  The patch operates
-    on the class object directly (not a module reference), so it works
-    reliably regardless of import order or namespace package quirks.
-
-    After construction, specific attributes used by tests are replaced
-    with MagicMock / AsyncMock for test control.
+    Issue #337: the engine seam is the canonical ``LanguageModel``
+    contract. A scripted fake model is injected; no Groq manager is
+    constructed or mocked at this seam. ``SentenceTransformer`` is
+    patched at construction so no real model loads.
     """
-    from backend.groq_manager import GroqClientManager
     from backend.memory import MemoryManager
 
-    _orig_groq_init = GroqClientManager.__init__
     _orig_mem_init = MemoryManager.__init__
     _orig_mem_st = None
 
-    # Patch SentenceTransformer on the memory module so MemoryManager.__init__
-    # never loads the real model.
     import backend.memory as memory_module
     _orig_mem_st = memory_module.SentenceTransformer
 
+    model = FakeScriptedModel()
     try:
-        GroqClientManager.__init__ = MagicMock(return_value=None)
         MemoryManager.__init__ = MagicMock(return_value=None)
         memory_module.SentenceTransformer = MagicMock()
 
         engine = ConversationEngine(
             clock=lambda: clock,
             archival_extraction_enabled=archival_extraction_enabled,
+            language_model=model,
         )
     finally:
-        GroqClientManager.__init__ = _orig_groq_init
         MemoryManager.__init__ = _orig_mem_init
         if _orig_mem_st is not None:
             memory_module.SentenceTransformer = _orig_mem_st
@@ -122,29 +212,16 @@ def _make_engine(archival_extraction_enabled=False, clock=FIXED_CLOCK):
         trusted_policy="You are a test assistant.",
     ))
 
-    # ---- Groq manager mocks ----
-    sync_m = MagicMock()
-    sync_m.choices = [MagicMock()]
-    sync_m.choices[0].message.content = "Hi"
-    engine.groq_manager.chat_completion = MagicMock(return_value=sync_m)
-    engine.groq_manager.chat_completion_async = AsyncMock()
-
+    # ---- Scripted fake model (contract seam) ----
+    engine._script_model = model
     return engine
 
 
-def _mock_async_result(content: str):
-    """Create a MagicMock that resembles a Groq async completion response."""
-    mock_resp = MagicMock()
-    mock_resp.choices = [MagicMock()]
-    mock_resp.choices[0].message.content = content
-    return mock_resp
-
-
 def _inject_ok_turn(engine):
-    """Set up ``chat_completion_async`` with two valid responses
-    (appraisal + generation) so a full turn succeeds.
+    """Script two valid responses (appraisal + generation) so a full
+    turn succeeds.
     """
-    engine.groq_manager.chat_completion_async.side_effect = [
+    engine._script_model.script = [
         _mock_async_result(json.dumps({
             "valence": 0.2, "arousal_shift": 0.1, "dominance_shift": 0.0,
             "triggered_emotions": {"joy": 0.5},
@@ -306,15 +383,18 @@ class TestSingleSourceOfTruth:
         assert MAIN_MAX_OUTPUT_TOKENS == 200
         assert APPRAISAL_MAX_OUTPUT_TOKENS == 256
         assert ARCHIVAL_MAX_OUTPUT_TOKENS == 512
-        # Dataclass defaults
+        # Dataclass defaults (the adapter is the single consumer of
+        # ProviderConfig since issue #337 — the engine carries no
+        # provider configuration anymore)
         assert ProviderConfig().main_max_output_tokens == 200
         assert ProviderConfig().appraisal_max_output_tokens == 256
         assert ProviderConfig().archival_max_output_tokens == 512
-        # Engine propagates
-        engine = _make_engine()
-        assert engine.provider_config.main_max_output_tokens == 200
-        assert engine.provider_config.appraisal_max_output_tokens == 256
-        assert engine.provider_config.archival_max_output_tokens == 512
+        # The adapter applies exactly these defaults
+        from backend.groq_language_model import GroqLanguageModel
+        adapter = GroqLanguageModel(manager=object())
+        assert adapter._config.main_max_output_tokens == 200
+        assert adapter._config.appraisal_max_output_tokens == 256
+        assert adapter._config.archival_max_output_tokens == 512
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -322,52 +402,56 @@ class TestSingleSourceOfTruth:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TestAppraisalParams:
-    """_appraise() must use the correct model, temperature, max_tokens, and JSON mode.
+    """Adapter appraise() must use the correct model, temperature,
+    max_tokens, and JSON mode.
 
-    Tests call ``_appraise()`` **directly** rather than going through
-    ``process_turn()`` so the assertion path is unambiguous — no try/except
-    is needed because any unexpected exception will fail the test immediately.
+    Issue #337: these provider-level call parameters live inside the
+    Groq adapter now. The adapter is exercised directly with a recording
+    manager so the exact kwargs are still asserted. The engine-side
+    appraise() is covered by the fake-contract flow tests below.
     """
 
-    @staticmethod
-    def _setup_appraisal(engine):
-        """Set a single valid appraisal response and return a TurnBudget."""
-        budget = create_budget(
-            TurnExecutionConfig.defaults(),
-            now_provider=lambda: time.monotonic(),
-        )
-        engine.groq_manager.chat_completion_async.side_effect = [
-            _mock_async_result(json.dumps({
-                "valence": 0.2, "arousal_shift": 0.1, "dominance_shift": 0.0,
-                "triggered_emotions": {"joy": 0.5},
-            })),
-        ]
-        return budget
+    def _adapter(self):
+        from backend.groq_language_model import GroqLanguageModel
+        from backend.provider_models import ProviderConfig
+
+        manager = RecordingManager(completion=_mock_async_result(json.dumps({
+            "valence": 0.2, "arousal_shift": 0.1, "dominance_shift": 0.0,
+            "triggered_emotions": {"joy": 0.5},
+        })))
+        model = GroqLanguageModel(manager=manager, provider_config=ProviderConfig())
+        return model, manager
 
     def test_appraisal_uses_fast_model(self):
         async def run():
-            engine = _make_engine()
-            budget = self._setup_appraisal(engine)
+            model, manager = self._adapter()
+            budget = create_budget(
+                TurnExecutionConfig.defaults(),
+                now_provider=lambda: time.monotonic(),
+            )
 
-            await engine._appraise("Hello", budget)
+            await model.appraise("Hello", budget)
 
-            assert engine.groq_manager.chat_completion_async.call_count == 1
-            params = engine.groq_manager.chat_completion_async.call_args_list[0][1]
+            assert len(manager.calls) == 1
+            params = manager.call_params(0)
             assert params["model"] == "openai/gpt-oss-20b"
             assert params["temperature"] == 0
-            assert params["max_tokens"] == engine.provider_config.appraisal_max_output_tokens
+            assert params["max_tokens"] == 256
             assert params["response_format"] == {"type": "json_object"}
 
         asyncio.run(run())
 
     def test_appraisal_stage_label(self):
         async def run():
-            engine = _make_engine()
-            budget = self._setup_appraisal(engine)
+            model, manager = self._adapter()
+            budget = create_budget(
+                TurnExecutionConfig.defaults(),
+                now_provider=lambda: time.monotonic(),
+            )
 
-            await engine._appraise("Hello", budget)
+            await model.appraise("Hello", budget)
 
-            params = engine.groq_manager.chat_completion_async.call_args_list[0][1]
+            params = manager.call_params(0)
             assert params["stage"] == "appraisal"
 
         asyncio.run(run())
@@ -378,33 +462,75 @@ class TestAppraisalParams:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class TestGenerationParams:
-    """_generate() must use the correct model, temperature, and max_tokens."""
+    """Adapter generate() must use the correct model, temperature, max_tokens."""
+
+    def _adapter(self, script):
+        from backend.groq_language_model import GroqLanguageModel
+        from backend.provider_models import ProviderConfig
+
+        manager = RecordingManager()
+        manager.completion = None
+        # Script responses per call by subclassing behavior: the manager
+        # returns scripted items in order.
+        items = list(script)
+        async def scripted(**kwargs):
+            manager.calls.append(kwargs)
+            item = items.pop(0) if items else _mock_async_result("")
+            if isinstance(item, Exception):
+                raise item
+            return item
+        manager.chat_completion_async = scripted
+        model = GroqLanguageModel(manager=manager, provider_config=ProviderConfig())
+        return model, manager
 
     def test_generation_uses_main_model(self):
         """Generation uses main model with temperature 0.8 and max_tokens 200."""
         async def run():
-            engine = _make_engine()
-            _inject_ok_turn(engine)
+            model, manager = self._adapter([
+                _mock_async_result(json.dumps({
+                    "valence": 0.2, "arousal_shift": 0.1, "dominance_shift": 0.0,
+                    "triggered_emotions": {"joy": 0.5},
+                })),
+                _mock_async_result("Hi there!"),
+            ])
+            budget = create_budget(
+                TurnExecutionConfig.defaults(),
+                now_provider=lambda: time.monotonic(),
+            )
 
-            resp, emotions = await engine.process_turn("user", "Hello")
+            await model.appraise("Hello", budget)
+            text = await model.generate(
+                [{"role": "user", "content": "Hello"}], budget
+            )
 
-            assert engine.groq_manager.chat_completion_async.call_count == 2
-            gen_params = engine.groq_manager.chat_completion_async.call_args_list[1][1]
+            assert text == "Hi there!"
+            assert len(manager.calls) == 2
+            gen_params = manager.call_params(1)
             assert gen_params["model"] == "openai/gpt-oss-120b"
             assert gen_params["temperature"] == 0.8
-            assert gen_params["max_tokens"] == engine.provider_config.main_max_output_tokens
+            assert gen_params["max_tokens"] == 200
             assert "response_format" not in gen_params
 
         asyncio.run(run())
 
     def test_generation_stage_label(self):
         async def run():
-            engine = _make_engine()
-            _inject_ok_turn(engine)
+            model, manager = self._adapter([
+                _mock_async_result(json.dumps({
+                    "valence": 0.2, "arousal_shift": 0.1, "dominance_shift": 0.0,
+                    "triggered_emotions": {"joy": 0.5},
+                })),
+                _mock_async_result("Hi there!"),
+            ])
+            budget = create_budget(
+                TurnExecutionConfig.defaults(),
+                now_provider=lambda: time.monotonic(),
+            )
 
-            await engine.process_turn("user", "Hello")
+            await model.appraise("Hello", budget)
+            await model.generate([{"role": "user", "content": "Hello"}], budget)
 
-            gen_params = engine.groq_manager.chat_completion_async.call_args_list[1][1]
+            gen_params = manager.call_params(1)
             assert gen_params["stage"] == "generation"
 
         asyncio.run(run())
@@ -416,14 +542,51 @@ class TestGenerationParams:
 
 class TestArchivalExtractionParams:
     """run_archival_extraction() must use the correct model, temperature,
-    max_tokens, and JSON mode.
+    max_tokens, and JSON mode (asserted at the adapter boundary — issue #337:
+    the adapter performs the exact call; the engine delegates).
     """
+
+    def _adapter(self):
+        from backend.groq_language_model import GroqLanguageModel
+        from backend.provider_models import ProviderConfig
+
+        manager = RecordingManager(completion=_mock_async_result(json.dumps({
+            "facts": [{"content": "User likes cats.", "importance": 0.7, "tags": ["interest"]}],
+            "schema_version": 1,
+            "extractor_version": 1,
+        })))
+        model = GroqLanguageModel(manager=manager, provider_config=ProviderConfig())
+        return model, manager
 
     def test_archival_extraction_uses_fast_model(self):
         async def run():
-            engine = _make_engine(archival_extraction_enabled=True)
+            model, manager = self._adapter()
+            budget = create_budget(
+                TurnExecutionConfig.defaults(),
+                now_provider=lambda: time.monotonic(),
+            )
 
-            engine.groq_manager.chat_completion_async.side_effect = [
+            await model.extract_archival(
+                [{"role": "user", "content": "Extract facts..."}], budget
+            )
+
+            assert len(manager.calls) == 1
+            arch_params = manager.call_params(0)
+            assert arch_params["model"] == "openai/gpt-oss-20b"
+            assert arch_params["temperature"] == 0.0
+            assert arch_params["max_tokens"] == 512
+            assert arch_params["response_format"] == {"type": "json_object"}
+            assert arch_params["stage"] == "archival_extraction"
+
+        asyncio.run(run())
+
+    def test_archival_extraction_flow_stores_facts(self):
+        """End-to-end archival flow through the engine with the fake
+        contract model: facts reach storage; the engine calls the
+        archival surface of the contract."""
+        async def run():
+            engine = _make_engine(archival_extraction_enabled=True)
+            engine._script_model.script = [
                 _mock_async_result(json.dumps({
                     "facts": [{"content": "User likes cats.", "importance": 0.7, "tags": ["interest"]}],
                     "schema_version": 1,
@@ -439,13 +602,8 @@ class TestArchivalExtractionParams:
             ref = PersistedTurnRef(user_id="u1", source_chat_log_id=1, assistant_chat_log_id=2)
             await engine.run_archival_extraction(ref)
 
-            assert engine.groq_manager.chat_completion_async.call_count >= 1
-            arch_params = engine.groq_manager.chat_completion_async.call_args_list[0][1]
-            assert arch_params["model"] == "openai/gpt-oss-20b"
-            assert arch_params["temperature"] == 0.0
-            assert arch_params["max_tokens"] == engine.provider_config.archival_max_output_tokens
-            assert arch_params["response_format"] == {"type": "json_object"}
-            assert arch_params["stage"] == "archival_extraction"
+            assert engine._script_model.generate_calls == 0
+            engine.memory_manager.store_archival_extraction.assert_called_once()
 
         asyncio.run(run())
 
@@ -457,7 +615,8 @@ class TestArchivalExtractionParams:
 
             await engine.process_turn("user", "Hello")
 
-            assert engine.groq_manager.chat_completion_async.call_count == 2
+            assert engine._script_model.generate_calls == 1
+            assert engine._script_model.appraise_calls == 1
 
         asyncio.run(run())
 
@@ -472,7 +631,7 @@ class TestValidAppraisalAccepted:
     def test_valid_appraisal_succeeds(self):
         async def run():
             engine = _make_engine()
-            engine.groq_manager.chat_completion_async.side_effect = [
+            engine._script_model.script = [
                 _mock_async_result(json.dumps({
                     "valence": 0.3, "arousal_shift": 0.1, "dominance_shift": -0.1,
                     "triggered_emotions": {"joy": 0.6, "tenderness": 0.4, "gratitude": 0.3},
@@ -497,7 +656,7 @@ class TestValidAppraisalAccepted:
                 "disgust": 0.0, "surprise": 0.5, "tenderness": 0.2,
                 "guilt": 0.0, "pride": 0.1, "jealousy": 0.0, "gratitude": 0.4,
             }
-            engine.groq_manager.chat_completion_async.side_effect = [
+            engine._script_model.script = [
                 _mock_async_result(json.dumps({
                     "valence": 0.0, "arousal_shift": 0.2, "dominance_shift": 0.0,
                     "triggered_emotions": all_emotions,
@@ -522,7 +681,7 @@ class TestInvalidAppraisalFails:
     def test_empty_appraisal_fails(self):
         async def run():
             engine = _make_engine()
-            engine.groq_manager.chat_completion_async.side_effect = [
+            engine._script_model.script = [
                 _mock_async_result(json.dumps({})),
             ]
 
@@ -535,7 +694,7 @@ class TestInvalidAppraisalFails:
     def test_missing_valence_fails(self):
         async def run():
             engine = _make_engine()
-            engine.groq_manager.chat_completion_async.side_effect = [
+            engine._script_model.script = [
                 _mock_async_result(json.dumps({
                     "triggered_emotions": {"joy": 0.5},
                 })),
@@ -550,7 +709,7 @@ class TestInvalidAppraisalFails:
     def test_non_json_appraisal_fails(self):
         async def run():
             engine = _make_engine()
-            engine.groq_manager.chat_completion_async.side_effect = [
+            engine._script_model.script = [
                 _mock_async_result("not json at all"),
             ]
 
@@ -564,7 +723,7 @@ class TestInvalidAppraisalFails:
         """Unknown top-level key triggers fallback -> typed failure."""
         async def run():
             engine = _make_engine()
-            engine.groq_manager.chat_completion_async.side_effect = [
+            engine._script_model.script = [
                 _mock_async_result(json.dumps({
                     "valence": 0.0, "arousal_shift": 0.0, "dominance_shift": 0.0,
                     "triggered_emotions": {"joy": 0.0},
@@ -595,7 +754,7 @@ class TestArchivalExtractionBehaviour:
     })
 
     async def _run_archival(self, engine, content):
-        engine.groq_manager.chat_completion_async.side_effect = [
+        engine._script_model.script = [
             _mock_async_result(content),
         ]
         engine.memory_manager.load_persisted_user_message = MagicMock(
@@ -639,9 +798,9 @@ class TestArchivalExtractionBehaviour:
         """Provider failure during archival extraction is logged, not fatal."""
         async def run():
             engine = _make_engine(archival_extraction_enabled=True)
-            engine.groq_manager.chat_completion_async.side_effect = RuntimeError(
-                "Provider failed"
-            )
+            engine._script_model.script = [
+                LanguageModelServerError(),
+            ]
             engine.memory_manager.load_persisted_user_message = MagicMock(
                 return_value="I love cats."
             )
@@ -667,12 +826,12 @@ class TestProviderFailuresSanitised:
         async def run():
             engine = _make_engine()
 
-            engine.groq_manager.chat_completion_async.side_effect = [
+            engine._script_model.script = [
                 _mock_async_result(json.dumps({
                     "valence": 0.0, "arousal_shift": 0.0, "dominance_shift": 0.0,
                     "triggered_emotions": {"joy": 0.0},
                 })),
-                GroqRequestError("Provider failed unexpectedly"),
+                LanguageModelServerError(),
             ]
 
             with pytest.raises(TurnExecutionError) as exc_info:
@@ -686,7 +845,7 @@ class TestProviderFailuresSanitised:
         async def run():
             engine = _make_engine()
 
-            engine.groq_manager.chat_completion_async.side_effect = [
+            engine._script_model.script = [
                 _mock_async_result(json.dumps({
                     "valence": 0.0, "arousal_shift": 0.0, "dominance_shift": 0.0,
                     "triggered_emotions": {"joy": 0.0},
@@ -729,18 +888,27 @@ class TestNoOldLlamaModels:
         assert "llama" not in FAST_MODEL_ID
 
     def test_no_fallback_to_old_models_in_engine(self):
-        """Engine does not have fallback attributes for old models."""
+        """Engine has no provider model attributes at all (issue #337).
+
+        The engine depends only on the canonical LanguageModel
+        contract; model selection is applied inside the adapter from
+        ``ProviderConfig`` defaults.
+        """
         engine = _make_engine()
         assert not hasattr(engine, "model_main")
         assert not hasattr(engine, "model_fast")
-        assert engine.provider_config.main_model_id == "openai/gpt-oss-120b"
-        assert engine.provider_config.fast_model_id == "openai/gpt-oss-20b"
+        assert not hasattr(engine, "provider_config")
+        from backend.groq_language_model import GroqLanguageModel
+        adapter = GroqLanguageModel(manager=object())
+        assert adapter._config.main_model_id == "openai/gpt-oss-120b"
+        assert adapter._config.fast_model_id == "openai/gpt-oss-20b"
 
     def test_engine_provider_config_has_no_llama(self):
-        """The active model IDs from the engine's provider_config never contain 'llama'."""
-        engine = _make_engine()
-        main_id = engine.provider_config.main_model_id
-        fast_id = engine.provider_config.fast_model_id
+        """The active model IDs the adapter uses never contain 'llama'."""
+        from backend.groq_language_model import GroqLanguageModel
+        adapter = GroqLanguageModel(manager=object())
+        main_id = adapter._config.main_model_id
+        fast_id = adapter._config.fast_model_id
         assert "llama" not in main_id
         assert "llama" not in fast_id
         assert main_id == "openai/gpt-oss-120b"
@@ -764,8 +932,11 @@ class TestNoExternalServices:
     def test_all_engine_deps_are_mocked_here(self):
         """_make_engine creates an engine whose deps are Mock instances."""
         engine = _make_engine()
-        assert isinstance(engine.groq_manager.chat_completion, MagicMock)
-        assert isinstance(engine.groq_manager.chat_completion_async, AsyncMock)
+        # Issue #337: the engine seam is the canonical LanguageModel;
+        # the injected fake records calls and holds scripted responses.
+        assert isinstance(engine._script_model, FakeScriptedModel)
+        assert engine._language_model is engine._script_model
+        assert not hasattr(engine, "groq_manager")
         assert isinstance(engine.memory_manager.load_user_state, MagicMock)
         assert isinstance(engine.memory_manager.sync_state, MagicMock)
         assert isinstance(engine.memory_manager.save_turn, MagicMock)

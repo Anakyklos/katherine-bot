@@ -194,3 +194,18 @@ em modo implícito.
 4. Se exigir configuração, adicione o campo em `Settings` com validação
    estrita e documente a variável em `docs/operations/configuration.md`.
 5. Teste: factory com fakes injetados, lifespan, ownership, readiness.
+
+## Fronteira LanguageModel (issue #337)
+
+O ciclo de vida da aplicação (web e desktop) constrói o provedor de
+linguagem **na composição**, por trás do contrato canônico
+`LanguageModel` (`backend/language_model.py`). O adapter Groq
+(`backend/groq_language_model.py`) é o único ponto onde o SDK do
+provedor aparece; nenhum símbolo Groq cruza essa fronteira para o
+domínio. No desktop, o adapter é **lazy**: a fábrica só constrói o
+adapter no primeiro turno que precisa do modelo — abrir o app sem
+provedor configurado, sem login e sem Supabase permanece o
+comportamento local-first (#334/#335/#336), sem requisição ou thread de
+provedor em idle. A seleção é explícita (sem auto-routing, sem
+fallback): falha do provedor é falha do turno, sanitizada. O prompt
+trafega ao provedor remoto configurado — transparência deliberada.

@@ -985,55 +985,80 @@ class TestEpistemicContracts:
 # 10. Appraisal boundary
 # ═══════════════════════════════════════════════════════════════════════
 
+
+class _RecordingContractModel:
+    """LanguageModel fake that records contract calls (issue #337).
+
+    ``appraise`` returns a neutral appraisal, ``generate`` returns a
+    fixed reply; both record their inputs so envelope structure stays
+    assertable at the engine seam without any Groq manager.
+    """
+
+    def __init__(self):
+        self.appraise_messages = []
+        self.generate_messages = []
+
+    async def appraise(self, message: str, budget):
+        from backend.emotional_domain import AppraisalV1
+        self.appraise_messages.append(message)
+        return AppraisalV1.neutral()
+
+    async def generate(self, messages: list, budget) -> str:
+        self.generate_messages.append([dict(m) for m in messages])
+        return "Hi there"
+
+    async def extract_archival(self, messages: list, budget) -> str:
+        return "{}"
+
+    def describe(self):
+        from backend.language_model import ModelSelection
+        return ModelSelection(
+            provider="fake", main_model_id="fake-main", fast_model_id="fake-fast"
+        )
+
+
 class TestAppraisalBoundary:
     """Appraisal uses separated system instruction and user message."""
 
     @pytest.mark.anyio
-    async def test_appraisal_system_and_user_separate(self, monkeypatch):
-        """Appraisal system instruction is in a system message, user message separate."""
+    async def test_appraisal_system_and_user_separate(self):
+        """Appraisal system instruction and user message are separate.
+
+        Issue #337: envelope construction lives in the Groq adapter, so
+        this boundary is asserted directly against the adapter with a
+        recording manager.
+        """
         import json
-        from unittest.mock import MagicMock, patch
-        from backend.engine import ConversationEngine
+        from backend.groq_language_model import GroqLanguageModel
+        from backend.provider_models import ProviderConfig
         from backend.turn_execution import create_budget, TurnExecutionConfig
-        from backend.groq_manager import GroqClientManager
-        from backend.memory import MemoryManager
 
         recorded = {}
 
-        async def mock_chat_completion_async(messages, **kwargs):
-            recorded["messages"] = messages
-            response_text = json.dumps({
-                "valence": 0.0, "arousal_shift": 0.0, "dominance_shift": 0.0,
-                "triggered_emotions": {
-                    "joy": 0, "sadness": 0, "anger": 0, "fear": 0,
-                    "disgust": 0, "surprise": 0, "tenderness": 0,
-                    "guilt": 0, "pride": 0, "jealousy": 0, "gratitude": 0,
-                },
-            })
-            class FakeContent:
-                content = response_text
-            class FakeMessage:
-                message = FakeContent()
-            class FakeResponse:
-                choices = [FakeMessage()]
-            return FakeResponse()
+        class _Msg:
+            def __init__(self, content):
+                self.message = type("M", (), {"content": content})()
 
-        # Install doubles BEFORE constructing ConversationEngine
-        with (
-            patch.object(GroqClientManager, "__init__", return_value=None),
-            patch.object(MemoryManager, "__init__", return_value=None),
-            patch("backend.memory.SentenceTransformer", return_value=MagicMock()),
-        ):
-            engine = ConversationEngine(clock=lambda: 1000.0)
+        class _Resp:
+            def __init__(self, content):
+                self.choices = [_Msg(content)]
 
-        monkeypatch.setattr(
-            engine.groq_manager, "chat_completion_async", mock_chat_completion_async
+        class _RecordingManager:
+            async def chat_completion_async(self, **kwargs):
+                recorded.update(kwargs)
+                return _Resp(json.dumps({
+                    "valence": 0.0, "arousal_shift": 0.0, "dominance_shift": 0.0,
+                    "triggered_emotions": {"joy": 0.5},
+                }))
+
+        model = GroqLanguageModel(
+            manager=_RecordingManager(), provider_config=ProviderConfig()
         )
 
-        budget = create_budget(TurnExecutionConfig.defaults(), now_provider=engine._monotonic)
+        budget = create_budget(TurnExecutionConfig.defaults(), now_provider=lambda: 0.0)
         user_text = "I love cats"
 
-        await engine._appraise(user_text, budget)
+        await model.appraise(user_text, budget)
 
         messages = recorded.get("messages")
         assert messages is not None and len(messages) >= 2
@@ -1049,51 +1074,43 @@ class TestAppraisalBoundary:
         assert user_msg.get("content") == user_text
 
     @pytest.mark.anyio
-    async def test_appraisal_policy_has_no_user_message_interpolated(self, monkeypatch):
-        """The appraisal policy does not contain the user message."""
+    async def test_appraisal_policy_has_no_user_message_interpolated(self):
+        """The appraisal policy does not contain the user message.
+
+        Issue #337: the appraisal envelope is built inside the Groq
+        adapter; asserted directly against the adapter.
+        """
         import json
-        from unittest.mock import MagicMock, patch
-        from backend.engine import ConversationEngine
+        from backend.groq_language_model import GroqLanguageModel
+        from backend.provider_models import ProviderConfig
         from backend.turn_execution import create_budget, TurnExecutionConfig
-        from backend.groq_manager import GroqClientManager
-        from backend.memory import MemoryManager
 
         recorded = {}
 
-        async def mock_chat_completion_async(messages, **kwargs):
-            recorded["messages"] = messages
-            response_text = json.dumps({
-                "valence": 0.0, "arousal_shift": 0.0, "dominance_shift": 0.0,
-                "triggered_emotions": {
-                    "joy": 0, "sadness": 0, "anger": 0, "fear": 0,
-                    "disgust": 0, "surprise": 0, "tenderness": 0,
-                    "guilt": 0, "pride": 0, "jealousy": 0, "gratitude": 0,
-                },
-            })
-            class _Msg:
-                content = response_text
-            class _Choice:
-                message = _Msg()
-            class _Resp:
-                choices = [_Choice()]
-            return _Resp()
+        class _Msg:
+            def __init__(self, content):
+                self.message = type("M", (), {"content": content})()
 
-        # Install doubles BEFORE constructing ConversationEngine
-        with (
-            patch.object(GroqClientManager, "__init__", return_value=None),
-            patch.object(MemoryManager, "__init__", return_value=None),
-            patch("backend.memory.SentenceTransformer", return_value=MagicMock()),
-        ):
-            engine = ConversationEngine(clock=lambda: 1000.0)
+        class _Resp:
+            def __init__(self, content):
+                self.choices = [_Msg(content)]
 
-        monkeypatch.setattr(
-            engine.groq_manager, "chat_completion_async", mock_chat_completion_async
+        class _RecordingManager:
+            async def chat_completion_async(self, **kwargs):
+                recorded.update(kwargs)
+                return _Resp(json.dumps({
+                    "valence": 0.0, "arousal_shift": 0.0, "dominance_shift": 0.0,
+                    "triggered_emotions": {"joy": 0.5},
+                }))
+
+        model = GroqLanguageModel(
+            manager=_RecordingManager(), provider_config=ProviderConfig()
         )
 
-        budget = create_budget(TurnExecutionConfig.defaults(), now_provider=engine._monotonic)
+        budget = create_budget(TurnExecutionConfig.defaults(), now_provider=lambda: 0.0)
         user_text = "My bank account number is 1234-5678."
 
-        await engine._appraise(user_text, budget)
+        await model.appraise(user_text, budget)
 
         messages = recorded.get("messages")
         assert messages is not None and len(messages) >= 2
@@ -1466,30 +1483,12 @@ class TestEngineGenerationPath:
 
     @pytest.mark.anyio
     async def test_generate_uses_envelope_with_history_roles(self, monkeypatch):
-        """The provider receives the full envelope with original history roles."""
-        import json
+        """The contract model receives the full envelope with original history roles."""
         from unittest.mock import MagicMock, patch
         from backend.engine import ConversationEngine
-        from backend.groq_manager import GroqClientManager
         from backend.memory import MemoryManager
 
-        recorded = {}
-
-        async def mock_chat_completion(messages, **kwargs):
-            recorded["messages"] = messages
-            resp_json = json.dumps({
-                "valence": 0.0, "arousal_shift": 0.0, "dominance_shift": 0.0,
-                "triggered_emotions": {
-                    "joy": 0, "sadness": 0, "anger": 0, "fear": 0,
-                    "disgust": 0, "surprise": 0, "tenderness": 0,
-                    "guilt": 0, "pride": 0, "jealousy": 0, "gratitude": 0,
-                },
-            })
-            return type("Resp", (), {
-                "choices": [type("C", (), {
-                    "message": type("M", (), {"content": resp_json}),
-                })()],
-            })()
+        model = _RecordingContractModel()
 
         def mock_load_state(uid, default_timestamp=None):
             return {
@@ -1522,15 +1521,13 @@ class TestEngineGenerationPath:
 
         # Install doubles BEFORE constructing ConversationEngine
         with (
-            patch.object(GroqClientManager, "__init__", return_value=None),
             patch.object(MemoryManager, "__init__", return_value=None),
             patch("backend.memory.SentenceTransformer", return_value=MagicMock()),
         ):
-            engine = ConversationEngine(clock=lambda: 1000.0)
+            engine = ConversationEngine(
+                clock=lambda: 1000.0, language_model=model
+            )
 
-        monkeypatch.setattr(
-            engine.groq_manager, "chat_completion_async", mock_chat_completion
-        )
         monkeypatch.setattr(
             engine.memory_manager, "load_user_state", mock_load_state
         )
@@ -1555,8 +1552,8 @@ class TestEngineGenerationPath:
         )
 
         assert result is not None
-        messages = recorded.get("messages")
-        assert messages is not None, "Provider was never called"
+        assert model.generate_messages, "Contract model was never called"
+        messages = model.generate_messages[0]
 
         # Verify the envelope structure:
         # 1. System message with trusted policy
@@ -1584,26 +1581,10 @@ class TestEngineGenerationPath:
         """Context is loaded exactly once during a turn."""
         from unittest.mock import MagicMock, patch
         from backend.engine import ConversationEngine
-        from backend.groq_manager import GroqClientManager
         from backend.memory import MemoryManager
 
+        model = _RecordingContractModel()
         load_count = 0
-
-        async def mock_chat_completion(messages, **kwargs):
-            import json
-            resp_json = json.dumps({
-                "valence": 0.0, "arousal_shift": 0.0, "dominance_shift": 0.0,
-                "triggered_emotions": {
-                    "joy": 0, "sadness": 0, "anger": 0, "fear": 0,
-                    "disgust": 0, "surprise": 0, "tenderness": 0,
-                    "guilt": 0, "pride": 0, "jealousy": 0, "gratitude": 0,
-                },
-            })
-            return type("Resp", (), {
-                "choices": [type("C", (), {
-                    "message": type("M", (), {"content": resp_json}),
-                })()],
-            })()
 
         def mock_load_state(uid, default_timestamp=None):
             return {
@@ -1635,15 +1616,13 @@ class TestEngineGenerationPath:
 
         # Install doubles BEFORE constructing ConversationEngine
         with (
-            patch.object(GroqClientManager, "__init__", return_value=None),
             patch.object(MemoryManager, "__init__", return_value=None),
             patch("backend.memory.SentenceTransformer", return_value=MagicMock()),
         ):
-            engine = ConversationEngine(clock=lambda: 1000.0)
+            engine = ConversationEngine(
+                clock=lambda: 1000.0, language_model=model
+            )
 
-        monkeypatch.setattr(
-            engine.groq_manager, "chat_completion_async", mock_chat_completion
-        )
         monkeypatch.setattr(
             engine.memory_manager, "load_user_state", mock_load_state
         )
@@ -1661,13 +1640,11 @@ class TestEngineGenerationPath:
             engine.memory_manager, "sync_state", lambda *a, **kw: None
         )
 
-        await engine.process_turn(
-            user_id="u1",
-            user_message="World",
-        )
+        result = await engine.process_turn(user_id="u1", user_message="Hello")
 
-        # Context must be loaded exactly once
-        assert load_count == 1, f"Expected 1 context load, got {load_count}"
+        assert result is not None
+        assert load_count == 1, f"Context loaded {load_count} times, expected exactly 1"
+        assert model.generate_messages, "Contract model was never called"
 
 
 # ═══════════════════════════════════════════════════════════════════════

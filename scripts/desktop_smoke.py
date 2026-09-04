@@ -274,25 +274,33 @@ _PROBE_BADGE = """
 
 
 def _make_scripted_provider():
-    """Deterministic offline provider for the smoke (#336).
+    """Deterministic offline LanguageModel for the smoke (#336, #337).
 
     The smoke must never spend real Groq quota and must not depend on a
-    configured key: the provider port answers with a fixed, valid reply
-    and a neutral appraisal. It exercises the same code path (port
-    interface, envelope validation, atomic commit) with zero network.
+    configured key: the canonical LanguageModel contract answers with a
+    fixed, valid reply and a neutral appraisal. It exercises the same
+    code path (contract interface, envelope validation, atomic commit)
+    with zero network. The trusted policy is a core responsibility and
+    is never a provider capability (issue #337).
     """
-    from backend.companion_runtime import ProviderPort
     from backend.emotional_domain import AppraisalV1
 
-    class ScriptedSmokeProvider(ProviderPort):
+    class ScriptedSmokeProvider:
         async def appraise(self, message, budget):
             return AppraisalV1.neutral()
 
         async def generate(self, messages, budget):
             return "Resposta de teste do smoke local (#336)."
 
-        def build_trusted_policy(self, emotional_state, relationship, adaptation_strategy=""):
-            return "Seja você mesma, com carinho."
+        async def extract_archival(self, messages, budget):
+            return "{}"
+
+        def describe(self):
+            from backend.language_model import ModelSelection
+            return ModelSelection(
+                provider="fake", main_model_id="fake-main",
+                fast_model_id="fake-fast",
+            )
 
     return ScriptedSmokeProvider()
 

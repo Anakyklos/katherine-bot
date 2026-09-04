@@ -425,11 +425,8 @@ def test_recreate_engine_preserves_context():
         engine1.memory_manager.sync_state = MagicMock()
         
         # This test only calls get_context directly, not process_turn,
-        # so the chat_completion mock is not needed. But keep it for safety.
-        mock_chat = MagicMock()
-        mock_chat.choices = [MagicMock()]
-        mock_chat.choices[0].message.content = "Response"
-        engine1.groq_manager.chat_completion = MagicMock(return_value=mock_chat)
+        # so no language-model double is needed (issue #337: the engine
+        # has no provider manager; the seam is the LanguageModel contract).
         
         # Mock history returned from DB
         history_data = [{"role": "user", "content": "hi"}]

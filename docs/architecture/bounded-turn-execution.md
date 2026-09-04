@@ -203,6 +203,59 @@ Key points:
 - The task name (`"turn-commit"` or `"turn-commit"`) contains no user data.
 - After the post-cancel wait ends, `original_cancel` is always re-raised.
 
+## LanguageModel Boundary (issue #337)
+
+The domain (engine, `process_turn`, companion runtime, HTTP layer)
+speaks **only** to the canonical `LanguageModel` contract
+(`backend/language_model.py`):
+
+- `appraise(message, budget)` — emotional appraisal (JSON mode inside the adapter);
+- `generate(messages, budget)` — response generation;
+- `extract_archival(messages, budget)` — long-term-memory fact extraction
+  (keeps its own contracted call shape: fast model, JSON mode,
+  temperature 0, explicit token limit, `archival_extraction` stage);
+- `describe()` — sanitized provider/model identification.
+
+The contract module is provider-agnostic by construction: it carries
+only the Protocol, the sanitized selection/failure types and the
+failure → `TurnErrorCode` mapping. It deliberately contains **no
+provider registry, no `SUPPORTED_PROVIDERS` set and no dynamic
+`backend.{provider}_language_model` import convention** — the concrete
+provider choice lives exclusively in the composition roots
+(`backend/dependencies.py` on the web, `backend/desktop/app.py` on the
+desktop), which close directly over the concrete adapter builder
+(`build_groq_language_model_factory` in the Groq adapter itself).
+
+**Cancellation semantics.** `asyncio.CancelledError` is control flow,
+not a provider failure. The adapter propagates it **immediately and
+natively** — no retry, no translation into `LanguageModel*Error`, no
+second provider call after cancellation (pinned by a deterministic
+adapter test). The `ModelFailure` taxonomy therefore has no `cancelled`
+code: the dead API was removed rather than pretending to represent
+task cancellation.
+
+Groq is a first-class remote provider **behind an explicit adapter**
+(`backend/groq_language_model.py`). No Groq symbol (SDK type, manager,
+exception) crosses the adapter upward; failures surface as the canonical
+`LanguageModel*Error` taxonomy with constant sanitized messages, and the
+existing failure → `TurnErrorCode` mapping is preserved bit a bit
+(minus the removed dead `cancelled` code).
+Selection is explicit at composition time — there is **no auto-routing
+and no fallback to another provider**: a provider failure is a turn
+failure. The composition roots capture the provider keys and the
+provider-call parameters from the application settings at composition
+time (`Settings.provider_keys()` / `Settings.turn_config` on the web;
+the desktop root reads its own key source), so the adapter never
+falls back to the process environment. The ``/ready`` provider check
+consumes a small injectable ``provider_configured_probe`` bound to the
+same captured configuration — a factory's existence alone never
+reports "configured"; the probe is presence-only (no SDK instantiation,
+no inference call, no secret echo). The trusted system policy is a
+Katherine-core responsibility (`build_trusted_policy` in
+`backend/trusted_policy.py`), never a provider capability. Honest
+disclosure: the prompt content still travels to the configured remote
+provider; nothing else about the turn does.
+
 ## Groq Client Management
 
 ### Async Clients (Request-Scoped)

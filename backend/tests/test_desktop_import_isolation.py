@@ -37,9 +37,11 @@ import backend.desktop.api  # noqa: F401
 import backend.desktop.app  # noqa: F401
 import backend.local_storage.legacy_import  # noqa: F401
 
-# First-use lazy path: the provider factory's own lazy import target
-# (module only, no client construction, no network).
-from backend.companion_runtime import build_groq_runtime_provider  # noqa: F401
+# First-use lazy path: the provider wiring now lives in the desktop
+# composition root (issue #337 review), not in the runtime. Importing
+# the composition-root builder must stay SDK-free (the factory defers
+# the adapter import to first use).
+from backend.desktop.app import _build_language_model_factory  # noqa: F401
 
 print(json.dumps(sorted(sys.modules.keys())))
 """

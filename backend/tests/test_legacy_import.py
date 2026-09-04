@@ -180,6 +180,10 @@ class TestLegacyFixtureImport:
         from backend.companion_runtime import CompanionRuntime
 
         class NullProvider:
+            """LanguageModel fake (issue #337): contract seam only.
+            The trusted policy is a core function, never a provider
+            capability, so it is absent here."""
+
             def __init__(self) -> None:
                 self.calls = 0
 
@@ -189,8 +193,15 @@ class TestLegacyFixtureImport:
             async def generate(self, messages, budget):  # pragma: no cover
                 raise AssertionError("provider must not be called")
 
-            def build_trusted_policy(self, *args, **kwargs):
+            async def extract_archival(self, messages, budget):  # pragma: no cover
                 raise AssertionError("provider must not be called")
+
+            def describe(self):  # pragma: no cover
+                from backend.language_model import ModelSelection
+                return ModelSelection(
+                    provider="fake", main_model_id="fake-main",
+                    fast_model_id="fake-fast",
+                )
 
         store = open_local_storage(tmp_path / "katherine.db")
         import_legacy_fixture(store, _fixture())
@@ -200,7 +211,7 @@ class TestLegacyFixtureImport:
 
         runtime = CompanionRuntime(
             storage_path=tmp_path / "katherine.db",
-            provider=NullProvider(),
+            language_model=NullProvider(),
         )
         history = runtime.load_history(limit=50)
         contents = [m["content"] for m in history]

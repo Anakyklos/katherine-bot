@@ -495,7 +495,6 @@ class TestEngineMalformedLoadedData:
         - log only the sanitized event — never the malicious payload.
         """
         from backend.engine import ConversationEngine
-        from backend.groq_manager import GroqClientManager
         from backend.memory import MemoryManager
         from backend.turn_execution import TurnExecutionError, TurnErrorCode
 
@@ -504,12 +503,27 @@ class TestEngineMalformedLoadedData:
         groq_call_count = [0]
         generate_called = [False]
 
-        async def mock_groq(messages, **kwargs):
-            groq_call_count[0] += 1
-            resp = MagicMock()
-            resp.choices = [MagicMock()]
-            resp.choices[0].message.content = self._APPRAISAL_JSON
-            return resp
+        class _CountingModel:
+            """Contract fake that must never be called (#337)."""
+
+            async def appraise(self, message, budget):
+                groq_call_count[0] += 1
+                raise AssertionError("model must not be called")
+
+            async def generate(self, messages, budget):
+                groq_call_count[0] += 1
+                raise AssertionError("model must not be called")
+
+            async def extract_archival(self, messages, budget):
+                groq_call_count[0] += 1
+                raise AssertionError("model must not be called")
+
+            def describe(self):
+                from backend.language_model import ModelSelection
+                return ModelSelection(
+                    provider="fake", main_model_id="fake-main",
+                    fast_model_id="fake-fast",
+                )
 
         def mock_load_state(uid, default_timestamp=None):
             from backend.emotional_domain import EmotionalStateV1
@@ -540,13 +554,11 @@ class TestEngineMalformedLoadedData:
             )
 
         with (
-            patch.object(GroqClientManager, "__init__", return_value=None),
             patch.object(MemoryManager, "__init__", return_value=None),
             patch("backend.memory.SentenceTransformer", return_value=MagicMock()),
         ):
-            engine = ConversationEngine(clock=lambda: 1000.0)
+            engine = ConversationEngine(clock=lambda: 1000.0, language_model=_CountingModel())
 
-        monkeypatch.setattr(engine.groq_manager, "chat_completion_async", mock_groq)
         monkeypatch.setattr(engine.memory_manager, "load_user_state", mock_load_state)
         monkeypatch.setattr(
             engine.memory_manager, "load_context_data", mock_load_context

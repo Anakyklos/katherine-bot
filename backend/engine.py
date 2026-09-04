@@ -4,14 +4,21 @@ import time
 import logging
 from typing import Callable, Optional
 from fastapi import BackgroundTasks
-from .groq_manager import GroqClientManager, GroqPoolExhaustedError, GroqRequestError, ProviderFailure, provider_failure_to_turn_code
+from .language_model import (
+    LanguageModel,
+    LanguageModelError,
+    LanguageModelConfigurationError,
+    LanguageModelInvalidResponseError,
+    ModelFailure,
+    language_failure_to_turn_code,
+)
+from .trusted_policy import build_trusted_policy
 from .emotional_core import AffectiveEngine
 from .emotional_domain import (
     AppraisalV1,
     EmotionalStateV1,
     TransitionConfig,
     migrate_legacy_snapshot,
-    parse_llm_appraisal,
     transition,
 )
 from .emotion_presentation import project_public_emotion, EmotionStateResponse
@@ -45,9 +52,6 @@ from .turn_execution import (
     run_blocking_write,
 )
 
-from .provider_models import (
-    ProviderConfig,
-)
 from .provider_envelope import (
     ContextFitResult,
     ProviderEnvelopeError,
@@ -68,8 +72,23 @@ from .trusted_context import (
 
 logger = logging.getLogger(__name__)
 
+#: Appraisal system instruction — fixed text, never interpolated with
+#: user content. Kept identical to the previous engine/provider text so
+#: the contracted behavior is unchanged; the adapter applies JSON mode.
+_APPRAISAL_POLICY_TEXT = (
+    'Analyze the emotional impact of this message on the listener (Katherine).\n'
+    'Return JSON ONLY:\n'
+    '{"valence": -1.0 to 1.0, "arousal_shift": -1.0 to 1.0, '
+    '"dominance_shift": -1.0 to 1.0, '
+    '"triggered_emotions": {"joy": 0-1, "sadness": 0-1, "anger": 0-1, '
+    '"fear": 0-1, "disgust": 0-1, "surprise": 0-1, "tenderness": 0-1, '
+    '"guilt": 0-1, "pride": 0-1, "jealousy": 0-1, "gratitude": 0-1}}'
+)
+
 
 class ConversationEngine:
+    """Conversation engine; the provider seam is the LanguageModel contract."""
+
     def __init__(
         self,
         clock=time.time,
@@ -77,18 +96,31 @@ class ConversationEngine:
         embeddings_enabled: bool = False,
         turn_config: Optional[TurnExecutionConfig] = None,
         *,
-        groq_keys: Optional[list] = None,
+        language_model: Optional[LanguageModel] = None,
+        language_model_factory: Optional[Callable[[], LanguageModel]] = None,
         supabase_factory: Optional[Callable[[], Optional[object]]] = None,
+        provider_configured_probe: Optional[Callable[[], bool]] = None,
     ):
+        """``language_model`` is the canonical LanguageModel contract
+        instance (injected by the composition root or tests).  A lazy
+        ``language_model_factory`` may be given instead — the model is
+        then built on first provider use, never at import/startup time.
+        There is no default remote construction here: callers wire an
+        explicit adapter (today the Groq one) through the contract."""
+        if language_model is not None and language_model_factory is not None:
+            raise ValueError("pass language_model or language_model_factory, not both")
         self._clock = clock
         self._monotonic = time.monotonic
         self._turn_config = turn_config or TurnExecutionConfig.defaults()
         self.archival_extraction_enabled = archival_extraction_enabled
-        groq_params = self._turn_config.to_groq_params()
-        self.groq_manager = GroqClientManager(
-            groq_params=groq_params,
-            keys=groq_keys,
-        )
+        self._language_model: Optional[LanguageModel] = language_model
+        self._language_model_factory = language_model_factory
+        # Readiness probe (issue #337 review): a factory's *existence* is
+        # not evidence of valid configuration. The composition root
+        # injects a cheap, pure probe bound to the same captured
+        # configuration the adapter will use (presence-only, no SDK
+        # instantiation, no inference call, no secret echo).
+        self._provider_configured_probe = provider_configured_probe
         self.presentation = AffectiveEngine()
         self.transition_config = TransitionConfig.defaults()
         self.memory_manager = MemoryManager(
@@ -99,7 +131,6 @@ class ConversationEngine:
         )
         self.relationship_config = RelationshipTransitionConfig.defaults()
         self.lock_manager = UserLockManager()
-        self.provider_config = ProviderConfig()
 
     async def run_archival_extraction(self, turn_ref: PersistedTurnRef):
         if not self.archival_extraction_enabled:
@@ -187,14 +218,12 @@ class ConversationEngine:
                     logger.error("Event: archival_extraction_budget_exceeded")
                     return
 
-        # Step 2: Run LLM extraction via async path with own budget
+        # Step 2: Run LLM extraction through the LanguageModel contract
+        # with its own bounded budget. ``extract_archival`` keeps the exact
+        # contracted call shape (fast model, JSON mode, temperature 0,
+        # explicit token limit) inside the adapter.
         try:
-            chat_completion = await self.groq_manager.chat_completion_async(
-                messages=archival_messages,
-                model=self.provider_config.fast_model_id, budget=budget, stage="archival_extraction",
-                temperature=0.0, max_tokens=self.provider_config.archival_max_output_tokens, response_format={"type": "json_object"},
-            )
-            response_text = chat_completion.choices[0].message.content
+            response_text = await self.extract_archival(archival_messages, budget)
         except Exception:
             logger.error("Event: archival_extraction_llm_failed")
             return
@@ -236,9 +265,44 @@ class ConversationEngine:
     def _project_emotion_state(state: EmotionalStateV1, appraisal: AppraisalV1) -> EmotionStateResponse:
         return project_public_emotion(state, appraisal)
 
-    # ─── ProcessTurn provider port (#272) ──────────────────────────────────────
-    # Public surface used by the ProcessTurn use case so provider calls stay
-    # outside the transaction while keeping the domain logic unchanged.
+    # ─── LanguageModel contract surface (#337) ──────────────────────────────────
+    # The engine IS a LanguageModel consumer and provider-port: the
+    # ProcessTurn use case and the archival path speak to it, while the
+    # engine delegates the actual remote call to the injected contract
+    # implementation (adapter). No provider SDK is visible here.
+
+    def _model(self) -> LanguageModel:
+        """Return the injected model, building it lazily on first use."""
+        if self._language_model is None:
+            if self._language_model_factory is not None:
+                self._language_model = self._language_model_factory()
+            else:
+                raise LanguageModelConfigurationError()
+        return self._language_model
+
+    def provider_status(self) -> bool:
+        """Cheap, sanitized provider-configured probe for health checks.
+
+        Presence only: never instantiates the remote client, never runs
+        an inference call, and never echoes any key material. The
+        composition root injects ``provider_configured_probe`` bound to
+        the same captured configuration the adapter will use; a missing
+        probe means "not wired", not "configured". An unconfigured
+        provider is a turn-time configuration failure, not a startup
+        failure.
+        """
+        if self._language_model is not None:
+            return True
+        if self._provider_configured_probe is not None:
+            try:
+                return bool(self._provider_configured_probe())
+            except Exception:  # noqa: BLE001 (probe must never raise)
+                return False
+        return False
+
+    def is_provider_configured(self) -> bool:
+        """Backward-compatible alias used by health checks."""
+        return self.provider_status()
 
     async def appraise(self, message: str, budget: TurnBudget) -> AppraisalV1:
         """Public appraisal port for the ProcessTurn use case."""
@@ -248,16 +312,39 @@ class ConversationEngine:
         """Public generation port for the ProcessTurn use case."""
         return await self._generate_with_messages(messages, budget)
 
+    async def extract_archival(self, messages: list, budget: TurnBudget) -> str:
+        """Public archival-extraction port — full contract surface.
+
+        Issue #337 second review: the engine facade passed to
+        ``build_process_turn`` as ``provider: LanguageModel`` must
+        satisfy the *complete* Protocol, not a subset. This is a pure
+        delegation to the injected model (same call shape the adapter
+        applies), and ``run_archival_extraction`` itself goes through
+        it so the facade is the single path.
+        """
+        return await self._model().extract_archival(messages, budget)
+
     def build_trusted_policy(
         self,
         emotional_state: EmotionalStateV1,
         relationship: RelationshipStateV1,
         adaptation_strategy: str = "",
     ) -> str:
-        """Public trusted-policy builder for the ProcessTurn use case."""
-        return self._build_trusted_policy(
-            emotional_state, relationship, adaptation_strategy
+        """Public trusted-policy builder for the ProcessTurn use case.
+
+        Delegates to the canonical core builder (issue #337): the
+        trusted policy is Katherine's responsibility, not the
+        provider's."""
+        return build_trusted_policy(
+            emotional_state,
+            relationship,
+            adaptation_strategy,
+            presentation=self.presentation,
         )
+
+    def describe(self):
+        """Sanitized provider/model identification (contract surface)."""
+        return self._model().describe()
 
     @staticmethod
     def _classify_commit_error(
@@ -429,22 +516,18 @@ class ConversationEngine:
                 code=exc.code, duration_ms=duration_ms,
             ))
             raise
-        except GroqPoolExhaustedError as exc:
+        except LanguageModelError as exc:
             duration_ms = (self._monotonic() - t0) * 1000
-            turn_code: Optional[TurnErrorCode] = None
+            turn_code: Optional[TurnErrorCode] = language_failure_to_turn_code(exc.failure)
             outcome = StageOutcome.failed
-            if exc.failure_code is not None:
-                turn_code = provider_failure_to_turn_code(exc.failure_code)
-                if exc.failure_code == ProviderFailure.timeout:
-                    outcome = StageOutcome.timeout
-                elif exc.failure_code == ProviderFailure.cancelled:
-                    outcome = StageOutcome.cancelled
+            if exc.failure == ModelFailure.timeout:
+                outcome = StageOutcome.timeout
             await self._emit_stage_event(StageEvent(
                 stage=TurnStage.appraisal, outcome=outcome,
                 code=turn_code, duration_ms=duration_ms,
             ))
-            raise
-        except GroqRequestError:
+            raise TurnExecutionError(turn_code, "Appraisal provider request failed.")
+        except LanguageModelConfigurationError:
             duration_ms = (self._monotonic() - t0) * 1000
             await self._emit_stage_event(StageEvent(
                 stage=TurnStage.appraisal, outcome=StageOutcome.failed,
@@ -483,8 +566,9 @@ class ConversationEngine:
         adaptation_strategy = ""
 
         # Build the trusted policy using the engine's own emotional presentation
-        trusted_policy = self._build_trusted_policy(
-            new_state, relationship, adaptation_strategy
+        trusted_policy = build_trusted_policy(
+            new_state, relationship, adaptation_strategy,
+            presentation=self.presentation,
         )
 
         # Convert loaded context into bundle and build envelope (pure domain, no I/O).
@@ -522,22 +606,18 @@ class ConversationEngine:
                 code=exc.code, duration_ms=duration_ms,
             ))
             raise
-        except GroqPoolExhaustedError as exc:
+        except LanguageModelError as exc:
             duration_ms = (self._monotonic() - t0) * 1000
-            turn_code: Optional[TurnErrorCode] = None
+            turn_code = language_failure_to_turn_code(exc.failure)
             outcome = StageOutcome.failed
-            if exc.failure_code is not None:
-                turn_code = provider_failure_to_turn_code(exc.failure_code)
-                if exc.failure_code == ProviderFailure.timeout:
-                    outcome = StageOutcome.timeout
-                elif exc.failure_code == ProviderFailure.cancelled:
-                    outcome = StageOutcome.cancelled
+            if exc.failure == ModelFailure.timeout:
+                outcome = StageOutcome.timeout
             await self._emit_stage_event(StageEvent(
                 stage=TurnStage.generation, outcome=outcome,
                 code=turn_code, duration_ms=duration_ms,
             ))
-            raise
-        except GroqRequestError:
+            raise TurnExecutionError(turn_code, "Generation provider request failed.")
+        except LanguageModelConfigurationError:
             duration_ms = (self._monotonic() - t0) * 1000
             await self._emit_stage_event(StageEvent(
                 stage=TurnStage.generation, outcome=StageOutcome.failed,
@@ -666,18 +746,11 @@ User message: "{user_message}"
     async def _appraise(self, message: str, budget: TurnBudget) -> AppraisalV1:
         # Appraisal uses separate system instruction and user message.
         # The instruction is not interpolated with the message content.
-        appraisal_policy = (
-            'Analyze the emotional impact of this message on the listener (Katherine).\n'
-            'Return JSON ONLY:\n'
-            '{"valence": -1.0 to 1.0, "arousal_shift": -1.0 to 1.0, '
-            '"dominance_shift": -1.0 to 1.0, '
-            '"triggered_emotions": {"joy": 0-1, "sadness": 0-1, "anger": 0-1, '
-            '"fear": 0-1, "disgust": 0-1, "surprise": 0-1, "tenderness": 0-1, '
-            '"guilt": 0-1, "pride": 0-1, "jealousy": 0-1, "gratitude": 0-1}}'
-        )
+        # The remote call goes through the injected LanguageModel
+        # contract; no provider SDK is visible in the engine.
         try:
             messages = [
-                {"role": "system", "content": appraisal_policy},
+                {"role": "system", "content": _APPRAISAL_POLICY_TEXT},
                 {"role": "user", "content": message},
             ]
             # Validate envelope BEFORE any client creation, key acquisition,
@@ -693,27 +766,15 @@ User message: "{user_message}"
                     "Provider input budget exceeded.",
                 )
 
-            response = await self.groq_manager.chat_completion_async(
-                messages=messages,
-                model=self.provider_config.fast_model_id, budget=budget, stage="appraisal",
-                temperature=0, max_tokens=self.provider_config.appraisal_max_output_tokens, response_format={"type": "json_object"},
-            )
-            raw = response.choices[0].message.content
-            if not raw or not isinstance(raw, str) or not raw.strip():
-                raise TurnExecutionError(TurnErrorCode.provider_invalid_response, "Empty appraisal response.")
-            raw_dict = json.loads(raw)
-        except json.JSONDecodeError:
-            raise TurnExecutionError(TurnErrorCode.provider_invalid_response, "Invalid JSON from appraisal.")
-        except TurnExecutionError:
-            raise
-        except GroqPoolExhaustedError:
-            raise
-
-        parse_result = parse_llm_appraisal(raw_dict)
-        if parse_result.is_fallback:
-            logger.info(f"event=emotional_appraisal_fallback code={parse_result.error_code.value}")
+            raw = await self._model().appraise(message, budget)
+        except LanguageModelInvalidResponseError:
             raise TurnExecutionError(TurnErrorCode.provider_invalid_response, "Invalid appraisal.")
-        return parse_result.appraisal
+        except LanguageModelError as exc:
+            raise TurnExecutionError(
+                language_failure_to_turn_code(exc.failure),
+                "Appraisal provider request failed.",
+            )
+        return raw
 
     async def _generate(self, system_prompt: str, user_message: str, budget: TurnBudget) -> str:
         """Backward-compatible generation with a pre-built system prompt."""
@@ -726,6 +787,7 @@ User message: "{user_message}"
         The messages list is validated before sending to the provider.
         Local validation failures are converted to ``TurnExecutionError``
         with ``provider_invalid_request``, never reaching the provider.
+        The remote call goes through the injected LanguageModel contract.
         """
         try:
             # Validate locally before any provider call
@@ -738,25 +800,12 @@ User message: "{user_message}"
                     "Provider input budget exceeded.",
                 )
 
-            response = await self.groq_manager.chat_completion_async(
-                messages=messages,
-                model=self.provider_config.main_model_id, budget=budget, stage="generation",
-                temperature=0.8, max_tokens=self.provider_config.main_max_output_tokens,
+            return await self._model().generate(messages, budget)
+        except LanguageModelError as exc:
+            raise TurnExecutionError(
+                language_failure_to_turn_code(exc.failure),
+                "Generation provider request failed.",
             )
-        except GroqPoolExhaustedError:
-            raise
-        except GroqRequestError:
-            raise TurnExecutionError(TurnErrorCode.provider_unavailable, "Generation provider request failed.")
-
-        try:
-            content = response.choices[0].message.content
-        except (IndexError, AttributeError):
-            raise TurnExecutionError(TurnErrorCode.provider_invalid_response, "Empty generation response.")
-
-        if not content or not isinstance(content, str) or not content.strip():
-            raise TurnExecutionError(TurnErrorCode.provider_invalid_response, "Empty generation response.")
-
-        return content
 
     def _build_system_prompt(self, emotion_state, context, relationship, adaptation_strategy=""):
         """Build a full system prompt with pre-assembled context.

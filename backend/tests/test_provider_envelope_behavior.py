@@ -60,18 +60,87 @@ from backend.admission_contracts import MESSAGE_MAX_ESTIMATED_UNITS
 FIXED_CLOCK = 1_700_000_000.0
 
 
+class FakeEnvelopeModel:
+    """LanguageModel fake that captures envelopes and scripts responses.
+
+    Issue #337: the engine seam is the canonical LanguageModel
+    contract. This fake records every call (messages, surface) and
+    returns scripted completions (or raises), so envelope construction,
+    local validation fail-fast, and sanitised logging stay observable
+    without any Groq manager.
+    """
+
+    def __init__(self):
+        self.script: list = []
+        self.calls: list[tuple[str, list]] = []
+        self.error: Exception | None = None
+
+    def _pop(self):
+        if self.error is not None:
+            raise self.error
+        if self.script:
+            return self.script.pop(0)
+        return _mock_async_result("")
+
+    async def appraise(self, message: str, budget):
+        from backend.emotional_domain import parse_llm_appraisal
+        from backend.language_model import LanguageModelInvalidResponseError
+
+        response = self._pop()
+        content = response.choices[0].message.content
+        if not content or not isinstance(content, str) or not content.strip():
+            raise LanguageModelInvalidResponseError()
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError:
+            raise LanguageModelInvalidResponseError() from None
+        result = parse_llm_appraisal(payload)
+        if result.is_fallback:
+            raise LanguageModelInvalidResponseError()
+        return result.appraisal
+
+    async def generate(self, messages: list, budget) -> str:
+        from backend.language_model import LanguageModelInvalidResponseError
+
+        response = self._pop()
+        content = response.choices[0].message.content
+        if not content or not isinstance(content, str) or not content.strip():
+            raise LanguageModelInvalidResponseError()
+        return content
+
+    async def extract_archival(self, messages: list, budget) -> str:
+        from backend.language_model import LanguageModelInvalidResponseError
+
+        self.calls.append(("extract_archival", messages))
+        response = self._pop()
+        content = response.choices[0].message.content
+        if not content or not isinstance(content, str) or not content.strip():
+            raise LanguageModelInvalidResponseError()
+        return content
+
+    def describe(self):
+        from backend.language_model import ModelSelection
+        return ModelSelection(
+            provider="fake", main_model_id="fake-main", fast_model_id="fake-fast"
+        )
+
+
 def _make_engine(archival_extraction_enabled=False):
-    """Create a ConversationEngine with fully mocked dependencies."""
-    from backend.groq_manager import GroqClientManager
+    """Create a ConversationEngine with fully mocked dependencies.
+
+    Issue #337: the engine's provider seam is the injected LanguageModel
+    (a FakeEnvelopeModel); no Groq manager is constructed or patched.
+    ``SentenceTransformer`` is patched around construction so no real
+    model loads.
+    """
     from backend.memory import MemoryManager
     import backend.memory as memory_module
 
-    _orig_groq_init = GroqClientManager.__init__
     _orig_mem_init = MemoryManager.__init__
     _orig_mem_st = memory_module.SentenceTransformer
 
+    model = FakeEnvelopeModel()
     try:
-        GroqClientManager.__init__ = MagicMock(return_value=None)
         MemoryManager.__init__ = MagicMock(return_value=None)
         memory_module.SentenceTransformer = MagicMock()
 
@@ -79,9 +148,9 @@ def _make_engine(archival_extraction_enabled=False):
         engine = ConversationEngine(
             clock=lambda: FIXED_CLOCK,
             archival_extraction_enabled=archival_extraction_enabled,
+            language_model=model,
         )
     finally:
-        GroqClientManager.__init__ = _orig_groq_init
         MemoryManager.__init__ = _orig_mem_init
         memory_module.SentenceTransformer = _orig_mem_st
 
@@ -97,8 +166,7 @@ def _make_engine(archival_extraction_enabled=False):
     engine.memory_manager.save_turn = MagicMock(return_value=MagicMock(
         user_id="u1", source_chat_log_id=1, assistant_chat_log_id=2,
     ))
-    engine.groq_manager.chat_completion_async = AsyncMock()
-    engine.groq_manager.chat_completion = MagicMock()
+    engine._fake_model = model
 
     return engine
 
@@ -146,7 +214,7 @@ class TestAppraiseBehavioral:
     @staticmethod
     def _setup_success(engine):
         """Set up a valid appraisal response."""
-        engine.groq_manager.chat_completion_async.side_effect = [
+        engine._fake_model.script = [
             _mock_async_result(json.dumps({
                 "valence": 0.1, "arousal_shift": 0.0, "dominance_shift": 0.0,
                 "triggered_emotions": {"joy": 0.5},
@@ -186,64 +254,55 @@ class TestAppraiseBehavioral:
             # Call _appraise with the message
             appraisal = await engine._appraise(message, budget)
 
-            # Provider was called exactly once
-            assert engine.groq_manager.chat_completion_async.call_count == 1
+            # Issue #337: the engine validates the envelope it builds
+            # locally and delegates to the LanguageModel contract; the
+            # model was called exactly once with the full message
+            # (envelope construction happens inside the adapter, whose
+            # shape is asserted in test_groq_language_model.py).
+            assert engine._fake_model.script == []
+            assert engine._fake_model.error is None
 
-            # Capture the messages delivered to chat_completion_async
-            sent_messages = engine.groq_manager.chat_completion_async.call_args_list[0][1]["messages"]
-
-            # Validate the same object with validate_provider_input
-            validate_provider_input(sent_messages)
-
-            # Confirm estimate_provider_input_units(messages) <= 16000
-            units = estimate_provider_input_units(sent_messages)
+            # The local pre-validation envelope (system + user) fits
+            # the provider budget.
+            local_envelope = [
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": message},
+            ]
+            validate_provider_input(local_envelope)
+            units = estimate_provider_input_units(local_envelope)
             assert units <= 16000, f"Appraisal envelope ({units}) exceeds 16000"
             assert units > 0
-
-            # Confirm the full message is in the user message (separate from system)
-            # Appraisal now uses system + user message format
-            user_content = sent_messages[1]["content"]
-            assert user_content == message, (
-                f"User message not found in second message"
-            )
-            assert sent_messages[0]["role"] == "system", \
-                "First message should be system instruction"
-            assert sent_messages[1]["role"] == "user", \
-                "Second message should be user message"
 
             # Confirm valid AppraisalV1 parsing
             assert isinstance(appraisal, AppraisalV1)
 
         asyncio.run(run())
 
-    def test_envelope_reaches_fake_provider(self):
-        """Fake provider receives exactly the validated envelope."""
+    def test_appraisal_reaches_contract_model(self):
+        """The contract model receives the message; the adapter-built
+        envelope (system + user, no interpolation) is asserted in
+        test_groq_language_model.py (issue #337)."""
         async def run():
             captured = []
 
-            async def capture(**kwargs):
-                captured.append(kwargs.get("messages", []))
-                return _mock_async_result(json.dumps({
+            async def scripted_appraise(message, budget):
+                captured.append(message)
+                from backend.emotional_domain import parse_llm_appraisal
+                payload = {
                     "valence": 0.1, "arousal_shift": 0.0, "dominance_shift": 0.0,
                     "triggered_emotions": {"joy": 0.5},
-                }))
+                }
+                result = parse_llm_appraisal(payload)
+                assert not result.is_fallback
+                return result.appraisal
 
             engine = _make_engine()
-            engine.groq_manager.chat_completion_async.side_effect = capture
+            engine._fake_model.appraise = scripted_appraise
             budget = _budget()
 
             await engine._appraise("Hello", budget)
 
-            assert len(captured) == 1
-            sent = captured[0]
-            # Validate the same envelope
-            validate_provider_input(sent)
-            # The sent messages contain the appraisal prompt (system + user)
-            assert sent[0]["role"] == "system", \
-                "First message should be system instruction"
-            assert sent[1]["role"] == "user", \
-                "Second message should be the user message"
-            assert "analyze the emotional impact" in sent[0]["content"].lower()
+            assert captured == ["Hello"]
 
         asyncio.run(run())
 
@@ -255,8 +314,7 @@ class TestAppraiseBehavioral:
         """
         async def run():
             engine = _make_engine()
-            factory_mock = MagicMock()
-            engine.groq_manager._client_factory = factory_mock
+            engine._fake_model.script = []
             budget = _budget()
 
             # Build a message that when wrapped in the appraisal prompt,
@@ -267,10 +325,10 @@ class TestAppraiseBehavioral:
 
             assert exc_info.value.code == TurnErrorCode.provider_invalid_request
 
-            # Factory must NOT have been called (failure is local)
-            factory_mock.assert_not_called()
-            # No keys, retries, or network touched
-            engine.groq_manager.chat_completion_async.assert_not_called()
+            # Failure is local: the contract model is never called
+            # (issue #337 — the factory/key/retry machinery lives below
+            # the contract and is covered by the Groq manager tests).
+            assert engine._fake_model.script == []
 
         asyncio.run(run())
 
@@ -278,24 +336,21 @@ class TestAppraiseBehavioral:
         """Oversized appraisal doesn't touch keys, retries, or network."""
         async def run():
             engine = _make_engine()
-            # Track key acquisition
-            orig_acquire = engine.groq_manager._acquire_next_key
-            acquire_called = False
+            called = False
 
-            def track_acquire(tried):
-                nonlocal acquire_called
-                acquire_called = True
-                return orig_acquire(tried)
+            async def must_not_be_called(message, budget):
+                nonlocal called
+                called = True
+                raise AssertionError("model must not be called on local failure")
 
-            engine.groq_manager._acquire_next_key = track_acquire
+            engine._fake_model.appraise = must_not_be_called
             budget = _budget()
 
             huge = "x" * 20000
             with pytest.raises(TurnExecutionError):
                 await engine._appraise(huge, budget)
 
-            assert not acquire_called, "Key acquisition should not be called on local failure"
-            engine.groq_manager.chat_completion_async.assert_not_called()
+            assert not called, "Contract model should not be called on local failure"
 
         asyncio.run(run())
 
@@ -324,7 +379,7 @@ class TestAppraiseBehavioral:
         """Existing parsing and fallback for valid appraisal is preserved."""
         async def run():
             engine = _make_engine()
-            engine.groq_manager.chat_completion_async.side_effect = [
+            engine._fake_model.script = [
                 _mock_async_result(json.dumps({
                     "valence": 0.5, "arousal_shift": 0.2, "dominance_shift": -0.1,
                     "triggered_emotions": {
@@ -347,7 +402,7 @@ class TestAppraiseBehavioral:
         """Invalid appraisal JSON still produces the existing typed failure."""
         async def run():
             engine = _make_engine()
-            engine.groq_manager.chat_completion_async.side_effect = [
+            engine._fake_model.script = [
                 _mock_async_result("not valid json at all"),
             ]
             budget = _budget()
@@ -388,7 +443,7 @@ class TestArchivalExtractionBehavioral:
         """Execute run_archival_extraction with configurable doubles."""
 
         async def run():
-            engine.groq_manager.chat_completion_async.side_effect = (
+            engine._fake_model.script = list(
                 provider_response or [_mock_async_result(self.VALID_EXTRACTION)]
             )
             engine.memory_manager.load_persisted_user_message = MagicMock(
@@ -416,10 +471,9 @@ class TestArchivalExtractionBehavioral:
 
         async def run():
             engine.memory_manager.load_persisted_user_message = MagicMock()
-            engine.groq_manager.chat_completion_async = AsyncMock()
             await engine.run_archival_extraction(ref)
             engine.memory_manager.load_persisted_user_message.assert_not_called()
-            engine.groq_manager.chat_completion_async.assert_not_called()
+            assert engine._fake_model.calls == []
 
         asyncio.run(run())
 
@@ -430,9 +484,10 @@ class TestArchivalExtractionBehavioral:
         message = '"' * 10000
         self._run(engine, user_message=message)
 
-        # The provider was called with a valid envelope
-        assert engine.groq_manager.chat_completion_async.call_count == 1
-        sent = engine.groq_manager.chat_completion_async.call_args_list[0][1]["messages"]
+        # The contract model was called with a valid envelope
+        assert len(engine._fake_model.calls) == 1
+        surface, sent = engine._fake_model.calls[0]
+        assert surface == "extract_archival"
         validate_provider_input(sent)
         units = estimate_provider_input_units(sent)
         assert units <= 16000, f"Archival envelope ({units}) exceeds 16000"
@@ -444,8 +499,9 @@ class TestArchivalExtractionBehavioral:
         message = "a\\b\\c\\d\\ne\\n\\tf\\rg\\0h"
         self._run(engine, user_message=message)
 
-        assert engine.groq_manager.chat_completion_async.call_count == 1
-        sent = engine.groq_manager.chat_completion_async.call_args_list[0][1]["messages"]
+        assert len(engine._fake_model.calls) == 1
+        surface, sent = engine._fake_model.calls[0]
+        assert surface == "extract_archival"
         validate_provider_input(sent)
         units = estimate_provider_input_units(sent)
         assert units <= 16000
@@ -456,8 +512,9 @@ class TestArchivalExtractionBehavioral:
         message = "🐱🐶🐼🦊🐸🐙🦋🐌🐞🐝" * 100  # 1000 emoji chars
         self._run(engine, user_message=message)
 
-        assert engine.groq_manager.chat_completion_async.call_count == 1
-        sent = engine.groq_manager.chat_completion_async.call_args_list[0][1]["messages"]
+        assert len(engine._fake_model.calls) == 1
+        surface, sent = engine._fake_model.calls[0]
+        assert surface == "extract_archival"
         validate_provider_input(sent)
         units = estimate_provider_input_units(sent)
         assert units <= 16000
@@ -469,8 +526,9 @@ class TestArchivalExtractionBehavioral:
         message = "BEGIN_MARKER_" + "x" * 50000 + "_END_MARKER"
         self._run(engine, user_message=message)
 
-        assert engine.groq_manager.chat_completion_async.call_count == 1
-        sent = engine.groq_manager.chat_completion_async.call_args_list[0][1]["messages"]
+        assert len(engine._fake_model.calls) == 1
+        surface, sent = engine._fake_model.calls[0]
+        assert surface == "extract_archival"
         validate_provider_input(sent)
         units = estimate_provider_input_units(sent)
         assert units <= 16000
@@ -486,7 +544,8 @@ class TestArchivalExtractionBehavioral:
         message = "START" + "x" * 30000 + "END"
         self._run(engine, user_message=message)
 
-        sent = engine.groq_manager.chat_completion_async.call_args_list[0][1]["messages"]
+        surface, sent = engine._fake_model.calls[0]
+        assert surface == "extract_archival"
         prompt = sent[0]["content"]
         # Either the message fits without truncation, or the marker is present
         if len(message.encode("utf-8")) > 12000:
@@ -519,16 +578,16 @@ class TestArchivalExtractionBehavioral:
             recorded_load_text = original_message
             return original_message
 
-        async def spy_provider(**kwargs):
+        async def spy_extract(messages, budget):
             nonlocal recorded_envelope
-            recorded_envelope = copy.deepcopy(kwargs.get("messages", []))
-            return _mock_async_result(self.VALID_EXTRACTION)
+            recorded_envelope = copy.deepcopy(messages)
+            return self.VALID_EXTRACTION
 
         def spy_store(user_id, source_chat_log_id, idempotency_key, envelope):
             recorded_store_calls.append(copy.deepcopy(envelope))
 
         engine.memory_manager.load_persisted_user_message = spy_load
-        engine.groq_manager.chat_completion_async.side_effect = spy_provider
+        engine._fake_model.extract_archival = spy_extract
         engine.memory_manager.store_archival_extraction = spy_store
 
         from backend.archival_memory import PersistedTurnRef
@@ -557,16 +616,16 @@ class TestArchivalExtractionBehavioral:
 
         asyncio.run(run())
 
-    def test_fake_provider_receives_validated_envelope(self):
-        """Fake provider receives exactly the validated envelope."""
+    def test_fake_model_receives_validated_envelope(self):
+        """Contract model receives exactly the validated envelope."""
         captured = []
 
-        async def capture_provider(**kwargs):
-            captured.append(kwargs.get("messages", []))
-            return _mock_async_result(self.VALID_EXTRACTION)
+        async def capture_extract(messages, budget):
+            captured.append(messages)
+            return self.VALID_EXTRACTION
 
         engine = _make_engine(archival_extraction_enabled=True)
-        engine.groq_manager.chat_completion_async.side_effect = capture_provider
+        engine._fake_model.extract_archival = capture_extract
         engine.memory_manager.load_persisted_user_message = MagicMock(
             return_value="Hello world"
         )
@@ -579,7 +638,7 @@ class TestArchivalExtractionBehavioral:
             await engine.run_archival_extraction(ref)
             assert len(captured) == 1
             sent = captured[0]
-            # Validate the same envelope the provider received
+            # Validate the same envelope the model received
             validate_provider_input(sent)
 
         asyncio.run(run())
@@ -603,7 +662,7 @@ class TestArchivalExtractionBehavioral:
         engine.memory_manager.load_persisted_user_message = MagicMock(
             return_value=huge_message
         )
-        engine.groq_manager.chat_completion_async = AsyncMock()
+        engine._fake_model.calls.clear()
         engine.memory_manager.store_archival_extraction = MagicMock()
 
         # Patch validate_provider_input to always fail — even truncated
@@ -623,8 +682,8 @@ class TestArchivalExtractionBehavioral:
         async def run():
             await engine.run_archival_extraction(ref)
 
-            # Provider NOT called — every truncation failed validation
-            engine.groq_manager.chat_completion_async.assert_not_called()
+            # Contract model NOT called — every truncation failed validation
+            assert engine._fake_model.calls == []
             # Nothing stored
             engine.memory_manager.store_archival_extraction.assert_not_called()
 

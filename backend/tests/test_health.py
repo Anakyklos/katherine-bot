@@ -89,7 +89,7 @@ def _deps_with_checks(checks):
 
     engine = SimpleNamespace(
         memory_manager=SimpleNamespace(supabase=object()),
-        groq_manager=SimpleNamespace(is_configured=lambda: True),
+        is_provider_configured=lambda: True,
     )
     return main_module.ApplicationDependencies(
         conversation_engine=engine,
@@ -595,7 +595,7 @@ def test_default_registry_component_set_and_order():
     settings = _settings()
     engine = SimpleNamespace(
         memory_manager=SimpleNamespace(embedding_model=object(), supabase=object()),
-        groq_manager=SimpleNamespace(is_configured=lambda: True),
+        is_provider_configured=lambda: True,
     )
     registry = build_health_registry(
         settings,
@@ -618,7 +618,7 @@ def test_default_registry_includes_embeddings_only_when_retrieval_enabled():
     settings = _settings(embeddings_retrieval_enabled=True)
     engine = SimpleNamespace(
         memory_manager=SimpleNamespace(embedding_model=object(), supabase=object()),
-        groq_manager=SimpleNamespace(is_configured=lambda: True),
+        is_provider_configured=lambda: True,
     )
     registry = build_health_registry(
         settings,
@@ -730,7 +730,7 @@ def _auth_ready_client(auth_probe):
     settings = _settings()
     engine = SimpleNamespace(
         memory_manager=SimpleNamespace(embedding_model=object(), supabase=object()),
-        groq_manager=SimpleNamespace(is_configured=lambda: True),
+        is_provider_configured=lambda: True,
     )
     registry = build_health_registry(
         settings,
@@ -857,7 +857,7 @@ def test_auth_and_persistence_surfaces_are_independent():
     settings = _settings()
     engine = SimpleNamespace(
         memory_manager=SimpleNamespace(embedding_model=object(), supabase=object()),
-        groq_manager=SimpleNamespace(is_configured=lambda: True),
+        is_provider_configured=lambda: True,
     )
     auth = _ok_auth_client()
     persistence = _OkProbeClient()
@@ -908,7 +908,7 @@ def _embeddings_client(retrieval_enabled: bool, model_available: bool):
             embedding_model=object() if model_available else None,
             supabase=object(),
         ),
-        groq_manager=SimpleNamespace(is_configured=lambda: True),
+        is_provider_configured=lambda: True,
     )
     registry = build_health_registry(
         settings,

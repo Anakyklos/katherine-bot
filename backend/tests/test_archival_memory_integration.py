@@ -132,14 +132,60 @@ class MockAuthResponse:
         self.user = user
 
 
+class FakeArchivalModel:
+    """LanguageModel fake for archival tests (issue #337).
+
+    ``extract_archival`` returns the scripted archival extraction JSON
+    (or raises), ``generate`` returns the scripted turn reply,
+    ``appraise`` returns a neutral appraisal. No Groq SDK objects are
+    constructed.
+    """
+
+    def __init__(self, generate_result=None, generate_error=None):
+        self.generate_result = generate_result
+        self.generate_error = generate_error
+        self.generate_calls = 0
+        self.extract_calls = 0
+
+    async def appraise(self, message: str, budget):
+        from backend.emotional_domain import AppraisalV1
+        return AppraisalV1.neutral()
+
+    async def generate(self, messages: list, budget) -> str:
+        self.generate_calls += 1
+        return self.generate_result
+
+    async def extract_archival(self, messages: list, budget) -> str:
+        self.extract_calls += 1
+        if self.generate_error is not None:
+            raise self.generate_error
+        return self.generate_result
+
+    def describe(self):
+        from backend.language_model import ModelSelection
+        return ModelSelection(
+            provider="fake",
+            main_model_id="fake-main",
+            fast_model_id="fake-fast",
+        )
+
+
+def _fact_payload_json() -> str:
+    return json.dumps({
+        "facts": [{"content": "likes coding", "importance": 0.9, "tags": []}],
+        "schema_version": 1,
+        "extractor_version": 1
+    })
+
+
 @pytest.mark.anyio
 async def test_run_archival_extraction_llm_failure(backend, caplog):
-    engine = backend.ConversationEngine(archival_extraction_enabled=True)
+    model = FakeArchivalModel(generate_error=Exception("provider error"))
+    engine = backend.ConversationEngine(
+        archival_extraction_enabled=True, language_model=model
+    )
     engine.memory_manager = MagicMock()
     engine.memory_manager.load_persisted_user_message = MagicMock(return_value="Hello")
-    
-    # Mock Groq client failure
-    engine.groq_manager.chat_completion_async = MagicMock(side_effect=Exception("Groq error"))
     
     ref = backend.PersistedTurnRef(user_id="user123", source_chat_log_id=1, assistant_chat_log_id=2)
     
@@ -150,25 +196,20 @@ async def test_run_archival_extraction_llm_failure(backend, caplog):
     # Check sensitive values are not logged
     assert "user123" not in caplog.text
     assert "Hello" not in caplog.text
-    assert "Groq error" not in caplog.text
+    assert "provider error" not in caplog.text
     engine.memory_manager.store_archival_extraction.assert_not_called()
 
 
 @pytest.mark.anyio
 async def test_run_archival_extraction_validation_failure(backend, caplog):
-    engine = backend.ConversationEngine(archival_extraction_enabled=True)
+    model = FakeArchivalModel(generate_result=json.dumps({
+        "facts": [{"content": "hello", "importance": True, "tags": []}]
+    }))
+    engine = backend.ConversationEngine(
+        archival_extraction_enabled=True, language_model=model
+    )
     engine.memory_manager = MagicMock()
     engine.memory_manager.load_persisted_user_message = MagicMock(return_value="Hello")
-    
-    # Mock Groq client returning invalid fact payload (importance is bool)
-    mock_resp = MagicMock()
-    mock_resp.choices = [MagicMock()]
-    mock_resp.choices[0].message.content = json.dumps({
-        "facts": [{"content": "hello", "importance": True, "tags": []}]
-    })
-    async def mock_async(*args, **kwargs):
-        return mock_resp
-    engine.groq_manager.chat_completion_async = MagicMock(side_effect=mock_async)
     
     ref = backend.PersistedTurnRef(user_id="user123", source_chat_log_id=1, assistant_chat_log_id=2)
     
@@ -182,20 +223,12 @@ async def test_run_archival_extraction_validation_failure(backend, caplog):
 
 @pytest.mark.anyio
 async def test_run_archival_extraction_duplicate(backend, caplog):
-    engine = backend.ConversationEngine(archival_extraction_enabled=True)
+    model = FakeArchivalModel(generate_result=_fact_payload_json())
+    engine = backend.ConversationEngine(
+        archival_extraction_enabled=True, language_model=model
+    )
     engine.memory_manager = MagicMock()
     engine.memory_manager.load_persisted_user_message = MagicMock(return_value="Hello")
-    
-    m = MagicMock()
-    m.choices = [MagicMock()]
-    m.choices[0].message.content = json.dumps({
-        "facts": [{"content": "likes coding", "importance": 0.9, "tags": []}],
-        "schema_version": 1,
-        "extractor_version": 1
-    })
-    async def _async_return(*args, **kwargs):
-        return m
-    engine.groq_manager.chat_completion_async = MagicMock(side_effect=_async_return)
     
     # Simulate unique constraint failure treated as duplicate success
     engine.memory_manager.store_archival_extraction.side_effect = backend.ArchivalDuplicateError("Duplicate")
@@ -211,20 +244,12 @@ async def test_run_archival_extraction_duplicate(backend, caplog):
 
 @pytest.mark.anyio
 async def test_run_archival_extraction_store_failed(backend, caplog):
-    engine = backend.ConversationEngine(archival_extraction_enabled=True)
+    model = FakeArchivalModel(generate_result=_fact_payload_json())
+    engine = backend.ConversationEngine(
+        archival_extraction_enabled=True, language_model=model
+    )
     engine.memory_manager = MagicMock()
     engine.memory_manager.load_persisted_user_message = MagicMock(return_value="Hello secret message")
-    
-    m = MagicMock()
-    m.choices = [MagicMock()]
-    m.choices[0].message.content = json.dumps({
-        "facts": [{"content": "likes coding", "importance": 0.9, "tags": []}],
-        "schema_version": 1,
-        "extractor_version": 1
-    })
-    async def _async_return(*args, **kwargs):
-        return m
-    engine.groq_manager.chat_completion_async = MagicMock(side_effect=_async_return)
     
     # Simulate general database failure
     engine.memory_manager.store_archival_extraction.side_effect = Exception("DB connection failed secret token")
@@ -259,7 +284,14 @@ def _valid_legacy_emotion_dict():
 
 @pytest.mark.anyio
 async def test_process_turn_schedules_background_task(backend):
-    engine = backend.ConversationEngine(archival_extraction_enabled=True)
+    model = FakeArchivalModel(generate_result="assistant reply")
+    model.appraisal_payload = {
+        "valence": 0.1, "arousal_shift": 0.0, "dominance_shift": 0.0,
+        "triggered_emotions": {"joy": 0.5},
+    }
+    engine = backend.ConversationEngine(
+        archival_extraction_enabled=True, language_model=model
+    )
     
     # Mock all internal methods of process_turn to focus on orchestration
     engine.memory_manager = MagicMock()
@@ -290,24 +322,17 @@ async def test_process_turn_schedules_background_task(backend):
     engine.memory_manager.save_turn = MagicMock(side_effect=mock_save_turn)
     engine.memory_manager.sync_state = MagicMock(side_effect=mock_sync_state)
     
-    from unittest.mock import AsyncMock
+    # Script the fake model's appraise to return the same valid appraisal
+    # payload the previous Groq client mock produced (issue #337).
+    async def scripted_appraise(message, budget):
+        from backend.emotional_domain import parse_llm_appraisal
+        result = parse_llm_appraisal(model.appraisal_payload)
+        if result.is_fallback:
+            from backend.language_model import LanguageModelInvalidResponseError
+            raise LanguageModelInvalidResponseError()
+        return result.appraisal
     
-    # Responses: first for appraisal (JSON), then for generation (text)
-    responses = [
-        MagicMock(choices=[MagicMock(message=MagicMock(content=json.dumps({
-            "valence": 0.1, "arousal_shift": 0.0, "dominance_shift": 0.0,
-            "triggered_emotions": {"joy": 0.5},
-        })))]),
-        MagicMock(choices=[MagicMock(message=MagicMock(content="assistant reply"))]),
-    ]
-    
-    async def async_create(**kwargs):
-        return responses.pop(0)
-    
-    # Override the groq manager's async factory to return a mock client
-    engine.groq_manager._async_client_factory = lambda k: AsyncMock(**{
-        "chat.completions.create": async_create
-    })
+    model.appraise = scripted_appraise
     
     bg_tasks = MagicMock(spec=BackgroundTasks)
     
@@ -334,7 +359,12 @@ async def test_process_turn_schedules_background_task(backend):
 @pytest.mark.anyio
 async def test_process_turn_does_not_schedule_when_extraction_disabled(backend):
     """With default archival_extraction_enabled=False, no background task is scheduled."""
-    engine = backend.ConversationEngine()  # default False
+    model = FakeArchivalModel(generate_result="reply")
+    model.appraisal_payload = {
+        "valence": 0.1, "arousal_shift": 0.0, "dominance_shift": 0.0,
+        "triggered_emotions": {"joy": 0.5},
+    }
+    engine = backend.ConversationEngine(language_model=model)  # default False
     assert not engine.archival_extraction_enabled
     
     engine.memory_manager = MagicMock()
@@ -357,23 +387,17 @@ async def test_process_turn_does_not_schedule_when_extraction_disabled(backend):
     ))
     engine.memory_manager.sync_state = MagicMock()
     
-    from unittest.mock import AsyncMock
+    # Script the fake model's appraise (issue #337) — same appraisal
+    # payload the previous Groq client mock produced.
+    async def scripted_appraise(message, budget):
+        from backend.emotional_domain import parse_llm_appraisal
+        result = parse_llm_appraisal(model.appraisal_payload)
+        if result.is_fallback:
+            from backend.language_model import LanguageModelInvalidResponseError
+            raise LanguageModelInvalidResponseError()
+        return result.appraisal
     
-    # Responses: first for appraisal (JSON), then for generation (text)
-    responses = [
-        MagicMock(choices=[MagicMock(message=MagicMock(content=json.dumps({
-            "valence": 0.1, "arousal_shift": 0.0, "dominance_shift": 0.0,
-            "triggered_emotions": {"joy": 0.5},
-        })))]),
-        MagicMock(choices=[MagicMock(message=MagicMock(content="reply"))]),
-    ]
-    
-    async def async_create(**kwargs):
-        return responses.pop(0)
-    
-    engine.groq_manager._async_client_factory = lambda k: AsyncMock(**{
-        "chat.completions.create": async_create
-    })
+    model.appraise = scripted_appraise
     
     bg_tasks = MagicMock(spec=BackgroundTasks)
     
@@ -386,21 +410,21 @@ async def test_process_turn_does_not_schedule_when_extraction_disabled(backend):
 @pytest.mark.anyio
 async def test_run_archival_extraction_disabled_returns_early(backend):
     """With archival_extraction_enabled=False, run_archival_extraction returns without doing anything."""
-    engine = backend.ConversationEngine()  # default False
+    model = FakeArchivalModel()
+    engine = backend.ConversationEngine(language_model=model)  # default False
     assert not engine.archival_extraction_enabled
     
     # Even with fully unmocked dependencies, it should return without touching anything
     engine.memory_manager = MagicMock()
-    engine.groq_manager = MagicMock()
     
     ref = backend.PersistedTurnRef(user_id="user123", source_chat_log_id=1, assistant_chat_log_id=2)
     
     await engine.run_archival_extraction(ref)
     
-    # No message loading, no Groq, no storage
+    # No message loading, no provider call, no storage
     engine.memory_manager.load_persisted_user_message.assert_not_called()
     engine.memory_manager.store_archival_extraction.assert_not_called()
-    engine.groq_manager.chat_completion.assert_not_called()
+    assert model.generate_calls == 0
 
 
 def test_chat_response_format(client_app, mock_supabase, monkeypatch):
@@ -623,20 +647,12 @@ async def test_run_archival_extraction_cancelled_during_store(backend, caplog):
     import threading
     import asyncio
 
-    engine = backend.ConversationEngine(archival_extraction_enabled=True)
+    model = FakeArchivalModel(generate_result=_fact_payload_json())
+    engine = backend.ConversationEngine(
+        archival_extraction_enabled=True, language_model=model
+    )
     engine.memory_manager = MagicMock()
     engine.memory_manager.load_persisted_user_message = MagicMock(return_value="Hello")
-
-    m = MagicMock()
-    m.choices = [MagicMock()]
-    m.choices[0].message.content = json.dumps({
-        "facts": [{"content": "likes coding", "importance": 0.9, "tags": []}],
-        "schema_version": 1,
-        "extractor_version": 1
-    })
-    async def _async_return(*args, **kwargs):
-        return m
-    engine.groq_manager.chat_completion_async = MagicMock(side_effect=_async_return)
 
     # Block store_archival_extraction in a thread so we can verify drain
     store_started = threading.Event()

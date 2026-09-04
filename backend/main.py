@@ -68,8 +68,12 @@ from .dependencies import (
     shutdown_dependencies,
 )
 from .emotion_presentation import EmotionStateResponse
-from .groq_manager import GroqPoolExhaustedError, GroqRequestError
 from .health import build_ready_response
+from .language_model import (
+    LanguageModelConfigurationError,
+    LanguageModelError,
+    language_failure_to_turn_code,
+)
 from .memory import StatePersistenceError
 from .observability import (
     EVENT_APP_STARTUP_FAILED,
@@ -379,11 +383,13 @@ def _map_turn_error(exc: Exception) -> HTTPException:
             detail={"code": code.value, "message": _turn_code_to_message(code)},
         )
 
-    if isinstance(exc, GroqPoolExhaustedError):
-        from .groq_manager import provider_failure_to_turn_code
-
+    if isinstance(exc, LanguageModelError):
+        # Canonical provider failure codes (issue #337): the same
+        # taxonomy the previous provider exceptions carried, now
+        # crossing the HTTP boundary through the LanguageModel contract.
         turn_code = (
-            provider_failure_to_turn_code(exc.failure_code) if exc.failure_code
+            language_failure_to_turn_code(exc.failure)
+            if exc.failure
             else TurnErrorCode.provider_unavailable
         )
         return HTTPException(
@@ -391,7 +397,7 @@ def _map_turn_error(exc: Exception) -> HTTPException:
             detail={"code": turn_code.value, "message": _turn_code_to_message(turn_code)},
         )
 
-    if isinstance(exc, GroqRequestError):
+    if isinstance(exc, LanguageModelConfigurationError):
         return HTTPException(
             status_code=503,
             detail={
@@ -780,8 +786,8 @@ async def chat_endpoint(
             correlation=correlation,
         )
         raise http_exc
-    except (DeadlineExceeded, TurnExecutionError, GroqPoolExhaustedError,
-            GroqRequestError, StatePersistenceError, PersistenceError) as exc:
+    except (DeadlineExceeded, TurnExecutionError, LanguageModelError,
+            LanguageModelConfigurationError, StatePersistenceError, PersistenceError) as exc:
         http_exc = _map_turn_error(exc)
         detail = http_exc.detail
         code = detail.get("code") if isinstance(detail, dict) else "internal_error"
