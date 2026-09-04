@@ -203,6 +203,31 @@ Key points:
 - The task name (`"turn-commit"` or `"turn-commit"`) contains no user data.
 - After the post-cancel wait ends, `original_cancel` is always re-raised.
 
+## LanguageModel Boundary (issue #337)
+
+The domain (engine, `process_turn`, companion runtime, HTTP layer)
+speaks **only** to the canonical `LanguageModel` contract
+(`backend/language_model.py`):
+
+- `appraise(message, budget)` — emotional appraisal (JSON mode inside the adapter);
+- `generate(messages, budget)` — response generation;
+- `extract_archival(messages, budget)` — long-term-memory fact extraction
+  (keeps its own contracted call shape: fast model, JSON mode,
+  temperature 0, explicit token limit, `archival_extraction` stage);
+- `describe()` — sanitized provider/model identification.
+
+Groq is a first-class remote provider **behind an explicit adapter**
+(`backend/groq_language_model.py`). No Groq symbol (SDK type, manager,
+exception) crosses the adapter upward; failures surface as the canonical
+`LanguageModel*Error` taxonomy with constant sanitized messages, and the
+existing failure → `TurnErrorCode` mapping is preserved bit a bit.
+Selection is explicit at composition time — there is **no auto-routing
+and no fallback to another provider**: a provider failure is a turn
+failure. The trusted system policy is a Katherine-core responsibility
+(`build_trusted_policy` in the contract module), never a provider
+capability. Honest disclosure: the prompt content still travels to the
+configured remote provider; nothing else about the turn does.
+
 ## Groq Client Management
 
 ### Async Clients (Request-Scoped)
