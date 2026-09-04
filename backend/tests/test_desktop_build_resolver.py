@@ -67,6 +67,19 @@ class TestMissingBuildFailsExplicitly:
         # No absolute local path leakage in the public message.
         assert "home" not in message.lower() or "frontend" in message.lower()
 
+    def test_packaged_root_suggests_reinstall(self, tmp_path: Path) -> None:
+        app_root = tmp_path / "katherine"
+        frontend_root = app_root / "frontend"
+        (app_root / "backend" / "desktop").mkdir(parents=True)
+        (app_root / "vendor").mkdir()
+        frontend_root.mkdir()
+        (app_root / "backend" / "desktop" / "build_resolver.py").write_text("module")
+
+        with pytest.raises(BuildResolutionError) as excinfo:
+            resolve_frontend_build(DesktopBuildConfig(frontend_root=frontend_root))
+
+        assert "reinstall" in str(excinfo.value).lower()
+
     def test_missing_index_html_fails(self, tmp_path: Path) -> None:
         dist = tmp_path / "frontend" / "dist"
         dist.mkdir(parents=True)

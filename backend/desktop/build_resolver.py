@@ -105,14 +105,19 @@ def packaged_build_hint() -> str:
 def _hint_for_root(frontend_root: Path) -> str:
     """Pick the actionable hint matching the root's origin.
 
-    A root is a *checkout* root when this module also lives inside that
-    same tree (``<root>/backend/desktop/build_resolver.py`` exists) —
-    the developer can run ``npm run build``. Otherwise the root came
-    from the installed layout and the fix is reinstalling the package.
+    The installed tree has a sibling backend module and ``vendor`` directory,
+    but deliberately does not ship the checkout's ``frontend/package.json``.
+    That structural combination distinguishes the package from both a normal
+    checkout and a temporary test root. Everything else gets the developer
+    hint, including explicit temporary roots used by resolver tests.
     """
-    if frontend_root.joinpath("backend", "desktop", "build_resolver.py").is_file():
-        return _BUILD_HINT
-    return _BUILD_HINT_PACKAGED
+    app_root = frontend_root.parent
+    is_installed_tree = (
+        not frontend_root.joinpath("package.json").is_file()
+        and app_root.joinpath("backend", "desktop", "build_resolver.py").is_file()
+        and app_root.joinpath("vendor").is_dir()
+    )
+    return _BUILD_HINT_PACKAGED if is_installed_tree else _BUILD_HINT
 
 
 @dataclass(frozen=True, slots=True)

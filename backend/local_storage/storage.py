@@ -310,6 +310,16 @@ class LocalStorage:
                 "select version from schema_migrations"
             ).fetchall()
             applied = {row[0] for row in applied_rows}
+            known_versions = {version for version, _ in migrations_module.MIGRATIONS}
+            unsupported = applied - known_versions
+            if unsupported:
+                # Opening a database written by a newer binary would make
+                # this older binary silently operate on an unknown schema.
+                # Fail closed and leave the file untouched instead.
+                raise PersistenceError(
+                    "schema_too_new",
+                    "database schema is newer than this application",
+                )
             for version in migrations_module.pending_versions(applied):
                 sql = migrations_module.migration_sql(version)
                 conn.execute("BEGIN IMMEDIATE")
