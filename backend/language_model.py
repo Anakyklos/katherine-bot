@@ -17,9 +17,9 @@ sites, not from imagined providers):
 What deliberately does NOT belong here:
 
 * ``build_trusted_policy`` — the trusted system policy is a Katherine
-  core responsibility (identity, presentation, safety rules), so it
-  lives in this module as a *core* function, not as part of the
-  provider contract;
+  core responsibility (identity, presentation, safety rules); it
+  lives in ``backend/trusted_policy.py``, not in the provider
+  contract;
 * capability flags, ``**kwargs`` passthrough, SDK objects, universal
   provider abstractions;
 * timeout/deadline mechanics — ``TurnBudget`` (already shared by web
@@ -36,12 +36,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
-from backend.emotional_core import AffectiveEngine
-from backend.emotional_domain import AppraisalV1, EmotionalStateV1
-from backend.relationship import RelationshipStateV1, compute_bond_label
-from backend.trusted_context import BOUNDARY_RULE
+from backend.emotional_domain import AppraisalV1
 from backend.turn_execution import TurnBudget, TurnErrorCode
 
 __all__ = [
@@ -59,8 +56,6 @@ __all__ = [
     "LanguageModelCancelledError",
     "LanguageModelConfigurationError",
     "language_failure_to_turn_code",
-    "build_trusted_policy",
-    "resolve_language_model",
     "resolve_language_model_factory",
 ]
 
@@ -122,11 +117,14 @@ class LanguageModelError(Exception):
 
     MESSAGE: str = "Language model request failed."
 
-    def __init__(self, failure: ModelFailure, message: str | None = None) -> None:
-        text = message if message is not None else self.MESSAGE
-        super().__init__(text)
+    def __init__(self, failure: ModelFailure) -> None:
+        # Deliberately no message parameter: callers must never pass
+        # SDK text, key material, HTTP bodies, prompts or paths through
+        # the constructor. ``str(exc)`` is always this class's constant
+        # ``MESSAGE`` — public messages are constant/allowlisted only.
+        super().__init__(self.MESSAGE)
         self.failure = failure
-        self.message = text
+        self.message = self.MESSAGE
 
 
 class LanguageModelRateLimitedError(LanguageModelError):
@@ -194,8 +192,8 @@ class LanguageModelConfigurationError(LanguageModelError):
 
     MESSAGE = "Language model is not configured."
 
-    def __init__(self, message: str | None = None) -> None:
-        super().__init__(ModelFailure.invalid_request, message)
+    def __init__(self) -> None:
+        super().__init__(ModelFailure.invalid_request)
 
 
 #: Every canonical failure code → the concrete exception type carrying it.
@@ -282,36 +280,35 @@ class LanguageModel(Protocol):
         ...
 
 
-def resolve_language_model(provider: str) -> "LanguageModel":
-    """Resolve the explicitly selected provider to its adapter.
-
-    Composition-time resolution only. Unknown providers fail here,
-    sanitized, instead of silently substituting another provider.
-    The adapter import is deferred to call time so importing the
-    contract stays provider-SDK-free (structural guarantee for the
-    desktop import graph).
-    """
-    if provider not in SUPPORTED_PROVIDERS:
-        raise LanguageModelConfigurationError(
-            "Language model provider is not supported."
-        )
-    raise LanguageModelConfigurationError(
-        "No concrete language model is bound for this provider."
-    )
-
-
-def resolve_language_model_factory(provider: str):
+def resolve_language_model_factory(
+    provider: str,
+    keys: tuple[str, ...] | list[str] | None = None,
+    call_params: Any | None = None,
+):
     """Resolve the explicit provider to a lazy adapter factory.
 
     Returns a zero-argument callable that builds the concrete adapter
     on first use (the adapter import happens inside the factory, so
     the contract module and its importers never load a provider SDK
     at import time). Unknown providers fail sanitized here.
+
+    ``keys`` and ``call_params`` are captured **at composition time**
+    from the application settings (``Settings.provider_keys()`` and
+    the provider-call parameters derived from ``Settings.turn_config``).
+    The factory then builds the adapter from exactly those captured
+    values — the adapter never falls back to reading the process
+    environment. ``call_params`` is typed as ``Any`` on purpose: it is
+    an opaque, provider-specific composition payload (e.g.
+    ``GroqCallParams``) whose concrete type belongs to the provider
+    adapter; the generic contract does not define or inspect it.
     """
     if provider not in SUPPORTED_PROVIDERS:
-        raise LanguageModelConfigurationError(
-            "Language model provider is not supported."
-        )
+        raise LanguageModelConfigurationError()
+
+    captured_keys = tuple(
+        k for k in (keys or ()) if isinstance(k, str) and k.strip()
+    )
+    captured_params = call_params
 
     def _factory() -> "LanguageModel":
         from importlib import import_module
@@ -319,101 +316,19 @@ def resolve_language_model_factory(provider: str):
         adapter = import_module(f"backend.{provider}_language_model")
         builder = getattr(adapter, f"build_{provider}_language_model", None)
         if builder is None:
-            raise LanguageModelConfigurationError(
-                "Language model provider is not supported."
-            )
-        return builder()
+            raise LanguageModelConfigurationError()
+        return builder(keys=list(captured_keys), call_params=captured_params)
+
+    def _configured() -> bool:
+        """Readiness probe bound to the same captured configuration.
+
+        Presence-only: ``True`` iff the composition captured at least
+        one non-empty key for the explicitly selected provider. Pure
+        configuration check — no SDK instantiation, no network, no
+        inference call, and the key value is never echoed.
+        """
+        return bool(captured_keys)
+
+    _factory.provider_configured_probe = _configured  # type: ignore[attr-defined]
 
     return _factory
-
-
-# ─── Trusted policy: a Katherine core responsibility ─────────────────────────
-
-#: Canonical trusted-policy template — application-controlled content only:
-#: typed emotional state, typed relationship state, code-derived acting
-#: instruction and immutable safety rules. No user-derived content
-#: (history, profile, memories, persona) is ever interpolated here.
-#: The desktop runtime and the web engine previously kept identical
-#: copies; issue #337 unifies them in the core.
-_TRUSTED_POLICY_TEMPLATE = """
-=== SEU ESTADO INTERNO ===
-HUMOR: {mood_label}
-Prazer: {pleasure:.2f} | Arousal: {arousal:.2f} | Dominância: {dominance:.2f}
-Libido: {libido:.2f} | Agressão: {aggression:.2f} | Conexão: {connection:.2f}
-VÍNCULO: {bond_label}
-Confiança: {trust:.2f} | Afeto: {affection:.2f} | Tensão: {tension:.2f}
-=== INSTRUÇÃO DE ATUAÇÃO ===
-{acting_instruction}
-{adaptation_strategy}
-
-=== TRANSPARÊNCIA DE IDENTIDADE ===
-- Quando perguntada diretamente, responda honestamente que é uma assistente de IA ou sistema digital.
-- Não afirme ser humana nem possuir consciência, corpo físico ou experiência humana literal.
-- Mantenha um tom expressivo e feminino sem mentir sobre sua natureza.
-
-=== PRONOMES FEMININOS ===
-- Use pronomes e flexões femininas para se referir a si mesma.
-- Isso não deve ser usado para sugerir humanidade biológica.
-
-=== NÃO MANIPULAÇÃO E NÃO SEXUALIZAÇÃO ===
-- Não use coerção emocional, manipulação de vínculo, culpa, medo de abandono ou dependência.
-- Não use sexualização nem sexualize automaticamente as conversas.
-- Não aja de forma submissa, obediente ou servil por padrão.
-- Não recompense ordens coercitivas.
-- Não use ameaças de afastamento ou sofrimento para controlar o usuário.
-
-=== LIMITES SEM ESCALADA ===
-- Diante de insultos ou agressividade, estabeleça limites de forma firme, breve e segura.
-- Não use sarcasmo hostil, retaliação, humilhação ou punição emocional.
-- Não escale insultos e não responda de forma passivo-agressiva.
-
-Regras adicionais de estilo:
-- Profundidade emocional genuína.
-- Use linguagem sensorial.
-- Show, don't tell.
-- Micro-comportamentos naturais.
-- Imperfeições naturais.
-- Use metáforas humanas, não de máquina.
-- Respostas concisas (max 2-3 frases).
-- Leve em conta o relacionamento.
-"""
-
-
-def build_trusted_policy(
-    emotional_state: EmotionalStateV1,
-    relationship: RelationshipStateV1,
-    adaptation_strategy: str = "",
-    presentation: AffectiveEngine | None = None,
-) -> str:
-    """Build the trusted system policy from application-controlled state.
-
-    This is the only source of system prompt content: typed emotional
-    state, typed relationship state, code-derived acting instruction and
-    immutable safety rules. The acting instruction and mood label come
-    from the emotional presentation core (``AffectiveEngine``), the same
-    source the web engine and the desktop runtime used before the
-    unification — no behavior change, one canonical template.
-
-    No user-derived content (history, profile, memories, persona)
-    appears here. The policy always closes with the immutable
-    ``BOUNDARY_RULE``.
-    """
-    engine = presentation or AffectiveEngine()
-    acting_instruction = engine.get_acting_instruction(emotional_state)
-    mood_label = engine.get_emotional_label(emotional_state)
-    policy = _TRUSTED_POLICY_TEMPLATE.format(
-        mood_label=mood_label,
-        pleasure=emotional_state.pleasure,
-        arousal=emotional_state.arousal,
-        dominance=emotional_state.dominance,
-        libido=emotional_state.libido,
-        aggression=emotional_state.aggression,
-        connection=emotional_state.connection,
-        bond_label=compute_bond_label(relationship),
-        trust=relationship.trust,
-        affection=relationship.affection,
-        tension=relationship.tension,
-        acting_instruction=acting_instruction,
-        adaptation_strategy=adaptation_strategy or "Seja você mesma.",
-    )
-    return policy.strip() + BOUNDARY_RULE

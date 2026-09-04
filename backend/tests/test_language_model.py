@@ -33,7 +33,6 @@ def test_contract_module_exists_with_core_types():
         LanguageModel,
         ModelFailure,
         ModelSelection,
-        build_trusted_policy,
         language_failure_to_turn_code,
     )
 
@@ -167,11 +166,11 @@ def _state_and_relationship():
 
 
 def test_build_trusted_policy_is_exported_from_core():
-    from backend.language_model import build_trusted_policy  # noqa: F401
+    from backend.trusted_policy import build_trusted_policy  # noqa: F401
 
 
 def test_build_trusted_policy_contains_canonical_sections_only():
-    from backend.language_model import build_trusted_policy
+    from backend.trusted_policy import build_trusted_policy
 
     state, relationship = _state_and_relationship()
     policy = build_trusted_policy(state, relationship, "")
@@ -193,7 +192,7 @@ def test_build_trusted_policy_contains_canonical_sections_only():
 
 def test_build_trusted_policy_rejects_nothing_user_derived():
     """The policy interpolates only app-controlled state — no user content."""
-    from backend.language_model import build_trusted_policy
+    from backend.trusted_policy import build_trusted_policy
 
     state, relationship = _state_and_relationship()
     secret_marker = "user-sensitive-content"
@@ -211,7 +210,7 @@ def test_build_trusted_policy_matches_web_engine_template_shape():
     from backend.companion_runtime import (
         _TRUSTED_POLICY_TEMPLATE as _desktop_template,
     )
-    from backend.language_model import build_trusted_policy
+    from backend.trusted_policy import build_trusted_policy
 
     state, relationship = _state_and_relationship()
     policy = build_trusted_policy(state, relationship, "")

@@ -272,17 +272,18 @@ def test_build_groq_language_model_without_keys_raises_configuration():
 
 
 def test_unknown_provider_fails_sanitized():
-    """Requirement: unknown provider fails sanitized configuration error."""
+    """Requirement: unknown provider fails sanitized configuration error.
+
+    The generic resolution API is deliberately just the factory
+    (``resolve_language_model`` — an always-raising stub — was removed
+    in the #337 review); unknown providers still fail sanitized.
+    """
     from backend.language_model import (
         LanguageModelConfigurationError,
-        resolve_language_model,
         resolve_language_model_factory,
     )
 
     with pytest.raises(LanguageModelConfigurationError):
         # The canonical resolution must reject anything that is not the
         # explicitly supported provider set (today: groq).
-        resolve_language_model(provider="not-a-provider")
-
-    with pytest.raises(LanguageModelConfigurationError):
         resolve_language_model_factory(provider="not-a-provider")

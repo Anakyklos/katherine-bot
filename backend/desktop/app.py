@@ -93,18 +93,49 @@ _MSG_RUNTIME_STARTUP = (
 )
 
 
+def _build_language_model_factory():
+    """Build the desktop provider wiring (issue #337 review).
+
+    The concrete provider choice lives in this composition root, not
+    in the runtime: the desktop selects Groq explicitly (no
+    auto-routing, no fallback) and reads its keys Python-side only
+    (env values are never echoed, never in the Vite bundle, never
+    through the bridge). The factory stays lazy — importing the app or
+    building the runtime never loads a provider SDK; the adapter is
+    constructed on the first turn that needs the model.
+    """
+    from backend.groq_keys import get_groq_api_keys
+    from backend.language_model import resolve_language_model_factory
+
+    keys = tuple(
+        k for k in get_groq_api_keys() if isinstance(k, str) and k.strip()
+    )
+    return resolve_language_model_factory("groq", keys=keys)
+
+
 def _build_runtime():
-    """Build the production companion runtime (#336).
+    """Build the production companion runtime (#336, #337).
 
     Lazy import on purpose: ``backend.desktop.app`` stays import-pure
     (no domain modules at import time; the runtime pulls only light,
     pure-domain dependencies — verified by the import-cost budget
     tests). The runtime opens its storage lazily on first use, so this
     call never touches SQLite; it just constructs the object.
+
+    Provider wiring (issue #337 review): the runtime itself is
+    provider-agnostic; this composition root supplies the explicit
+    Groq factory and the configuration probe (presence-only, never a
+    generation call).
     """
     from backend.companion_runtime import build_companion_runtime
 
-    return build_companion_runtime()
+    factory = _build_language_model_factory()
+    return build_companion_runtime(
+        language_model_factory=factory,
+        provider_configured_probe=getattr(
+            factory, "provider_configured_probe", None
+        ),
+    )
 
 
 def _repo_root() -> Path:

@@ -95,8 +95,10 @@ from backend.language_model import (
     LanguageModelConfigurationError,
     LanguageModelError,
     ModelFailure,
-    build_trusted_policy as build_core_trusted_policy,
     language_failure_to_turn_code,
+)
+from backend.trusted_policy import (
+    build_trusted_policy as build_core_trusted_policy,
 )
 from backend.local_storage import open_local_storage
 from backend.local_storage.errors import (
@@ -460,23 +462,16 @@ class CompanionRuntime:
         return self._storage is not None and getattr(self._storage, "_closed", False) is True
 
     def _default_provider_configured_probe(self) -> bool:
-        """True iff a remote provider key is configured (presence only).
+        """Default readiness answer when the composition root injects none.
 
-        Deliberately does NOT build the provider: ``runtime_state`` must
-        be cheap and safe before any window interaction, and an
-        unconfigured key must not raise here (that failure belongs to the
-        turn that needs the model). The key loader stays behind the
-        provider boundary (env values are read Python-side only and
-        never echoed).
+        The runtime is provider-agnostic (issue #337 review): it never
+        reads provider credentials itself. With no injected probe the
+        honest answer is "not configured" — the desktop composition root
+        (``backend.desktop.app``) injects the real provider-specific
+        probe, and a turn that needs the model surfaces the sanitized
+        configuration error either way.
         """
-        try:
-            from importlib import import_module
-
-            keys_module = import_module("backend.groq_keys")
-            keys = keys_module.get_groq_api_keys()
-        except Exception:  # noqa: BLE001 (probe must never raise)
-            return False
-        return any(isinstance(k, str) and k.strip() for k in keys)
+        return False
 
     def _ensure_storage(self):
         if self._injected_storage is not None:
@@ -500,12 +495,18 @@ class CompanionRuntime:
     # ── provider access ───────────────────────────────────────────────────
 
     def _provider_port(self) -> LanguageModel:
-        """Return the contract instance, building it lazily on first use."""
+        """Return the contract instance, building it lazily on first use.
+
+        Provider-agnostic (issue #337 review): with neither an injected
+        model nor a factory there is nothing to build — the sanitized
+        configuration error is the honest answer. The concrete provider
+        wiring is supplied by the desktop composition root.
+        """
         if self._model is None:
             if self._model_factory is not None:
                 self._model = self._model_factory()
             else:
-                self._model = build_default_language_model()
+                raise LanguageModelConfigurationError()
         return self._model
 
     # ── public API (called by the bridge) ─────────────────────────────────
@@ -536,15 +537,23 @@ class CompanionRuntime:
         opens and reads local data; the configuration error surfaces
         only when a turn actually needs the model.
         """
-        probe = (
-            self._provider_configured_probe
-            if self._provider_configured_probe is not None
-            else self._default_provider_configured_probe
-        )
-        try:
-            configured = bool(probe())
-        except Exception:  # noqa: BLE001 (probe must never raise)
-            configured = False
+        if self._provider_configured_probe is not None:
+            # The composition root supplied the authoritative probe
+            # bound to the same configuration the adapter will use.
+            try:
+                configured = bool(self._provider_configured_probe())
+            except Exception:  # noqa: BLE001 (probe must never raise)
+                configured = False
+        elif self._model is not None:
+            # No probe and an already-built model: presence is the only
+            # signal available (tests inject fakes; the desktop
+            # composition root always injects the probe alongside).
+            configured = True
+        else:
+            try:
+                configured = bool(self._default_provider_configured_probe())
+            except Exception:  # noqa: BLE001 (probe must never raise)
+                configured = False
         try:
             revision = self._load_state().revision
             return {
@@ -915,33 +924,21 @@ def _load_local_memories(storage) -> list[_LocalContextMemory]:
         logger.error("event=memory_row_dropped count=%d", dropped_rows)
     return memories
 
-def build_default_language_model() -> "LanguageModel":
-    """Build the default remote provider lazily (canonical contract).
-
-    Issue #337: the desktop runtime no longer owns a Groq-specific
-    provider class. The remote provider is the explicit Groq adapter
-    behind the canonical ``LanguageModel`` contract. The import is
-    deliberately lazy (inside this factory) so importing the runtime
-    never loads a provider SDK and the adapter is only built on the
-    first turn that needs the model.
-
-    Keys are read on the Python side only (never in the Vite bundle,
-    never through the bridge). A missing key raises the canonical,
-    sanitized configuration error, which the runtime maps to the
-    stable ``configuration`` code.
-    """
-    from backend.language_model import resolve_language_model_factory
-
-    factory = resolve_language_model_factory("groq")
-    return factory()
-
 
 def build_companion_runtime(
     storage_path: Path | str | None = None,
     *,
     language_model: "LanguageModel | None" = None,
+    language_model_factory: "Callable[[], LanguageModel] | None" = None,
+    provider_configured_probe: "Callable[[], bool] | None" = None,
 ) -> "CompanionRuntime":
-    """Build the production runtime with the default local database path."""
+    """Build the production runtime with the default local database path.
+
+    The runtime is provider-agnostic (issue #337 review): it never
+    selects or names a concrete provider. The composition root
+    (``backend.desktop.app``) wires the explicit adapter factory and
+    the configuration probe; nothing here imports any provider.
+    """
     if storage_path is None:
         from backend.local_storage.storage import default_database_path
 
@@ -949,4 +946,6 @@ def build_companion_runtime(
     return CompanionRuntime(
         storage_path=storage_path,
         language_model=language_model,
+        language_model_factory=language_model_factory,
+        provider_configured_probe=provider_configured_probe,
     )

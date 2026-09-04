@@ -46,6 +46,7 @@ class ChatConversationEngine(ConversationEngine):
         language_model: Optional[LanguageModel] = None,
         language_model_factory: Optional[Callable[[], LanguageModel]] = None,
         supabase_factory: Optional[Callable[[], Optional[object]]] = None,
+        provider_configured_probe: Optional[Callable[[], bool]] = None,
     ):
         super().__init__(
             clock=clock,
@@ -55,6 +56,7 @@ class ChatConversationEngine(ConversationEngine):
             language_model=language_model,
             language_model_factory=language_model_factory,
             supabase_factory=supabase_factory,
+            provider_configured_probe=provider_configured_probe,
         )
         self._process_turn = build_process_turn(self)
 

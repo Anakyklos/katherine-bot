@@ -187,10 +187,27 @@ def build_default_dependencies(
         # builds the remote adapter behind the canonical LanguageModel
         # contract. Today the supported remote provider is Groq; the
         # selection is explicit and there is no fallback to another
-        # provider. Keys come from validated settings (Python-side only).
+        # provider. Keys and provider-call parameters are captured from
+        # the validated settings **here, at composition time** — the
+        # factory builds the adapter from exactly these captured values
+        # and the adapter never falls back to the process environment
+        # (Settings is the single source of truth for the web backend).
         from .language_model import resolve_language_model_factory
 
-        language_model_factory = resolve_language_model_factory("groq")
+        language_model_factory = resolve_language_model_factory(
+            "groq",
+            keys=settings.provider_keys(),
+            call_params=settings.turn_config.to_groq_params(),
+        )
+        # Readiness (issue #337 review): the ``/ready`` provider check
+        # must distinguish "a factory exists" from "configuration is
+        # valid". The probe is bound to the same captured settings the
+        # adapter will use — presence-only, never a generation call.
+        provider_readiness_probe = getattr(
+            language_model_factory,
+            "provider_configured_probe",
+            None,
+        )
 
         engine = ChatConversationEngine(
             archival_extraction_enabled=settings.archival_extraction_enabled,
@@ -198,6 +215,7 @@ def build_default_dependencies(
             turn_config=settings.turn_config,
             language_model_factory=language_model_factory,
             supabase_factory=_supabase_factory_from_settings(settings),
+            provider_configured_probe=provider_readiness_probe,
         )
         created.append(engine)
 

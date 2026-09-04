@@ -10,9 +10,9 @@ from .language_model import (
     LanguageModelConfigurationError,
     LanguageModelInvalidResponseError,
     ModelFailure,
-    build_trusted_policy,
     language_failure_to_turn_code,
 )
+from .trusted_policy import build_trusted_policy
 from .emotional_core import AffectiveEngine
 from .emotional_domain import (
     AppraisalV1,
@@ -103,6 +103,7 @@ class ConversationEngine:
         language_model: Optional[LanguageModel] = None,
         language_model_factory: Optional[Callable[[], LanguageModel]] = None,
         supabase_factory: Optional[Callable[[], Optional[object]]] = None,
+        provider_configured_probe: Optional[Callable[[], bool]] = None,
     ):
         """``language_model`` is the canonical LanguageModel contract
         instance (injected by the composition root or tests).  A lazy
@@ -118,6 +119,12 @@ class ConversationEngine:
         self.archival_extraction_enabled = archival_extraction_enabled
         self._language_model: Optional[LanguageModel] = language_model
         self._language_model_factory = language_model_factory
+        # Readiness probe (issue #337 review): a factory's *existence* is
+        # not evidence of valid configuration. The composition root
+        # injects a cheap, pure probe bound to the same captured
+        # configuration the adapter will use (presence-only, no SDK
+        # instantiation, no inference call, no secret echo).
+        self._provider_configured_probe = provider_configured_probe
         self.presentation = AffectiveEngine()
         self.transition_config = TransitionConfig.defaults()
         self.memory_manager = MemoryManager(
@@ -282,18 +289,21 @@ class ConversationEngine:
     def provider_status(self) -> bool:
         """Cheap, sanitized provider-configured probe for health checks.
 
-        Presence only: never instantiates the remote client and never
-        echoes any key material. An unconfigured provider is a turn-time
-        configuration failure, not a startup failure.
+        Presence only: never instantiates the remote client, never runs
+        an inference call, and never echoes any key material. The
+        composition root injects ``provider_configured_probe`` bound to
+        the same captured configuration the adapter will use; a missing
+        probe means "not wired", not "configured". An unconfigured
+        provider is a turn-time configuration failure, not a startup
+        failure.
         """
         if self._language_model is not None:
             return True
-        if self._language_model_factory is not None:
-            # A factory exists: the composition declared an explicit
-            # provider. Configuration presence is the factory's own
-            # concern (it fails sanitized on first use); the probe
-            # only reports that a provider was wired.
-            return True
+        if self._provider_configured_probe is not None:
+            try:
+                return bool(self._provider_configured_probe())
+            except Exception:  # noqa: BLE001 (probe must never raise)
+                return False
         return False
 
     def is_provider_configured(self) -> bool:

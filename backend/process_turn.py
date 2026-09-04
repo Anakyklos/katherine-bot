@@ -47,7 +47,8 @@ from .emotional_domain import (
     transition,
 )
 from .emotion_presentation import EmotionStateResponse, project_public_emotion
-from .language_model import LanguageModel, build_trusted_policy
+from .language_model import LanguageModel
+from .trusted_policy import build_trusted_policy
 from .relationship import (
     RelationshipStateV1,
     RelationshipTransitionConfig,
@@ -142,7 +143,7 @@ class ProcessTurnResult:
 
 #: The provider seam is the canonical ``LanguageModel`` contract
 #: (issue #337). The engine implements it; tests substitute fakes. The
-#: trusted policy is built by the core (``language_model.build_trusted_policy``),
+#: trusted policy is built by the core (``trusted_policy.build_trusted_policy``),
 #: no longer a provider responsibility — see ``_run_once``.
 
 

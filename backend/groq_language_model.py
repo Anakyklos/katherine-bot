@@ -224,9 +224,19 @@ def _translate_provider_error(exc: BaseException) -> Exception:
 
 def build_groq_language_model(
     keys: list[str] | None = None,
+    call_params: GroqCallParams | None = None,
     groq_params: GroqCallParams | None = None,
 ) -> GroqLanguageModel:
     """Build the real remote provider (Groq) for the composition roots.
+
+    ``keys`` and ``call_params`` come from the application settings
+    captured at composition time (issue #337 review): the composition
+    root passes exactly the values derived from ``Settings`` — never
+    environment fallbacks. ``call_params`` carries the provider-call
+    parameters derived from ``Settings.turn_config`` (e.g. via
+    ``TurnExecutionConfig.to_groq_params()``). The legacy
+    ``groq_params`` alias is accepted for existing tests; when both
+    are given, ``call_params`` wins.
 
     Keys are read on the Python side only (never in any frontend
     bundle, never through any bridge). Raises
@@ -235,10 +245,11 @@ def build_groq_language_model(
     """
     from backend.groq_manager import GroqClientManager, GroqConfigurationError
 
+    effective_params = call_params if call_params is not None else groq_params
     try:
         manager = GroqClientManager(
-            keys=keys,
-            groq_params=groq_params or GroqCallParams(),
+            keys=list(keys) if keys is not None else None,
+            groq_params=effective_params or GroqCallParams(),
         )
     except GroqConfigurationError:
         raise LanguageModelConfigurationError() from None

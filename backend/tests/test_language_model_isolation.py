@@ -69,6 +69,31 @@ def _groq_import_violations(path: Path) -> list[str]:
     return violations
 
 
+def _groq_toplevel_import_violations(path: Path) -> list[str]:
+    """Groq imports at *module import time* only (function-level lazy
+    imports inside composition-root factories are allowed by design)."""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    violations: list[str] = []
+    # Only statements directly in the module body execute when the
+    # module is imported; imports nested inside functions run at call
+    # time (the sanctioned lazy mechanism for the composition root).
+    for node in tree.body:
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                module = alias.name
+                if module in _BANNED_MODULES or module.split(".")[0] == "groq":
+                    violations.append(
+                        f"{path}:{node.lineno}: imports Groq module {module!r} at import time"
+                    )
+        elif isinstance(node, ast.ImportFrom):
+            module = f"backend.{node.module}" if node.level else (node.module or "")
+            if module in _BANNED_MODULES or module.split(".")[0] == "groq":
+                violations.append(
+                    f"{path}:{node.lineno}: imports Groq module {module!r} at import time"
+                )
+    return violations
+
+
 def _groq_name_violations(path: Path) -> list[str]:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     violations: list[str] = []
@@ -108,10 +133,27 @@ def test_domain_modules_never_reference_groq_names():
 
 
 def test_desktop_shell_never_imports_groq():
-    """The desktop shell stays a pure bridge: no provider imports at all."""
+    """The desktop shell stays a pure bridge, except the composition root.
+
+    ``backend/desktop/app.py`` is the desktop composition root (issue
+    #337 review): it is the one desktop file allowed to select the
+    concrete provider, capture its keys Python-side and build the
+    lazy adapter factory. Every other desktop module must stay
+    provider-free, and even the composition root must not import the
+    provider SDK at import time (the factory defers it).
+    """
     violations: list[str] = []
     desktop_dir = REPO_ROOT / _FORBIDDEN_DESKTOP_DIR
+    composition_root = desktop_dir / "app.py"
     for path in sorted(desktop_dir.rglob("*.py")):
+        if path == composition_root:
+            # Composition root: explicit provider selection is its job.
+            # It must never IMPORT the SDK/manager/keys at module level
+            # (import-time purity is what keeps startup SDK-free); the
+            # lazy, function-level imports inside the factory builder
+            # are its sanctioned mechanism.
+            violations.extend(_groq_toplevel_import_violations(path))
+            continue
         violations.extend(_groq_import_violations(path))
         violations.extend(_groq_name_violations(path))
     assert violations == [], (
@@ -145,4 +187,33 @@ def test_contract_module_has_no_groq_imports():
     )
     assert _groq_name_violations(contract) == [], (
         "the LanguageModel contract must not reference Groq symbols"
+    )
+
+
+def test_companion_runtime_is_provider_agnostic():
+    """The desktop runtime must not know any concrete provider (review).
+
+    Issue #337 review: the concrete choice (groq, Groq keys, Groq
+    adapter) happens in the desktop composition root, never inside
+    ``backend/companion_runtime.py``. This structural test fails if
+    the runtime ever grows ``groq``/``groq_keys``/
+    ``GroqClientManager``/``GroqLanguageModel`` references again.
+    It deliberately does not forbid those names in the adapter,
+    manager, keys loader, composition roots or adapter tests.
+    """
+    runtime_path = REPO_ROOT / "backend/companion_runtime.py"
+    assert runtime_path.exists()
+    text = runtime_path.read_text(encoding="utf-8")
+    banned = (
+        "groq",
+        "groq_keys",
+        "GroqClientManager",
+        "GroqLanguageModel",
+    )
+    violations = [name for name in banned if name in text]
+    assert violations == [], (
+        "companion_runtime.py must stay provider-agnostic; "
+        f"found provider references: {violations}. Move the concrete "
+        "provider wiring to the desktop composition root "
+        "(backend/desktop/app.py)."
     )
