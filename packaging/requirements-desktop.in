@@ -1,0 +1,35 @@
+# Desktop runtime dependencies for the Katherine .deb (#338).
+#
+# This is a DELIBERATELY SEPARATE lock from backend/requirements.in:
+# the .deb ships only what the desktop runtime imports (the companion
+# graph + the lazy remote provider), not the cloud/web stack (FastAPI,
+# uvicorn, Supabase, torch, sentence-transformers) that the desktop
+# never loads (proven by backend/tests/test_desktop_import_isolation.py).
+#
+# Versions mirror backend/requirements.txt pins so the packaged app
+# runs the same code as the checkout.
+#
+# Native/system dependencies (NOT pip): python3-gi, WebKitGTK 4.1,
+# GTK 3 — provided by the .deb Depends field, matching the validated
+# environment of docs/operations/desktop-shell-linux.md.
+
+pywebview==6.2.1
+python-dotenv==1.2.2
+groq==1.5.0
+
+# Transitive pins mirroring backend/requirements.txt exactly, so the
+# packaged dependency closure is byte-identical to the validated one.
+annotated-types==0.7.0
+anyio==4.14.1
+bottle==0.13.4
+certifi==2026.6.17
+distro==1.9.0
+h11==0.16.0
+httpcore==1.0.9
+httpx==0.28.1
+idna==3.19
+pydantic==2.13.4
+pydantic-core==2.46.4
+sniffio==1.3.1
+typing-extensions==4.16.0
+typing-inspection==0.4.4
