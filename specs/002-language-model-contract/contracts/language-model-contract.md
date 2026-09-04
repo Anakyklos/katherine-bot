@@ -29,6 +29,14 @@ class LanguageModel(Protocol):
         Conteúdo vazio/inválido → LanguageModelInvalidResponseError.
         """
 
+    async def extract_archival(self, messages: list[dict[str, str]], budget: TurnBudget) -> str:
+        """Extrai fatos de memória de longo prazo de um turno persistido.
+
+        Terceiro call site real (``run_archival_extraction``). Mantém seu
+        próprio shape contratado — fast model, JSON mode, temperatura 0,
+        limite de tokens explícito — aplicado dentro do adapter.
+        """
+
     def describe(self) -> ModelSelection:
         """Identificação sanitizada para observabilidade.
 
@@ -136,6 +144,9 @@ class FakeLanguageModel:
         return AppraisalV1(...)
     async def generate(self, messages, budget):
         self.calls.append(("generate", [m["role"] for m in messages]))
+
+    async def extract_archival(self, messages, budget):
+        self.calls.append(("extract_archival", [m["role"] for m in messages]))
         return "resposta determinística"
     def describe(self):
         return ModelSelection(provider="fake", main_model_id="fake-main", fast_model_id="fake-fast")

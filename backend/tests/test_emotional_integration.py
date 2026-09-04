@@ -73,6 +73,84 @@ from backend.turn_execution import TurnExecutionError, TurnErrorCode
 FIXED_CLOCK = 1_700_000_000.0
 
 
+# ─── Fake LanguageModel (canonical contract, issue #337) ──────────────────────
+
+class FakeLanguageModel:
+    """Deterministic in-memory ``LanguageModel``.
+
+    ``appraisal_payload`` is the JSON payload the appraisal step would
+    receive from a remote provider. The fake keeps the parsing inside the
+    fake so tests still exercise the domain rules (valid/invalid
+    appraisal, fallback, sanitised logging) without touching the Groq
+    adapter. ``fail_appraise_with``/``fail_generate_with`` inject
+    canonical failures.
+    """
+
+    def __init__(self):
+        self.appraisal_payload: dict | None = {
+            "valence": 0.2, "arousal_shift": 0.1, "dominance_shift": 0.0,
+            "triggered_emotions": {"joy": 0.5},
+        }
+        self.generation_text = "Hi there!"
+        self.appraise_calls = 0
+        self.generate_calls = 0
+        self.fail_appraise_with: Exception | None = None
+        self.fail_generate_with: Exception | None = None
+
+    async def appraise(self, message: str, budget):
+        self.appraise_calls += 1
+        if self.fail_appraise_with is not None:
+            raise self.fail_appraise_with
+        if self.appraisal_payload is None:
+            from backend.language_model import LanguageModelInvalidResponseError
+            raise LanguageModelInvalidResponseError()
+        from backend.emotional_domain import parse_llm_appraisal
+        result = parse_llm_appraisal(self.appraisal_payload)
+        if result.is_fallback:
+            # Mirror the Groq adapter's sanitised fallback event so the
+            # engine-level sanitisation guarantees stay observable with
+            # any LanguageModel implementation: code only, never payload.
+            import logging
+            logging.getLogger("backend.engine").info(
+                "event=emotional_appraisal_fallback code=%s",
+                result.error_code.value if result.error_code else "unknown",
+            )
+            from backend.language_model import LanguageModelInvalidResponseError
+            raise LanguageModelInvalidResponseError()
+        return result.appraisal
+
+    async def generate(self, messages: list, budget) -> str:
+        self.generate_calls += 1
+        if self.fail_generate_with is not None:
+            raise self.fail_generate_with
+        return self.generation_text
+
+    async def extract_archival(self, messages: list, budget) -> str:
+        # Not exercised by emotional integration tests; present to
+        # satisfy the contract.
+        return "{}"
+
+    def describe(self):
+        from backend.language_model import ModelSelection
+        return ModelSelection(
+            provider="fake",
+            main_model_id="fake-main",
+            fast_model_id="fake-fast",
+        )
+
+
+class MockCompletion:
+    """Minimal ChatCompletion-like shape (kept local to this suite).
+
+    Used only by tests that still exercise the raw content contract of
+    the adapter-facing layer (None/empty content). It is NOT a Groq SDK
+    object; it mimics the boundary shape the fake model consumes.
+    """
+
+    def __init__(self, content):
+        self.choices = [type("Choice", (), {"message": type("Msg", (), {"content": content})()})()]
+
+
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
 def _legacy_emotion_dict(pleasure=0.0, arousal=0.0, dominance=0.0) -> dict:
@@ -100,8 +178,19 @@ def _v1_emotion_dict(pleasure=0.0) -> dict:
 
 
 def _make_engine(clock=FIXED_CLOCK, archival_extraction_enabled=False):
-    """Create a ConversationEngine with fixed clock and mocked external deps."""
-    engine = ConversationEngine(clock=lambda: clock, archival_extraction_enabled=archival_extraction_enabled)
+    """Create a ConversationEngine with fixed clock and mocked external deps.
+
+    Issue #337: the engine seam is the canonical ``LanguageModel``
+    contract (``appraise``/``generate``/``describe``). The fake below
+    replaces the previous ``engine.groq_manager`` mocks — no provider
+    SDK objects (ChatCompletion shapes) are constructed in these tests.
+    """
+    model = FakeLanguageModel()
+    engine = ConversationEngine(
+        clock=lambda: clock,
+        archival_extraction_enabled=archival_extraction_enabled,
+        language_model=model,
+    )
     engine.memory_manager.load_user_state = MagicMock(return_value={
         "emotional_state": _legacy_emotion_dict(),
     })
@@ -117,31 +206,12 @@ def _make_engine(clock=FIXED_CLOCK, archival_extraction_enabled=False):
         persona_snapshot="",
     ))
 
-    # Mock sync completion for archival extraction
-    sync_m = MagicMock()
-    sync_m.choices = [MagicMock()]
-    sync_m.choices[0].message.content = "Hi"
-    engine.groq_manager.chat_completion = MagicMock(return_value=sync_m)
-    
-    # Mock async completion for appraisal (returns valid JSON)
-    async def _mock_async_completion(**kwargs):
-        async_m = MagicMock()
-        async_m.choices = [MagicMock()]
-        async_m.choices[0].message.content = json.dumps({
-            "valence": 0.2, "arousal_shift": 0.1, "dominance_shift": 0.0,
-            "triggered_emotions": {"joy": 0.5},
-        })
-        return async_m
-    
-    # Mock async completion for generation (returns valid text)
-    async def _mock_generation(**kwargs):
-        gen_m = MagicMock()
-        gen_m.choices = [MagicMock()]
-        gen_m.choices[0].message.content = "Hi there!"
-        return gen_m
-    
-    engine.groq_manager.chat_completion_async = MagicMock(side_effect=_mock_async_completion)
-    
+    # Appraisal payload returned by the fake model (valid appraisal JSON).
+    model.appraisal_payload = {
+        "valence": 0.2, "arousal_shift": 0.1, "dominance_shift": 0.0,
+        "triggered_emotions": {"joy": 0.5},
+    }
+
     return engine
 
 
@@ -238,7 +308,10 @@ class TestSpyBasedFlowCounting:
             parse_spy = MagicMock(wraps=parse_llm_appraisal)
             transition_spy = MagicMock(wraps=transition)
 
-            with patch("backend.engine.parse_llm_appraisal", parse_spy), \
+            # Issue #337: parsing lives in the adapter (here the fake
+            # model's appraise), so the spy patches the emotional_domain
+            # package namespace — the one the adapter/fake import from.
+            with patch("backend.emotional_domain.parse_llm_appraisal", parse_spy), \
                  patch("backend.engine.transition", transition_spy):
 
                 resp, emotions = await engine.process_turn("user", "Hello")
@@ -288,7 +361,15 @@ class TestRelationshipAdaptationSpy:
                     },
                 })
                 return mock_resp
-            engine.groq_manager.chat_completion_async = MagicMock(side_effect=_mock_appraisal)
+            engine._language_model.appraisal_payload = {
+                "valence": 0.5,
+                "arousal_shift": 0.2,
+                "dominance_shift": 0.1,
+                "triggered_emotions": {
+                    "joy": 0.8,
+                    "tenderness": 0.6,
+                },
+            }
 
             await engine.process_turn("user", "Hello")
 
@@ -328,7 +409,13 @@ class TestRelationshipAdaptationSpy:
                     SENSITIVE_KEY: "should_not_leak",
                 })
                 return mock_resp
-            engine.groq_manager.chat_completion_async = MagicMock(side_effect=_mock_appraisal)
+            engine._language_model.appraisal_payload = {
+                "valence": 0.5,
+                "arousal_shift": 0.2,
+                "dominance_shift": 0.1,
+                "triggered_emotions": {"joy": 0.8},
+                SENSITIVE_KEY: "should_not_leak",
+            }
 
             logger = logging.getLogger("backend.engine")
             logger.setLevel(logging.INFO)
@@ -359,20 +446,15 @@ class TestRelationshipAdaptationSpy:
         async def run():
             engine = _make_engine()
             # Payload with known emotion joy=0.8 and unknown emotion_92841=0.9
-            async def _mock_appraisal(**kwargs):
-                mock_resp = MagicMock()
-                mock_resp.choices = [MagicMock()]
-                mock_resp.choices[0].message.content = json.dumps({
-                    "valence": 0.2,
-                    "arousal_shift": 0.1,
-                    "dominance_shift": 0.0,
-                    "triggered_emotions": {
-                        "joy": 0.8,
-                        "unknown_emotion_92841": 0.9,
-                    },
-                })
-                return mock_resp
-            engine.groq_manager.chat_completion_async = MagicMock(side_effect=_mock_appraisal)
+            engine._language_model.appraisal_payload = {
+                "valence": 0.2,
+                "arousal_shift": 0.1,
+                "dominance_shift": 0.0,
+                "triggered_emotions": {
+                    "joy": 0.8,
+                    "unknown_emotion_92841": 0.9,
+                },
+            }
 
             await engine.process_turn("user", "Hello")
 
@@ -391,12 +473,7 @@ class TestRelationshipAdaptationSpy:
         """Empty appraisal dict triggers fallback in parser, which raises at orchestration boundary."""
         async def run():
             engine = _make_engine()
-            async def _mock_empty_appraisal(**kwargs):
-                mock_resp = MagicMock()
-                mock_resp.choices = [MagicMock()]
-                mock_resp.choices[0].message.content = json.dumps({})
-                return mock_resp
-            engine.groq_manager.chat_completion_async = MagicMock(side_effect=_mock_empty_appraisal)
+            engine._language_model.appraisal_payload = {}
 
             with pytest.raises(TurnExecutionError) as exc_info:
                 await engine.process_turn("user", "Hello")
@@ -445,14 +522,16 @@ class TestFailClosedThroughProcessTurn:
     ])
     def test_corrupt_snapshot_blocks_flow(self, description, bad_state):
         async def run():
-            engine = ConversationEngine(clock=lambda: FIXED_CLOCK)
+            # Install spies on all downstream methods
+            model = FakeLanguageModel()
+            engine = ConversationEngine(
+                clock=lambda: FIXED_CLOCK,
+                language_model=model,
+            )
             engine.memory_manager.load_user_state = MagicMock(return_value={
                 "emotional_state": bad_state,
             })
-
-            # Install spies on all downstream methods
             engine.memory_manager.get_context = MagicMock()
-            engine.groq_manager.chat_completion_async = MagicMock()
             engine.memory_manager.save_turn = MagicMock()
             engine.memory_manager.sync_state = MagicMock()
 
@@ -461,14 +540,10 @@ class TestFailClosedThroughProcessTurn:
             with pytest.raises(EmotionalDomainError):
                 await engine.process_turn("user", "Msg", background_tasks=bg_tasks)
 
-            # Zero downstream calls: no context, no async LLM, no persist
+            # Zero downstream calls: no context, no LLM, no persist
             engine.memory_manager.get_context.assert_not_called()
-            engine.groq_manager.chat_completion_async.assert_not_called()
+            assert model.appraise_calls == 0
             engine.memory_manager.save_turn.assert_not_called()
-            engine.memory_manager.sync_state.assert_not_called()
-            # transition_relationship is called inside process_turn, but
-            # since the corrupt snapshot blocks the flow before transition,
-            # sync_state is never called (relationship never reached)
             engine.memory_manager.sync_state.assert_not_called()
             bg_tasks.add_task.assert_not_called()
 
@@ -476,7 +551,10 @@ class TestFailClosedThroughProcessTurn:
 
     def test_nan_snapshot_fails_closed(self):
         async def run():
-            engine = ConversationEngine(clock=lambda: FIXED_CLOCK)
+            model = FakeLanguageModel()
+            engine = ConversationEngine(
+                clock=lambda: FIXED_CLOCK, language_model=model
+            )
             engine.memory_manager.load_user_state = MagicMock(return_value={
                 "emotional_state": {
                     "pleasure": float("nan"), "arousal": 0.0, "dominance": 0.0,
@@ -485,7 +563,6 @@ class TestFailClosedThroughProcessTurn:
                     "last_update": FIXED_CLOCK,
                 },
             })
-            engine.groq_manager.chat_completion_async = MagicMock()
             engine.memory_manager.save_turn = MagicMock()
             engine.memory_manager.sync_state = MagicMock()
             bg_tasks = MagicMock()
@@ -493,7 +570,7 @@ class TestFailClosedThroughProcessTurn:
             with pytest.raises(EmotionalDomainError):
                 await engine.process_turn("user", "Msg", background_tasks=bg_tasks)
 
-            engine.groq_manager.chat_completion_async.assert_not_called()
+            assert model.appraise_calls == 0
             engine.memory_manager.save_turn.assert_not_called()
             engine.memory_manager.sync_state.assert_not_called()
             bg_tasks.add_task.assert_not_called()
@@ -502,7 +579,10 @@ class TestFailClosedThroughProcessTurn:
 
     def test_inf_snapshot_fails_closed(self):
         async def run():
-            engine = ConversationEngine(clock=lambda: FIXED_CLOCK)
+            model = FakeLanguageModel()
+            engine = ConversationEngine(
+                clock=lambda: FIXED_CLOCK, language_model=model
+            )
             engine.memory_manager.load_user_state = MagicMock(return_value={
                 "emotional_state": {
                     "pleasure": float("inf"), "arousal": 0.0, "dominance": 0.0,
@@ -511,7 +591,6 @@ class TestFailClosedThroughProcessTurn:
                     "last_update": FIXED_CLOCK,
                 },
             })
-            engine.groq_manager.chat_completion_async = MagicMock()
             engine.memory_manager.save_turn = MagicMock()
             engine.memory_manager.sync_state = MagicMock()
             bg_tasks = MagicMock()
@@ -519,7 +598,7 @@ class TestFailClosedThroughProcessTurn:
             with pytest.raises(EmotionalDomainError):
                 await engine.process_turn("user", "Msg", background_tasks=bg_tasks)
 
-            engine.groq_manager.chat_completion_async.assert_not_called()
+            assert model.appraise_calls == 0
             engine.memory_manager.save_turn.assert_not_called()
             engine.memory_manager.sync_state.assert_not_called()
             bg_tasks.add_task.assert_not_called()
@@ -529,11 +608,13 @@ class TestFailClosedThroughProcessTurn:
     def test_corrupt_snapshot_blocks_before_transition(self):
         """Also verify transition is never called for corrupt snapshots."""
         async def run():
-            engine = ConversationEngine(clock=lambda: FIXED_CLOCK)
+            model = FakeLanguageModel()
+            engine = ConversationEngine(
+                clock=lambda: FIXED_CLOCK, language_model=model
+            )
             engine.memory_manager.load_user_state = MagicMock(return_value={
                 "emotional_state": {"schema_version": 99},
             })
-            engine.groq_manager.chat_completion_async = MagicMock()
             engine.memory_manager.save_turn = MagicMock()
             engine.memory_manager.sync_state = MagicMock()
 
@@ -816,7 +897,10 @@ class TestNewProfileFirstTurn:
 
             # ── Isolate from real SentenceTransformer (would hang in CI)  ──
             with patch("backend.memory.SentenceTransformer", return_value=MagicMock()) as embedding_cls:
-                engine = ConversationEngine(clock=clock, embeddings_enabled=True)
+                model = FakeLanguageModel()
+                engine = ConversationEngine(
+                    clock=clock, embeddings_enabled=True, language_model=model
+                )
             embedding_cls.assert_called_once()
 
             # ── Mock Supabase: empty select (new user), then insert OK     ──
@@ -860,7 +944,11 @@ class TestNewProfileFirstTurn:
                 mock_resp.choices[0].message.content = "Hello!"
                 return mock_resp
             
-            engine.groq_manager.chat_completion_async = MagicMock(side_effect=_mock_appraisal_new)
+            engine._language_model.appraisal_payload = {
+                "valence": 0.2, "arousal_shift": 0.1, "dominance_shift": 0.0,
+                "triggered_emotions": {"joy": 0.3},
+            }
+            engine._language_model.generation_text = "Hello!"
 
             # ── Imports for real transition functions / spies             ──
             from backend.emotional_domain import transition as real_e_transition
@@ -949,7 +1037,10 @@ class TestSanitisedLogging:
 
     def test_fallback_logs_only_sanitised_code(self):
         async def run():
-            engine = ConversationEngine(clock=lambda: FIXED_CLOCK)
+            model = FakeLanguageModel()
+            engine = ConversationEngine(
+                clock=lambda: FIXED_CLOCK, language_model=model
+            )
             engine.memory_manager.load_user_state = MagicMock(return_value={
                 "emotional_state": _legacy_emotion_dict(),
             })
@@ -982,7 +1073,13 @@ class TestSanitisedLogging:
                     "triggered_emotions": {"joy": 0.5},
                 })
                 return mock_resp
-            engine.groq_manager.chat_completion_async = MagicMock(side_effect=_mock_bad_appraisal)
+            model.appraisal_payload = {
+                "valence": self.SENSITIVE_PAYLOAD,
+                "arousal_shift": 0.0,
+                "dominance_shift": 0.0,
+                self.SENSITIVE_KEY: "should_not_leak",
+                "triggered_emotions": {"joy": 0.5},
+            }
 
             logger = logging.getLogger("backend.engine")
             logger.setLevel(logging.INFO)
@@ -1041,12 +1138,7 @@ class TestSanitisedLogging:
         """None content from appraisal is treated as provider_invalid_response."""
         async def run():
             engine = _make_engine()
-            async def _mock_none(**kwargs):
-                mock_resp = MagicMock()
-                mock_resp.choices = [MagicMock()]
-                mock_resp.choices[0].message.content = None
-                return mock_resp
-            engine.groq_manager.chat_completion_async = MagicMock(side_effect=_mock_none)
+            engine._language_model.appraisal_payload = None
 
             with pytest.raises(TurnExecutionError) as exc_info:
                 await engine.process_turn("user", "Hello")
@@ -1175,10 +1267,12 @@ class TestLegacyFlowNotUsed:
 
     def test_load_failure_blocks_processing(self):
         async def run():
-            engine = ConversationEngine(clock=lambda: FIXED_CLOCK)
+            model = FakeLanguageModel()
+            engine = ConversationEngine(
+                clock=lambda: FIXED_CLOCK, language_model=model
+            )
             engine.memory_manager.supabase = MagicMock()
             engine.memory_manager.supabase.table.return_value.select.return_value.eq.return_value.execute.side_effect = Exception("DB down")
-            engine.groq_manager.chat_completion_async = MagicMock()
 
             with pytest.raises(TurnExecutionError):
                 await engine.process_turn("user", "Msg")

@@ -47,6 +47,7 @@ from .emotional_domain import (
     transition,
 )
 from .emotion_presentation import EmotionStateResponse, project_public_emotion
+from .language_model import LanguageModel, build_trusted_policy
 from .relationship import (
     RelationshipStateV1,
     RelationshipTransitionConfig,
@@ -139,23 +140,10 @@ class ProcessTurnResult:
     emotion_state: EmotionStateResponse
 
 
-class ProviderPort(Protocol):
-    """Provider + policy surface used outside the transaction.
-
-    The engine implements this port with its existing appraisal, generation
-    and trusted-policy builders; tests substitute fakes.
-    """
-
-    async def appraise(self, message: str, budget: TurnBudget) -> AppraisalV1: ...
-
-    async def generate(self, messages: list, budget: TurnBudget) -> str: ...
-
-    def build_trusted_policy(
-        self,
-        emotional_state: Any,
-        relationship: Any,
-        adaptation_strategy: str = "",
-    ) -> str: ...
+#: The provider seam is the canonical ``LanguageModel`` contract
+#: (issue #337). The engine implements it; tests substitute fakes. The
+#: trusted policy is built by the core (``language_model.build_trusted_policy``),
+#: no longer a provider responsibility — see ``_run_once``.
 
 
 @dataclass(frozen=True)
@@ -236,7 +224,7 @@ class ProcessTurn:
         commit_repository: Any,
         replay_repository: Any,
         context_loader: Callable[..., Any],
-        provider: ProviderPort,
+        provider: LanguageModel,
         transition_config: TransitionConfig,
         relationship_config: RelationshipTransitionConfig,
         clock: Callable[[], float] = _time.time,
@@ -431,8 +419,11 @@ class ProcessTurn:
         )
 
         # ---- 5. Provider envelope (pure domain, no I/O) -----------------------
+        # Issue #337: the trusted policy is a Katherine-core
+        # responsibility, built from the canonical core template — not a
+        # provider capability.
         adaptation_strategy = ""
-        trusted_policy = self._provider.build_trusted_policy(
+        trusted_policy = build_trusted_policy(
             new_state, relationship, adaptation_strategy
         )
         try:

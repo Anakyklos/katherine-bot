@@ -471,23 +471,24 @@ class PersistenceClientCheck:
 class ProviderCheck:
     """Provider path availability check (configuration-level, no generation).
 
-    Verifies that the Groq manager holds validated keys and is ready to build
-    clients. It deliberately never runs a completion, never sends a request,
-    and never loads models. Deployments that want a real network probe must
-    inject their own check with an explicit, documented timeout.
+    Verifies that the engine's LanguageModel wiring is configured and
+    ready. It deliberately never runs a completion, never sends a
+    request, and never loads models. Deployments that want a real
+    network probe must inject their own check with an explicit,
+    documented timeout.
     """
 
     name = "provider"
 
-    def __init__(self, groq_manager: Any, timeout_seconds: float) -> None:
-        self._groq_manager = groq_manager
+    def __init__(self, provider_status: Any, timeout_seconds: float) -> None:
+        self._provider_status = provider_status
         self.timeout_seconds = timeout_seconds
 
     async def run(self) -> None:
-        if self._groq_manager is None:
+        if self._provider_status is None:
             raise CheckFailure()
         try:
-            configured = await asyncio.to_thread(self._groq_manager.is_configured)
+            configured = await asyncio.to_thread(self._provider_status)
         except Exception:
             raise CheckFailure() from None
         if not configured:
@@ -597,7 +598,7 @@ def build_health_registry(
     )
     registry.add(
         ProviderCheck(
-            engine.groq_manager,
+            engine.is_provider_configured,
             timeout_seconds=settings.readiness_provider_timeout_ms / 1000.0,
         )
     )

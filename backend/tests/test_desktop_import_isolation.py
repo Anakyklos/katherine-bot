@@ -38,8 +38,10 @@ import backend.desktop.app  # noqa: F401
 import backend.local_storage.legacy_import  # noqa: F401
 
 # First-use lazy path: the provider factory's own lazy import target
-# (module only, no client construction, no network).
-from backend.companion_runtime import build_groq_runtime_provider  # noqa: F401
+# (module only, no client construction, no network). Issue #337: the
+# builder is the canonical LanguageModel factory (Groq adapter behind
+# the contract), imported lazily from the runtime.
+from backend.companion_runtime import build_default_language_model  # noqa: F401
 
 print(json.dumps(sorted(sys.modules.keys())))
 """

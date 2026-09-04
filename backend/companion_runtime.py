@@ -18,7 +18,7 @@ What it does
   2. load recent history into a ``LoadedContextData`` (no Supabase, no
      embeddings; memories retrieved from the local ``memories`` table as
      approved ``RetrievedMemory``-contract objects);
-  3. LLM appraisal via the provider port (remote Groq);
+  3. LLM appraisal via the canonical LanguageModel contract;
   4. pure-domain transitions (``transition`` / ``transition_relationship``);
   5. trusted-policy + envelope construction (``build_context_bundle`` /
      ``build_envelope``) with the canonical trusted policy text;
@@ -46,8 +46,8 @@ What it deliberately does NOT do
 * No generic RPC: the bridge (``backend.desktop.api``) stays a small,
   explicit allowlist on top of this runtime.
 * No heavy imports at module import time: only light domain modules are
-  imported eagerly (``groq_manager`` and the provider adapter are imported
-  lazily inside the factory ``build_groq_runtime`` / on first use).
+  imported eagerly (the remote adapter is imported lazily inside the
+  default factory, built on the first turn that needs the model).
 
 Concurrency model
 ------------------
@@ -90,6 +90,14 @@ from backend.emotional_domain import (
     parse_llm_appraisal,
 )
 from backend.emotional_domain import transition as transition_emotion
+from backend.language_model import (
+    LanguageModel,
+    LanguageModelConfigurationError,
+    LanguageModelError,
+    ModelFailure,
+    build_trusted_policy as build_core_trusted_policy,
+    language_failure_to_turn_code,
+)
 from backend.local_storage import open_local_storage
 from backend.local_storage.errors import (
     ConflictError,
@@ -115,7 +123,6 @@ from backend.trusted_context import (
 )
 from backend.turn_execution import (
     DeadlineExceeded,
-    GroqCallParams,
     TurnBudget,
     TurnExecutionError,
 )
@@ -240,23 +247,10 @@ def runtime_error_code(exc: BaseException) -> LocalErrorCode:
     exception *types* (never messages), so no provider detail, path or
     SQL can leak through it.
     """
-    # Import lazily: groq_manager must stay out of the import cost of
-    # callers that only need the error vocabulary.
-    from backend.groq_manager import (
-        GroqConfigurationError,
-        GroqPoolExhaustedError,
-        GroqRequestError,
-        ProviderFailure,
-    )
-
     if isinstance(exc, LocalStorageError):
         return exc.code
-    if isinstance(exc, GroqConfigurationError):
+    if isinstance(exc, LanguageModelConfigurationError):
         return LocalErrorCode.CONFIGURATION
-    if isinstance(exc, GroqRequestError):
-        # Generic provider request failure — the web maps this to
-        # provider_unavailable (503); the same vocabulary here.
-        return LocalErrorCode.SERVICE_UNAVAILABLE
     if isinstance(exc, TurnExecutionError):
         # TurnExecutionError codes are already sanitized enum values.
         from backend.turn_execution import TurnErrorCode
@@ -266,15 +260,15 @@ def runtime_error_code(exc: BaseException) -> LocalErrorCode:
         if exc.code == TurnErrorCode.upstream_rate_limited:
             return LocalErrorCode.RATE_LIMITED
         return LocalErrorCode.SERVICE_UNAVAILABLE
-    if isinstance(exc, GroqPoolExhaustedError):
-        failure = exc.failure_code
-        if failure == ProviderFailure.rate_limited:
+    if isinstance(exc, LanguageModelError):
+        failure = exc.failure
+        if failure == ModelFailure.rate_limited:
             return LocalErrorCode.RATE_LIMITED
-        if failure == ProviderFailure.timeout:
+        if failure == ModelFailure.timeout:
             return LocalErrorCode.TIMEOUT
-        if failure in (ProviderFailure.connection_failed, ProviderFailure.server_error):
+        if failure in (ModelFailure.connection_failed, ModelFailure.server_error):
             return LocalErrorCode.SERVICE_UNAVAILABLE
-        if failure == ProviderFailure.auth_failed:
+        if failure == ModelFailure.auth_failed:
             return LocalErrorCode.CONFIGURATION
         return LocalErrorCode.SERVICE_UNAVAILABLE
     if isinstance(exc, ConflictError):
@@ -307,6 +301,13 @@ def sanitized_error(exc: BaseException) -> LocalStorageError:
     """Convert any exception into the sanitized :class:`LocalStorageError`."""
     if isinstance(exc, LocalStorageError):
         return exc
+    if isinstance(exc, LanguageModelError):
+        # Canonical provider failure: the constant MESSAGE is already
+        # sanitized (no secret, no detail) — preserve it verbatim so
+        # UI/bridge keep a stable, human-readable provider message.
+        return LocalStorageError(
+            runtime_error_code(exc), message=exc.MESSAGE
+        )
     code = runtime_error_code(exc)
     return LocalStorageError(code)
 
@@ -349,23 +350,9 @@ class TurnResult:
         return payload
 
 
-#: Provider port — the remote LLM boundary (mirrors ProcessTurn's port).
-#: The desktop runtime speaks to Groq through this port only; tests
-#: substitute it with a deterministic fake at this exact seam.
-class ProviderPort:
-    async def appraise(self, message: str, budget: TurnBudget) -> AppraisalV1:
-        raise NotImplementedError
-
-    async def generate(self, messages: list, budget: TurnBudget) -> str:
-        raise NotImplementedError
-
-    def build_trusted_policy(
-        self,
-        emotional_state: EmotionalStateV1,
-        relationship: RelationshipStateV1,
-        adaptation_strategy: str = "",
-    ) -> str:
-        raise NotImplementedError
+#: LanguageModel seam — the desktop runtime speaks to the remote LLM
+#: through the canonical contract only (issue #337); tests substitute
+#: a deterministic fake at this exact seam.
 
 
 class _LocalContextMemory:
@@ -422,8 +409,8 @@ class CompanionRuntime:
         self,
         *,
         storage_path: Path | str,
-        provider: ProviderPort | None = None,
-        provider_factory: Callable[[], ProviderPort] | None = None,
+        language_model: LanguageModel | None = None,
+        language_model_factory: Callable[[], LanguageModel] | None = None,
         history_limit: int = _HISTORY_CONTEXT_LIMIT,
         now_provider: Callable[[], float] | None = None,
         turn_deadline_seconds: float = 50.0,
@@ -434,18 +421,25 @@ class CompanionRuntime:
         web engine's ``time.time`` clock used for snapshot timestamps and
         transitions); the turn budget uses a real monotonic clock.
 
+        ``language_model`` / ``language_model_factory`` is the canonical
+        contract seam (issue #337): the runtime accepts an injected model
+        (tests) or a lazy factory (production builds the remote adapter
+        on first turn, never at startup). The legacy ``provider`` /
+        ``provider_factory`` aliases are kept for the bridge callers.
+
         ``provider_configured_probe`` answers "is a remote provider key
         configured?" without instantiating the client (env keys are read
-        Python-side only and never echoed). Defaults to checking the Groq
-        key env presence via the same loader the real provider uses.
+        Python-side only and never echoed). Defaults to checking the
+        provider key env presence via the loader behind the provider
+        boundary (never echoing values).
         """
-        if provider is not None and provider_factory is not None:
-            raise ValueError("pass provider or provider_factory, not both")
+        if language_model is not None and language_model_factory is not None:
+            raise ValueError("pass language_model or language_model_factory, not both")
         if history_limit < 1 or history_limit > 500:
             raise ValueError("history_limit must be in [1, 500]")
         self._storage_path = Path(storage_path)
-        self._provider: ProviderPort | None = provider
-        self._provider_factory = provider_factory
+        self._model: LanguageModel | None = language_model
+        self._model_factory = language_model_factory
         self._history_limit = history_limit
         self._now = now_provider or _real_epoch_clock
         self._turn_deadline = turn_deadline_seconds
@@ -466,17 +460,20 @@ class CompanionRuntime:
         return self._storage is not None and getattr(self._storage, "_closed", False) is True
 
     def _default_provider_configured_probe(self) -> bool:
-        """True iff a Groq key is configured (presence only, never echoed).
+        """True iff a remote provider key is configured (presence only).
 
         Deliberately does NOT build the provider: ``runtime_state`` must
         be cheap and safe before any window interaction, and an
         unconfigured key must not raise here (that failure belongs to the
-        turn that needs the model).
+        turn that needs the model). The key loader stays behind the
+        provider boundary (env values are read Python-side only and
+        never echoed).
         """
         try:
-            from backend.groq_keys import get_groq_api_keys
+            from importlib import import_module
 
-            keys = get_groq_api_keys()
+            keys_module = import_module("backend.groq_keys")
+            keys = keys_module.get_groq_api_keys()
         except Exception:  # noqa: BLE001 (probe must never raise)
             return False
         return any(isinstance(k, str) and k.strip() for k in keys)
@@ -502,13 +499,14 @@ class CompanionRuntime:
 
     # ── provider access ───────────────────────────────────────────────────
 
-    def _provider_port(self) -> ProviderPort:
-        if self._provider is None:
-            if self._provider_factory is not None:
-                self._provider = self._provider_factory()
+    def _provider_port(self) -> LanguageModel:
+        """Return the contract instance, building it lazily on first use."""
+        if self._model is None:
+            if self._model_factory is not None:
+                self._model = self._model_factory()
             else:
-                self._provider = build_groq_runtime_provider()
-        return self._provider
+                self._model = build_default_language_model()
+        return self._model
 
     # ── public API (called by the bridge) ─────────────────────────────────
 
@@ -754,7 +752,10 @@ class CompanionRuntime:
         )
 
         # 5. Trusted policy + envelope (pure domain).
-        trusted_policy = provider.build_trusted_policy(
+        # Issue #337: the trusted policy is a Katherine-core
+        # responsibility (canonical core builder), not a provider
+        # capability.
+        trusted_policy = build_core_trusted_policy(
             new_emotional, new_relationship, ""
         )
         bundle = build_context_bundle(
@@ -914,140 +915,32 @@ def _load_local_memories(storage) -> list[_LocalContextMemory]:
         logger.error("event=memory_row_dropped count=%d", dropped_rows)
     return memories
 
+def build_default_language_model() -> "LanguageModel":
+    """Build the default remote provider lazily (canonical contract).
 
-class GroqRuntimeProvider(ProviderPort):
-    """Adapter that speaks to Groq via ``GroqClientManager``.
-
-    Appraisal and generation mirror the web engine's calls (models,
-    temperatures, token limits, JSON mode for appraisal) with the trusted
-    policy built from the same canonical template.
-    """
-
-    def __init__(self, manager: Any, provider_config: ProviderConfig | None = None) -> None:
-        self._manager = manager
-        self._config = provider_config or ProviderConfig()
-        self._presentation = AffectiveEngine()
-
-    async def appraise(self, message: str, budget: TurnBudget) -> AppraisalV1:
-        import json as _json
-
-        messages = [
-            {"role": "system", "content": _APPRAISAL_POLICY},
-            {"role": "user", "content": message},
-        ]
-        validate_provider_input(messages)
-        response = await self._manager.chat_completion_async(
-            messages=messages,
-            model=self._config.fast_model_id,
-            budget=budget,
-            stage="appraisal",
-            temperature=0,
-            max_tokens=self._config.appraisal_max_output_tokens,
-            response_format={"type": "json_object"},
-        )
-        raw = response.choices[0].message.content
-        if not raw or not isinstance(raw, str) or not raw.strip():
-            raise _invalid_response("Empty appraisal response.")
-        try:
-            payload = _json.loads(raw)
-        except _json.JSONDecodeError:
-            raise _invalid_response("Invalid JSON from appraisal.") from None
-        parse_result = parse_llm_appraisal(payload)
-        if parse_result.is_fallback:
-            raise _invalid_response("Invalid appraisal.")
-        return parse_result.appraisal
-
-    async def generate(self, messages: list, budget: TurnBudget) -> str:
-        validate_provider_input(messages)
-        response = await self._manager.chat_completion_async(
-            messages=messages,
-            model=self._config.main_model_id,
-            budget=budget,
-            stage="generation",
-            temperature=0.8,
-            max_tokens=self._config.main_max_output_tokens,
-        )
-        content = response.choices[0].message.content
-        if not content or not isinstance(content, str) or not content.strip():
-            raise _invalid_response("Empty generation response.")
-        return content
-
-    def build_trusted_policy(
-        self,
-        emotional_state: EmotionalStateV1,
-        relationship: RelationshipStateV1,
-        adaptation_strategy: str = "",
-    ) -> str:
-        acting = self._presentation.get_acting_instruction(_to_legacy_state(emotional_state))
-        mood = self._presentation.get_emotional_label(_to_legacy_state(emotional_state))
-        policy = _TRUSTED_POLICY_TEMPLATE.format(
-            mood_label=mood,
-            pleasure=emotional_state.pleasure,
-            arousal=emotional_state.arousal,
-            dominance=emotional_state.dominance,
-            libido=emotional_state.libido,
-            aggression=emotional_state.aggression,
-            connection=emotional_state.connection,
-            bond_label=compute_bond_label(relationship),
-            trust=relationship.trust,
-            affection=relationship.affection,
-            tension=relationship.tension,
-            acting_instruction=acting,
-            adaptation_strategy=adaptation_strategy or "Seja você mesma.",
-        )
-        return policy.strip() + BOUNDARY_RULE
-
-
-def _invalid_response(message: str) -> TurnExecutionError:
-    from backend.turn_execution import TurnErrorCode
-
-    return TurnExecutionError(TurnErrorCode.provider_invalid_response, message)
-
-
-def _to_legacy_state(state: EmotionalStateV1):
-    """Adapt ``EmotionalStateV1`` to the light ``EmotionalState`` used by
-    :class:`AffectiveEngine` presentation methods."""
-    from backend.emotional_core import EmotionalState
-
-    return EmotionalState(
-        pleasure=state.pleasure,
-        arousal=state.arousal,
-        dominance=state.dominance,
-        libido=state.libido,
-        aggression=state.aggression,
-        connection=state.connection,
-        energy=state.energy,
-        tension=state.tension,
-        coping_mode=state.coping_mode,
-        last_update=state.timestamp,
-    )
-
-
-def build_groq_runtime_provider(
-    keys: list[str] | None = None,
-    groq_params: GroqCallParams | None = None,
-) -> GroqRuntimeProvider:
-    """Build the real remote provider (Groq) for the desktop runtime.
+    Issue #337: the desktop runtime no longer owns a Groq-specific
+    provider class. The remote provider is the explicit Groq adapter
+    behind the canonical ``LanguageModel`` contract. The import is
+    deliberately lazy (inside this factory) so importing the runtime
+    never loads a provider SDK and the adapter is only built on the
+    first turn that needs the model.
 
     Keys are read on the Python side only (never in the Vite bundle,
-    never through the bridge). Raises ``GroqConfigurationError`` when no
-    key is configured — the caller maps that to the sanitized
-    ``configuration`` code.
+    never through the bridge). A missing key raises the canonical,
+    sanitized configuration error, which the runtime maps to the
+    stable ``configuration`` code.
     """
-    from backend.groq_manager import GroqClientManager
+    from backend.language_model import resolve_language_model_factory
 
-    manager = GroqClientManager(
-        keys=keys,
-        groq_params=groq_params or GroqCallParams(),
-    )
-    return GroqRuntimeProvider(manager)
+    factory = resolve_language_model_factory("groq")
+    return factory()
 
 
 def build_companion_runtime(
     storage_path: Path | str | None = None,
     *,
-    provider: ProviderPort | None = None,
-) -> CompanionRuntime:
+    language_model: "LanguageModel | None" = None,
+) -> "CompanionRuntime":
     """Build the production runtime with the default local database path."""
     if storage_path is None:
         from backend.local_storage.storage import default_database_path
@@ -1055,5 +948,5 @@ def build_companion_runtime(
         storage_path = default_database_path()
     return CompanionRuntime(
         storage_path=storage_path,
-        provider=provider,
+        language_model=language_model,
     )

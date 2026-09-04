@@ -104,6 +104,11 @@ class GroqLanguageModel:
             raise LanguageModelInvalidResponseError() from None
         parse_result = parse_llm_appraisal(payload)
         if parse_result.is_fallback:
+            # Sanitized fallback event: code only, never payload/prompt/exception.
+            logger.info(
+                "event=emotional_appraisal_fallback code=%s",
+                parse_result.error_code.value if parse_result.error_code else "unknown",
+            )
             raise LanguageModelInvalidResponseError()
         return parse_result.appraisal
 
@@ -117,6 +122,34 @@ class GroqLanguageModel:
                 stage="generation",
                 temperature=0.8,
                 max_tokens=self._config.main_max_output_tokens,
+            )
+        except Exception as exc:
+            raise _translate_provider_error(exc) from None
+
+        content = _extract_content(response)
+        if not content or not isinstance(content, str) or not content.strip():
+            raise LanguageModelInvalidResponseError()
+        return content
+
+    async def extract_archival(self, messages: list, budget: TurnBudget) -> str:
+        """Archival fact-extraction call (fast model, JSON mode).
+
+        Preserves the exact contracted call shape of the legacy
+        ``run_archival_extraction`` call site: fast model, temperature
+        0, explicit token limit, JSON mode, ``archival_extraction``
+        stage. Failure is a caller-logged background event; here it
+        still surfaces as a canonical error.
+        """
+        validate_provider_input(messages)
+        try:
+            response = await self._manager.chat_completion_async(
+                messages=messages,
+                model=self._config.fast_model_id,
+                budget=budget,
+                stage="archival_extraction",
+                temperature=0.0,
+                max_tokens=self._config.archival_max_output_tokens,
+                response_format={"type": "json_object"},
             )
         except Exception as exc:
             raise _translate_provider_error(exc) from None

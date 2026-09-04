@@ -252,6 +252,10 @@ class TestBridgeRuntimeIntegration:
         from backend.companion_runtime import CompanionRuntime
 
         class FakeProvider:
+            """LanguageModel fake (issue #337): the runtime seam is the
+            canonical contract; the trusted policy is a core function,
+            not a provider capability."""
+
             async def appraise(self, message, budget):
                 from backend.emotional_domain import AppraisalV1
 
@@ -260,16 +264,22 @@ class TestBridgeRuntimeIntegration:
             async def generate(self, messages, budget):
                 return "local desktop response"
 
-            def build_trusted_policy(self, emotional_state, relationship,
-                                     adaptation_strategy=""):
-                return "policy"
+            async def extract_archival(self, messages, budget):
+                return "{}"
+
+            def describe(self):
+                from backend.language_model import ModelSelection
+                return ModelSelection(
+                    provider="fake", main_model_id="fake-main",
+                    fast_model_id="fake-fast",
+                )
 
         monkeypatch.delenv("GROQ_API_KEY", raising=False)
         monkeypatch.delenv("GROQ_API_KEY_2", raising=False)
 
         runtime = CompanionRuntime(
             storage_path=tmp_path / "katherine.db",
-            provider=FakeProvider(),
+            language_model=FakeProvider(),
             provider_configured_probe=lambda: provider_configured,
         )
         return make_js_api(runtime=runtime), runtime
@@ -383,6 +393,9 @@ class TestSmokeSeams:
         monkeypatch.setattr(desktop_app_module, "_build_runtime", _forbidden)
 
         class OfflineProvider:
+            """LanguageModel fake (issue #337): contract seam only; the
+            trusted policy is core, not a provider capability."""
+
             async def appraise(self, message, budget):
                 from backend.emotional_domain import AppraisalV1
 
@@ -391,8 +404,15 @@ class TestSmokeSeams:
             async def generate(self, messages, budget):
                 return "offline reply"
 
-            def build_trusted_policy(self, emotional_state, relationship, adaptation_strategy=""):
-                return "policy"
+            async def extract_archival(self, messages, budget):
+                return "{}"
+
+            def describe(self):
+                from backend.language_model import ModelSelection
+                return ModelSelection(
+                    provider="fake", main_model_id="fake-main",
+                    fast_model_id="fake-fast",
+                )
 
         db_path = tmp_path / "smoke.db"
         exit_code = desktop_app_module.run_desktop_shell(

@@ -442,7 +442,7 @@ def run_desktop_shell(
 
         runtime = CompanionRuntime(
             storage_path=storage_path,
-            provider=provider,
+            language_model=provider,
         )
 
     # ``create_window`` returns the Window synchronously, before

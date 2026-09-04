@@ -369,6 +369,26 @@ def test_unexpected_error_503(client_app, mock_supabase, mock_engine_process, ca
     mock_supabase.table.assert_not_called()
 
 
+class _AuthFakeLanguageModel:
+    """Neutral LanguageModel fake for auth sanitization tests (#337)."""
+
+    async def appraise(self, message: str, budget):
+        from backend.emotional_domain import AppraisalV1
+        return AppraisalV1.neutral()
+
+    async def generate(self, messages: list, budget) -> str:
+        return "Katherine replies safely."
+
+    async def extract_archival(self, messages: list, budget) -> str:
+        return "{}"
+
+    def describe(self):
+        from backend.language_model import ModelSelection
+        return ModelSelection(
+            provider="fake", main_model_id="fake-main", fast_model_id="fake-fast"
+        )
+
+
 def test_http_chat_load_failure_sanitization(client_app, mock_supabase, caplog):
     engine = _app_engine(client_app)
     mock_supabase.auth.get_user.return_value = MockAuthResponse(user=MockUser("user123"))
@@ -376,13 +396,9 @@ def test_http_chat_load_failure_sanitization(client_app, mock_supabase, caplog):
     # Mock supabase select call to raise a sensitive exception
     mock_supabase.table.return_value.select.return_value.eq.return_value.execute.side_effect = Exception("SENSITIVE_DB_LOAD_ERROR")
 
-    # Mock async LLM calls (appraisal and generation)
-    async def _mock_async(**kwargs):
-        mock_resp = MagicMock()
-        mock_resp.choices = [MagicMock()]
-        mock_resp.choices[0].message.content = '{"valence": 0, "arousal_shift": 0, "dominance_shift": 0}'
-        return mock_resp
-    engine.groq_manager.chat_completion_async = MagicMock(side_effect=_mock_async)
+    # Script the LLM contract (issue #337: the seam is LanguageModel).
+    # The DB load fails before any LLM call, so no model is needed; the
+    # engine's configured model simply stays unused.
 
     with caplog.at_level(logging.ERROR):
         response = client_app.post(
@@ -414,13 +430,10 @@ def test_http_chat_persistence_failure_sanitization(client_app, mock_supabase, c
     # Mock sync_state (update) to raise a sensitive exception
     mock_supabase.table.return_value.update.return_value.eq.return_value.execute.side_effect = Exception("SENSITIVE_DB_SYNC_ERROR")
 
-    # Mock async LLM calls
-    async def _mock_async_persist(**kwargs):
-        mock_resp = MagicMock()
-        mock_resp.choices = [MagicMock()]
-        mock_resp.choices[0].message.content = '{"valence": 0, "arousal_shift": 0, "dominance_shift": 0}'
-        return mock_resp
-    engine.groq_manager.chat_completion_async = MagicMock(side_effect=_mock_async_persist)
+    # Script the LLM contract (issue #337): inject a fake model through
+    # the engine's lazy factory seam so appraisal/generation produce
+    # neutral, valid outputs while persistence fails.
+    engine._language_model_factory = lambda: _AuthFakeLanguageModel()
 
     with caplog.at_level(logging.ERROR):
         response = client_app.post(

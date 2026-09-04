@@ -183,11 +183,20 @@ def build_default_dependencies(
     """
     created: list[Any] = []
     try:
+        # Explicit provider selection (issue #337): the composition root
+        # builds the remote adapter behind the canonical LanguageModel
+        # contract. Today the supported remote provider is Groq; the
+        # selection is explicit and there is no fallback to another
+        # provider. Keys come from validated settings (Python-side only).
+        from .language_model import resolve_language_model_factory
+
+        language_model_factory = resolve_language_model_factory("groq")
+
         engine = ChatConversationEngine(
             archival_extraction_enabled=settings.archival_extraction_enabled,
             embeddings_enabled=settings.embeddings_retrieval_enabled,
             turn_config=settings.turn_config,
-            groq_keys=list(settings.provider_keys()),
+            language_model_factory=language_model_factory,
             supabase_factory=_supabase_factory_from_settings(settings),
         )
         created.append(engine)

@@ -86,16 +86,18 @@ def test_language_model_is_a_small_protocol():
     import inspect
     from backend.language_model import LanguageModel
 
-    # The contract covers exactly the real call sites: appraise, generate,
-    # describe. No build_trusted_policy (core responsibility), no kwargs
-    # passthrough, no capability flags.
+    # The contract covers exactly the real call sites: appraise,
+    # generate, extract_archival (the run_archival_extraction call
+    # site keeps its own contracted shape), describe. No
+    # build_trusted_policy (core responsibility), no kwargs passthrough,
+    # no capability flags.
     members = {
         name
         for name, _ in inspect.getmembers(LanguageModel, predicate=inspect.isfunction)
         if not name.startswith("_")
     }
-    assert members == {"appraise", "generate", "describe"}
-    for method_name in ("appraise", "generate"):
+    assert members == {"appraise", "generate", "extract_archival", "describe"}
+    for method_name in ("appraise", "generate", "extract_archival"):
         signature = inspect.signature(getattr(LanguageModel, method_name))
         assert not any(
             p.kind is inspect.Parameter.VAR_KEYWORD
@@ -239,6 +241,10 @@ def test_fake_language_model_satisfies_contract():
         async def generate(self, messages, budget) -> str:
             self.calls.append(("generate", len(messages)))
             return "deterministic"
+
+        async def extract_archival(self, messages, budget) -> str:
+            self.calls.append(("extract_archival", len(messages)))
+            return "{}"
 
         def describe(self) -> ModelSelection:
             return ModelSelection(

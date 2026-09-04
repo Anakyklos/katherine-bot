@@ -266,6 +266,17 @@ class LanguageModel(Protocol):
         """Generate a response from validated structured messages."""
         ...
 
+    async def extract_archival(self, messages: list, budget: TurnBudget) -> str:
+        """Extract long-term memory facts from a persisted turn.
+
+        This is the third real call site (``run_archival_extraction``).
+        It keeps its own contracted call shape — fast model, JSON
+        mode, temperature 0, explicit token limit — which the adapter
+        applies; collapsing it into ``generate`` would silently change
+        the provider call parameters at runtime.
+        """
+        ...
+
     def describe(self) -> ModelSelection:
         """Sanitized provider/model identification for observability."""
         ...

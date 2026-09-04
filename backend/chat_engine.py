@@ -7,6 +7,7 @@ import time
 from typing import Callable, Optional
 
 from .engine import ConversationEngine
+from .language_model import LanguageModel
 from .process_turn import (
     ProcessTurnInput,
     TurnMode,
@@ -42,7 +43,8 @@ class ChatConversationEngine(ConversationEngine):
         embeddings_enabled: bool = False,
         turn_config: Optional[TurnExecutionConfig] = None,
         *,
-        groq_keys: Optional[list] = None,
+        language_model: Optional[LanguageModel] = None,
+        language_model_factory: Optional[Callable[[], LanguageModel]] = None,
         supabase_factory: Optional[Callable[[], Optional[object]]] = None,
     ):
         super().__init__(
@@ -50,7 +52,8 @@ class ChatConversationEngine(ConversationEngine):
             archival_extraction_enabled=archival_extraction_enabled,
             embeddings_enabled=embeddings_enabled,
             turn_config=turn_config,
-            groq_keys=groq_keys,
+            language_model=language_model,
+            language_model_factory=language_model_factory,
             supabase_factory=supabase_factory,
         )
         self._process_turn = build_process_turn(self)

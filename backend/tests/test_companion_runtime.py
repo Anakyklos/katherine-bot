@@ -15,7 +15,7 @@ LocalStorage foundation (#335): it must
   resources).
 
 All persistence evidence uses **real temporary SQLite databases**; the
-only mocked boundary is the remote LLM provider (Groq), which is the
+only mocked boundary is the remote LLM (the LanguageModel contract fake),
 legitimate mocking point per the constitution.
 """
 
@@ -42,6 +42,7 @@ from backend.companion_runtime import (
     runtime_error_code,
 )
 from backend.emotion_presentation import EmotionStateResponse
+from backend.language_model import LanguageModelConfigurationError
 from backend.local_storage.errors import ConflictError as StorageConflict
 from backend.local_storage.errors import PersistenceError
 from backend.local_storage.errors import StorageCorruptError
@@ -58,13 +59,17 @@ pytestmark = pytest.mark.anyio
 
 
 class ScriptedProvider:
-    """Deterministic provider used to prove flow, retries and failure."""
+    """Deterministic LanguageModel fake used to prove flow and failure.
+
+    Implements the canonical contract (issue #337): appraise, generate,
+    describe. The trusted policy is a core responsibility, so the fake
+    no longer builds it.
+    """
 
     def __init__(self, response: str = "local response"):
         self.response = response
         self.calls = 0
         self.appraisal_calls = 0
-        self.policies: list[str] = []
         self.fail_with: Exception | None = None
 
     async def appraise(self, message: str, budget) -> object:
@@ -81,9 +86,14 @@ class ScriptedProvider:
             raise self.fail_with
         return self.response
 
-    def build_trusted_policy(self, emotional_state, relationship, adaptation_strategy=""):
-        self.policies.append("policy")
-        return "policy"
+    def describe(self):
+        from backend.language_model import ModelSelection
+
+        return ModelSelection(
+            provider="fake",
+            main_model_id="fake-main",
+            fast_model_id="fake-fast",
+        )
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -95,7 +105,7 @@ def make_runtime(tmp_path: Path, provider: ScriptedProvider | None = None) -> Co
     provider = provider or ScriptedProvider()
     return CompanionRuntime(
         storage_path=tmp_path / "katherine.db",
-        provider=provider,
+        language_model=provider,
         now_provider=_test_clock,
     )
 
@@ -113,7 +123,8 @@ def history(runtime: CompanionRuntime) -> list[dict]:
 def test_runtime_state_reports_storage_and_provider_flags(tmp_path, monkeypatch):
     runtime = make_runtime(tmp_path)
 
-    # Provider probe must not instantiate Groq: key env is irrelevant here
+    # Provider probe must not instantiate the adapter: key env is
+    # irrelevant here because the injected model is already built.
     # because the injected provider is already built.
     state = runtime.runtime_state()
 
@@ -131,8 +142,8 @@ def test_runtime_state_unconfigured_provider_still_opens_storage(tmp_path, monke
 
     runtime = CompanionRuntime(
         storage_path=tmp_path / "katherine.db",
-        provider=None,
-        provider_factory=None,
+        language_model=None,
+        language_model_factory=None,
         provider_configured_probe=lambda: False,
         now_provider=_test_clock,
     )
@@ -149,7 +160,7 @@ def test_runtime_state_unconfigured_provider_still_opens_storage(tmp_path, monke
 def test_runtime_state_storage_failure_is_sanitized(tmp_path):
     runtime = CompanionRuntime(
         storage_path=tmp_path / "katherine.db",
-        provider=ScriptedProvider(),
+        language_model=ScriptedProvider(),
         now_provider=_test_clock,
     )
 
@@ -185,7 +196,7 @@ async def test_runtime_opens_local_storage_lazily_and_survives_restart(tmp_path)
     provider2 = ScriptedProvider(response="second response")
     runtime2 = CompanionRuntime(
         storage_path=tmp_path / "katherine.db",
-        provider=provider2,
+        language_model=provider2,
         now_provider=_test_clock,
     )
     entries = runtime2.load_history(limit=10)
@@ -330,27 +341,25 @@ async def test_commit_turn_message_too_long_is_rejected(tmp_path):
 
 
 async def test_commit_turn_provider_failure_is_sanitized(tmp_path):
-    from backend.groq_manager import GroqRequestError
+    from backend.language_model import LanguageModelServerError
 
     provider = ScriptedProvider()
-    provider.fail_with = GroqRequestError("429 too many requests: api_key=SECRET")
+    provider.fail_with = LanguageModelServerError()
     runtime = make_runtime(tmp_path, provider)
     result = await runtime.commit_turn_async(request_id="r-1", message="hello")
     assert result.success is False
-    # GroqRequestError is a generic provider failure (the web maps it to
-    # provider_unavailable/503); the secret must never cross.
+    # Canonical server_error is a generic provider failure (the web maps it
+    # to provider_unavailable/503); a secret must never cross.
     assert result.error_code == LocalErrorCode.SERVICE_UNAVAILABLE
-    assert "SECRET" not in (result.error_message or "")
+    assert result.error_message == LanguageModelServerError.MESSAGE
     runtime.close()
 
 
 async def test_commit_turn_pool_exhausted_rate_limited(tmp_path):
-    from backend.groq_manager import GroqPoolExhaustedError, ProviderFailure
+    from backend.language_model import LanguageModelRateLimitedError
 
     provider = ScriptedProvider()
-    provider.fail_with = GroqPoolExhaustedError(
-        "exhausted", code=ProviderFailure.rate_limited
-    )
+    provider.fail_with = LanguageModelRateLimitedError()
     runtime = make_runtime(tmp_path, provider)
     result = await runtime.commit_turn_async(request_id="r-1", message="hello")
     assert result.success is False
@@ -541,18 +550,18 @@ async def test_healthy_memories_still_flow_into_context(tmp_path):
 
 
 async def test_unconfigured_provider_yields_configuration_error(tmp_path):
-    from backend.groq_manager import GroqConfigurationError
+    from backend.language_model import LanguageModelConfigurationError
 
     class Unconfigured:
         async def appraise(self, message, budget):
-            raise GroqConfigurationError("missing key")
+            raise LanguageModelConfigurationError()
 
         async def generate(self, messages, budget):
-            raise GroqConfigurationError("missing key")
+            raise LanguageModelConfigurationError()
 
     runtime = CompanionRuntime(
         storage_path=tmp_path / "katherine.db",
-        provider=Unconfigured(),
+        language_model=Unconfigured(),
         now_provider=_test_clock,
     )
     result = await runtime.commit_turn_async(request_id="r-1", message="hello")
@@ -581,10 +590,10 @@ async def test_runtime_error_code_maps_storage_errors():
     assert (
         runtime_error_code(StorageValidation("bad", "x")) is LocalErrorCode.VALIDATION
     )
-    from backend.groq_manager import GroqConfigurationError
+    from backend.language_model import LanguageModelConfigurationError
 
     assert (
-        runtime_error_code(GroqConfigurationError("missing GROQ_API_KEY"))
+        runtime_error_code(LanguageModelConfigurationError())
         is LocalErrorCode.CONFIGURATION
     )
     assert runtime_error_code(Exception("plain")) is LocalErrorCode.UNKNOWN
