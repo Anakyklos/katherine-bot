@@ -62,15 +62,9 @@ def default_frontend_root(module_file: Path | None = None) -> Path:
     * checkout: ``<repo>/frontend`` — this file is ``<repo>/backend/
       desktop/build_resolver.py`` (parents[2] is the repo root) **and**
       a ``frontend`` directory exists there;
-    * installed: ``<app>/frontend`` — this file is somewhere under an
-      installed application root that carries a ``frontend`` directory
-      as its direct child. The ``.deb`` layout is
-      ``/usr/lib/katherine/{backend,frontend}``, where
-      ``backend/desktop`` is three levels below the app root
-      (``parents[4]``); the search walks upward a bounded number of
-      levels looking for the first directory whose direct child is
-      ``frontend`` (and that child is not the module's own checkout
-      root).
+    * installed: ``<app>/frontend`` — the ``.deb`` layout is
+      ``/usr/lib/katherine/{backend,frontend}``, where the app root is
+      exactly ``parents[2]`` from this module.
 
     Never uses the CWD, the environment, or ``sys.path``; never falls
     back to a guess. If no root carries a ``frontend`` directory, the
@@ -78,22 +72,10 @@ def default_frontend_root(module_file: Path | None = None) -> Path:
     with the actionable checkout hint.
     """
     here = (module_file if module_file is not None else Path(__file__)).resolve()
-    # Walk a bounded number of parents: enough for both layouts
-    # (checkout: parents[2]; deb layout: parents[4]; plus margin for
-    # a future prefix like /opt/katherine/lib/katherine).
-    candidates: list[Path] = []
-    for parent in here.parents[:6]:
-        candidates.append(parent / _FRONTEND_DIR_NAME)
-    # Prefer the FIRST (deepest, closest to this file) existing root:
-    # in the .deb layout /usr/lib/katherine/frontend is closer than any
-    # accidental /frontend that might exist higher up; in the checkout
-    # layout <repo>/frontend is the only match. parents[:6] is ordered
-    # nearest-first, so the first existing match is the right one.
-    for candidate in candidates:
-        if candidate.is_dir():
-            return candidate
-    # No frontend anywhere: fall back to the checkout-style location so
-    # the error message is the actionable dev hint (parent of backend/).
+    # Both supported layouts place this module at
+    # ``<root>/backend/desktop/build_resolver.py``. Use that exact structural
+    # relation rather than searching arbitrary ancestors for a directory named
+    # ``frontend``.
     return here.parents[2] / _FRONTEND_DIR_NAME
 
 

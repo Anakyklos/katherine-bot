@@ -20,11 +20,12 @@
 # app's Python, WebKitGTK, the X server (Xvfb), the app process.
 #
 # Usage:
-#   packaging/isolated-install.sh <deb> [command...]
+#   packaging/isolated-install.sh <deb> [command]
 #
-# The command (and any args) runs inside the isolated environment
-# after the .deb is unpacked+configured at /install-root. When no
-# command is given, an interactive shell runs.
+# The single command argument is a bash script run inside the isolated
+# environment after the .deb is unpacked+configured at /install-root. When no
+# command is given, an interactive shell runs. Keeping it as one argument
+# preserves newlines without reconstructing argv or using eval.
 #
 # Extra environment understood inside:
 #   KAT_DISPLAY - passed as DISPLAY (e.g. :99 from a host Xvfb).
@@ -33,7 +34,12 @@
 set -euo pipefail
 
 DEB_PATH="${1:?usage: isolated-install.sh <deb> [command...]}"
-shift || true
+shift
+if [ "$#" -gt 1 ]; then
+  echo "error: command must be one script argument" >&2
+  exit 2
+fi
+KAT_CMD="${1:-bash}"
 DEB_PATH="$(readlink -f "$DEB_PATH")"
 [ -f "$DEB_PATH" ] || { echo "no such .deb: $DEB_PATH" >&2; exit 2; }
 DEB_FILE="$(basename "$DEB_PATH")"
@@ -47,7 +53,6 @@ export KAT_WORK="$WORK"
 export KAT_DEB_FILE="$DEB_FILE"
 export KAT_DEB_DIR="$DEB_DIR"
 export KAT_DISPLAY="${KAT_DISPLAY:-}"
-export KAT_CMD="${*:-bash}"
 
 exec unshare --user --map-root-user --mount --pid --fork \
   env KAT_WORK="$KAT_WORK" KAT_DEB_FILE="$KAT_DEB_FILE" KAT_DEB_DIR="$KAT_DEB_DIR" \
@@ -126,6 +131,7 @@ dpkg --root=/install-root --admindir=/dpkg-db --force-not-root --log=/dpkg-db/dp
 echo "=== ISOLATED ENV READY ==="
 dpkg-query --root=/install-root --admindir=/dpkg-db -W katherine-desktop
 
-# Run the requested command (or an interactive shell).
-eval "$KAT_CMD"
+# Run the requested command (or an interactive shell). The command is already
+# one explicit script argument, so bash -c avoids eval's second expansion pass.
+bash -c "$KAT_CMD"
 INNER

@@ -187,7 +187,7 @@ lock desktop:
 ```bash
 cd frontend && npm ci && npm run build && cd ..
 SOURCE_DATE_EPOCH=1700000000 \
-  python3 packaging/build_deb.py \
+  python3.12 packaging/build_deb.py \
   --version 0.1.0 \
   --out-dir dist/deb
 ```
@@ -196,12 +196,18 @@ Em uma instalação Debian/Ubuntu, instale primeiro as dependências nativas
 listadas no metadata do pacote, depois instale o arquivo gerado:
 
 ```bash
-sudo apt install python3 python3-gi gir1.2-webkit2-4.1 \
+sudo apt install python3.12 python3.12-venv python3-gi gir1.2-webkit2-4.1 \
   libwebkit2gtk-4.1-0 libgtk-3-0 libglib2.0-0
-sudo dpkg -i dist/deb/katherine-desktop_0.1.0_all.deb
+sudo dpkg -i dist/deb/katherine-desktop_0.1.0_amd64.deb
 sudo apt-get -f install
 katherine
 ```
+
+O pacote é deliberadamente `Architecture: amd64` e depende de
+`python3.12`: `pydantic-core` é uma extensão nativa CPython e não pode ser
+declarada como `Architecture: all`. O builder rejeita hosts que não sejam
+x86_64/CPython 3.12. Os arquivos baixados pelo pip também precisam coincidir
+com os SHA-256 versionados em `packaging/requirements-desktop.sha256`.
 
 O build e a instalação nunca criam nem copiam um banco de dados de usuário.
 Em runtime, o arquivo fica em `~/.local/share/katherine/katherine.db`.
@@ -213,13 +219,13 @@ upgrade, remove e purge não devem apagar dados do usuário.
 Um upgrade normal substitui somente a árvore do pacote:
 
 ```bash
-sudo dpkg -i katherine-desktop_0.2.0_all.deb
+sudo dpkg -i katherine-desktop_0.2.0_amd64.deb
 ```
 
 O rollback é a instalação do `.deb` anterior:
 
 ```bash
-sudo dpkg -i katherine-desktop_0.1.0_all.deb
+sudo dpkg -i katherine-desktop_0.1.0_amd64.deb
 ```
 
 O banco não é revertido durante nenhum desses comandos. O runner de
@@ -236,8 +242,8 @@ Ele não usa Docker, mocka o dpkg ou toca o banco do host. O teste completo é:
 
 ```bash
 python3 packaging/smoke_deb.py \
-  --deb dist/deb/katherine-desktop_0.1.0~test2_all.deb \
-  --old-deb dist/deb/katherine-desktop_0.1.0~test1_all.deb
+  --deb dist/deb/katherine-desktop_0.1.0~test2_amd64.deb \
+  --old-deb dist/deb/katherine-desktop_0.1.0~test1_amd64.deb
 ```
 
 Na execução validada, o resultado foi `ALL PASS (7/7)`:
@@ -256,15 +262,15 @@ página de smoke:
 
 ```bash
 packaging/gui_smoke_deb.sh \
-  dist/deb/katherine-desktop_0.1.0~test2_all.deb
+  dist/deb/katherine-desktop_0.1.0~test2_amd64.deb
 ```
 
 Esse probe abre a entrada `/usr/bin/katherine` em Xvfb, espera a janela
-Katherine, digita e envia uma mensagem pela UI real, mede os descendentes do
-shell, verifica que não há sockets TCP em LISTEN e fecha a janela. No caso
-sem chave, o turno retornou o erro de configuração esperado. A execução
-validada terminou com `clean_exit=true`, `exit_code=0`, nenhum processo
-remanescente e nenhum listener TCP.
+Katherine, digita e envia uma mensagem pela UI real, mede os descendentes e o
+grupo de processos dedicado ao shell, verifica que não há sockets TCP em
+LISTEN e fecha a janela. No caso sem chave, o turno retornou o erro de
+configuração esperado. A execução validada terminou com `clean_exit=true`,
+`exit_code=0`, nenhum processo remanescente e nenhum listener TCP.
 
 ### Medição do pacote (#338)
 
@@ -272,7 +278,9 @@ Ambiente da medição: Linux Mint 22.3, kernel 7.0.0-30-generic, x86_64,
 Python 3.12.3, PyGObject 3.48.2, WebKitGTK 2.52.3, Node.js 22.23.2,
 12 CPUs. O pacote foi construído com `SOURCE_DATE_EPOCH=1700000000`.
 Uma reconstrução do mesmo commit e versão produziu o mesmo SHA-256:
-`2f44175ca70d98876bd28c8ef692652a84693f74308c33b5e0550e07b0e0f82d`.
+`22b96f80a020624c3ff8943830b1b7ddaaaddc51d9e5833ea9e40439aaf67b6b`.
+O builder fixa `SOURCE_DATE_EPOCH` e verifica os hashes dos 18 artefatos
+Python antes de desempacotá-los, incluindo o wheel nativo do `pydantic-core`.
 
 Os números abaixo são uma execução real do `GUI_RESULTS`, em Xvfb
 1280x800 com o app instalado, após o carregamento inicial. RSS e CPU são a
@@ -282,15 +290,15 @@ aceitação:
 
 | Medida | Resultado |
 | --- | ---: |
-| `.deb` | 3,147,830 bytes (3,074 KiB) |
-| `Installed-Size` Debian | 12,488 KiB |
+| `.deb` | 3,147,238 bytes (3,073 KiB) |
+| `Installed-Size` Debian | 12,487 KiB |
 | Árvore instalada (`du -sk`) | 13,756 KiB |
-| Startup até janela GTK | 1,033.2 ms |
-| RSS idle, descendentes | 603,156 KiB |
-| CPU idle, janela de 5 s | 0.0% |
-| Pico RSS durante turno | 638,204 KiB |
-| CPU durante turno, janela de 3 s | 19.45% |
-| Shutdown após fechar a janela | 113.8 ms |
+| Startup até janela GTK | 515.3 ms |
+| RSS idle, descendentes | 603,308 KiB |
+| CPU idle, janela de 5 s | 0.2% |
+| Pico RSS durante turno | 642,532 KiB |
+| CPU durante turno, janela de 3 s | 8.6% |
+| Shutdown após fechar a janela | 63.8 ms |
 
 A variação de startup e CPU entre execuções depende da carga do host e do
 backend WebKitGTK. Por isso o projeto registra os números observados e o

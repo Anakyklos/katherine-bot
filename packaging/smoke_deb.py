@@ -30,8 +30,10 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -65,9 +67,37 @@ def sh(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, check=False, **kw)
 
 
-def run_in_env(deb: Path, inner: str) -> tuple[int, str]:
-    """Run `inner` (bash) inside the isolated env with `deb` installed."""
-    out = sh(["bash", str(HARNESS), str(deb), inner], capture_output=True, text=True)
+def run_in_env(
+    deb: Path, inner: str, extra_debs: tuple[Path, ...] = ()
+) -> tuple[int, str]:
+    """Run ``inner`` with the requested package files visible under ``/debs``.
+
+    The harness bind-mounts one host directory as ``/debs``. Stage all
+    packages for an upgrade/downgrade invocation into a temporary sibling
+    directory so the smoke remains valid when callers provide paths from
+    different directories.
+    """
+    packages = (deb, *extra_debs)
+    if not extra_debs:
+        command_deb = deb
+        out = sh(
+            ["bash", str(HARNESS), str(command_deb), inner],
+            capture_output=True,
+            text=True,
+        )
+        return out.returncode, out.stdout + out.stderr
+
+    with tempfile.TemporaryDirectory(prefix="katherine-smoke-debs-") as td:
+        staged = Path(td)
+        for package in packages:
+            if not package.is_file():
+                raise FileNotFoundError(package)
+            shutil.copy2(package, staged / package.name)
+        out = sh(
+            ["bash", str(HARNESS), str(staged / deb.name), inner],
+            capture_output=True,
+            text=True,
+        )
     return out.returncode, out.stdout + out.stderr
 
 
@@ -207,6 +237,7 @@ def main(argv: list[str] | None = None) -> int:
             "dpkg --root=/install-root --admindir=/dpkg-db --force-not-root --log=/dpkg-db/dpkg.log -i /debs/"
             + deb.name
             + " && echo UPGRADED $(dpkg-query --root=/install-root --admindir=/dpkg-db -W -f='${Version}' katherine-desktop)",
+            extra_debs=(deb,),
         )
         up = find_marker(out, "UPGRADED")
         results.append(step("upgrade: dpkg -i newer .deb", up == f"UPGRADED {new_version}",
@@ -239,6 +270,7 @@ def main(argv: list[str] | None = None) -> int:
             + "p = default_database_path()\n"
             + "LocalStorage(path=p)\n"
             + "print('REOPENED', p, p.exists(), p.stat().st_size)\nPY",
+            extra_debs=(old,),
         )
         dg = find_marker(out, "DOWNGRADED")
         ro = find_marker(out, "REOPENED")

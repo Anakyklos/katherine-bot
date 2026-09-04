@@ -43,10 +43,10 @@ Reproducibility:
     fails if it is missing instead of rebuilding silently.
 
 Usage:
-    python3 packaging/build_deb.py --version 1.0.0~test1 [--out-dir dist/deb]
+    python3.12 packaging/build_deb.py --version 1.0.0~test1 [--out-dir dist/deb]
 
 Outputs:
-    <out-dir>/katherine-desktop_<version>_all.deb
+    <out-dir>/katherine-desktop_<version>_amd64.deb
 """
 
 from __future__ import annotations
@@ -54,6 +54,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -68,6 +70,17 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 #: future server package without implying a second app.
 PACKAGE = "katherine-desktop"
 
+# pydantic-core is a native CPython extension. The package therefore targets
+# the exact interpreter/architecture validated by the desktop evidence rather
+# than claiming Debian's architecture-independent ``all`` compatibility.
+ARCHITECTURE = "amd64"
+TARGET_MACHINE = "x86_64"
+TARGET_PYTHON = (3, 12)
+
+# A version lock alone is not sufficient: an index can publish multiple
+# artifacts for one version, and pydantic-core's native wheel is ABI-specific.
+ARTIFACT_MANIFEST = REPO_ROOT / "packaging" / "requirements-desktop.sha256"
+
 #: Where the application lives once installed (FHS: architecture-independent
 #: application data belongs in /usr/lib).
 APP_DIR = Path("usr/lib/katherine")
@@ -80,7 +93,7 @@ APP_DIR = Path("usr/lib/katherine")
 #: explicitly for clarity. No recommends, no suggests: nothing else is
 #: needed for the desktop app to run.
 DEPENDS = [
-    "python3 (>= 3.12)",
+    "python3.12 (>= 3.12.0)",
     "python3-gi (>= 3.48)",
     "gir1.2-webkit2-4.1",
     "libwebkit2gtk-4.1-0",
@@ -162,7 +175,7 @@ ENTRYPOINT = """#!/bin/sh
 set -e
 SELF=$(readlink -f "$0")
 APP=$(dirname "$(dirname "$SELF")")/lib/katherine
-exec python3 -c 'import sys; sys.path.insert(0, "'"$APP"'/vendor"); sys.path.insert(0, "'"$APP"'"); from backend.desktop.app import main; sys.exit(main())' "$@"
+exec python3.12 -c 'import sys; sys.path.insert(0, "'"$APP"'/vendor"); sys.path.insert(0, "'"$APP"'"); from backend.desktop.app import main; sys.exit(main())' "$@"
 """
 
 #: XDG .desktop launcher (menu integration; no extra runtime dep).
@@ -186,6 +199,79 @@ def fail(msg: str) -> None:
 
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, check=True, **kw)
+
+
+def validate_target() -> None:
+    """Fail before staging when the build host cannot produce this package."""
+    machine = platform.machine().lower()
+    if machine not in {TARGET_MACHINE, ARCHITECTURE}:
+        fail(
+            f"desktop package targets {ARCHITECTURE}/{TARGET_MACHINE}, "
+            f"not {machine!r}"
+        )
+    if (
+        sys.implementation.name != "cpython"
+        or sys.version_info[:2] != TARGET_PYTHON
+    ):
+        fail(
+            "desktop package targets CPython 3.12 because the vendored "
+            f"pydantic-core wheel is ABI-specific, not {sys.version_info.major}."
+            f"{sys.version_info.minor}"
+        )
+
+
+def validate_version(version: str) -> None:
+    """Validate a Debian version before it reaches paths or control data."""
+    if not version or version.startswith("-"):
+        fail("package version must be non-empty and must not start with '-'")
+    if re.fullmatch(r"[0-9A-Za-z.+:~-]+", version) is None:
+        fail(
+            "package version contains unsupported characters; use Debian-safe "
+            "digits, letters, '.', '+', ':', '~', or '-'."
+        )
+
+
+def parse_artifact_manifest(path: Path = ARTIFACT_MANIFEST) -> dict[str, str]:
+    """Read ``sha256sum``-style artifact pins used by the desktop build."""
+    expected: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        digest, separator, filename = line.partition("  ")
+        if (
+            not separator
+            or len(digest) != 64
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            fail(f"invalid artifact hash entry in {path}: {line!r}")
+        if not filename or filename in expected:
+            fail(f"duplicate or missing artifact filename in {path}: {line!r}")
+        expected[filename] = digest
+    if not expected:
+        fail(f"no artifact hashes found in {path}")
+    return expected
+
+
+def verify_download_artifacts(files: list[Path]) -> None:
+    """Require every downloaded artifact to match the committed manifest."""
+    expected = parse_artifact_manifest()
+    actual = {path.name for path in files}
+    expected_names = set(expected)
+    if actual != expected_names:
+        missing = sorted(expected_names - actual)
+        extra = sorted(actual - expected_names)
+        fail(
+            "desktop artifact set differs from manifest; "
+            f"missing={missing}, extra={extra}"
+        )
+    for path in files:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        if digest != expected[path.name]:
+            fail(
+                f"desktop artifact hash mismatch for {path.name}: "
+                f"expected {expected[path.name]}, got {digest}"
+            )
 
 
 def normalize_stage_mtimes(stage: Path, epoch: int) -> None:
@@ -240,10 +326,19 @@ def download_wheels(
     only for packages without wheels, e.g. proxy-tools)."""
     reqs = [f"{n}=={v}" for n, v in pins]
     run(
-        [*pip, "download", *reqs, "-d", str(dest), "--no-deps"],
+        [
+            *pip,
+            "download",
+            *reqs,
+            "-d",
+            str(dest),
+            "--no-deps",
+            "--no-build-isolation",
+        ],
         stdout=subprocess.DEVNULL,
     )
     files = sorted(dest.iterdir())
+    verify_download_artifacts(files)
     wheels = [f for f in files if f.name.endswith(".whl")]
     sdists = [f for f in files if f.name.endswith((".tar.gz", ".zip"))]
     # Everything else (e.g. pip metadata leftovers) is a build error.
@@ -314,6 +409,8 @@ def build(
     pip: list[str],
     keep_stage: Path | None = None,
 ) -> Path:
+    validate_target()
+    validate_version(version)
     # ── inputs ────────────────────────────────────────────────────────
     frontend_dist = REPO_ROOT / "frontend" / "dist"
     if not (frontend_dist / "desktop.html").is_file():
@@ -398,7 +495,7 @@ def build(
     (debian / "control").write_text(
         f"Package: {PACKAGE}\n"
         f"Version: {version}\n"
-        "Architecture: all\n"
+        f"Architecture: {ARCHITECTURE}\n"
         'Maintainer: Katherine maintainers <maintainers@katherine.invalid>\n'
         f"Depends: {', '.join(DEPENDS)}\n"
         f"Installed-Size: {installed_size}\n"
@@ -428,7 +525,7 @@ def build(
     normalize_stage_mtimes(stage, source_date_epoch)
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    deb_name = f"{PACKAGE}_{version}_all.deb"
+    deb_name = f"{PACKAGE}_{version}_{ARCHITECTURE}.deb"
     deb_path = out_dir / deb_name
     env = {
         "TMPDIR": "/tmp",

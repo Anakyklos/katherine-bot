@@ -43,6 +43,30 @@ def test_desktop_lock_contains_only_pinned_runtime_dependencies() -> None:
     ))
 
 
+def test_package_targets_native_amd64_python_312_runtime() -> None:
+    assert build_deb.ARCHITECTURE == "amd64"
+    assert build_deb.TARGET_MACHINE == "x86_64"
+    assert build_deb.TARGET_PYTHON == (3, 12)
+    assert "python3.12" in build_deb.DEPENDS[0]
+
+
+def test_artifact_manifest_is_complete_and_sha256_valid() -> None:
+    manifest = build_deb.parse_artifact_manifest()
+    assert len(manifest) == len(dict(build_deb.parse_lock(
+        REPO_ROOT / "packaging/requirements-desktop.txt"
+    )))
+    assert all(len(digest) == 64 for digest in manifest.values())
+    assert any("pydantic_core-2.46.4-cp312" in name for name in manifest)
+
+
+def test_package_version_rejects_path_or_control_injection() -> None:
+    build_deb.validate_version("0.1.0~test1")
+    with pytest.raises(SystemExit):
+        build_deb.validate_version("0.1.0/../../tmp")
+    with pytest.raises(SystemExit):
+        build_deb.validate_version("-bad")
+
+
 def test_vendor_guard_rejects_cloud_or_ml_stack(tmp_path: Path) -> None:
     vendor = tmp_path / "vendor"
     vendor.mkdir()
@@ -78,6 +102,7 @@ def test_unpack_sdist_extracts_proxy_tools_package(tmp_path: Path) -> None:
 def test_entrypoint_derives_app_dir_from_its_own_location() -> None:
     assert "readlink -f \"$0\"" in build_deb.ENTRYPOINT
     assert 'APP=$(dirname "$(dirname "$SELF")")/lib/katherine' in build_deb.ENTRYPOINT
+    assert "exec python3.12 -c" in build_deb.ENTRYPOINT
     assert "/usr/lib/katherine" not in build_deb.ENTRYPOINT
 
 

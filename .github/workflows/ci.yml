@@ -616,14 +616,15 @@ jobs:
             --version 0.1.0~ci \
             --out-dir /tmp/katherine-deb-b
           cmp \
-            /tmp/katherine-deb-a/katherine-desktop_0.1.0~ci_all.deb \
-            /tmp/katherine-deb-b/katherine-desktop_0.1.0~ci_all.deb
+            /tmp/katherine-deb-a/katherine-desktop_0.1.0~ci_amd64.deb \
+            /tmp/katherine-deb-b/katherine-desktop_0.1.0~ci_amd64.deb
 
       - name: Inspect package contract
         run: |
           set -euo pipefail
-          deb=/tmp/katherine-deb-a/katherine-desktop_0.1.0~ci_all.deb
+          deb=/tmp/katherine-deb-a/katherine-desktop_0.1.0~ci_amd64.deb
           dpkg-deb -f "$deb" Package Version Architecture Depends Installed-Size
+          test "$(dpkg-deb -f "$deb" Architecture)" = amd64
           listing="$(dpkg-deb -c "$deb")"
           grep -Fq './usr/bin/katherine' <<<"$listing"
           grep -Fq './usr/lib/katherine/frontend/dist/desktop.html' <<<"$listing"

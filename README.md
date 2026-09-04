@@ -58,9 +58,9 @@ To build and install the reproducible desktop package:
 
 ```bash
 cd frontend && npm ci && npm run build && cd ..
-SOURCE_DATE_EPOCH=1700000000 python3 packaging/build_deb.py \
+SOURCE_DATE_EPOCH=1700000000 python3.12 packaging/build_deb.py \
   --version 0.1.0 --out-dir dist/deb
-sudo dpkg -i dist/deb/katherine-desktop_0.1.0_all.deb
+sudo dpkg -i dist/deb/katherine-desktop_0.1.0_amd64.deb
 sudo apt-get -f install
 ```
 

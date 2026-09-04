@@ -62,6 +62,15 @@ def read_ppid(pid):
         pass
     return None
 
+def read_pgid(pid):
+    try:
+        raw = pathlib.Path("/proc", str(pid), "stat").read_text()
+        # Fields after the final parenthesized command are state, ppid, pgrp, ...
+        fields = raw[raw.rfind(")") + 2:].split()
+        return int(fields[2])
+    except (FileNotFoundError, PermissionError, ValueError, IndexError):
+        return None
+
 def descendants(root_pid):
     known = {root_pid}
     changed = True
@@ -77,6 +86,13 @@ def descendants(root_pid):
                 known.add(pid)
                 changed = True
     return known
+
+def process_group_pids(pgid):
+    pids = set()
+    for entry in os.listdir("/proc"):
+        if entry.isdigit() and read_pgid(int(entry)) == pgid:
+            pids.add(int(entry))
+    return pids
 
 def rss_kib(pid):
     try:
@@ -117,7 +133,9 @@ launch_started = time.monotonic()
 proc = subprocess.Popen(
     ["/install-root/usr/bin/katherine"],
     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    start_new_session=True,
 )
+app_pgid = read_pgid(proc.pid) or proc.pid
 
 # GTK window appears on the display (WebKitGTK creates one).
 def window_up():
@@ -151,6 +169,7 @@ results["xdg_db_created"] = bool(wait_for(db_created, timeout=10))
 # WebKit network/render processes are children of the installed shell;
 # they must disappear with it too.
 observed_pids = descendants(proc.pid)
+observed_pids.update(process_group_pids(app_pgid))
 
 # Let the first WebKit load settle before taking idle measurements.
 time.sleep(1.0)
@@ -202,6 +221,8 @@ if turn_sent:
     )
 
 # No UI TCP listener: file:// build only, no server, no daemon.
+observed_pids.update(descendants(proc.pid))
+observed_pids.update(process_group_pids(app_pgid))
 def my_listeners():
     listeners = []
     for pid in observed_pids:
@@ -259,17 +280,23 @@ except subprocess.TimeoutExpired:
     results["exit_code"] = "timeout"
     results["no_key_turn_observed"] = False
 
-time.sleep(1)
-# Inspect only the process subtree captured while the package was alive.
-# This avoids matching the probe own command line and also catches
-# orphaned WebKit child processes.
+time.sleep(0.5)
+# Re-scan both the live subtree and the dedicated process group after the
+# shell exits. The group catches WebKit descendants that reparent before the
+# final check, while start_new_session keeps the probe and harness out of it.
 leftovers = []
-for pid in sorted(observed_pids):
-    if pid == os.getpid():
-        continue
-    cmdline = read_cmdline(pid)
-    if cmdline:
-        leftovers.append(f"{pid} {cmdline}")
+for _ in range(20):
+    observed_pids.update(process_group_pids(app_pgid))
+    leftovers = []
+    for pid in sorted(observed_pids):
+        if pid == os.getpid():
+            continue
+        cmdline = read_cmdline(pid)
+        if cmdline:
+            leftovers.append(f"{pid} {cmdline}")
+    if not leftovers:
+        break
+    time.sleep(0.25)
 results["leftover_processes"] = " | ".join(leftovers)
 
 print("GUI_RESULTS " + json.dumps(results))
