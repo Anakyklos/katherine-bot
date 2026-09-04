@@ -618,15 +618,20 @@ class TestFailClosedThroughProcessTurn:
             engine.memory_manager.save_turn = MagicMock()
             engine.memory_manager.sync_state = MagicMock()
 
-            parse_spy = MagicMock(wraps=parse_llm_appraisal)
+            # Issue #337: appraisal parsing lives behind the adapter
+            # (the engine no longer imports parse_llm_appraisal), so
+            # the fail-closed proof patches the domain transition and
+            # the injected model's appraise — neither may be reached
+            # with a corrupt snapshot.
+            appraise_spy = MagicMock(wraps=model.appraise)
+            model.appraise = appraise_spy
             transition_spy = MagicMock(wraps=transition)
-            with patch("backend.engine.parse_llm_appraisal", parse_spy), \
-                 patch("backend.engine.transition", transition_spy):
+            with patch("backend.engine.transition", transition_spy):
                 with pytest.raises(EmotionalDomainError):
                     await engine.process_turn("user", "Msg")
 
-            # Parse and transition should never be called
-            parse_spy.assert_not_called()
+            # Appraisal and transition should never be called
+            appraise_spy.assert_not_called()
             transition_spy.assert_not_called()
 
         asyncio.run(run())

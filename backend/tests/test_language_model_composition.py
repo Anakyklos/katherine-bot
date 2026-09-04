@@ -25,10 +25,8 @@ from typing import Any
 
 import pytest
 
-from backend.language_model import (
-    LanguageModelConfigurationError,
-    resolve_language_model_factory,
-)
+from backend.groq_language_model import build_groq_language_model_factory
+from backend.language_model import LanguageModelConfigurationError
 from backend.settings import AppEnvironment, Settings
 from backend.turn_execution import TurnExecutionConfig, TurnBudget
 
@@ -76,8 +74,7 @@ def test_factory_builds_adapter_from_settings_key_without_env(monkeypatch):
     )
 
     settings = _settings()
-    factory = resolve_language_model_factory(
-        "groq",
+    factory = build_groq_language_model_factory(
         keys=settings.provider_keys(),
         call_params=settings.turn_config.to_groq_params(),
     )
@@ -100,8 +97,7 @@ def test_factory_without_keys_raises_sanitized_configuration_error(monkeypatch):
     text appears.
     """
     _no_groq_env(monkeypatch)
-    factory = resolve_language_model_factory(
-        "groq",
+    factory = build_groq_language_model_factory(
         keys=(),
         call_params=TurnExecutionConfig.defaults().to_groq_params(),
     )
@@ -116,8 +112,7 @@ def test_factory_captures_turn_config_params(monkeypatch):
     """Provider-call parameters from ``Settings.turn_config`` reach the manager."""
     _no_groq_env(monkeypatch)
     config = TurnExecutionConfig.defaults()
-    factory = resolve_language_model_factory(
-        "groq",
+    factory = build_groq_language_model_factory(
         keys=_settings().provider_keys(),
         call_params=config.to_groq_params(),
     )
@@ -138,8 +133,7 @@ def test_readiness_fails_when_factory_exists_but_config_absent(monkeypatch):
 
     _no_groq_env(monkeypatch)
     # Factory exists (explicit provider wired) but captured no keys.
-    factory = resolve_language_model_factory(
-        "groq",
+    factory = build_groq_language_model_factory(
         keys=(),
         call_params=TurnExecutionConfig.defaults().to_groq_params(),
     )
@@ -158,8 +152,7 @@ def test_readiness_passes_with_valid_captured_configuration(monkeypatch):
 
     _no_groq_env(monkeypatch)
     settings = _settings()
-    factory = resolve_language_model_factory(
-        "groq",
+    factory = build_groq_language_model_factory(
         keys=settings.provider_keys(),
         call_params=settings.turn_config.to_groq_params(),
     )
@@ -180,8 +173,7 @@ def test_readiness_never_runs_inference_call(monkeypatch):
 
     _no_groq_env(monkeypatch)
     settings = _settings()
-    factory = resolve_language_model_factory(
-        "groq",
+    factory = build_groq_language_model_factory(
         keys=settings.provider_keys(),
         call_params=settings.turn_config.to_groq_params(),
     )
@@ -210,8 +202,7 @@ def test_readiness_does_not_echo_secret(monkeypatch, caplog):
 
     _no_groq_env(monkeypatch)
     settings = _settings()
-    factory = resolve_language_model_factory(
-        "groq",
+    factory = build_groq_language_model_factory(
         keys=settings.provider_keys(),
         call_params=settings.turn_config.to_groq_params(),
     )
@@ -234,15 +225,13 @@ def test_probe_is_bound_to_same_config_as_adapter(monkeypatch):
     """
     _no_groq_env(monkeypatch)
     settings = _settings()
-    factory = resolve_language_model_factory(
-        "groq",
+    factory = build_groq_language_model_factory(
         keys=settings.provider_keys(),
         call_params=settings.turn_config.to_groq_params(),
     )
     assert factory.provider_configured_probe() is True
 
-    empty_factory = resolve_language_model_factory(
-        "groq",
+    empty_factory = build_groq_language_model_factory(
         keys=(),
         call_params=settings.turn_config.to_groq_params(),
     )
@@ -289,8 +278,7 @@ def test_ready_endpoint_fails_without_real_configuration(monkeypatch):
         cors_allowed_origins=("https://allowed.example",),
     )
     # Build a factory capturing NO keys (simulating unconfigured state).
-    factory = resolve_language_model_factory(
-        "groq",
+    factory = build_groq_language_model_factory(
         keys=(),
         call_params=settings.turn_config.to_groq_params(),
     )
@@ -302,3 +290,103 @@ def test_ready_endpoint_fails_without_real_configuration(monkeypatch):
     )
     # Engine-level readiness is the contract the /ready check consumes.
     assert engine.is_provider_configured() is False
+
+
+# ─── Second review: engine facade satisfies the FULL contract ────────────────
+
+
+def test_engine_facade_satisfies_full_language_model_protocol():
+    """Second review blocker: the web facade IS a complete LanguageModel.
+
+    ``build_process_turn`` passes the engine as ``provider:
+    LanguageModel``. The engine must satisfy the *complete* Protocol —
+    ``appraise`` / ``generate`` / ``extract_archival`` / ``describe`` —
+    not a subset. ``extract_archival`` delegates to the injected model
+    and ``run_archival_extraction`` goes through the facade.
+    """
+    from backend.chat_engine import ChatConversationEngine
+    from backend.language_model import LanguageModel, ModelSelection
+
+    class RecordingModel:
+        """Fake implementing the contract; records every call."""
+
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        async def appraise(self, message, budget):
+            self.calls.append("appraise")
+            from backend.emotional_domain import AppraisalV1
+
+            return AppraisalV1.neutral()
+
+        async def generate(self, messages, budget):
+            self.calls.append("generate")
+            return "deterministic"
+
+        async def extract_archival(self, messages, budget):
+            self.calls.append("extract_archival")
+            return "{}"
+
+        def describe(self) -> ModelSelection:
+            self.calls.append("describe")
+            return ModelSelection(
+                provider="fake", main_model_id="fake-main", fast_model_id="fake-fast"
+            )
+
+    model = RecordingModel()
+    engine = ChatConversationEngine(language_model=model)
+
+    # Structural typing against the runtime-checkable Protocol: the
+    # facade satisfies it completely (all four methods).
+    assert isinstance(engine, LanguageModel)
+
+    # The archival port delegates to the injected model.
+    import asyncio
+
+    budget = TurnBudget(deadline=1_000.0, reserve=10.0, now_provider=lambda: 0.0)
+    result = asyncio.new_event_loop().run_until_complete(
+        engine.extract_archival([{"role": "user", "content": "x"}], budget)
+    )
+    assert result == "{}"
+    assert "extract_archival" in model.calls
+
+
+def test_language_model_contract_carries_no_provider_composition():
+    """Second review blocker: the generic contract has no provider registry.
+
+    ``backend/language_model.py`` must not know ``SUPPORTED_PROVIDERS``,
+    dynamic ``backend.{provider}_language_model`` import conventions, or
+    any factory resolution carrying provider credentials/payloads. The
+    composition roots close over the concrete builders directly.
+    """
+    import ast
+    from pathlib import Path
+
+    contract = Path(__file__).resolve().parents[1] / "language_model.py"
+    tree = ast.parse(contract.read_text(encoding="utf-8"))
+
+    # No module-level provider registry / set of provider names.
+    top_names = {
+        t.id for node in tree.body if isinstance(node, ast.Assign)
+        for t in node.targets if isinstance(t, ast.Name)
+    }
+    assert "SUPPORTED_PROVIDERS" not in top_names, (
+        "the generic contract must not define a provider registry"
+    )
+
+    # No factory resolution / dynamic adapter-import functions at all.
+    func_names = {
+        node.name for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    assert func_names == {"canonical_error_for", "language_failure_to_turn_code"}, (
+        f"the contract must contain only taxonomy helpers, found: {sorted(func_names)}"
+    )
+
+    # No importlib / dynamic import anywhere in the module.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                assert not alias.name.startswith("importlib"), (
+                    "the contract must not import modules dynamically"
+                )

@@ -18,10 +18,19 @@ of the envelope before any provider call, and one attempt per turn
 call (the manager's own bounded retry policy remains inside
 ``groq_manager`` — no provider-level fallback to another provider or
 model ever happens here).
+
+Cancellation semantics (executable contract, review follow-up):
+``asyncio.CancelledError`` is control flow, not a provider failure.
+The manager propagates it immediately and the adapter does **not**
+translate or retry it: every provider call in this module re-raises
+``asyncio.CancelledError`` untouched, so no second provider call ever
+happens after cancellation. It is deliberately absent from the
+``ModelFailure`` taxonomy.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -92,6 +101,10 @@ class GroqLanguageModel:
                 max_tokens=self._config.appraisal_max_output_tokens,
                 response_format={"type": "json_object"},
             )
+        except asyncio.CancelledError:
+            # Control flow, not a provider failure: propagate the native
+            # cancellation immediately — no translation, no second call.
+            raise
         except Exception as exc:
             raise _translate_provider_error(exc) from None
 
@@ -123,6 +136,10 @@ class GroqLanguageModel:
                 temperature=0.8,
                 max_tokens=self._config.main_max_output_tokens,
             )
+        except asyncio.CancelledError:
+            # Control flow, not a provider failure: propagate the native
+            # cancellation immediately — no translation, no second call.
+            raise
         except Exception as exc:
             raise _translate_provider_error(exc) from None
 
@@ -151,6 +168,10 @@ class GroqLanguageModel:
                 max_tokens=self._config.archival_max_output_tokens,
                 response_format={"type": "json_object"},
             )
+        except asyncio.CancelledError:
+            # Control flow, not a provider failure: propagate the native
+            # cancellation immediately — no translation, no second call.
+            raise
         except Exception as exc:
             raise _translate_provider_error(exc) from None
 
@@ -254,3 +275,42 @@ def build_groq_language_model(
     except GroqConfigurationError:
         raise LanguageModelConfigurationError() from None
     return GroqLanguageModel(manager)
+
+
+def build_groq_language_model_factory(
+    keys: list[str] | None = None,
+    call_params: GroqCallParams | None = None,
+):
+    """Composition helper for the Groq adapter (review follow-up).
+
+    Issue #337 second review: provider-specific factory resolution left
+    the generic contract (``backend/language_model.py``), so the Groq
+    adapter itself now offers the zero-argument lazy factory the
+    composition roots need. Keys and provider-call parameters are
+    captured **at composition time** from the application settings —
+    the adapter never falls back to the process environment. The
+    returned callable defers both the adapter import and the SDK
+    client construction to first use, and carries a
+    ``provider_configured_probe`` bound to the same captured values
+    (presence-only: no SDK instantiation, no network, no inference
+    call, no secret echo). This is a provider-specific helper in the
+    provider's own module — not a universal registry.
+    """
+    captured_keys = tuple(
+        k for k in (keys or ()) if isinstance(k, str) and k.strip()
+    )
+    captured_params = call_params
+
+    def _factory() -> GroqLanguageModel:
+        return build_groq_language_model(
+            keys=list(captured_keys),
+            call_params=captured_params,
+        )
+
+    def _configured() -> bool:
+        """Presence-only probe over the same captured configuration."""
+        return bool(captured_keys)
+
+    _factory.provider_configured_probe = _configured  # type: ignore[attr-defined]
+
+    return _factory

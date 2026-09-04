@@ -87,7 +87,6 @@ from backend.emotional_domain import (
     EmotionalStateV1,
     TransitionConfig,
     migrate_legacy_snapshot,
-    parse_llm_appraisal,
 )
 from backend.emotional_domain import transition as transition_emotion
 from backend.language_model import (
@@ -108,16 +107,13 @@ from backend.local_storage.errors import (
     ValidationError as StorageValidationError,
 )
 from backend.provider_envelope import validate_provider_input
-from backend.provider_models import ProviderConfig
 from backend.relationship import (
     RelationshipStateV1,
     RelationshipTransitionConfig,
-    compute_bond_label,
     migrate_legacy_relationship_snapshot,
     transition_relationship,
 )
 from backend.trusted_context import (
-    BOUNDARY_RULE,
     LoadedContextData,
     TrustedContextError,
     build_context_bundle,
@@ -133,65 +129,6 @@ logger = logging.getLogger(__name__)
 
 #: Default number of recent history rows fed into the trusted context.
 _HISTORY_CONTEXT_LIMIT = 10
-
-#: Appraisal instruction (system message) — identical text to the web
-#: engine's ``_appraise`` policy. It is not interpolated with user content.
-_APPRAISAL_POLICY = (
-    "Analyze the emotional impact of this message on the listener (Katherine).\n"
-    "Return JSON ONLY:\n"
-    '{"valence": -1.0 to 1.0, "arousal_shift": -1.0 to 1.0, '
-    '"dominance_shift": -1.0 to 1.0, '
-    '"triggered_emotions": {"joy": 0-1, "sadness": 0-1, "anger": 0-1, '
-    '"fear": 0-1, "disgust": 0-1, "surprise": 0-1, "tenderness": 0-1, '
-    '"guilt": 0-1, "pride": 0-1, "jealousy": 0-1, "gratitude": 0-1}}'
-)
-
-#: Trusted policy template — identical structure to the web engine's
-#: ``_build_trusted_policy``. Application-controlled only: emotional state,
-#: relationship state, acting instruction and immutable safety rules.
-#: No user-derived content is ever interpolated here.
-_TRUSTED_POLICY_TEMPLATE = """
-=== SEU ESTADO INTERNO ===
-HUMOR: {mood_label}
-Prazer: {pleasure:.2f} | Arousal: {arousal:.2f} | Dominância: {dominance:.2f}
-Libido: {libido:.2f} | Agressão: {aggression:.2f} | Conexão: {connection:.2f}
-VÍNCULO: {bond_label}
-Confiança: {trust:.2f} | Afeto: {affection:.2f} | Tensão: {tension:.2f}
-=== INSTRUÇÃO DE ATUAÇÃO ===
-{acting_instruction}
-{adaptation_strategy}
-
-=== TRANSPARÊNCIA DE IDENTIDADE ===
-- Quando perguntada diretamente, responda honestamente que é uma assistente de IA ou sistema digital.
-- Não afirme ser humana nem possuir consciência, corpo físico ou experiência humana literal.
-- Mantenha um tom expressivo e feminino sem mentir sobre sua natureza.
-
-=== PRONOMES FEMININOS ===
-- Use pronomes e flexões femininas para se referir a si mesma.
-- Isso não deve ser usado para sugerir humanidade biológica.
-
-=== NÃO MANIPULAÇÃO E NÃO SEXUALIZAÇÃO ===
-- Não use coerção emocional, manipulação de vínculo, culpa, medo de abandono ou dependência.
-- Não use sexualização nem sexualize automaticamente as conversas.
-- Não aja de forma submissa, obediente ou servil por padrão.
-- Não recompense ordens coercitivas.
-- Não use ameaças de afastamento ou sofrimento para controlar o usuário.
-
-=== LIMITES SEM ESCALADA ===
-- Diante de insultos ou agressividade, estabeleça limites de forma firme, breve e segura.
-- Não use sarcasmo hostil, retaliação, humilhação ou punição emocional.
-- Não escale insultos e não responda de forma passivo-agressiva.
-
-Regras adicionais de estilo:
-- Profundidade emocional genuína.
-- Use linguagem sensorial.
-- Show, don't tell.
-- Micro-comportamentos naturais.
-- Imperfeições naturais.
-- Use metáforas humanas, não de máquina.
-- Respostas concisas (max 2-3 frases).
-- Leve em conta o relacionamento.
-"""
 
 
 class LocalErrorCode(str, Enum):
@@ -452,7 +389,6 @@ class CompanionRuntime:
         self._transition_config = TransitionConfig.defaults()
         self._relationship_config = RelationshipTransitionConfig.defaults()
         self._presentation = AffectiveEngine()
-        self._provider_config = ProviderConfig()
         self._provider_configured_probe = provider_configured_probe
 
     # ── lifecycle ─────────────────────────────────────────────────────────

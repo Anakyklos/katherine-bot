@@ -97,20 +97,21 @@ def _build_language_model_factory():
     """Build the desktop provider wiring (issue #337 review).
 
     The concrete provider choice lives in this composition root, not
-    in the runtime: the desktop selects Groq explicitly (no
-    auto-routing, no fallback) and reads its keys Python-side only
+    in the runtime or in the generic contract: the desktop selects
+    Groq explicitly (no auto-routing, no fallback) and closes over the
+    adapter's own factory helper, reading its keys Python-side only
     (env values are never echoed, never in the Vite bundle, never
     through the bridge). The factory stays lazy — importing the app or
     building the runtime never loads a provider SDK; the adapter is
     constructed on the first turn that needs the model.
     """
     from backend.groq_keys import get_groq_api_keys
-    from backend.language_model import resolve_language_model_factory
+    from backend.groq_language_model import build_groq_language_model_factory
 
     keys = tuple(
         k for k in get_groq_api_keys() if isinstance(k, str) and k.strip()
     )
-    return resolve_language_model_factory("groq", keys=keys)
+    return build_groq_language_model_factory(keys=keys)
 
 
 def _build_runtime():

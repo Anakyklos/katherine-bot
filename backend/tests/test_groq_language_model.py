@@ -271,19 +271,79 @@ def test_build_groq_language_model_without_keys_raises_configuration():
         build_groq_language_model(keys=[])
 
 
-def test_unknown_provider_fails_sanitized():
-    """Requirement: unknown provider fails sanitized configuration error.
+def test_groq_adapter_factory_is_lazy_and_probe_bound(monkeypatch):
+    """Second review: provider composition helper lives in the adapter.
 
-    The generic resolution API is deliberately just the factory
-    (``resolve_language_model`` — an always-raising stub — was removed
-    in the #337 review); unknown providers still fail sanitized.
+    ``build_groq_language_model_factory`` (in the Groq adapter module,
+    not the generic contract) captures keys at composition time, defers
+    the adapter construction to first use and binds the readiness probe
+    to the same captured values.
     """
-    from backend.language_model import (
-        LanguageModelConfigurationError,
-        resolve_language_model_factory,
-    )
+    import backend.groq_keys as groq_keys_module
+    from backend.groq_language_model import build_groq_language_model_factory
 
-    with pytest.raises(LanguageModelConfigurationError):
-        # The canonical resolution must reject anything that is not the
-        # explicitly supported provider set (today: groq).
-        resolve_language_model_factory(provider="not-a-provider")
+    monkeypatch.delenv("GROQ_API_KEY", raising=False)
+    monkeypatch.delenv("GROQ_API_KEY_2", raising=False)
+    monkeypatch.setattr(groq_keys_module, "get_groq_api_keys", lambda: [None, None])
+
+    keys = ["gsk_test_composition_capture"]
+    factory = build_groq_language_model_factory(keys=keys)
+
+    # Probe answers from the captured configuration only: True with a
+    # captured key, False without one — and it never constructs the
+    # adapter (no SDK instantiation, no inference call).
+    assert factory.provider_configured_probe() is True
+    empty = build_groq_language_model_factory(keys=[])
+    assert empty.provider_configured_probe() is False
+
+    model = factory()
+    assert model.describe().provider == "groq"
+    # The adapter was built from exactly the captured keys.
+    assert model._manager._keys == ["gsk_test_composition_capture"]
+
+
+def test_cancellation_propagates_natively_without_second_call():
+    """Second review: executable cancellation semantics.
+
+    ``asyncio.CancelledError`` is control flow: the adapter propagates
+    it immediately, untranslated (never a ``LanguageModel*Error``), and
+    deterministic proof that no second provider call happens after the
+    cancellation.
+    """
+    import asyncio
+
+    from backend.groq_language_model import GroqLanguageModel
+
+    class CancellingManager:
+        """Manager that raises CancelledError on the Nth call."""
+
+        def __init__(self, cancel_on: int) -> None:
+            self.calls = 0
+            self._cancel_on = cancel_on
+
+        async def chat_completion_async(self, **kwargs):
+            self.calls += 1
+            if self.calls >= self._cancel_on:
+                raise asyncio.CancelledError()
+            return object()
+
+    async def _run() -> tuple[type | None, int]:
+        manager = CancellingManager(cancel_on=1)
+        model = GroqLanguageModel(manager)
+        budget = _budget()
+        try:
+            await model.generate([{"role": "user", "content": "hi"}], budget)
+        except BaseException as exc:  # noqa: BLE001 (capture native type)
+            return type(exc), manager.calls
+        return None, manager.calls
+
+    loop = asyncio.new_event_loop()
+    try:
+        exc_type, calls = loop.run_until_complete(_run())
+    finally:
+        loop.close()
+
+    # Native cancellation propagated as itself, exactly one provider
+    # call, no retry, no translation into the canonical taxonomy.
+    assert exc_type is asyncio.CancelledError
+    assert calls == 1

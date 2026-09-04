@@ -11,9 +11,9 @@ call sites:
 * the trusted policy is a Katherine-core responsibility and MUST NOT be
   part of the provider contract.
 
-These tests are the executable version of
-``specs/002-language-model-contract/contracts/language-model-contract.md``.
-They use no network and no SDK.
+These tests are the executable version of the contract documented in
+``docs/architecture/bounded-turn-execution.md`` (the LanguageModel
+boundary section). They use no network and no SDK.
 """
 
 from __future__ import annotations
@@ -65,9 +65,11 @@ def test_model_failure_codes_match_existing_taxonomy():
     from backend.language_model import ModelFailure
     from backend.groq_manager import ProviderFailure
 
-    # The canonical codes ARE the existing sanitized taxonomy: same names,
-    # same values — no new vocabulary, no SDK detail.
-    assert {f.name for f in ModelFailure} == {f.name for f in ProviderFailure}
+    # The canonical codes ARE the existing sanitized taxonomy minus
+    # ``cancelled`` (second review): asyncio.CancelledError is control
+    # flow, propagated natively, never a classified failure code.
+    manager_codes = {f.name for f in ProviderFailure} - {"cancelled"}
+    assert {f.name for f in ModelFailure} == manager_codes
     for name in (
         "rate_limited",
         "auth_failed",
@@ -76,9 +78,26 @@ def test_model_failure_codes_match_existing_taxonomy():
         "invalid_request",
         "invalid_response",
         "timeout",
-        "cancelled",
     ):
         assert getattr(ModelFailure, name).value == getattr(ProviderFailure, name).value
+
+
+def test_model_failure_deliberately_has_no_cancelled_code():
+    """Cancellation is control flow, not a provider failure.
+
+    ``asyncio.CancelledError`` propagates natively across the boundary
+    (immediately, no retry, no translation). A ``cancelled`` code would
+    be dead API pretending to represent task cancellation.
+    """
+    from backend.language_model import ModelFailure
+
+    assert not hasattr(ModelFailure, "cancelled")
+    from backend.language_model import LanguageModelError
+
+    assert not any(
+        issubclass(sub, LanguageModelError) and "cancel" in sub.__name__.lower()
+        for sub in LanguageModelError.__subclasses__()
+    )
 
 
 def test_language_model_is_a_small_protocol():
@@ -132,7 +151,6 @@ def test_canonical_exceptions_carry_failure_and_constant_message():
         ("server_error", TurnErrorCode.provider_unavailable),
         ("timeout", TurnErrorCode.turn_timeout),
         ("invalid_response", TurnErrorCode.provider_invalid_response),
-        ("cancelled", TurnErrorCode.internal_error),
     ],
 )
 def test_language_failure_to_turn_code_preserves_current_mapping(failure, expected):
@@ -205,17 +223,23 @@ def test_build_trusted_policy_rejects_nothing_user_derived():
     assert "VÍNCULO:" in policy
 
 
-def test_build_trusted_policy_matches_web_engine_template_shape():
-    """Web engine and desktop runtime must produce the same policy text."""
-    from backend.companion_runtime import (
-        _TRUSTED_POLICY_TEMPLATE as _desktop_template,
-    )
+def test_build_trusted_policy_is_canonical_single_source():
+    """The trusted policy has exactly one canonical template.
+
+    Second review: ``companion_runtime.py`` kept a dead copy of the
+    template after ``trusted_policy.py`` became the canonical source;
+    the copy is removed. The canonical builder must produce every
+    section header of the canonical template (single source of truth,
+    no divergence between web and desktop).
+    """
+    import backend.trusted_policy as trusted_policy_module
     from backend.trusted_policy import build_trusted_policy
 
+    template = trusted_policy_module._TRUSTED_POLICY_TEMPLATE
     state, relationship = _state_and_relationship()
     policy = build_trusted_policy(state, relationship, "")
-    # All template sections from the current canonical template present.
-    for line in _desktop_template.splitlines():
+    # All template sections from the canonical template present.
+    for line in template.splitlines():
         stripped = line.strip()
         if stripped.startswith("==="):
             assert stripped in policy
@@ -278,12 +302,13 @@ def test_all_canonical_exceptions_are_sanitized_in_repr_and_str(caplog):
         LanguageModelInvalidRequestError,
         LanguageModelInvalidResponseError,
         LanguageModelTimeoutError,
-        LanguageModelCancelledError,
         LanguageModelConfigurationError,
     )
 
     secret = "gsk_SECRET_MARKER_98765"
     # Simulate a provider SDK error text used to construct each class.
+    # No cancelled case: asyncio.CancelledError is control flow and is
+    # never translated into this taxonomy (second review).
     cases = [
         (LanguageModelRateLimitedError(), "rate limited"),
         (LanguageModelAuthFailedError(), "auth failed"),
@@ -292,7 +317,6 @@ def test_all_canonical_exceptions_are_sanitized_in_repr_and_str(caplog):
         (LanguageModelInvalidRequestError(), "invalid request"),
         (LanguageModelInvalidResponseError(), "invalid response"),
         (LanguageModelTimeoutError(), "timeout"),
-        (LanguageModelCancelledError(), "cancelled"),
         (LanguageModelConfigurationError(), "configuration"),
     ]
     for exc, label in cases:

@@ -14,6 +14,13 @@ sites, not from imagined providers):
   observability;
 * canonical typed failures (``ModelFailure``) with constant messages.
 
+Cancellation semantics (executable, not aspirational): task
+``asyncio.CancelledError`` is control flow, not a provider failure.
+Implementations propagate it **immediately and natively** — no
+retry, no translation into ``LanguageModel*Error``, no second
+provider call. The failure taxonomy therefore deliberately has no
+``cancelled`` code; cancellation crosses the boundary as itself.
+
 What deliberately does NOT belong here:
 
 * ``build_trusted_policy`` — the trusted system policy is a Katherine
@@ -36,7 +43,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from backend.emotional_domain import AppraisalV1
 from backend.turn_execution import TurnBudget, TurnErrorCode
@@ -53,10 +60,8 @@ __all__ = [
     "LanguageModelInvalidRequestError",
     "LanguageModelInvalidResponseError",
     "LanguageModelTimeoutError",
-    "LanguageModelCancelledError",
     "LanguageModelConfigurationError",
     "language_failure_to_turn_code",
-    "resolve_language_model_factory",
 ]
 
 
@@ -79,22 +84,27 @@ class ModelSelection:
     fast_model_id: str
 
 
-#: Providers with a concrete adapter behind this contract. Adding a new
-#: remote provider means adding a new adapter and extending this set —
-#: nothing else in the domain changes.
-SUPPORTED_PROVIDERS: frozenset[str] = frozenset({"groq"})
-
-
 # ─── Canonical failure taxonomy ─────────────────────────────────────────────
+#
+# Review follow-up: this module deliberately contains no provider
+# registry, no ``SUPPORTED_PROVIDERS`` set and no dynamic
+# ``backend.{provider}_language_model`` import convention. The concrete
+# provider choice and its builder belong to the composition roots
+# (``backend/dependencies.py`` for the web, ``backend/desktop/app.py``
+# for the desktop) and to the adapter modules themselves; adding a
+# provider means adding an adapter and wiring it in a composition root,
+# never editing this contract.
 
 
 class ModelFailure(str, Enum):
     """Sanitized, low-cardinality provider-agnostic failure codes.
 
-    Identical vocabulary to the existing ``ProviderFailure`` taxonomy
+    Identical vocabulary to the manager taxonomy minus ``cancelled``
     (``backend.groq_manager``), which is preserved bit-for-bit in
-    ``language_failure_to_turn_code``. No raw exception text, key
-    prefixes, HTTP bodies or user content ever travel with these codes.
+    ``language_failure_to_turn_code``. ``asyncio.CancelledError``
+    deliberately has no code here: it is control flow, propagated
+    natively. No raw exception text, key prefixes, HTTP bodies or
+    user content ever travel with these codes.
     """
 
     rate_limited = "rate_limited"
@@ -104,7 +114,10 @@ class ModelFailure(str, Enum):
     invalid_request = "invalid_request"
     invalid_response = "invalid_response"
     timeout = "timeout"
-    cancelled = "cancelled"
+    # Deliberately NO ``cancelled`` code: ``asyncio.CancelledError`` is
+    # control flow (a ``BaseException``), not a provider failure. It
+    # propagates natively and immediately across this boundary — never
+    # classified, never translated, never retried (review follow-up).
 
 
 class LanguageModelError(Exception):
@@ -176,13 +189,6 @@ class LanguageModelTimeoutError(LanguageModelError):
         super().__init__(ModelFailure.timeout)
 
 
-class LanguageModelCancelledError(LanguageModelError):
-    MESSAGE = "Language model request was cancelled."
-
-    def __init__(self) -> None:
-        super().__init__(ModelFailure.cancelled)
-
-
 class LanguageModelConfigurationError(LanguageModelError):
     """Configuration is missing or invalid (no key, unknown provider).
 
@@ -205,7 +211,6 @@ _FAILURE_TO_ERROR: dict[ModelFailure, type[LanguageModelError]] = {
     ModelFailure.invalid_request: LanguageModelInvalidRequestError,
     ModelFailure.invalid_response: LanguageModelInvalidResponseError,
     ModelFailure.timeout: LanguageModelTimeoutError,
-    ModelFailure.cancelled: LanguageModelCancelledError,
 }
 
 
@@ -225,7 +230,10 @@ def language_failure_to_turn_code(failure: ModelFailure) -> TurnErrorCode:
     * connection_failed / server_error → provider_unavailable (503)
     * timeout → turn_timeout (504)
     * invalid_response → provider_invalid_response (500)
-    * cancelled → propagated (internal_error only when converted)
+
+    ``asyncio.CancelledError`` is absent on purpose: it is not a
+    ``ModelFailure`` and never flows through this mapping — task
+    cancellation propagates natively without classification.
     """
     mapping = {
         ModelFailure.rate_limited: TurnErrorCode.upstream_rate_limited,
@@ -235,7 +243,6 @@ def language_failure_to_turn_code(failure: ModelFailure) -> TurnErrorCode:
         ModelFailure.server_error: TurnErrorCode.provider_unavailable,
         ModelFailure.timeout: TurnErrorCode.turn_timeout,
         ModelFailure.invalid_response: TurnErrorCode.provider_invalid_response,
-        ModelFailure.cancelled: TurnErrorCode.internal_error,
     }
     return mapping.get(failure, TurnErrorCode.provider_invalid_response)
 
@@ -278,57 +285,3 @@ class LanguageModel(Protocol):
     def describe(self) -> ModelSelection:
         """Sanitized provider/model identification for observability."""
         ...
-
-
-def resolve_language_model_factory(
-    provider: str,
-    keys: tuple[str, ...] | list[str] | None = None,
-    call_params: Any | None = None,
-):
-    """Resolve the explicit provider to a lazy adapter factory.
-
-    Returns a zero-argument callable that builds the concrete adapter
-    on first use (the adapter import happens inside the factory, so
-    the contract module and its importers never load a provider SDK
-    at import time). Unknown providers fail sanitized here.
-
-    ``keys`` and ``call_params`` are captured **at composition time**
-    from the application settings (``Settings.provider_keys()`` and
-    the provider-call parameters derived from ``Settings.turn_config``).
-    The factory then builds the adapter from exactly those captured
-    values — the adapter never falls back to reading the process
-    environment. ``call_params`` is typed as ``Any`` on purpose: it is
-    an opaque, provider-specific composition payload (e.g.
-    ``GroqCallParams``) whose concrete type belongs to the provider
-    adapter; the generic contract does not define or inspect it.
-    """
-    if provider not in SUPPORTED_PROVIDERS:
-        raise LanguageModelConfigurationError()
-
-    captured_keys = tuple(
-        k for k in (keys or ()) if isinstance(k, str) and k.strip()
-    )
-    captured_params = call_params
-
-    def _factory() -> "LanguageModel":
-        from importlib import import_module
-
-        adapter = import_module(f"backend.{provider}_language_model")
-        builder = getattr(adapter, f"build_{provider}_language_model", None)
-        if builder is None:
-            raise LanguageModelConfigurationError()
-        return builder(keys=list(captured_keys), call_params=captured_params)
-
-    def _configured() -> bool:
-        """Readiness probe bound to the same captured configuration.
-
-        Presence-only: ``True`` iff the composition captured at least
-        one non-empty key for the explicitly selected provider. Pure
-        configuration check — no SDK instantiation, no network, no
-        inference call, and the key value is never echoed.
-        """
-        return bool(captured_keys)
-
-    _factory.provider_configured_probe = _configured  # type: ignore[attr-defined]
-
-    return _factory

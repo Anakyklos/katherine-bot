@@ -19,7 +19,6 @@ from .emotional_domain import (
     EmotionalStateV1,
     TransitionConfig,
     migrate_legacy_snapshot,
-    parse_llm_appraisal,
     transition,
 )
 from .emotion_presentation import project_public_emotion, EmotionStateResponse
@@ -53,9 +52,6 @@ from .turn_execution import (
     run_blocking_write,
 )
 
-from .provider_models import (
-    ProviderConfig,
-)
 from .provider_envelope import (
     ContextFitResult,
     ProviderEnvelopeError,
@@ -135,7 +131,6 @@ class ConversationEngine:
         )
         self.relationship_config = RelationshipTransitionConfig.defaults()
         self.lock_manager = UserLockManager()
-        self.provider_config = ProviderConfig()
 
     async def run_archival_extraction(self, turn_ref: PersistedTurnRef):
         if not self.archival_extraction_enabled:
@@ -228,8 +223,7 @@ class ConversationEngine:
         # contracted call shape (fast model, JSON mode, temperature 0,
         # explicit token limit) inside the adapter.
         try:
-            model = self._model()
-            response_text = await model.extract_archival(archival_messages, budget)
+            response_text = await self.extract_archival(archival_messages, budget)
         except Exception:
             logger.error("Event: archival_extraction_llm_failed")
             return
@@ -317,6 +311,18 @@ class ConversationEngine:
     async def generate(self, messages: list, budget: TurnBudget) -> str:
         """Public generation port for the ProcessTurn use case."""
         return await self._generate_with_messages(messages, budget)
+
+    async def extract_archival(self, messages: list, budget: TurnBudget) -> str:
+        """Public archival-extraction port — full contract surface.
+
+        Issue #337 second review: the engine facade passed to
+        ``build_process_turn`` as ``provider: LanguageModel`` must
+        satisfy the *complete* Protocol, not a subset. This is a pure
+        delegation to the injected model (same call shape the adapter
+        applies), and ``run_archival_extraction`` itself goes through
+        it so the facade is the single path.
+        """
+        return await self._model().extract_archival(messages, budget)
 
     def build_trusted_policy(
         self,
@@ -516,8 +522,6 @@ class ConversationEngine:
             outcome = StageOutcome.failed
             if exc.failure == ModelFailure.timeout:
                 outcome = StageOutcome.timeout
-            elif exc.failure == ModelFailure.cancelled:
-                outcome = StageOutcome.cancelled
             await self._emit_stage_event(StageEvent(
                 stage=TurnStage.appraisal, outcome=outcome,
                 code=turn_code, duration_ms=duration_ms,
@@ -608,8 +612,6 @@ class ConversationEngine:
             outcome = StageOutcome.failed
             if exc.failure == ModelFailure.timeout:
                 outcome = StageOutcome.timeout
-            elif exc.failure == ModelFailure.cancelled:
-                outcome = StageOutcome.cancelled
             await self._emit_stage_event(StageEvent(
                 stage=TurnStage.generation, outcome=outcome,
                 code=turn_code, duration_ms=duration_ms,

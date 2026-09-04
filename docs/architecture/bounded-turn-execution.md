@@ -216,11 +216,30 @@ speaks **only** to the canonical `LanguageModel` contract
   temperature 0, explicit token limit, `archival_extraction` stage);
 - `describe()` — sanitized provider/model identification.
 
+The contract module is provider-agnostic by construction: it carries
+only the Protocol, the sanitized selection/failure types and the
+failure → `TurnErrorCode` mapping. It deliberately contains **no
+provider registry, no `SUPPORTED_PROVIDERS` set and no dynamic
+`backend.{provider}_language_model` import convention** — the concrete
+provider choice lives exclusively in the composition roots
+(`backend/dependencies.py` on the web, `backend/desktop/app.py` on the
+desktop), which close directly over the concrete adapter builder
+(`build_groq_language_model_factory` in the Groq adapter itself).
+
+**Cancellation semantics.** `asyncio.CancelledError` is control flow,
+not a provider failure. The adapter propagates it **immediately and
+natively** — no retry, no translation into `LanguageModel*Error`, no
+second provider call after cancellation (pinned by a deterministic
+adapter test). The `ModelFailure` taxonomy therefore has no `cancelled`
+code: the dead API was removed rather than pretending to represent
+task cancellation.
+
 Groq is a first-class remote provider **behind an explicit adapter**
 (`backend/groq_language_model.py`). No Groq symbol (SDK type, manager,
 exception) crosses the adapter upward; failures surface as the canonical
 `LanguageModel*Error` taxonomy with constant sanitized messages, and the
-existing failure → `TurnErrorCode` mapping is preserved bit a bit.
+existing failure → `TurnErrorCode` mapping is preserved bit a bit
+(minus the removed dead `cancelled` code).
 Selection is explicit at composition time — there is **no auto-routing
 and no fallback to another provider**: a provider failure is a turn
 failure. The composition roots capture the provider keys and the

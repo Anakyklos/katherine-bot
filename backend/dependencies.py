@@ -183,19 +183,21 @@ def build_default_dependencies(
     """
     created: list[Any] = []
     try:
-        # Explicit provider selection (issue #337): the composition root
-        # builds the remote adapter behind the canonical LanguageModel
-        # contract. Today the supported remote provider is Groq; the
+        # Explicit provider selection (issue #337): the composition
+        # root closes over the concrete Groq builder directly — the
+        # generic contract (backend.language_model) carries no provider
+        # registry or dynamic import convention (second review). The
         # selection is explicit and there is no fallback to another
         # provider. Keys and provider-call parameters are captured from
         # the validated settings **here, at composition time** — the
         # factory builds the adapter from exactly these captured values
         # and the adapter never falls back to the process environment
         # (Settings is the single source of truth for the web backend).
-        from .language_model import resolve_language_model_factory
+        # The import lives inside the builder function, so importing
+        # this module never loads a provider SDK.
+        from .groq_language_model import build_groq_language_model_factory
 
-        language_model_factory = resolve_language_model_factory(
-            "groq",
+        language_model_factory = build_groq_language_model_factory(
             keys=settings.provider_keys(),
             call_params=settings.turn_config.to_groq_params(),
         )

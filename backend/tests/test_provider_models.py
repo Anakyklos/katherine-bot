@@ -383,15 +383,18 @@ class TestSingleSourceOfTruth:
         assert MAIN_MAX_OUTPUT_TOKENS == 200
         assert APPRAISAL_MAX_OUTPUT_TOKENS == 256
         assert ARCHIVAL_MAX_OUTPUT_TOKENS == 512
-        # Dataclass defaults
+        # Dataclass defaults (the adapter is the single consumer of
+        # ProviderConfig since issue #337 — the engine carries no
+        # provider configuration anymore)
         assert ProviderConfig().main_max_output_tokens == 200
         assert ProviderConfig().appraisal_max_output_tokens == 256
         assert ProviderConfig().archival_max_output_tokens == 512
-        # Engine propagates
-        engine = _make_engine()
-        assert engine.provider_config.main_max_output_tokens == 200
-        assert engine.provider_config.appraisal_max_output_tokens == 256
-        assert engine.provider_config.archival_max_output_tokens == 512
+        # The adapter applies exactly these defaults
+        from backend.groq_language_model import GroqLanguageModel
+        adapter = GroqLanguageModel(manager=object())
+        assert adapter._config.main_max_output_tokens == 200
+        assert adapter._config.appraisal_max_output_tokens == 256
+        assert adapter._config.archival_max_output_tokens == 512
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -885,18 +888,27 @@ class TestNoOldLlamaModels:
         assert "llama" not in FAST_MODEL_ID
 
     def test_no_fallback_to_old_models_in_engine(self):
-        """Engine does not have fallback attributes for old models."""
+        """Engine has no provider model attributes at all (issue #337).
+
+        The engine depends only on the canonical LanguageModel
+        contract; model selection is applied inside the adapter from
+        ``ProviderConfig`` defaults.
+        """
         engine = _make_engine()
         assert not hasattr(engine, "model_main")
         assert not hasattr(engine, "model_fast")
-        assert engine.provider_config.main_model_id == "openai/gpt-oss-120b"
-        assert engine.provider_config.fast_model_id == "openai/gpt-oss-20b"
+        assert not hasattr(engine, "provider_config")
+        from backend.groq_language_model import GroqLanguageModel
+        adapter = GroqLanguageModel(manager=object())
+        assert adapter._config.main_model_id == "openai/gpt-oss-120b"
+        assert adapter._config.fast_model_id == "openai/gpt-oss-20b"
 
     def test_engine_provider_config_has_no_llama(self):
-        """The active model IDs from the engine's provider_config never contain 'llama'."""
-        engine = _make_engine()
-        main_id = engine.provider_config.main_model_id
-        fast_id = engine.provider_config.fast_model_id
+        """The active model IDs the adapter uses never contain 'llama'."""
+        from backend.groq_language_model import GroqLanguageModel
+        adapter = GroqLanguageModel(manager=object())
+        main_id = adapter._config.main_model_id
+        fast_id = adapter._config.fast_model_id
         assert "llama" not in main_id
         assert "llama" not in fast_id
         assert main_id == "openai/gpt-oss-120b"
