@@ -67,7 +67,16 @@ $MB --rbind /etc "$NEW/etc"
 $MB --rbind /var "$NEW/var"
 $MB --rbind /opt "$NEW/opt"
 $MB --rbind /dev "$NEW/dev"
+${MB} -t proc proc "$NEW/proc"
 mkdir -p "$NEW/home/user"
+chmod 1777 "$NEW/tmp"
+# GUI smoke runs use an Xvfb on the host.  The new root has its own
+# tmpfs /tmp, so expose only the X11 Unix-socket directory when it is
+# present.  No host user data is mounted here.
+if [ -d /tmp/.X11-unix ]; then
+  mkdir -p "$NEW/tmp/.X11-unix"
+  $MB --bind /tmp/.X11-unix "$NEW/tmp/.X11-unix"
+fi
 ln -s usr/bin "$NEW/bin"
 ln -s usr/lib "$NEW/lib"
 ln -s usr/lib64 "$NEW/lib64"

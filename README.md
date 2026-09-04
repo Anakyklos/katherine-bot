@@ -52,6 +52,23 @@ history/memories, reset emotional/relationship state) are available in
 the desktop sidebar. See
 [Desktop Shell no Linux](docs/operations/desktop-shell-linux.md).
 
+#### Linux `.deb`
+
+To build and install the reproducible desktop package:
+
+```bash
+cd frontend && npm ci && npm run build && cd ..
+SOURCE_DATE_EPOCH=1700000000 python3 packaging/build_deb.py \
+  --version 0.1.0 --out-dir dist/deb
+sudo dpkg -i dist/deb/katherine-desktop_0.1.0_all.deb
+sudo apt-get -f install
+```
+
+The package runs the same pywebview/WebKitGTK shell and keeps user data in
+`~/.local/share/katherine/`; it never packages or replaces `katherine.db`.
+See the [Linux package operations guide](docs/operations/desktop-shell-linux.md#pacote-deb-do-desktop-338)
+for native dependencies, lifecycle evidence, rollback, and benchmarks.
+
 ### Frontend
 
 1. Navigate to the `frontend` directory:

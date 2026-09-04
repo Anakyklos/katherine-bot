@@ -160,6 +160,142 @@ da máquina de estados same-URL (todas as transições do trust) está em
   consecutivas a 0% com a janela viva)
 - Processos: 1 (nenhum servidor/worker extra)
 
+## Pacote `.deb` do desktop (#338)
+
+O pacote Debian reutiliza exatamente o shell `backend.desktop.app` e o
+build de produção do Vite. O layout instalado é:
+
+- `/usr/bin/katherine`: wrapper que fixa o `sys.path` na árvore instalada;
+- `/usr/lib/katherine/backend`: somente o fechamento de imports do runtime
+  desktop;
+- `/usr/lib/katherine/frontend/dist`: `desktop.html` e os assets do build;
+- `/usr/lib/katherine/vendor`: dependências Python desktop travadas em
+  `packaging/requirements-desktop.txt`;
+- `/usr/share/applications/katherine.desktop`: atalho do menu.
+
+Não há servidor HTTP, daemon, serviço systemd ou uma segunda implementação
+do runtime. O pacote depende do Python e do stack nativo PyGObject,
+WebKitGTK 4.1, GTK 3 e GLib do sistema. As dependências Python puras são
+desempacotadas no diretório `vendor`; FastAPI, Supabase, Uvicorn, PyTorch e
+NumPy não entram no pacote.
+
+### Build e instalação
+
+O build exige que o frontend já esteja pronto e baixa somente as versões do
+lock desktop:
+
+```bash
+cd frontend && npm ci && npm run build && cd ..
+SOURCE_DATE_EPOCH=1700000000 \
+  python3 packaging/build_deb.py \
+  --version 0.1.0 \
+  --out-dir dist/deb
+```
+
+Em uma instalação Debian/Ubuntu, instale primeiro as dependências nativas
+listadas no metadata do pacote, depois instale o arquivo gerado:
+
+```bash
+sudo apt install python3 python3-gi gir1.2-webkit2-4.1 \
+  libwebkit2gtk-4.1-0 libgtk-3-0 libglib2.0-0
+sudo dpkg -i dist/deb/katherine-desktop_0.1.0_all.deb
+sudo apt-get -f install
+katherine
+```
+
+O build e a instalação nunca criam nem copiam um banco de dados de usuário.
+Em runtime, o arquivo fica em `~/.local/share/katherine/katherine.db`.
+Também não há arquivo de configuração em `/etc` nem `conffile`, portanto
+upgrade, remove e purge não devem apagar dados do usuário.
+
+### Upgrade, rollback e migrações
+
+Um upgrade normal substitui somente a árvore do pacote:
+
+```bash
+sudo dpkg -i katherine-desktop_0.2.0_all.deb
+```
+
+O rollback é a instalação do `.deb` anterior:
+
+```bash
+sudo dpkg -i katherine-desktop_0.1.0_all.deb
+```
+
+O banco não é revertido durante nenhum desses comandos. O runner de
+migrações aplica cada versão dentro de uma transação e só grava a versão
+depois do sucesso. Se uma versão mais nova estiver registrada no banco, uma
+versão antiga do app falha fechada com `schema_too_new`, sem resetar,
+recriar ou abrir silenciosamente um schema desconhecido.
+
+### Evidência de ciclo de vida real
+
+`packaging/isolated-install.sh` cria um namespace de usuário, mount e PID,
+usa `pivot_root`, executa o `dpkg` real e mantém um banco `status` separado.
+Ele não usa Docker, mocka o dpkg ou toca o banco do host. O teste completo é:
+
+```bash
+python3 packaging/smoke_deb.py \
+  --deb dist/deb/katherine-desktop_0.1.0~test2_all.deb \
+  --old-deb dist/deb/katherine-desktop_0.1.0~test1_all.deb
+```
+
+Na execução validada, o resultado foi `ALL PASS (7/7)`:
+
+1. instalação e configuração `dpkg`;
+2. import fora do checkout e resolução do frontend instalado;
+3. criação do banco XDG no primeiro uso, com schema 1;
+4. turno sem chave com erro sanitizado `configuration`;
+5. upgrade para a versão nova;
+6. downgrade para a versão anterior com o banco reaberto e preservado;
+7. purge, confirmação de que os arquivos do pacote sumiram, reinstalação e
+   confirmação independente de uma linha sentinela no mesmo `katherine.db`.
+
+A aceitação gráfica do pacote instalado usa a janela GTK/WebKit real, não a
+página de smoke:
+
+```bash
+packaging/gui_smoke_deb.sh \
+  dist/deb/katherine-desktop_0.1.0~test2_all.deb
+```
+
+Esse probe abre a entrada `/usr/bin/katherine` em Xvfb, espera a janela
+Katherine, digita e envia uma mensagem pela UI real, mede os descendentes do
+shell, verifica que não há sockets TCP em LISTEN e fecha a janela. No caso
+sem chave, o turno retornou o erro de configuração esperado. A execução
+validada terminou com `clean_exit=true`, `exit_code=0`, nenhum processo
+remanescente e nenhum listener TCP.
+
+### Medição do pacote (#338)
+
+Ambiente da medição: Linux Mint 22.3, kernel 7.0.0-30-generic, x86_64,
+Python 3.12.3, PyGObject 3.48.2, WebKitGTK 2.52.3, Node.js 22.23.2,
+12 CPUs. O pacote foi construído com `SOURCE_DATE_EPOCH=1700000000`.
+Uma reconstrução do mesmo commit e versão produziu o mesmo SHA-256:
+`2f44175ca70d98876bd28c8ef692652a84693f74308c33b5e0550e07b0e0f82d`.
+
+Os números abaixo são uma execução real do `GUI_RESULTS`, em Xvfb
+1280x800 com o app instalado, após o carregamento inicial. RSS e CPU são a
+soma dos processos descendentes observados; idle foi amostrado por 5 s e o
+turno por 3 s. Eles são evidência do ambiente acima, não limites de
+aceitação:
+
+| Medida | Resultado |
+| --- | ---: |
+| `.deb` | 3,147,830 bytes (3,074 KiB) |
+| `Installed-Size` Debian | 12,488 KiB |
+| Árvore instalada (`du -sk`) | 13,756 KiB |
+| Startup até janela GTK | 1,033.2 ms |
+| RSS idle, descendentes | 603,156 KiB |
+| CPU idle, janela de 5 s | 0.0% |
+| Pico RSS durante turno | 638,204 KiB |
+| CPU durante turno, janela de 3 s | 19.45% |
+| Shutdown após fechar a janela | 113.8 ms |
+
+A variação de startup e CPU entre execuções depende da carga do host e do
+backend WebKitGTK. Por isso o projeto registra os números observados e o
+método, sem transformar esta amostra em um threshold artificial.
+
 ## Modelo de confiança da bridge (resumo)
 
 1. `make_js_api()` (api.py) entrega só a allowlist `DESKTOP_API_METHODS`

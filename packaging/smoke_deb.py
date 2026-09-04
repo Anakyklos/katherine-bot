@@ -9,7 +9,7 @@ unshare environment (see isolated-install.sh), collecting evidence:
   3. storage        XDG database created in isolated HOME
   4. turn (no key)  sanitized configuration error, no crash
   5. upgrade        newer .deb over older, dpkg replaces files
-  6. downgrade      dpkg refuses (fail-closed) without --force
+  6. downgrade      older package restores without touching user data
   7. purge          package removed, user data PRESERVED
   8. benchmarks     size, startup, RAM — real measurements
 
@@ -17,7 +17,7 @@ Every step prints PASS/FAIL lines; the exit code is non-zero if any
 step fails. All evidence is reproducible: same .deb, same commands.
 
 Usage:
-  packaging/smoke_deb.py [--deb PATH] [--keep] [--skip-upgrade]
+  packaging/smoke_deb.py [--deb PATH] [--old-deb PATH] [--skip-upgrade]
 
 The .deb defaults to the newest katherine-desktop_*.deb in
 packaging/dist/ (or the path given). Two .debs are needed for the
@@ -28,6 +28,7 @@ upgrade/downgrade steps: build one at 0.1.0~test1 and one at
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import subprocess
 import sys
@@ -60,14 +61,6 @@ async def main():
 asyncio.run(main())
 '''
 
-DB_PROBE = r'''
-import json, pathlib, sys
-home = pathlib.Path.home()
-dbs = list(home.rglob("katherine.db"))
-print(json.dumps({"db_count": len(dbs), "paths": [str(p) for p in dbs]}))
-'''
-
-
 def sh(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, check=False, **kw)
 
@@ -96,7 +89,16 @@ def json_line(out: str) -> dict | None:
     return None
 
 
-import json  # noqa: E402 (used by json_line)
+def deb_version(path: Path) -> str:
+    """Read a package version from the real Debian control archive."""
+    result = sh(
+        ["dpkg-deb", "-f", str(path), "Version"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"cannot read package version: {path}")
+    return result.stdout.strip()
 
 
 def step(name: str, ok: bool, detail: str = "") -> bool:
@@ -132,7 +134,8 @@ def main(argv: list[str] | None = None) -> int:
     if not deb.is_file():
         print(f"missing .deb: {deb}")
         return 2
-    print(f"# deb under test: {deb.name}")
+    new_version = deb_version(deb)
+    print(f"# deb under test: {deb.name} ({new_version})")
 
     old = Path(args.old_deb).resolve() if args.old_deb else None
     if old is None and not args.skip_upgrade:
@@ -141,12 +144,17 @@ def main(argv: list[str] | None = None) -> int:
     if old is None and not args.skip_upgrade:
         print("# no second .deb for upgrade test — skipping those steps")
         args.skip_upgrade = True
+    old_version = deb_version(old) if old is not None else None
 
     results: list[bool] = []
 
     # ── 1. install ───────────────────────────────────────────────────
-    rc, out = run_in_env(deb, "dpkg-query --root=/install-root --admindir=/dpkg-db -W katherine-desktop")
-    m = re.search(r"katherine-desktop\s+(\S+)", out)
+    rc, out = run_in_env(
+        deb,
+        "dpkg-query --root=/install-root --admindir=/dpkg-db "
+        "-W -f='${Status} ${Version}\\n' katherine-desktop",
+    )
+    m = re.search(r"^install ok installed (\S+)\s*$", out, re.MULTILINE)
     results.append(step("install: dpkg configure OK", rc == 0 and m is not None,
                         m.group(1) if m else out[-200:]))
 
@@ -167,10 +175,16 @@ def main(argv: list[str] | None = None) -> int:
         + "sys.path.insert(0, '/usr/lib/katherine')\n"
         + "from backend.local_storage import LocalStorage, default_database_path\n"
         + "p = default_database_path()\n"
-        + "LocalStorage(path=p)\n"
-        + "print('DBOK', p, p.exists())\nPY")
+        + "store = LocalStorage(path=p)\n"
+        + "print('DBOK', p, p.exists(), 'SCHEMA', store.schema_version())\n"
+        + "store.close()\nPY")
     dbok = find_marker(out, "DBOK")
-    ok = dbok is not None and "True" in dbok and "/home/user/" in dbok
+    ok = (
+        dbok is not None
+        and "True" in dbok
+        and "/home/user/" in dbok
+        and "SCHEMA 1" in dbok
+    )
     results.append(step("storage: XDG db created in isolated HOME", ok, dbok or out[-200:]))
 
     # ── 4. no-key turn (sanitized error) ─────────────────────────────
@@ -195,7 +209,7 @@ def main(argv: list[str] | None = None) -> int:
             + " && echo UPGRADED $(dpkg-query --root=/install-root --admindir=/dpkg-db -W -f='${Version}' katherine-desktop)",
         )
         up = find_marker(out, "UPGRADED")
-        results.append(step("upgrade: dpkg -i newer .deb", up is not None and "~test2" in up or (up and "test2" in up),
+        results.append(step("upgrade: dpkg -i newer .deb", up == f"UPGRADED {new_version}",
                             up or out[-300:]))
 
         # Downgrade evidence: dpkg -i permits version downgrades by
@@ -228,37 +242,72 @@ def main(argv: list[str] | None = None) -> int:
         )
         dg = find_marker(out, "DOWNGRADED")
         ro = find_marker(out, "REOPENED")
+        ro_parts = ro.split() if ro else []
         ok = (
-            dg is not None and "test1" in dg
-            and ro is not None and " True " in ro and int(ro.split()[-1]) > 0
+            dg == f"DOWNGRADED {old_version}"
+            and len(ro_parts) >= 2
+            and ro_parts[-2] == "True"
+            and ro_parts[-1].isdigit()
+            and int(ro_parts[-1]) > 0
         )
         results.append(step("downgrade: data preserved after version downgrade", ok,
                             f"{dg} | {ro}" if dg and ro else out[-300:]))
 
-    # ── 7. purge preserves user data ────────────────────────────────
+    # ── 7. purge + reinstall preserves user data ────────────────────
     rc, out = run_in_env(
         deb,
         "cd /tmp && PYTHONPATH=/install-root/usr/lib/katherine:/install-root/usr/lib/katherine/vendor python3 - <<'PY'\n"
         + "import sys\n"
+        + "import sqlite3\n"
         + "sys.path.insert(0, '/usr/lib/katherine/vendor')\n"
         + "sys.path.insert(0, '/usr/lib/katherine')\n"
         + "from backend.local_storage import LocalStorage, default_database_path\n"
-        + "LocalStorage(path=default_database_path())\n"
-        + "print('DATA WRITTEN')\nPY\n"
+        + "p = default_database_path()\n"
+        + "store = LocalStorage(path=p)\n"
+        + "store.close()\n"
+        + "conn = sqlite3.connect(p)\n"
+        + "conn.execute(\"insert into chat_logs (role, content) values (?, ?)\", ('user', 'lifecycle sentinel'))\n"
+        + "conn.commit()\n"
+        + "conn.close()\n"
+        + "print('DATA WRITTEN', p)\nPY\n"
         + "dpkg --root=/install-root --admindir=/dpkg-db --force-not-root --log=/dpkg-db/dpkg.log --purge katherine-desktop\n"
+        + "test ! -e /install-root/usr/bin/katherine && echo PURGE_FILES_GONE\n"
         + "echo PURGED; ls /install-root/usr/lib 2>/dev/null | wc -l; "
+        + "dpkg --root=/install-root --admindir=/dpkg-db --force-not-root --log=/dpkg-db/dpkg.log --force-depends -i /debs/"
+        + deb.name
+        + "\n"
+        + "echo REINSTALLED_PACKAGE $(dpkg-query --root=/install-root --admindir=/dpkg-db -W -f='${Status} ${Version}' katherine-desktop)\n"
         + "python3 - <<'PY'\n"
         + "import pathlib\n"
+        + "import sqlite3\n"
         + "dbs = list(pathlib.Path('/home/user').rglob('katherine.db'))\n"
-        + "print('AFTER PURGE dbs:', len(dbs))\nPY",
+        + "print('AFTER PURGE dbs:', len(dbs))\n"
+        + "if len(dbs) == 1:\n"
+        + "    conn = sqlite3.connect(dbs[0])\n"
+        + "    row = conn.execute(\"select count(*) from chat_logs where content = ?\", ('lifecycle sentinel',)).fetchone()\n"
+        + "    conn.close()\n"
+        + "    print('REINSTALLED_SENTINEL', bool(row[0]))\n"
+        + "else:\n"
+        + "    print('REINSTALLED_SENTINEL', False)\nPY",
     )
-    # dpkg --root purge of the only installed package removes dirs; the
-    # user data lives in /home/user (isolated tmpfs home), NOT in the
-    # package tree, so purge cannot touch it by construction. The probe
-    # proves the db survives a purge of the app.
+    # dpkg --purge removes package files, then a real reinstall must open the
+    # same user database and retain the sentinel row. The user data lives in
+    # /home/user, NOT in the package tree, so purge cannot touch it by design.
     after = find_marker(out, "AFTER PURGE dbs:")
-    ok = after is not None and after.endswith("1")
-    results.append(step("purge: user data preserved", ok, after or out[-300:]))
+    sentinel = find_marker(out, "REINSTALLED_SENTINEL")
+    package = find_marker(out, "REINSTALLED_PACKAGE")
+    ok = (
+        rc == 0
+        and find_marker(out, "PURGE_FILES_GONE") is not None
+        and after is not None
+        and after.endswith("1")
+        and sentinel is not None
+        and sentinel.endswith("True")
+        and package is not None
+        and "install ok installed" in package
+    )
+    results.append(step("purge/reinstall: user data preserved", ok,
+                        f"{after} | {sentinel} | {package}" if after else out[-300:]))
 
     # ── 8. benchmarks (real numbers) ─────────────────────────────────
     size = deb.stat().st_size
@@ -270,7 +319,6 @@ def main(argv: list[str] | None = None) -> int:
     kb = find_marker(out, "INSTALLED_KB")
     if kb:
         print(f"bench: installed size = {kb.split()[1]} KiB (du -sk)")
-    t0 = time.monotonic()
     rc, out = run_in_env(
         deb,
         "cd /tmp && PYTHONPATH=/install-root/usr/lib/katherine:/install-root/usr/lib/katherine/vendor "

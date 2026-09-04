@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import shutil
 import subprocess
 import sys
@@ -149,15 +150,18 @@ DESKTOP_BACKEND_FILES = [
 #: Entrypoint wrapper installed at /usr/bin/katherine. Minimal and
 #: explicit around backend.desktop.app: it fixes sys.path to the
 #: installed app (code + vendored wheels), never touches CWD, and
-# execs the SAME desktop shell. The `python3` interpreter is the
-# system one; PyGObject comes from system site-packages.
+#: execs the SAME desktop shell. The app dir is derived from $0 so
+#: the entrypoint stays correct if the tree is relocated (also how
+#: the isolated install harness reaches it under /install-root).
+#: No server, no daemon, no env dependence.
 ENTRYPOINT = """#!/bin/sh
 # Katherine desktop entrypoint (installed package, #338).
 # Runs the same backend.desktop.app shell as the checkout; the only
 # additions are sys.path setup for the installed code and vendored
 # dependencies. No CWD dependence, no server, no daemon.
 set -e
-APP=/usr/lib/katherine
+SELF=$(readlink -f "$0")
+APP=$(dirname "$(dirname "$SELF")")/lib/katherine
 exec python3 -c 'import sys; sys.path.insert(0, "'"$APP"'/vendor"); sys.path.insert(0, "'"$APP"'"); from backend.desktop.app import main; sys.exit(main())' "$@"
 """
 
@@ -182,6 +186,35 @@ def fail(msg: str) -> None:
 
 def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, check=True, **kw)
+
+
+def normalize_stage_mtimes(stage: Path, epoch: int) -> None:
+    """Set every staging entry's mtime to the reproducibility epoch.
+
+    ``dpkg-deb`` archives the mtimes present in the staging tree.  Source
+    checkouts, downloaded wheels, and frontend output otherwise carry
+    wall-clock mtimes into the archive, making identical builds differ.
+    Symlinks are never followed so this cannot mutate anything outside
+    the staging tree.
+    """
+    if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
+        raise ValueError("SOURCE_DATE_EPOCH must be a non-negative integer")
+    timestamp_ns = epoch * 1_000_000_000
+    for path in sorted(stage.rglob("*"), key=lambda value: str(value)):
+        os.utime(path, ns=(timestamp_ns, timestamp_ns), follow_symlinks=False)
+    os.utime(stage, ns=(timestamp_ns, timestamp_ns), follow_symlinks=False)
+
+
+def normalize_stage_modes(stage: Path) -> None:
+    """Set archive entries to ordinary Debian directory and file modes."""
+    stage.chmod(0o755)
+    for path in sorted(stage.rglob("*"), key=lambda value: str(value)):
+        if path.is_symlink():
+            continue
+        path.chmod(0o755 if path.is_dir() else 0o644)
+    entrypoint = stage / "usr/bin/katherine"
+    if entrypoint.is_file():
+        entrypoint.chmod(0o755)
 
 
 def parse_lock(lock_path: Path) -> list[tuple[str, str]]:
@@ -292,18 +325,6 @@ def build(
 
     stage = keep_stage or Path(tempfile.mkdtemp(prefix="katherine-deb-"))
     stage.mkdir(parents=True, exist_ok=True)
-    # Standard package dir modes (dpkg would fix on install, but the
-    # archive itself must not carry private modes: 755 dirs, 644 files).
-    stage.chmod(0o755)
-    for child in sorted(stage.rglob("*")):
-        if child.is_dir():
-            child.chmod(0o755)
-        else:
-            child.chmod(0o644)
-    # Re-apply executable bits the content itself requires.
-    entry_probe = stage / "usr/bin/katherine"
-    if entry_probe.exists():
-        entry_probe.chmod(0o755)
 
     app = stage / APP_DIR
     app.mkdir(parents=True)
@@ -393,10 +414,27 @@ def build(
     # settings live in XDG dirs owned by the app at runtime.
 
     # ── build the .deb ───────────────────────────────────────────────
+    # Normalize after every copy/write operation. shutil.copy2 preserves
+    # source modes and mkdir follows the caller umask, so doing this only
+    # before staging would leave group-writable archive entries.
+    normalize_stage_modes(stage)
+    raw_epoch = os.environ.get("SOURCE_DATE_EPOCH", "0")
+    try:
+        source_date_epoch = int(raw_epoch)
+    except ValueError:
+        fail("SOURCE_DATE_EPOCH must be a non-negative integer")
+    if source_date_epoch < 0:
+        fail("SOURCE_DATE_EPOCH must be a non-negative integer")
+    normalize_stage_mtimes(stage, source_date_epoch)
+
     out_dir.mkdir(parents=True, exist_ok=True)
     deb_name = f"{PACKAGE}_{version}_all.deb"
     deb_path = out_dir / deb_name
-    env = {"TMPDIR": "/tmp", "PATH": "/usr/bin:/bin"}
+    env = {
+        "TMPDIR": "/tmp",
+        "PATH": "/usr/bin:/bin",
+        "SOURCE_DATE_EPOCH": str(source_date_epoch),
+    }
     run(
         ["dpkg-deb", "--root-owner-group", "--build", str(stage), str(deb_path)],
         env=env,
