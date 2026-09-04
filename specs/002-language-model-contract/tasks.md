@@ -117,7 +117,7 @@
 - [x] T033 Smoke desktop headless: `xvfb-run -a python scripts/desktop_smoke.py`.
 - [x] T034 Frontend gates: `npm test`, `npm run lint`, `npm run build` (sem mudança funcional esperada; nenhuma API key na UI).
 - [x] T035 Auditoria Groq final: `grep` documentado na PR — símbolos Groq restritos a `groq_manager.py`, `groq_language_model.py`, composição (`dependencies.py`), testes do adapter e docs; módulos legados (`meta_cognition.py`, `turing_test.py`, `test_keys.py`, `final_verification.py`) documentados como fora de escopo (não ativos no fluxo).
-- [ ] T036 Commit Conventional (`refactor(llm): ...`) + PR única contra `main` com "Closes #337" e checklist completo (contrato, ports, trusted policy, seleção, erros, segredos, testes com números, smoke, auditoria, fora de escopo).
+- [x] T036 Commit Conventional (`refactor(llm): ...`) + PR única contra `main` com "Closes #337" e checklist completo (contrato, ports, trusted policy, seleção, erros, segredos, testes com números, smoke, auditoria, fora de escopo).
 - [ ] T037 STOP — não iniciar outra issue.
 
 ## Dependencies & Execution Order
