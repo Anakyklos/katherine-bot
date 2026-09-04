@@ -223,10 +223,19 @@ exception) crosses the adapter upward; failures surface as the canonical
 existing failure → `TurnErrorCode` mapping is preserved bit a bit.
 Selection is explicit at composition time — there is **no auto-routing
 and no fallback to another provider**: a provider failure is a turn
-failure. The trusted system policy is a Katherine-core responsibility
-(`build_trusted_policy` in the contract module), never a provider
-capability. Honest disclosure: the prompt content still travels to the
-configured remote provider; nothing else about the turn does.
+failure. The composition roots capture the provider keys and the
+provider-call parameters from the application settings at composition
+time (`Settings.provider_keys()` / `Settings.turn_config` on the web;
+the desktop root reads its own key source), so the adapter never
+falls back to the process environment. The ``/ready`` provider check
+consumes a small injectable ``provider_configured_probe`` bound to the
+same captured configuration — a factory's existence alone never
+reports "configured"; the probe is presence-only (no SDK instantiation,
+no inference call, no secret echo). The trusted system policy is a
+Katherine-core responsibility (`build_trusted_policy` in
+`backend/trusted_policy.py`), never a provider capability. Honest
+disclosure: the prompt content still travels to the configured remote
+provider; nothing else about the turn does.
 
 ## Groq Client Management
 
