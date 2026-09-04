@@ -86,6 +86,12 @@ class ScriptedProvider:
             raise self.fail_with
         return self.response
 
+    async def extract_archival(self, messages: list, budget) -> str:
+        self.calls += 1
+        if self.fail_with is not None:
+            raise self.fail_with
+        return "{}"
+
     def describe(self):
         from backend.language_model import ModelSelection
 

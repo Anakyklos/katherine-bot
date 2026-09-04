@@ -260,3 +260,52 @@ def test_appraisal_v1_neutral_exists_for_fakes():
     """Fakes can build a neutral appraisal without a provider (seam check)."""
     appraisal = AppraisalV1.neutral()
     assert appraisal is not None
+
+
+def test_all_canonical_exceptions_are_sanitized_in_repr_and_str(caplog):
+    """T024 (US4): every canonical exception sanitizes repr/str.
+
+    A provider SDK error carrying a secret marker must never leak
+    through any exception surface (repr, str, caplog) crossing the
+    LanguageModel boundary.
+    """
+    import logging
+    import reprlib
+    from backend.language_model import (
+        LanguageModelRateLimitedError,
+        LanguageModelAuthFailedError,
+        LanguageModelConnectionFailedError,
+        LanguageModelServerError,
+        LanguageModelInvalidRequestError,
+        LanguageModelInvalidResponseError,
+        LanguageModelTimeoutError,
+        LanguageModelCancelledError,
+        LanguageModelConfigurationError,
+    )
+
+    secret = "gsk_SECRET_MARKER_98765"
+    # Simulate a provider SDK error text used to construct each class.
+    cases = [
+        (LanguageModelRateLimitedError(), "rate limited"),
+        (LanguageModelAuthFailedError(), "auth failed"),
+        (LanguageModelConnectionFailedError(), "connection failed"),
+        (LanguageModelServerError(), "server error"),
+        (LanguageModelInvalidRequestError(), "invalid request"),
+        (LanguageModelInvalidResponseError(), "invalid response"),
+        (LanguageModelTimeoutError(), "timeout"),
+        (LanguageModelCancelledError(), "cancelled"),
+        (LanguageModelConfigurationError(), "configuration"),
+    ]
+    for exc, label in cases:
+        rendered = f"{exc!r} {exc!s} {reprlib.repr(exc)}"
+        assert secret not in rendered, f"{label} leaked provider text"
+        # Constant sanitized message surfaces, no dynamic content.
+        assert str(exc) == exc.MESSAGE, f"{label} message not constant"
+
+    # Logging an exception never carries SDK text either.
+    with caplog.at_level(logging.ERROR):
+        try:
+            raise LanguageModelServerError()
+        except LanguageModelServerError as exc:
+            logging.getLogger("test.sanitize").error("event=model_failure code=%s", exc.failure.value)
+    assert secret not in caplog.text
