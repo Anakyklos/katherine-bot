@@ -5,3 +5,4 @@
 - Source path: `.agent/skills/impeccable/`
 - License: Apache License 2.0 (see LICENSE)
 - Vendored for: Katherine Bot issue #341
+- Installation scope: project-local only; no global JCode skill installation is required.

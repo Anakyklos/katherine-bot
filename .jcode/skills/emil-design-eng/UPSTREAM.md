@@ -5,3 +5,4 @@
 - Source path: `skills/emil-design-eng/`
 - License: MIT (see LICENSE)
 - Vendored for: Katherine Bot issue #341
+- Installation scope: project-local only; no global JCode skill installation is required.

@@ -23,8 +23,6 @@ const SKILL_CONTRACTS = [
 ];
 
 test('project-local design skills are present with pinned provenance', () => {
-    const rootMetadata = readFileSync(join(SKILLS_ROOT, 'UPSTREAM.md'), 'utf8');
-
     for (const skill of SKILL_CONTRACTS) {
         const skillRoot = join(SKILLS_ROOT, skill.name);
         const skillFile = join(skillRoot, 'SKILL.md');
@@ -40,11 +38,10 @@ test('project-local design skills are present with pinned provenance', () => {
         assert.match(skillSource, new RegExp(`name:\\s*${skill.name}`));
         assert.match(provenance, new RegExp(skill.revision));
         assert.match(provenance, new RegExp(skill.license.replaceAll(' ', '\\s+')));
+        assert.match(provenance, /project-local only/i);
+        assert.match(provenance, /No global JCode skill installation is required/i);
         assert.equal(realpathSync(skillRoot).startsWith(realpathSync(SKILLS_ROOT)), true);
     }
-
-    assert.match(rootMetadata, /project-local only/i);
-    assert.match(rootMetadata, /No global JCode skill installation is required/i);
 });
 
 test('the design skill gate is reproducible from workspace-local paths without a global install', () => {
