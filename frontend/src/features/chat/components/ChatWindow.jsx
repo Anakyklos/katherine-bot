@@ -6,7 +6,13 @@ import ChatInput from './ChatInput';
 import PrivacyPanel from '../../privacy/PrivacyPanel';
 import { useChat } from '../hooks/useChat';
 
-const ChatWindow = ({ faceSlot = null }) => {
+const ChatWindow = ({ faceSlot = null, renderLayout = null }) => {
+    const chatModel = useChat();
+
+    if (renderLayout) {
+        return renderLayout(chatModel);
+    }
+
     const {
         messages,
         input,
@@ -18,7 +24,7 @@ const ChatWindow = ({ faceSlot = null }) => {
         handleSend,
         clearScreen,
         transport
-    } = useChat();
+    } = chatModel;
 
     return (
         <div className="flex flex-col h-screen max-w-6xl mx-auto relative">

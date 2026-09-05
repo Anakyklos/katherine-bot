@@ -76,3 +76,13 @@ test('Katherine face CSS declares reduced-motion behavior', () => {
     assert.match(css, /animation:\s*none\s*!important/);
     assert.match(css, /transition-duration:\s*0ms\s*!important/);
 });
+
+test('companion layout disables incidental disclosure motion for reduced-motion users', () => {
+    const css = readFileSync(
+        join(FRONTEND_ROOT, 'src', 'features', 'chat', 'components', 'CompanionLayout.css'),
+        'utf8',
+    );
+
+    assert.match(css, /@media\s*\(prefers-reduced-motion:\s*reduce\)/);
+    assert.match(css, /transition-duration:\s*0ms/);
+});

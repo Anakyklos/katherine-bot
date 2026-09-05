@@ -122,8 +122,22 @@ export default function CompanionLayout({
                     </div>
                     <ChatInput input={input} setInput={setInput} handleSend={handleSend} isLoading={isLoading} inputRef={inputRef} />
                     <div className="companion-layout__utilities" data-testid="companion-utilities">
-                        {emotionState && <details>...</details>}
-                        <details>...</details>
+                        {emotionState ? (
+                            <details data-testid="companion-emotion-details">
+                                <summary>Detalhes do estado</summary>
+                                <div className="companion-layout__utility-content">
+                                    <EmotionPanel emotionState={emotionState} />
+                                </div>
+                            </details>
+                        ) : null}
+                        {isDesktopTransport(transport) ? (
+                            <details data-testid="companion-privacy-details">
+                                <summary>Privacidade local</summary>
+                                <div className="companion-layout__utility-content">
+                                    <PrivacyPanel transport={transport} />
+                                </div>
+                            </details>
+                        ) : null}
                     </div>
                 </section>
             </main>
