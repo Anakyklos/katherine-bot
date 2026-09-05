@@ -59,6 +59,7 @@ export const validateEmotionState = (payload) => {
     if (typeof pleasure !== 'number' || !Number.isFinite(pleasure)) return null;
     if (typeof arousal !== 'number' || !Number.isFinite(arousal)) return null;
     if (typeof dominance !== 'number' || !Number.isFinite(dominance)) return null;
+    if ([pleasure, arousal, dominance].some((value) => value < -1 || value > 1)) return null;
 
     // Validate dominant_emotions (must be array, may be empty)
     if (!Array.isArray(payload.dominant_emotions)) return null;
@@ -77,6 +78,7 @@ export const validateEmotionState = (payload) => {
         if (seenNames.has(item.name)) return null;
         seenNames.add(item.name);
         if (typeof item.intensity !== 'number' || !Number.isFinite(item.intensity)) return null;
+        if (item.intensity < 0 || item.intensity > 1) return null;
     }
 
     // Valid mood_label
@@ -84,6 +86,7 @@ export const validateEmotionState = (payload) => {
 
     // Valid timestamp
     if (typeof payload.timestamp !== 'number' || !Number.isFinite(payload.timestamp)) return null;
+    if (payload.timestamp <= 0) return null;
 
     // Deep-copy dominant_emotions to avoid sharing references with the outside payload.
     // Each emotion object is reconstructed so mutations to the original payload have

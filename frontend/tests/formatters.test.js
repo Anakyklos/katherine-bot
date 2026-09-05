@@ -185,6 +185,22 @@ test('validateEmotionState: pad with Infinity returns null', () => {
     assert.strictEqual(validateEmotionState(payload), null);
 });
 
+test('validateEmotionState: PAD values outside the public range return null', () => {
+    for (const field of ['pleasure', 'arousal', 'dominance']) {
+        const above = {
+            ...VALID_PAYLOAD,
+            pad: { ...VALID_PAYLOAD.pad, [field]: 1.01 },
+        };
+        const below = {
+            ...VALID_PAYLOAD,
+            pad: { ...VALID_PAYLOAD.pad, [field]: -1.01 },
+        };
+
+        assert.strictEqual(validateEmotionState(above), null);
+        assert.strictEqual(validateEmotionState(below), null);
+    }
+});
+
 test('validateEmotionState: dominant_emotions absent returns null', () => {
     const payload = {
         schema_version: 1,
@@ -263,6 +279,23 @@ test('validateEmotionState: dominant_emotion with non-finite intensity returns n
         timestamp: 1700000000,
     };
     assert.strictEqual(validateEmotionState(payload), null);
+});
+
+test('validateEmotionState: intensity outside the public range returns null', () => {
+    assert.strictEqual(
+        validateEmotionState({
+            ...VALID_PAYLOAD,
+            dominant_emotions: [{ name: 'joy', intensity: -0.01 }],
+        }),
+        null,
+    );
+    assert.strictEqual(
+        validateEmotionState({
+            ...VALID_PAYLOAD,
+            dominant_emotions: [{ name: 'joy', intensity: 1.01 }],
+        }),
+        null,
+    );
 });
 
 test('validateEmotionState: dominant_emotion item not an object returns null', () => {
@@ -344,6 +377,17 @@ test('validateEmotionState: zero emotions with canonical empty list passes', () 
         dominant_emotions: [],
     };
     assert(validateEmotionState(payload) !== null);
+});
+
+test('validateEmotionState: non-positive timestamp returns null', () => {
+    assert.strictEqual(
+        validateEmotionState({ ...VALID_PAYLOAD, timestamp: 0 }),
+        null,
+    );
+    assert.strictEqual(
+        validateEmotionState({ ...VALID_PAYLOAD, timestamp: -1 }),
+        null,
+    );
 });
 
 // ─── getEmotionLabel ────────────────────────────────────────────────────────
