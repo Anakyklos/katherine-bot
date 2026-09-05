@@ -112,5 +112,6 @@ describe('KatherineFace', () => {
         expect(bfcePublic).not.toHaveProperty('EXPRESSION_NAMES');
         expect(bfcePublic).not.toHaveProperty('REACTIONS');
         expect(bfcePublic).not.toHaveProperty('REACTION_NAMES');
+        expect(bfcePublic).not.toHaveProperty('createFace');
     });
 });

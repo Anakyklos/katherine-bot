@@ -33,6 +33,20 @@ export const toPercent = (val) => intensityToPercent(val);
 
 const hasOwn = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
 
+const readOwnDataProperty = (object, key) => {
+    if (!object || typeof object !== 'object') return { present: false, value: undefined };
+
+    try {
+        const descriptor = Object.getOwnPropertyDescriptor(object, key);
+        if (!descriptor || !hasOwn(descriptor, 'value')) {
+            return { present: false, value: undefined };
+        }
+        return { present: true, value: descriptor.value };
+    } catch {
+        return { present: false, value: undefined };
+    }
+};
+
 /**
  * Validate the public emotion state payload from the backend.
  * Returns the validated payload object, or null if invalid.
@@ -51,58 +65,83 @@ const hasOwn = (object, key) => Object.prototype.hasOwnProperty.call(object, key
 export const validateEmotionState = (payload) => {
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return null;
 
-    // Validate schema_version
-    if (payload.schema_version !== 1) return null;
+    // JSON contract fields must be own data properties. This rejects inherited
+    // values and accessors that could otherwise masquerade as validated data.
+    const schemaVersion = readOwnDataProperty(payload, 'schema_version');
+    if (!schemaVersion.present || schemaVersion.value !== 1) return null;
 
     // Validate pad
-    if (!payload.pad || typeof payload.pad !== 'object' || Array.isArray(payload.pad)) return null;
+    const padResult = readOwnDataProperty(payload, 'pad');
+    const pad = padResult.value;
+    if (!padResult.present || !pad || typeof pad !== 'object' || Array.isArray(pad)) return null;
 
-    const { pleasure, arousal, dominance } = payload.pad;
+    const pleasureResult = readOwnDataProperty(pad, 'pleasure');
+    const arousalResult = readOwnDataProperty(pad, 'arousal');
+    const dominanceResult = readOwnDataProperty(pad, 'dominance');
+    if (!pleasureResult.present || !arousalResult.present || !dominanceResult.present) return null;
+
+    const { value: pleasure } = pleasureResult;
+    const { value: arousal } = arousalResult;
+    const { value: dominance } = dominanceResult;
     if (typeof pleasure !== 'number' || !Number.isFinite(pleasure)) return null;
     if (typeof arousal !== 'number' || !Number.isFinite(arousal)) return null;
     if (typeof dominance !== 'number' || !Number.isFinite(dominance)) return null;
     if ([pleasure, arousal, dominance].some((value) => value < -1 || value > 1)) return null;
 
     // Validate dominant_emotions (must be array, may be empty)
-    if (!Array.isArray(payload.dominant_emotions)) return null;
+    const dominantEmotionsResult = readOwnDataProperty(payload, 'dominant_emotions');
+    const dominantEmotions = dominantEmotionsResult.value;
+    if (!dominantEmotionsResult.present || !Array.isArray(dominantEmotions)) return null;
 
     // At most 3 emotions
-    if (payload.dominant_emotions.length > 3) return null;
+    if (dominantEmotions.length > 3) return null;
 
     const seenNames = new Set();
-    for (let i = 0; i < payload.dominant_emotions.length; i++) {
-        const item = payload.dominant_emotions[i];
+    const validatedEmotions = [];
+    for (let i = 0; i < dominantEmotions.length; i++) {
+        const itemResult = readOwnDataProperty(dominantEmotions, i);
+        const item = itemResult.value;
+        if (!itemResult.present) return null;
         if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
-        if (typeof item.name !== 'string' || item.name.length === 0) return null;
+        const nameResult = readOwnDataProperty(item, 'name');
+        const intensityResult = readOwnDataProperty(item, 'intensity');
+        if (!nameResult.present || !intensityResult.present) return null;
+
+        const { value: name } = nameResult;
+        const { value: intensity } = intensityResult;
+        if (typeof name !== 'string' || name.length === 0) return null;
         // Reject unknown canonical names
-        if (!hasOwn(EMOTION_LABELS, item.name)) return null;
+        if (!hasOwn(EMOTION_LABELS, name)) return null;
         // Reject duplicates
-        if (seenNames.has(item.name)) return null;
-        seenNames.add(item.name);
-        if (typeof item.intensity !== 'number' || !Number.isFinite(item.intensity)) return null;
-        if (item.intensity < 0 || item.intensity > 1) return null;
+        if (seenNames.has(name)) return null;
+        seenNames.add(name);
+        if (typeof intensity !== 'number' || !Number.isFinite(intensity)) return null;
+        if (intensity < 0 || intensity > 1) return null;
+        validatedEmotions.push({ name, intensity });
     }
 
     // Valid mood_label
-    if (typeof payload.mood_label !== 'string' || payload.mood_label.length === 0) return null;
+    const moodLabelResult = readOwnDataProperty(payload, 'mood_label');
+    const moodLabel = moodLabelResult.value;
+    if (!moodLabelResult.present || typeof moodLabel !== 'string' || moodLabel.length === 0) return null;
 
     // Valid timestamp
-    if (typeof payload.timestamp !== 'number' || !Number.isFinite(payload.timestamp)) return null;
-    if (payload.timestamp <= 0) return null;
+    const timestampResult = readOwnDataProperty(payload, 'timestamp');
+    const timestamp = timestampResult.value;
+    if (!timestampResult.present || typeof timestamp !== 'number' || !Number.isFinite(timestamp)) return null;
+    if (timestamp <= 0) return null;
 
     // Deep-copy dominant_emotions to avoid sharing references with the outside payload.
     // Each emotion object is reconstructed so mutations to the original payload have
     // no effect on the validated result.
-    const clonedEmotions = payload.dominant_emotions.map(
-        (item) => ({ name: item.name, intensity: item.intensity })
-    );
+    const clonedEmotions = validatedEmotions.map(({ name, intensity }) => ({ name, intensity }));
 
     return {
         schema_version: 1,
         pad: { pleasure, arousal, dominance },
-        mood_label: payload.mood_label,
+        mood_label: moodLabel,
         dominant_emotions: clonedEmotions,
-        timestamp: payload.timestamp,
+        timestamp,
     };
 };
 

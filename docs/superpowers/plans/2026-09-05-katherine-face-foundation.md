@@ -154,7 +154,7 @@ git commit -m "fix(frontend): align emotion validation with public ranges"
 - Export `STRONG_EXPRESSION_THRESHOLD` equal to `0.70`.
 - Export `selectKatherineFaceState({ emotionState, isLoading })` returning `{ expression, reaction? }`.
 - The mapper reads only `emotionState.dominant_emotions[].name/intensity` and `isLoading`; it never reads `mood_label` or PAD to choose expression.
-- Dominance is the first item in the validated `dominant_emotions` array. Empty, malformed, or invalid input returns `{ expression: 'idle' }`, except `isLoading === true`, which returns `{ expression: 'thinking' }`.
+- Dominance is the highest-intensity item in the validated `dominant_emotions` array, with the first item winning exact ties. Empty, malformed, or invalid input returns `{ expression: 'idle' }`, except `isLoading === true`, which returns `{ expression: 'thinking' }`.
 
 - [ ] **Step 1: Write failing mapper tests.**
 
@@ -209,7 +209,8 @@ const EXPRESSION_MAP = Object.freeze({
 
 export function selectKatherineFaceState({ emotionState, isLoading } = {}) {
   if (isLoading === true) return { expression: 'thinking' };
-  const dominant = emotionState?.dominant_emotions?.[0];
+  const dominant = emotionState?.dominant_emotions?.reduce((current, candidate) =>
+    !current || candidate.intensity > current.intensity ? candidate : current, null);
   const variants = EXPRESSION_MAP[dominant?.name];
   if (!variants) return { expression: 'idle' };
   const strong = dominant.intensity >= STRONG_EXPRESSION_THRESHOLD;

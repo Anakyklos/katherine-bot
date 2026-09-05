@@ -153,6 +153,62 @@ test('validateEmotionState: schema_version != 1 returns null', () => {
     assert.strictEqual(validateEmotionState(payload), null);
 });
 
+test('validateEmotionState: inherited top-level contract fields return null', () => {
+    for (const field of ['schema_version', 'mood_label', 'pad', 'dominant_emotions', 'timestamp']) {
+        const payload = { ...VALID_PAYLOAD };
+        const inheritedValue = payload[field];
+        delete payload[field];
+        Object.setPrototypeOf(payload, { [field]: inheritedValue });
+
+        assert.strictEqual(validateEmotionState(payload), null, field);
+    }
+});
+
+test('validateEmotionState: inherited PAD and emotion fields return null', () => {
+    const inheritedPad = Object.create({ pleasure: 0.5, arousal: 0.3, dominance: -0.2 });
+    assert.strictEqual(
+        validateEmotionState({ ...VALID_PAYLOAD, pad: inheritedPad }),
+        null,
+    );
+
+    const inheritedEmotion = Object.create({ name: 'joy', intensity: 0.8 });
+    assert.strictEqual(
+        validateEmotionState({
+            ...VALID_PAYLOAD,
+            dominant_emotions: [inheritedEmotion],
+        }),
+        null,
+    );
+});
+
+test('validateEmotionState: accessor-backed contract fields return null', () => {
+    const cases = [
+        ['timestamp', { ...VALID_PAYLOAD }, VALID_PAYLOAD.timestamp],
+        ['pad.pleasure', { ...VALID_PAYLOAD, pad: { ...VALID_PAYLOAD.pad } }, VALID_PAYLOAD.pad.pleasure],
+        [
+            'dominant_emotions[0].name',
+            { ...VALID_PAYLOAD, dominant_emotions: [{ ...VALID_PAYLOAD.dominant_emotions[0] }] },
+            VALID_PAYLOAD.dominant_emotions[0].name,
+        ],
+    ];
+
+    for (const [field, payload, value] of cases) {
+        const target = field === 'timestamp'
+            ? payload
+            : field === 'pad.pleasure'
+                ? payload.pad
+                : payload.dominant_emotions[0];
+        const property = field.split('.').at(-1).replace(/\]$/, '').replace(/\[\d+$/, '');
+        Object.defineProperty(target, property, {
+            configurable: true,
+            enumerable: true,
+            get: () => value,
+        });
+
+        assert.strictEqual(validateEmotionState(payload), null, field);
+    }
+});
+
 test('validateEmotionState: pad absent returns null', () => {
     const payload = {
         schema_version: 1,

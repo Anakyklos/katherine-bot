@@ -8,4 +8,4 @@
 - Vendored paths: `Face.jsx`, `core.js`, `expressions.js`, `face.css`, `index.js`.
 - Runtime policy: this repository uses no CDN, runtime download, or face-owned network request.
 - Local hardening note: lifecycle-only changes to `core.js` ensure pointer listeners are reference-counted and removed on final destroy, reduced-motion faces do not schedule RAF work, and offscreen faces pause the shared loop. The approved upstream revision remains the source baseline.
-- Local adapter boundary: `index.js` exports only `Face` and `createFace`; the upstream expression and reaction catalogs are internal and cannot be imported through the vendor public surface.
+- Local adapter boundary: `index.js` exports only the hardened `Face` component. The raw `createFace` engine and upstream expression/reaction catalogs remain internal. `Face` normalizes all initial and imperative expression changes to the approved Katherine vocabulary and does not forward arbitrary props to the host element.
