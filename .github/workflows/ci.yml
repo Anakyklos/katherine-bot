@@ -572,3 +572,124 @@ jobs:
       - name: Stop and remove containers and volumes
         if: always()
         run: docker compose down -v
+
+  desktop-package:
+    name: Desktop .deb package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Build production frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Install native desktop runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            python3.12 \
+            python3-gi \
+            gir1.2-webkit2-4.1 \
+            libwebkit2gtk-4.1-0 \
+            libgtk-3-0 \
+            libglib2.0-0
+
+      - name: Run packaging contract tests
+        run: |
+          python -m pip install -r backend/requirements-test.txt
+          python -m compileall -q backend packaging
+          python -m pytest -q \
+            packaging/test_build_deb.py \
+            packaging/test_gui_smoke_contract.py
+
+      - name: Build old and new packages with a fixed source date
+        env:
+          SOURCE_DATE_EPOCH: "1700000000"
+        run: |
+          set -euo pipefail
+          python packaging/build_deb.py \
+            --version 0.1.0~ci1 \
+            --out-dir /tmp/katherine-deb-old
+          python packaging/build_deb.py \
+            --version 0.1.0~ci2 \
+            --out-dir /tmp/katherine-deb-new-a
+          python packaging/build_deb.py \
+            --version 0.1.0~ci2 \
+            --out-dir /tmp/katherine-deb-new-b
+          cmp \
+            /tmp/katherine-deb-new-a/katherine-desktop_0.1.0~ci2_amd64.deb \
+            /tmp/katherine-deb-new-b/katherine-desktop_0.1.0~ci2_amd64.deb
+
+      - name: Inspect package contract
+        run: |
+          set -euo pipefail
+          deb=/tmp/katherine-deb-new-a/katherine-desktop_0.1.0~ci2_amd64.deb
+          dpkg-deb -f "$deb" Package Version Architecture Depends Installed-Size
+          test "$(dpkg-deb -f "$deb" Architecture)" = amd64
+          listing="$(dpkg-deb -c "$deb")"
+          grep -Fq './usr/bin/katherine' <<<"$listing"
+          grep -Fq './usr/lib/katherine/frontend/dist/desktop.html' <<<"$listing"
+          grep -Fq './usr/lib/katherine/vendor/' <<<"$listing"
+          if grep -Eiq '/(katherine\.db|\.env)(/|$)' <<<"$listing"; then
+            echo "user data or environment file included in package" >&2
+            exit 1
+          fi
+          if grep -Eiq \
+            '/usr/lib/katherine/vendor/(fastapi|uvicorn|supabase|torch|numpy)(/|-)' \
+            <<<"$listing"; then
+            echo "cloud or ML dependency included in desktop vendor tree" >&2
+            exit 1
+          fi
+
+      - name: Run real isolated dpkg lifecycle
+        id: lifecycle
+        shell: bash
+        run: |
+          set +e
+          python packaging/smoke_deb.py \
+            --deb /tmp/katherine-deb-new-a/katherine-desktop_0.1.0~ci2_amd64.deb \
+            --old-deb /tmp/katherine-deb-old/katherine-desktop_0.1.0~ci1_amd64.deb \
+            > /tmp/katherine-lifecycle.log 2>&1
+          rc=$?
+          cat /tmp/katherine-lifecycle.log
+          if [ "$rc" -eq 0 ]; then
+            echo "namespace_available=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if grep -Eqi \
+            'unshare.*(operation not permitted|permission denied|invalid argument)|cannot open user namespace' \
+            /tmp/katherine-lifecycle.log; then
+            echo "namespace_available=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::GitHub runner blocked unprivileged user/mount namespaces; the real lifecycle was attempted and is recorded above. The host-level smoke remains the acceptance evidence."
+            exit 0
+          fi
+          exit "$rc"
+
+      - name: Run installed package provider path
+        if: steps.lifecycle.outputs.namespace_available == 'true'
+        run: |
+          set -euo pipefail
+          bash packaging/isolated-install.sh \
+            /tmp/katherine-deb-new-a/katherine-desktop_0.1.0~ci2_amd64.deb \
+            "cd /tmp && PYTHONPATH=/install-root/usr/lib/katherine:/install-root/usr/lib/katherine/vendor python3.12 /oldroot${GITHUB_WORKSPACE}/packaging/provider_smoke.py"
+
+      - name: Record namespace limitation when lifecycle cannot run
+        if: steps.lifecycle.outputs.namespace_available == 'false'
+        run: |
+          echo "Real dpkg lifecycle was attempted but this GitHub runner denied the required unprivileged namespace operation."
+          echo "No mock lifecycle substituted. Re-run packaging/smoke_deb.py on a host with user and mount namespaces enabled."

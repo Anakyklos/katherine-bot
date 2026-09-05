@@ -25,6 +25,7 @@ import pytest
 from backend.local_storage import (
     ConflictError,
     LocalStorage,
+    PersistenceError,
     StorageCorruptError,
     ValidationError as LocalValidationError,
     default_database_path,
@@ -145,6 +146,27 @@ class TestMigrations:
             assert table_left == 0, "mid-migration DDL must roll back with the version row"
         finally:
             migrations_module.MIGRATIONS = original
+
+    def test_newer_schema_fails_closed_without_resetting_database(
+        self, tmp_path: Path
+    ) -> None:
+        """An older binary must not open a database from a newer binary."""
+        path = tmp_path / "newer.db"
+        store = open_local_storage(path)
+        store.close()
+
+        conn = sqlite3.connect(path)
+        conn.execute("insert into schema_migrations (version) values (99999)")
+        conn.commit()
+        conn.close()
+
+        with pytest.raises(PersistenceError) as excinfo:
+            open_local_storage(path)
+        assert excinfo.value.code == "schema_too_new"
+        assert str(excinfo.value) == (
+            "schema_too_new: database schema is newer than this application"
+        )
+        assert path.is_file(), "fail-closed open must not reset the database"
 
 
 class TestRestartAndRecovery:

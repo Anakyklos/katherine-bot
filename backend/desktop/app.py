@@ -69,6 +69,7 @@ from backend.desktop.build_resolver import (
     BuildResolutionError,
     DesktopBuildConfig,
     ResolvedBuild,
+    default_frontend_root,
     resolve_frontend_build,
 )
 
@@ -137,11 +138,6 @@ def _build_runtime():
             factory, "provider_configured_probe", None
         ),
     )
-
-
-def _repo_root() -> Path:
-    """Repository root derived from this file's location (no env, no cwd)."""
-    return Path(__file__).resolve().parents[2]
 
 
 def is_local_build_url(url: str | None, build: ResolvedBuild) -> bool:
@@ -453,8 +449,14 @@ def run_desktop_shell(
     spend real provider quota. Production callers never pass them —
     the default path and the real Groq provider factory stay exactly
     as they are.
+
+    Frontend root resolution (#338): with no explicit ``frontend_root``,
+    the root is derived structurally from this package's own location
+    (``default_frontend_root``), so the shell works both in a checkout
+    and from the installed ``.deb`` layout at ``/usr/lib/katherine`` —
+    never from the CWD, never requiring a checkout or ``PYTHONPATH``.
     """
-    root = frontend_root if frontend_root is not None else _repo_root() / "frontend"
+    root = frontend_root if frontend_root is not None else default_frontend_root()
     config = DesktopBuildConfig(frontend_root=root)
     build = resolve_frontend_build(config)
 
