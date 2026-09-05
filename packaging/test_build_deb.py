@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import re
 import tarfile
 from pathlib import Path
 
@@ -21,6 +22,19 @@ _spec = importlib.util.spec_from_file_location("katherine_build_deb", BUILD_SCRI
 assert _spec is not None and _spec.loader is not None
 build_deb = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(build_deb)
+
+
+def _normalized_pins(path: Path) -> dict[str, str]:
+    pins: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        match = re.match(
+            r"^([A-Za-z0-9_.-]+)(?:\[[^]]+\])?==([^;\s]+)", line
+        )
+        if match:
+            name = re.sub(r"[-_.]+", "-", match.group(1)).lower()
+            pins[name] = match.group(2)
+    return pins
 
 
 def test_desktop_file_list_is_explicit_and_exists() -> None:
@@ -41,6 +55,26 @@ def test_desktop_lock_contains_only_pinned_runtime_dependencies() -> None:
         "sentence-transformers",
         "numpy",
     ))
+
+
+def test_shared_desktop_pins_match_backend_runtime_lock() -> None:
+    backend = _normalized_pins(REPO_ROOT / "backend/requirements.txt")
+    for path in (
+        REPO_ROOT / "packaging/requirements-desktop.in",
+        REPO_ROOT / "packaging/requirements-desktop.txt",
+    ):
+        desktop = _normalized_pins(path)
+        shared = set(desktop) & set(backend)
+        assert shared
+        assert {name: desktop[name] for name in shared} == {
+            name: backend[name] for name in shared
+        }
+
+
+def test_proxy_tools_sdist_uses_direct_pinned_artifact_url() -> None:
+    filename, url = build_deb.DIRECT_SDIST_ARTIFACTS[("proxy-tools", "0.1.0")]
+    assert filename == "proxy_tools-0.1.0.tar.gz"
+    assert url.startswith("https://files.pythonhosted.org/")
 
 
 def test_package_targets_native_amd64_python_312_runtime() -> None:

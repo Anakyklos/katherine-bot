@@ -40,7 +40,7 @@ httpx==0.28.1
     # via
     #   -r packaging/requirements-desktop.in
     #   groq
-idna==3.19
+idna==3.18
     # via
     #   -r packaging/requirements-desktop.in
     #   anyio
@@ -72,7 +72,7 @@ typing-extensions==4.16.0
     #   pydantic-core
     #   pywebview
     #   typing-inspection
-typing-inspection==0.4.4
+typing-inspection==0.4.2
     # via
     #   -r packaging/requirements-desktop.in
     #   pydantic

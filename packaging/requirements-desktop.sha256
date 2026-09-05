@@ -9,7 +9,7 @@ a927fd75b4a60cb066c408cb4f9647536caf74e241ea75bc57d1810501b8203f  groq-1.5.0-py3
 63cf8bbe7522de3bf65932fda1d9c2772064ffb3dae62d55932da54b31cb6c86  h11-0.16.0-py3-none-any.whl
 2d400746a40668fc9dec9810239072b40b4484b640a8c38fd654a024c7a1bf55  httpcore-1.0.9-py3-none-any.whl
 d909fcccc110f8c7faf814ca82a9a4d816bc5a6dbfea25d6591d6985b8ba59ad  httpx-0.28.1-py3-none-any.whl
-815e7be7a7806d54abb586dc943addc79e8b2ee16915059658cbeff4b1b43bf4  idna-3.19-py3-none-any.whl
+7f952cbe720b688055e3f87de14f5c3e5fdaa8bc3928985c4077ca689de849a2  idna-3.18-py3-none-any.whl
 ccb3751f529c047e2d8a58440d86b205303cf0fe8146f784d1cbcd94f0a28010  proxy_tools-0.1.0.tar.gz
 45a282cde31d808236fd7ea9d919b128653c8b38b393d1c4ab335c62924d9aba  pydantic-2.13.4-py3-none-any.whl
 926c9541b14b12b1681dca8a0b75feb510b06c6341b70a8e500c2fdcff837cce  pydantic_core-2.46.4-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl
@@ -17,4 +17,4 @@ ccb3751f529c047e2d8a58440d86b205303cf0fe8146f784d1cbcd94f0a28010  proxy_tools-0.
 9d07275f53894ab4d5e2e0e996227193e7187dec276d9b624dccbce029216b46  pywebview-6.2.1-py3-none-any.whl
 2f6da418d1f1e0fddd844478f41680e794e6051915791a034ff65e5f100525a2  sniffio-1.3.1-py3-none-any.whl
 481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8  typing_extensions-4.16.0-py3-none-any.whl
-65b8397ba37ccbce054456aaccddfc91e6e3083c92824df348d96ca832f3f147  typing_inspection-0.4.4-py3-none-any.whl
+4ed1cacbdc298c220f1bd249ed5287caa16f34d44ef4e9c3d0cbad5b521545e7  typing_inspection-0.4.2-py3-none-any.whl

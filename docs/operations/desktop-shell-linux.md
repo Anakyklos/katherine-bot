@@ -31,6 +31,9 @@ O ambiente validado usa o PyGObject do **sistema**, não do pip:
 - GTK 3 e GLib (`libgtk-3-0`, `libglib2.0-0`).
 - Xvfb para execução headless (apenas validação/CI):
   `xvfb-run -a -s "-screen 0 1280x800x24"`.
+- `xdotool` para a interação real da janela e `strace` para observar
+  syscalls de rede durante a janela idle; ambos são dependências do smoke,
+  não do aplicativo instalado.
 
 Instalação do lado Python: o `requirements.in` trava `pywebview==6.2.1`
 (**sem** o extra `[gtk]`). O backend GTK é selecionado automaticamente
@@ -40,7 +43,8 @@ estão disponíveis; o extra `[gtk]` do pip (que traria
 reproduzível do ambiente validado:
 
 ```bash
-sudo apt install python3-gi gir1.2-webkit2-4.1 libgtk-3-0 xvfb python3.12-venv
+sudo apt install python3-gi gir1.2-webkit2-4.1 libgtk-3-0 \
+  xvfb xdotool strace python3.12-venv
 # venv com acesso aos pacotes Python do sistema (python3-gi):
 python3 -m venv .venv --system-site-packages
 source .venv/bin/activate
@@ -192,6 +196,12 @@ SOURCE_DATE_EPOCH=1700000000 \
   --out-dir dist/deb
 ```
 
+O pip é usado apenas para os wheels binários/pure-Python e recebe
+`--only-binary=:all:`. O único sdist, `proxy-tools==0.1.0`, é baixado pelo
+builder usando uma URL de arquivo fixa, sem preparação de metadata ou build
+isolation; seu SHA-256 precisa estar no manifesto versionado. Assim o job não
+instala `setuptools` ad hoc nem busca backend de build não pinado.
+
 Em uma instalação Debian/Ubuntu, instale primeiro as dependências nativas
 listadas no metadata do pacote, depois instale o arquivo gerado:
 
@@ -246,16 +256,32 @@ python3 packaging/smoke_deb.py \
   --old-deb dist/deb/katherine-desktop_0.1.0~test1_amd64.deb
 ```
 
-Na execução validada, o resultado foi `ALL PASS (7/7)`:
+Na execução validada, o resultado foi `ALL PASS (9/9)`:
 
 1. instalação e configuração `dpkg`;
 2. import fora do checkout e resolução do frontend instalado;
 3. criação do banco XDG no primeiro uso, com schema 1;
-4. turno sem chave com erro sanitizado `configuration`;
-5. upgrade para a versão nova;
-6. downgrade para a versão anterior com o banco reaberto e preservado;
-7. purge, confirmação de que os arquivos do pacote sumiram, reinstalação e
+4. fechamento e reabertura do runtime sobre o mesmo banco XDG;
+5. turno sem chave com erro sanitizado `configuration`;
+6. upgrade para a versão nova;
+7. downgrade para a versão anterior com o banco reaberto e preservado;
+8. schema desconhecido rejeitado com `schema_too_new`, sem apagar o banco;
+9. purge, confirmação de que os arquivos do pacote sumiram, reinstalação e
    confirmação independente de uma linha sentinela no mesmo `katherine.db`.
+
+O job `Desktop .deb package` tenta esse mesmo smoke com os dois artefatos. Se
+o runner do GitHub negar user/mount namespaces, o próprio job registra o erro
+do `unshare` e marca a limitação como ambiental, sem substituir o lifecycle
+por mock; nesse caso a execução host-level acima permanece a evidência real.
+
+A prova do provider instalado usa `packaging/provider_smoke.py` dentro do
+harness. Ela injeta somente o transporte controlado no
+`GroqClientManager`, mas usa o `CompanionRuntime`, o contrato
+`LanguageModel`, `GroqLanguageModel` e `GroqClientManager` reais que o `.deb`
+distribui. O resultado validado foi `success=true`, resposta
+`packaged provider response`, dois calls na ordem appraisal/generation,
+`provider=groq`, `fallback=false`, `key_echoed=false` e ambos os clientes
+fechados. Não há rede nem credencial real nessa prova.
 
 A aceitação gráfica do pacote instalado usa a janela GTK/WebKit real, não a
 página de smoke:
@@ -267,10 +293,11 @@ packaging/gui_smoke_deb.sh \
 
 Esse probe abre a entrada `/usr/bin/katherine` em Xvfb, espera a janela
 Katherine, digita e envia uma mensagem pela UI real, mede os descendentes e o
-grupo de processos dedicado ao shell, verifica que não há sockets TCP em
-LISTEN e fecha a janela. No caso sem chave, o turno retornou o erro de
-configuração esperado. A execução validada terminou com `clean_exit=true`,
-`exit_code=0`, nenhum processo remanescente e nenhum listener TCP.
+grupo de processos dedicado ao shell, verifica sockets TCP/UDP e syscalls
+Internet durante 5 s de idle, verifica que não há sockets TCP em LISTEN e
+fecha a janela. No caso sem chave, o turno retornou o erro de configuração
+esperado. A execução validada terminou com `clean_exit=true`, `exit_code=0`,
+nenhum processo remanescente, nenhum listener TCP e `idle_internet_syscalls=0`.
 
 ### Medição do pacote (#338)
 
@@ -278,31 +305,77 @@ Ambiente da medição: Linux Mint 22.3, kernel 7.0.0-30-generic, x86_64,
 Python 3.12.3, PyGObject 3.48.2, WebKitGTK 2.52.3, Node.js 22.23.2,
 12 CPUs. O pacote foi construído com `SOURCE_DATE_EPOCH=1700000000`.
 Uma reconstrução do mesmo commit e versão produziu o mesmo SHA-256:
-`22b96f80a020624c3ff8943830b1b7ddaaaddc51d9e5833ea9e40439aaf67b6b`.
+`9d5b9f27952ff84be1ffd6d36368895bc806a646f4460f867a7b1110ed78b00f`.
 O builder fixa `SOURCE_DATE_EPOCH` e verifica os hashes dos 18 artefatos
 Python antes de desempacotá-los, incluindo o wheel nativo do `pydantic-core`.
 
 Os números abaixo são uma execução real do `GUI_RESULTS`, em Xvfb
-1280x800 com o app instalado, após o carregamento inicial. RSS e CPU são a
-soma dos processos descendentes observados; idle foi amostrado por 5 s e o
-turno por 3 s. Eles são evidência do ambiente acima, não limites de
-aceitação:
+1280x800 com o app instalado, após o carregamento inicial. RSS é a soma dos
+processos do app na amostra, PSS é a soma proporcional de `smaps_rollup`, e
+os picos são acompanhados durante cada janela. O tracer `strace` é excluído
+dos agregados de recursos, mas o grupo dedicado continua sendo verificado no
+shutdown. Idle foi amostrado por 5.39 s e o turno de UI por 3 s. Eles são
+evidência do ambiente acima, não limites de aceitação:
 
 | Medida | Resultado |
 | --- | ---: |
-| `.deb` | 3,147,238 bytes (3,073 KiB) |
-| `Installed-Size` Debian | 12,487 KiB |
-| Árvore instalada (`du -sk`) | 13,756 KiB |
-| Startup até janela GTK | 515.3 ms |
-| RSS idle, descendentes | 603,308 KiB |
-| CPU idle, janela de 5 s | 0.2% |
-| Pico RSS durante turno | 642,532 KiB |
-| CPU durante turno, janela de 3 s | 8.6% |
-| Shutdown após fechar a janela | 63.8 ms |
+| `.deb` | 3,145,992 bytes (3,071 KiB) |
+| `Installed-Size` Debian | 12,476 KiB |
+| Árvore instalada, soma de arquivos | 14,699.1 KiB |
+| Árvore instalada (`du -sk`) | 13,748 KiB |
+| Bundle frontend (`dist`) | 632,210 bytes (617.4 KiB) |
+| Banco inicial `katherine.db` | 4,096 bytes |
+| Startup até janela GTK | 1,041.5 ms |
+| Pico RSS durante startup | 257,572 KiB |
+| Pico PSS durante startup | 125,836 KiB |
+| RSS idle, pico agregado | 602,664 KiB |
+| PSS idle, pico agregado | 352,689 KiB |
+| RSS idle, snapshot breakdown | 598,772 KiB |
+| PSS idle, snapshot breakdown | 348,733 KiB |
+| CPU idle, janela de 5.39 s | 0.19% |
+| Processos idle do app | 3 |
+| Threads idle do app | 93 |
+| Pico RSS durante turno de UI | 641,568 KiB |
+| Pico PSS durante turno de UI | 391,402 KiB |
+| CPU durante turno UI/bridge, janela de 3 s | 43.95% |
+| Shutdown após fechar a janela | 163.8 ms |
+| Syscalls de rede idle | 0 |
+| Syscalls Internet idle (`AF_INET/AF_INET6`) | 0 |
+| Sockets TCP/UDP idle observados | 0 |
+| Listeners TCP observados | 0 |
+| Crescimento de logs na sessão | 0 bytes |
+| Crescimento de cache na sessão | 164,560 bytes |
 
 A variação de startup e CPU entre execuções depende da carga do host e do
 backend WebKitGTK. Por isso o projeto registra os números observados e o
 método, sem transformar esta amostra em um threshold artificial.
+
+#### Breakdown de memória idle
+
+| Processo/role | RSS | PSS | Threads |
+| --- | ---: | ---: | ---: |
+| Python principal | 219,124 KiB | 101,938 KiB | 36 |
+| WebKit network process | 52,252 KiB | 18,495 KiB | 8 |
+| WebKit web process | 327,396 KiB | 228,300 KiB | 49 |
+| **Total no snapshot** | **598,772 KiB** | **348,733 KiB** | **93** |
+
+Os cerca de 603 MiB de RSS não são um único processo Python: a maior parte
+vem do `WebKitWebProcess` (327,396 KiB RSS) e do Python principal (219,124
+KiB), com mais 52,252 KiB do processo de rede WebKit. O RSS soma páginas
+compartilhadas mais de uma vez entre processos; o PSS de `smaps_rollup`,
+348,733 KiB no snapshot, é a medida apropriada para custo proporcional. O
+resultado representa o custo real do modelo multiprocessado WebKitGTK usado
+pelo pywebview, não uma página extra ou um servidor HTTP. O processo WebKit
+de rede existe para o shell, mas durante a janela idle não tinha FD TCP/UDP,
+não produziu syscall `AF_INET/AF_INET6` e não houve tráfego de saída
+observado.
+
+O turno de provider controlado, separado do benchmark gráfico, registrou
+`provider_turn_duration_ms=44.1`, `provider_turn_rss_before_kib=51,584`,
+`provider_turn_rss_peak_kib=51,868`, `provider_turn_pss_peak_kib=40,718` e
+`provider_turn_cpu_percent=19.35`. Esse número mede o caminho real do
+runtime/adapter com transporte determinístico, sem fingir uma chamada de
+rede real.
 
 ## Modelo de confiança da bridge (resumo)
 

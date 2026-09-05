@@ -61,6 +61,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import urllib.request
 import zipfile
 from pathlib import Path
 
@@ -80,6 +81,19 @@ TARGET_PYTHON = (3, 12)
 # A version lock alone is not sufficient: an index can publish multiple
 # artifacts for one version, and pydantic-core's native wheel is ABI-specific.
 ARTIFACT_MANIFEST = REPO_ROOT / "packaging" / "requirements-desktop.sha256"
+
+# proxy-tools is the only desktop dependency distributed only as a legacy
+# setuptools sdist. Fetch its immutable file URL directly so CI never needs
+# to import ``setuptools.build_meta`` or download an unpinned build backend.
+DIRECT_SDIST_ARTIFACTS = {
+    (
+        "proxy-tools",
+        "0.1.0",
+    ): (
+        "proxy_tools-0.1.0.tar.gz",
+        "https://files.pythonhosted.org/packages/f2/cf/77d3e19b7fabd03895caca7857ef51e4c409e0ca6b37ee6e9f7daa50b642/proxy_tools-0.1.0.tar.gz",
+    ),
+}
 
 #: Where the application lives once installed (FHS: architecture-independent
 #: application data belongs in /usr/lib).
@@ -319,24 +333,52 @@ def parse_lock(lock_path: Path) -> list[tuple[str, str]]:
     return pins
 
 
+def download_direct_artifact(filename: str, url: str, dest: Path) -> Path:
+    """Download one known artifact without invoking packaging metadata."""
+    target = dest / filename
+    partial = target.with_name(target.name + ".part")
+    try:
+        with (
+            urllib.request.urlopen(url, timeout=60) as response,
+            partial.open("wb") as stream,
+        ):
+            shutil.copyfileobj(response, stream)
+        partial.replace(target)
+    finally:
+        partial.unlink(missing_ok=True)
+    return target
+
+
 def download_wheels(
     pins: list[tuple[str, str]], dest: Path, pip: list[str]
 ) -> list[Path]:
-    """Download the locked dependency closure as wheels (sdist fallback
-    only for packages without wheels, e.g. proxy-tools)."""
-    reqs = [f"{n}=={v}" for n, v in pins]
-    run(
-        [
-            *pip,
-            "download",
-            *reqs,
-            "-d",
-            str(dest),
-            "--no-deps",
-            "--no-build-isolation",
-        ],
-        stdout=subprocess.DEVNULL,
-    )
+    """Download locked wheels plus explicitly mapped pure-Python sdists.
+
+    Pip is restricted to wheels, so a new unexpected sdist fails closed
+    instead of triggering metadata generation or build isolation. The one
+    known sdist is fetched directly from its immutable PyPI file URL and is
+    still checked by :func:`verify_download_artifacts` below.
+    """
+    direct_pins = set(DIRECT_SDIST_ARTIFACTS)
+    wheel_pins = [pin for pin in pins if pin not in direct_pins]
+    if wheel_pins:
+        reqs = [f"{n}=={v}" for n, v in wheel_pins]
+        run(
+            [
+                *pip,
+                "download",
+                *reqs,
+                "-d",
+                str(dest),
+                "--no-deps",
+                "--only-binary=:all:",
+            ],
+            stdout=subprocess.DEVNULL,
+        )
+    for pin in pins:
+        artifact = DIRECT_SDIST_ARTIFACTS.get(pin)
+        if artifact is not None:
+            download_direct_artifact(*artifact, dest)
     files = sorted(dest.iterdir())
     verify_download_artifacts(files)
     wheels = [f for f in files if f.name.endswith(".whl")]

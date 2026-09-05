@@ -7,11 +7,13 @@ unshare environment (see isolated-install.sh), collecting evidence:
   1. install        dpkg unpack+configure, file list matches lock
   2. import         app imports outside the checkout, finds dist
   3. storage        XDG database created in isolated HOME
-  4. turn (no key)  sanitized configuration error, no crash
-  5. upgrade        newer .deb over older, dpkg replaces files
-  6. downgrade      older package restores without touching user data
-  7. purge          package removed, user data PRESERVED
-  8. benchmarks     size, startup, RAM — real measurements
+  4. restart        runtime closes and reopens the same XDG database
+  5. turn (no key)  sanitized configuration error, no crash
+  6. upgrade        newer .deb over older, dpkg replaces files
+  7. downgrade      older package restores without touching user data
+  8. fail-closed    unknown schema version remains intact and is rejected
+  9. purge          package removed, user data PRESERVED
+ 10. benchmarks     size, startup, RAM — real measurements
 
 Every step prints PASS/FAIL lines; the exit code is non-zero if any
 step fails. All evidence is reproducible: same .deb, same commands.
@@ -61,6 +63,44 @@ async def main():
     }))
     rt.close()
 asyncio.run(main())
+'''
+
+RESTART_PROBE = r'''
+import json, sys
+sys.path.insert(0, "/usr/lib/katherine/vendor")
+sys.path.insert(0, "/usr/lib/katherine")
+from backend.desktop.app import _build_runtime
+first = _build_runtime()
+first_health = first.health()
+first.close()
+second = _build_runtime()
+second_health = second.health()
+second.close()
+print(json.dumps({
+    "first_storage": first_health.get("storage"),
+    "second_storage": second_health.get("storage"),
+}))
+'''
+
+FAIL_CLOSED_PROBE = r'''
+import sqlite3, sys
+sys.path.insert(0, "/usr/lib/katherine/vendor")
+sys.path.insert(0, "/usr/lib/katherine")
+from backend.local_storage import default_database_path, open_local_storage
+from backend.local_storage.errors import PersistenceError
+p = default_database_path()
+store = open_local_storage(p)
+store.close()
+conn = sqlite3.connect(p)
+conn.execute("insert into schema_migrations (version) values (?)", (99999,))
+conn.commit()
+conn.close()
+try:
+    open_local_storage(p)
+except PersistenceError as exc:
+    print("FAIL_CLOSED", exc.code, p.exists())
+else:
+    print("FAIL_CLOSED", "opened", p.exists())
 '''
 
 def sh(cmd: list[str], **kw) -> subprocess.CompletedProcess:
@@ -217,7 +257,24 @@ def main(argv: list[str] | None = None) -> int:
     )
     results.append(step("storage: XDG db created in isolated HOME", ok, dbok or out[-200:]))
 
-    # ── 4. no-key turn (sanitized error) ─────────────────────────────
+    # ── 4. restart (same isolated user database) ─────────────────────
+    rc, out = run_in_env(
+        deb,
+        "cd /tmp && PYTHONPATH=/install-root/usr/lib/katherine:/install-root/usr/lib/katherine/vendor python3 - <<'PY'\n"
+        + RESTART_PROBE
+        + "PY",
+    )
+    restart = json_line(out)
+    ok = (
+        rc == 0
+        and restart is not None
+        and restart.get("first_storage") is True
+        and restart.get("second_storage") is True
+    )
+    results.append(step("restart: same XDG database reopens", ok,
+                        json.dumps(restart) if restart else out[-200:]))
+
+    # ── 5. no-key turn (sanitized error) ─────────────────────────────
     rc, out = run_in_env(deb, "cd /tmp && PYTHONPATH=/install-root/usr/lib/katherine:/install-root/usr/lib/katherine/vendor python3 - <<'PY'\n" + TURN_PROBE + "PY")
     j = json_line(out)
     ok = (
@@ -230,7 +287,7 @@ def main(argv: list[str] | None = None) -> int:
     results.append(step("turn(no key): sanitized configuration error", ok,
                         json.dumps(j) if j else out[-200:]))
 
-    # ── 5/6. upgrade + downgrade ─────────────────────────────────────
+    # ── 6/7. upgrade + downgrade ─────────────────────────────────────
     if not args.skip_upgrade and old is not None:
         rc, out = run_in_env(
             old,
@@ -284,6 +341,21 @@ def main(argv: list[str] | None = None) -> int:
         )
         results.append(step("downgrade: data preserved after version downgrade", ok,
                             f"{dg} | {ro}" if dg and ro else out[-300:]))
+
+        # An unknown schema marker must fail closed after the downgrade path,
+        # without deleting or rewriting the user's database.
+        rc, out = run_in_env(
+            deb,
+            "cd /tmp && PYTHONPATH=/install-root/usr/lib/katherine:/install-root/usr/lib/katherine/vendor python3 - <<'PY'\n"
+            + FAIL_CLOSED_PROBE
+            + "PY",
+        )
+        fc = find_marker(out, "FAIL_CLOSED")
+        results.append(step(
+            "fail-closed: unknown schema preserved",
+            rc == 0 and fc == "FAIL_CLOSED schema_too_new True",
+            fc or out[-300:],
+        ))
 
     # ── 7. purge + reinstall preserves user data ────────────────────
     rc, out = run_in_env(
