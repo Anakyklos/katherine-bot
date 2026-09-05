@@ -169,6 +169,27 @@ describe('vendored bfce lifecycle boundary', () => {
         );
     });
 
+    it('does not wake a destroyed face through animation APIs', () => {
+        const requestFrame = vi.fn(() => 1);
+        vi.stubGlobal('requestAnimationFrame', requestFrame);
+        vi.stubGlobal('cancelAnimationFrame', vi.fn());
+        const host = makeHost();
+
+        const face = createFace(host, {
+            expression: 'idle',
+            track: false,
+            blink: false,
+            idle: false,
+        });
+        face.destroy();
+
+        face.setExpression('happy');
+        face.react('bounce');
+        face.look(1, 1);
+
+        expect(requestFrame).not.toHaveBeenCalled();
+    });
+
     it('consults prefers-reduced-motion and avoids network activity', () => {
         const requestFrame = vi.fn(() => 1);
         vi.stubGlobal('requestAnimationFrame', requestFrame);
@@ -210,7 +231,7 @@ describe('vendored bfce lifecycle boundary', () => {
             expression: 'idle',
             track: false,
             blink: false,
-            idle: false,
+            idle: true,
         });
 
         expect(requestFrame).toHaveBeenCalledTimes(1);
@@ -219,6 +240,61 @@ describe('vendored bfce lifecycle boundary', () => {
 
         observerInstances[0].callback([{ isIntersecting: true }]);
         expect(requestFrame).toHaveBeenCalledTimes(2);
+        face.destroy();
+    });
+
+    it('sleeps stable faces without continuous behaviors and wakes for expression changes', () => {
+        const frameCallbacks = new Map();
+        let nextFrameId = 1;
+        const requestFrame = vi.fn((callback) => {
+            const id = nextFrameId++;
+            frameCallbacks.set(id, callback);
+            return id;
+        });
+        const cancelFrame = vi.fn((id) => frameCallbacks.delete(id));
+        vi.stubGlobal('requestAnimationFrame', requestFrame);
+        vi.stubGlobal('cancelAnimationFrame', cancelFrame);
+        const host = makeHost();
+        const face = createFace(host, {
+            expression: 'idle',
+            track: false,
+            blink: false,
+            idle: false,
+        });
+
+        const runUntilSleep = (startingAt) => {
+            let now = startingAt;
+            let frames = 0;
+            while (frameCallbacks.size && frames < 240) {
+                const [id, callback] = frameCallbacks.entries().next().value;
+                frameCallbacks.delete(id);
+                callback(now);
+                now += 1000 / 60;
+                frames += 1;
+            }
+            return { frames, now };
+        };
+
+        const initial = runUntilSleep(16.666);
+        expect(initial.frames).toBe(0);
+        expect(frameCallbacks.size).toBe(0);
+
+        const scheduledBeforeExpression = requestFrame.mock.calls.length;
+        face.setExpression('happy');
+        expect(requestFrame).toHaveBeenCalledTimes(scheduledBeforeExpression + 1);
+        expect(frameCallbacks.size).toBe(1);
+
+        const transition = runUntilSleep(initial.now);
+        expect(transition.frames).toBeGreaterThan(0);
+        expect(frameCallbacks.size).toBe(0);
+
+        const scheduledBeforeSecondExpression = requestFrame.mock.calls.length;
+        face.setExpression('sad');
+        expect(requestFrame).toHaveBeenCalledTimes(scheduledBeforeSecondExpression + 1);
+        expect(frameCallbacks.size).toBe(1);
+        runUntilSleep(transition.now);
+        expect(frameCallbacks.size).toBe(0);
+
         face.destroy();
     });
 });

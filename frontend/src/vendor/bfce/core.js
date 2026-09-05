@@ -90,7 +90,9 @@ let lastTick = 0
 function tick(now) {
   const dt = lastTick ? clamp((now - lastTick) / 1000, 0.001, 1 / 30) : 1 / 60
   lastTick = now
-  for (const face of living) face._frame(dt, now)
+  for (const face of living) {
+    if (!face._frame(dt, now)) living.delete(face)
+  }
   raf = living.size ? requestAnimationFrame(tick) : null
 }
 
@@ -267,6 +269,22 @@ export function createFace(host, options = {}) {
   let alive = true
   let pointerTrackingAcquired = false
 
+  const springIsMoving = (springValue) => {
+    if (Math.abs(springValue.to - springValue.x) <= 0.001 && Math.abs(springValue.v) <= 0.001) {
+      settle(springValue)
+      return false
+    }
+    return true
+  }
+
+  const needsFrame = () => {
+    if (reduced || !visible) return false
+    if (active.length || override) return true
+    if (opt.track || opt.blink || opt.idle) return true
+    if (springIsMoving(gaze.x) || springIsMoving(gaze.y)) return true
+    return Object.values(shape).some(springIsMoving)
+  }
+
   const invalidate = () => { box = null }
   window.addEventListener('scroll', invalidate, { passive: true, capture: true })
   window.addEventListener('resize', invalidate, { passive: true })
@@ -279,8 +297,10 @@ export function createFace(host, options = {}) {
         const nextVisible = entry.isIntersecting
         if (visible === nextVisible) return
         visible = nextVisible
-        if (visible && reduced) frame(0, performance.now())
-        else if (visible) join(api)
+        if (visible) {
+          frame(reduced ? 0 : 1 / 60, performance.now())
+          if (needsFrame()) join(api)
+        }
         else leave(api)
       },
       { rootMargin: '80px' },
@@ -457,6 +477,8 @@ export function createFace(host, options = {}) {
       mouthOpen.setAttribute('ry', (open * 8).toFixed(2))
       mouthOpen.setAttribute('opacity', open.toFixed(3))
     }
+
+    return needsFrame()
   }
 
   const api = {
@@ -464,6 +486,7 @@ export function createFace(host, options = {}) {
     _frame: frame,
 
     setExpression(name) {
+      if (!alive) return api
       const preset = EXPRESSIONS[name]
       if (!preset) return api
       for (const key in shape) {
@@ -472,22 +495,28 @@ export function createFace(host, options = {}) {
       if (reduced) {
         for (const key in shape) settle(shape[key])
         frame(0, performance.now())
+      } else if (visible) {
+        join(api)
       }
       return api
     },
 
     react(name, { force = false } = {}) {
+      if (!alive) return api
       const def = REACTIONS[name]
       if (!def) return api
       if (reduced && !force) return api
       active.push({ def, t: 0 })
+      if (!reduced && visible) join(api)
       return api
     },
 
     // Force the gaze somewhere for a moment. x/y are -1..1 from the centre.
     look(x, y, ms = 900) {
+      if (!alive) return api
       if (reduced) return api
       override = { x: clamp(x, -1, 1), y: clamp(y, -1, 1), until: performance.now() + ms }
+      if (visible) join(api)
       return api
     },
 
@@ -503,6 +532,7 @@ export function createFace(host, options = {}) {
         releasePointerTracking()
         pointerTrackingAcquired = false
       }
+      if (!reduced && visible && (opt.track || opt.blink || opt.idle)) join(api)
       return api
     },
 
@@ -529,8 +559,8 @@ export function createFace(host, options = {}) {
     acquirePointerTracking()
     pointerTrackingAcquired = true
   }
-  if (!reduced) join(api)
-  frame(1 / 60, performance.now())
+  frame(reduced ? 0 : 1 / 60, performance.now())
+  if (!reduced && needsFrame()) join(api)
 
   return api
 }
