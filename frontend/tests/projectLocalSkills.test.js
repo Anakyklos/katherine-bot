@@ -76,3 +76,38 @@ test('Katherine face CSS declares reduced-motion behavior', () => {
     assert.match(css, /animation:\s*none\s*!important/);
     assert.match(css, /transition-duration:\s*0ms\s*!important/);
 });
+
+test('companion layout disables incidental disclosure motion for reduced-motion users', () => {
+    const css = readFileSync(
+        join(FRONTEND_ROOT, 'src', 'features', 'chat', 'components', 'CompanionLayout.css'),
+        'utf8',
+    );
+
+    assert.match(css, /@media\s*\(prefers-reduced-motion:\s*reduce\)/);
+    assert.match(css, /transition-duration:\s*0ms/);
+});
+
+test('narrow desktop keeps the Katherine presence track wider than the conversation rail', () => {
+    const css = readFileSync(
+        join(FRONTEND_ROOT, 'src', 'features', 'chat', 'components', 'CompanionLayout.css'),
+        'utf8',
+    );
+    const narrowDesktop = css.match(
+        /@media\s*\(max-width:\s*68rem\)([\s\S]*?)@media\s*\(max-width:\s*48rem\)/,
+    )?.[1];
+
+    assert.ok(narrowDesktop, 'narrow desktop media query is missing');
+    const columns = narrowDesktop.match(
+        /grid-template-columns:\s*minmax\(0,\s*([\d.]+)fr\)\s+minmax\(18rem,\s*([\d.]+)rem\)/,
+    );
+
+    assert.ok(columns, 'narrow desktop columns must reserve a bounded conversation rail');
+    const conversationMaxPx = Number(columns[2]) * 16;
+
+    for (const viewportWidth of [769, 800]) {
+        assert.ok(
+            viewportWidth - conversationMaxPx > conversationMaxPx,
+            `presence must remain wider than the conversation rail at ${viewportWidth}px`,
+        );
+    }
+});

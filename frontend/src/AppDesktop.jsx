@@ -12,20 +12,16 @@
  * desktopBridge).
  */
 import ChatWindow from './features/chat/components/ChatWindow';
-import KatherineFace from './features/katherine-face/KatherineFace.jsx';
+import CompanionLayout from './features/chat/components/CompanionLayout.jsx';
 
-const renderKatherineFace = ({ emotionState, isLoading }) => (
-    <KatherineFace
-        emotionState={emotionState}
-        isLoading={isLoading}
-        className="katherine-face--header"
-    />
+const renderCompanionLayout = (chatModel) => (
+    <CompanionLayout {...chatModel} />
 );
 
 export default function AppDesktop() {
     return (
         <div className="min-h-screen bg-gray-900 text-gray-100 font-sans antialiased">
-            <ChatWindow faceSlot={renderKatherineFace} />
+            <ChatWindow renderLayout={renderCompanionLayout} />
         </div>
     );
 }
