@@ -1,0 +1,38 @@
+.katherine-face {
+    --face-skin: #20252c;
+    --face-ink: #f3f4f6;
+    --face-ring: rgba(148, 163, 184, 0.35);
+    --face-pupil: #111827;
+    display: grid;
+    place-items: center;
+    width: clamp(7rem, 14vw, 10rem);
+    aspect-ratio: 1;
+    flex: 0 0 auto;
+    contain: layout paint;
+    pointer-events: none;
+    user-select: none;
+}
+
+.katherine-face__vendor {
+    display: block;
+    width: 100% !important;
+    height: 100% !important;
+}
+
+.katherine-face--header {
+    width: 3.25rem;
+}
+
+@media (max-width: 767px) {
+    .katherine-face {
+        width: 5.5rem;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .katherine-face,
+    .katherine-face * {
+        animation: none !important;
+        transition-duration: 0ms !important;
+    }
+}

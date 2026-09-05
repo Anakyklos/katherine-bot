@@ -6,7 +6,7 @@ import ChatInput from './ChatInput';
 import PrivacyPanel from '../../privacy/PrivacyPanel';
 import { useChat } from '../hooks/useChat';
 
-const ChatWindow = () => {
+const ChatWindow = ({ faceSlot = null }) => {
     const {
         messages,
         input,
@@ -23,7 +23,14 @@ const ChatWindow = () => {
     return (
         <div className="flex flex-col h-screen max-w-6xl mx-auto relative">
             {/* Header */}
-            <ChatHeader clearScreen={clearScreen} />
+            <div className="relative flex-shrink-0">
+                <ChatHeader clearScreen={clearScreen} />
+                {faceSlot && (
+                    <div className="pointer-events-none absolute inset-y-0 left-1/2 z-20 hidden -translate-x-1/2 items-center md:flex">
+                        {faceSlot({ emotionState, isLoading })}
+                    </div>
+                )}
+            </div>
 
             {/* Main Content Area */}
             <div className="flex-1 flex flex-col md:flex-row overflow-hidden">

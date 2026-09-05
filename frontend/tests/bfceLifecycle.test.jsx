@@ -1,0 +1,171 @@
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { createFace } from '../src/vendor/bfce/core.js';
+
+const makeHost = () => {
+    const host = document.createElement('div');
+    host.style.width = '160px';
+    host.style.height = '160px';
+    document.body.appendChild(host);
+    return host;
+};
+
+const installIntersectionObserver = () => {
+    const instances = [];
+    class TestIntersectionObserver {
+        constructor(callback) {
+            this.callback = callback;
+            this.disconnect = vi.fn();
+            instances.push(this);
+        }
+
+        observe() {}
+    }
+    vi.stubGlobal('IntersectionObserver', TestIntersectionObserver);
+    return instances;
+};
+
+describe('vendored bfce lifecycle boundary', () => {
+    beforeEach(() => {
+        vi.restoreAllMocks();
+        vi.unstubAllGlobals();
+        document.body.innerHTML = '';
+    });
+
+    it('cleans listeners, observers, and the animation frame on destroy', () => {
+        const observerInstances = installIntersectionObserver();
+        const frameCallbacks = new Map();
+        let nextFrameId = 1;
+        const requestFrame = vi.fn((callback) => {
+            const id = nextFrameId++;
+            frameCallbacks.set(id, callback);
+            return id;
+        });
+        const cancelFrame = vi.fn((id) => frameCallbacks.delete(id));
+        vi.stubGlobal('requestAnimationFrame', requestFrame);
+        vi.stubGlobal('cancelAnimationFrame', cancelFrame);
+        const addEventListener = vi.spyOn(window, 'addEventListener');
+        const removeEventListener = vi.spyOn(window, 'removeEventListener');
+        const host = makeHost();
+
+        const face = createFace(host, {
+            expression: 'happy',
+            track: true,
+            blink: false,
+            idle: false,
+        });
+        face.destroy();
+
+        expect(observerInstances).toHaveLength(1);
+        expect(observerInstances[0].disconnect).toHaveBeenCalledTimes(1);
+        expect(cancelFrame).toHaveBeenCalledTimes(1);
+        expect(host.querySelector('svg')).toBeNull();
+
+        for (const eventName of ['pointermove', 'pointerdown', 'blur']) {
+            expect(addEventListener).toHaveBeenCalledWith(
+                eventName,
+                expect.any(Function),
+                expect.anything(),
+            );
+            expect(removeEventListener).toHaveBeenCalledWith(
+                eventName,
+                expect.any(Function),
+                expect.anything(),
+            );
+        }
+        expect(addEventListener).toHaveBeenCalledWith(
+            'scroll',
+            expect.any(Function),
+            { capture: true, passive: true },
+        );
+        expect(removeEventListener).toHaveBeenCalledWith(
+            'scroll',
+            expect.any(Function),
+            { capture: true },
+        );
+        expect(addEventListener).toHaveBeenCalledWith(
+            'resize',
+            expect.any(Function),
+            { passive: true },
+        );
+        expect(removeEventListener).toHaveBeenCalledWith('resize', expect.any(Function));
+    });
+
+    it('does not install pointer tracking when tracking is disabled', () => {
+        vi.stubGlobal('requestAnimationFrame', vi.fn(() => 1));
+        vi.stubGlobal('cancelAnimationFrame', vi.fn());
+        const addEventListener = vi.spyOn(window, 'addEventListener');
+        const host = makeHost();
+
+        const face = createFace(host, {
+            expression: 'idle',
+            track: false,
+            blink: false,
+            idle: false,
+        });
+        face.destroy();
+
+        expect(addEventListener).not.toHaveBeenCalledWith(
+            'pointermove',
+            expect.any(Function),
+            expect.anything(),
+        );
+        expect(addEventListener).not.toHaveBeenCalledWith(
+            'pointerdown',
+            expect.any(Function),
+            expect.anything(),
+        );
+    });
+
+    it('consults prefers-reduced-motion and avoids network activity', () => {
+        const requestFrame = vi.fn(() => 1);
+        vi.stubGlobal('requestAnimationFrame', requestFrame);
+        vi.stubGlobal('cancelAnimationFrame', vi.fn());
+        const matchMedia = vi.fn(() => ({ matches: true, addEventListener: vi.fn(), removeEventListener: vi.fn() }));
+        vi.stubGlobal('matchMedia', matchMedia);
+        const fetchSpy = vi.spyOn(globalThis, 'fetch');
+        const host = makeHost();
+
+        const face = createFace(host, {
+            expression: 'thinking',
+            track: false,
+            blink: true,
+            idle: true,
+        });
+        face.destroy();
+
+        expect(matchMedia).toHaveBeenCalledWith('(prefers-reduced-motion: reduce)');
+        expect(requestFrame).not.toHaveBeenCalled();
+        expect(fetchSpy).not.toHaveBeenCalled();
+        fetchSpy.mockRestore();
+    });
+
+    it('pauses and resumes the shared animation loop with visibility', () => {
+        const observerInstances = installIntersectionObserver();
+        const frameCallbacks = new Map();
+        let nextFrameId = 1;
+        const requestFrame = vi.fn((callback) => {
+            const id = nextFrameId++;
+            frameCallbacks.set(id, callback);
+            return id;
+        });
+        const cancelFrame = vi.fn((id) => frameCallbacks.delete(id));
+        vi.stubGlobal('requestAnimationFrame', requestFrame);
+        vi.stubGlobal('cancelAnimationFrame', cancelFrame);
+        const host = makeHost();
+
+        const face = createFace(host, {
+            expression: 'idle',
+            track: false,
+            blink: false,
+            idle: false,
+        });
+
+        expect(requestFrame).toHaveBeenCalledTimes(1);
+        observerInstances[0].callback([{ isIntersecting: false }]);
+        expect(cancelFrame).toHaveBeenCalledTimes(1);
+
+        observerInstances[0].callback([{ isIntersecting: true }]);
+        expect(requestFrame).toHaveBeenCalledTimes(2);
+        face.destroy();
+    });
+});

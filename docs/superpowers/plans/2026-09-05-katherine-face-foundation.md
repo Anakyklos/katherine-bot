@@ -4,7 +4,7 @@
 
 **Goal:** Add a local, pinned, safe bfce-backed Katherine face that presents only validated public emotion state and ephemeral loading state through a pure allowlisted mapper.
 
-**Architecture:** Keep `useChat()` as the only owner of `emotionState` and `isLoading`. `selectKatherineFaceState({ emotionState, isLoading })` converts validated structured state to a small approved expression vocabulary, and `KatherineFace` passes only that result to a hardened local bfce adapter. `AppDesktop` composes the face beside the existing `ChatWindow`; `AppWeb` and the chat transport remain unchanged.
+**Architecture:** Keep `useChat()` as the only owner of `emotionState` and `isLoading`. `selectKatherineFaceState({ emotionState, isLoading })` converts validated structured state to a small approved expression vocabulary, and `KatherineFace` passes only that result to a hardened local bfce adapter. `AppDesktop` composes the face through a narrow `ChatWindow` render slot; `AppWeb` and the chat transport remain unchanged.
 
 **Tech Stack:** React 18, Vite, Vitest, Testing Library, Node test runner, plain vendored bfce source, CSS custom properties and `prefers-reduced-motion`.
 
@@ -289,7 +289,7 @@ git -C "$BFCE" archive 814e199c2045b3be057f59f8dc4ed395a4d2bbd6 \
   | tar -x -C frontend/src/vendor/bfce --strip-components=1
 ```
 
-Record canonical resolution from `https://github.com/bwndapp/bwndapp/bbot` only if the exact API URL redirect is represented as `https://github.com/bwndapp/bbot`; do not fetch latest and do not use CDN or runtime network.
+Record canonical resolution from `https://github.com/bwndapp/bfce` only if the exact API URL redirect is represented as `https://github.com/bwndapp/bbot`; do not fetch latest and do not use CDN or runtime network.
 
 - [ ] **Step 4: Apply only lifecycle-safe local changes required by the acceptance contract.**
 
