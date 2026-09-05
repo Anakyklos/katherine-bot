@@ -153,6 +153,62 @@ test('validateEmotionState: schema_version != 1 returns null', () => {
     assert.strictEqual(validateEmotionState(payload), null);
 });
 
+test('validateEmotionState: inherited top-level contract fields return null', () => {
+    for (const field of ['schema_version', 'mood_label', 'pad', 'dominant_emotions', 'timestamp']) {
+        const payload = { ...VALID_PAYLOAD };
+        const inheritedValue = payload[field];
+        delete payload[field];
+        Object.setPrototypeOf(payload, { [field]: inheritedValue });
+
+        assert.strictEqual(validateEmotionState(payload), null, field);
+    }
+});
+
+test('validateEmotionState: inherited PAD and emotion fields return null', () => {
+    const inheritedPad = Object.create({ pleasure: 0.5, arousal: 0.3, dominance: -0.2 });
+    assert.strictEqual(
+        validateEmotionState({ ...VALID_PAYLOAD, pad: inheritedPad }),
+        null,
+    );
+
+    const inheritedEmotion = Object.create({ name: 'joy', intensity: 0.8 });
+    assert.strictEqual(
+        validateEmotionState({
+            ...VALID_PAYLOAD,
+            dominant_emotions: [inheritedEmotion],
+        }),
+        null,
+    );
+});
+
+test('validateEmotionState: accessor-backed contract fields return null', () => {
+    const cases = [
+        ['timestamp', { ...VALID_PAYLOAD }, VALID_PAYLOAD.timestamp],
+        ['pad.pleasure', { ...VALID_PAYLOAD, pad: { ...VALID_PAYLOAD.pad } }, VALID_PAYLOAD.pad.pleasure],
+        [
+            'dominant_emotions[0].name',
+            { ...VALID_PAYLOAD, dominant_emotions: [{ ...VALID_PAYLOAD.dominant_emotions[0] }] },
+            VALID_PAYLOAD.dominant_emotions[0].name,
+        ],
+    ];
+
+    for (const [field, payload, value] of cases) {
+        const target = field === 'timestamp'
+            ? payload
+            : field === 'pad.pleasure'
+                ? payload.pad
+                : payload.dominant_emotions[0];
+        const property = field.split('.').at(-1).replace(/\]$/, '').replace(/\[\d+$/, '');
+        Object.defineProperty(target, property, {
+            configurable: true,
+            enumerable: true,
+            get: () => value,
+        });
+
+        assert.strictEqual(validateEmotionState(payload), null, field);
+    }
+});
+
 test('validateEmotionState: pad absent returns null', () => {
     const payload = {
         schema_version: 1,
@@ -183,6 +239,22 @@ test('validateEmotionState: pad with Infinity returns null', () => {
         timestamp: 1700000000,
     };
     assert.strictEqual(validateEmotionState(payload), null);
+});
+
+test('validateEmotionState: PAD values outside the public range return null', () => {
+    for (const field of ['pleasure', 'arousal', 'dominance']) {
+        const above = {
+            ...VALID_PAYLOAD,
+            pad: { ...VALID_PAYLOAD.pad, [field]: 1.01 },
+        };
+        const below = {
+            ...VALID_PAYLOAD,
+            pad: { ...VALID_PAYLOAD.pad, [field]: -1.01 },
+        };
+
+        assert.strictEqual(validateEmotionState(above), null);
+        assert.strictEqual(validateEmotionState(below), null);
+    }
 });
 
 test('validateEmotionState: dominant_emotions absent returns null', () => {
@@ -265,6 +337,23 @@ test('validateEmotionState: dominant_emotion with non-finite intensity returns n
     assert.strictEqual(validateEmotionState(payload), null);
 });
 
+test('validateEmotionState: intensity outside the public range returns null', () => {
+    assert.strictEqual(
+        validateEmotionState({
+            ...VALID_PAYLOAD,
+            dominant_emotions: [{ name: 'joy', intensity: -0.01 }],
+        }),
+        null,
+    );
+    assert.strictEqual(
+        validateEmotionState({
+            ...VALID_PAYLOAD,
+            dominant_emotions: [{ name: 'joy', intensity: 1.01 }],
+        }),
+        null,
+    );
+});
+
 test('validateEmotionState: dominant_emotion item not an object returns null', () => {
     const payload = {
         schema_version: 1,
@@ -313,6 +402,16 @@ test('validateEmotionState: unknown emotion name returns null', () => {
     assert.strictEqual(validateEmotionState(payload), null);
 });
 
+test('validateEmotionState: inherited property names are not canonical emotions', () => {
+    for (const name of ['constructor', 'toString', '__proto__']) {
+        const payload = {
+            ...VALID_PAYLOAD,
+            dominant_emotions: [{ name, intensity: 0.5 }],
+        };
+        assert.strictEqual(validateEmotionState(payload), null, name);
+    }
+});
+
 test('validateEmotionState: duplicate emotion names returns null', () => {
     const payload = {
         ...VALID_PAYLOAD,
@@ -344,6 +443,17 @@ test('validateEmotionState: zero emotions with canonical empty list passes', () 
         dominant_emotions: [],
     };
     assert(validateEmotionState(payload) !== null);
+});
+
+test('validateEmotionState: non-positive timestamp returns null', () => {
+    assert.strictEqual(
+        validateEmotionState({ ...VALID_PAYLOAD, timestamp: 0 }),
+        null,
+    );
+    assert.strictEqual(
+        validateEmotionState({ ...VALID_PAYLOAD, timestamp: -1 }),
+        null,
+    );
 });
 
 // ─── getEmotionLabel ────────────────────────────────────────────────────────

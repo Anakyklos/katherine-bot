@@ -12,11 +12,20 @@
  * desktopBridge).
  */
 import ChatWindow from './features/chat/components/ChatWindow';
+import KatherineFace from './features/katherine-face/KatherineFace.jsx';
+
+const renderKatherineFace = ({ emotionState, isLoading }) => (
+    <KatherineFace
+        emotionState={emotionState}
+        isLoading={isLoading}
+        className="katherine-face--header"
+    />
+);
 
 export default function AppDesktop() {
     return (
         <div className="min-h-screen bg-gray-900 text-gray-100 font-sans antialiased">
-            <ChatWindow />
+            <ChatWindow faceSlot={renderKatherineFace} />
         </div>
     );
 }

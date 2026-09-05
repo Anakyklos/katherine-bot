@@ -18,6 +18,16 @@ import { render, screen, waitFor } from '@testing-library/react';
 const mockGetSession = vi.fn().mockResolvedValue({ data: { session: null } });
 const mockOnAuthStateChange = vi.fn(() => ({ data: { subscription: { unsubscribe: vi.fn() } } }));
 
+vi.mock('../src/features/katherine-face/KatherineFace.jsx', () => ({
+    default: ({ emotionState, isLoading }) => (
+        <div
+            data-testid="katherine-face"
+            data-has-emotion={String(Boolean(emotionState))}
+            data-loading={String(isLoading)}
+        />
+    ),
+}));
+
 vi.mock('../src/lib/supabaseClient', () => ({
     supabase: {
         auth: {
@@ -43,6 +53,8 @@ describe('App desktop root', () => {
         // Chat UI present without any login flow.
         expect(screen.getByPlaceholderText(/escreva aqui sua mensagem/i)).toBeInTheDocument();
         expect(screen.queryByRole('button', { name: /entrar/i })).toBeNull();
+        expect(screen.getByTestId('katherine-face')).toHaveAttribute('data-has-emotion', 'false');
+        expect(screen.getByTestId('katherine-face')).toHaveAttribute('data-loading', 'false');
 
         // No Supabase session read happened on the desktop root.
         expect(mockGetSession).not.toHaveBeenCalled();
@@ -55,5 +67,6 @@ describe('App web root', () => {
         await waitFor(() => expect(mockGetSession).toHaveBeenCalled());
         // Auth surface present (web login unchanged).
         expect(screen.queryByPlaceholderText(/escreva aqui sua mensagem/i)).toBeNull();
+        expect(screen.queryByTestId('katherine-face')).toBeNull();
     });
 });
