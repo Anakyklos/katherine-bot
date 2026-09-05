@@ -130,7 +130,8 @@
 
 @media (max-width: 68rem) {
     .companion-layout__body {
-        grid-template-columns: minmax(0, 1.25fr) minmax(19rem, 27rem);
+        /* Keep the conversation rail below half the viewport until stacking. */
+        grid-template-columns: minmax(0, 1.25fr) minmax(18rem, 22rem);
     }
 
     .companion-layout__body--with-auxiliary {
