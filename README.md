@@ -13,34 +13,61 @@ The project is divided into two main components:
 
 ### Backend
 
-1. Navigate to the `backend` directory:
+Python dependencies are managed with [uv](https://docs.astral.sh/uv/). The authoritative graph is `backend/pyproject.toml` + `backend/uv.lock`; do not install backend dependencies with pip in your global Python.
+
+1. Install [uv](https://docs.astral.sh/uv/getting-started/installation/) (one-time, per machine).
+2. Sync the locked environment from the repository root (or inside `backend/`):
+
    ```bash
-   cd backend
-   ```
-2. Create and activate a virtual environment (optional but recommended):
-   ```bash
-   python3 -m venv venv
-   # Windows
-   .\venv\Scripts\activate
-   # Linux/Mac
-   source venv/bin/activate
-   ```
-3. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-4. Run the server (development only):
-   ```bash
-   python main.py
+   uv sync --project backend
    ```
 
-   > **Production:** Use `python -m backend.serve` instead.
-   > See [Production Containment](docs/operations/production-containment.md).
+   This creates `backend/.venv` with Python 3.12, the runtime dependencies (CPU-only PyTorch) and the test group, exactly as locked in `backend/uv.lock`. `--frozen` is implicit in CI; locally `uv sync` is enough.
+
+3. Run anything through the managed environment with `uv run`:
+
+   ```bash
+   uv run --project backend python -m backend.serve --host 127.0.0.1 --port 8000   # production entrypoint
+   uv run --project backend python -m pytest backend/tests                          # test suite
+   ```
+
+   For the development entrypoint: `uv run --project backend python backend/main.py`.
+
+> **Production containment:** `uv run` wraps the same production entrypoint
+> (`python -m backend.serve`) validated in CI. See
+> [Production Containment](docs/operations/production-containment.md).
+
+### Managing dependencies
+
+```bash
+cd backend
+
+# add a runtime dependency (updates pyproject.toml + uv.lock)
+uv add "package==x.y.z"
+
+# add a test-only dependency
+uv add --group test "package==x.y.z"
+
+# remove a dependency
+uv remove "package"          # or: uv remove --group test "package"
+
+# verify the lock matches pyproject.toml WITHOUT modifying it (CI gate)
+uv lock --check
+
+# update the lock deliberately, then refresh the Docker compatibility export
+uv lock
+uv export --frozen --no-emit-project --no-hashes \
+    --emit-index-url --no-group test --output-file requirements.txt
+```
+
+`backend/requirements.txt` is a **generated** export for the Docker build only — never edit it by hand (a test regenerates it and fails on drift).
+
+The PyTorch CPU index is configured as an *explicit*, torch-only source in `pyproject.toml`; the lock always resolves the CPU-only wheels (`torch==X.Y.Z+cpu`, no CUDA/NVIDIA packages).
 
 ### Desktop Shell (Linux)
 
 ```bash
-python -m backend.desktop.app
+uv run --project backend python -m backend.desktop.app
 ```
 
 Opens the production frontend build in a native GTK window (WebKitGTK)
@@ -94,39 +121,37 @@ for native dependencies, lifecycle evidence, rollback, and benchmarks.
 
 ## CI Commands Reference
 
-The following commands are used in the CI pipeline to ensure reproducible and isolated environments:
+The following commands mirror the CI pipeline (reproducible, locked environment):
 
 ### Backend Setup and Tests
 ```bash
-# Create and activate environment
-python3 -m venv .venv-ci
-source .venv-ci/bin/activate
+# Provision the locked environment (runtime + test group, Python 3.12, CPU-only PyTorch).
+# --frozen fails if pyproject.toml and uv.lock diverge and never rewrites the lock.
+uv sync --project backend --frozen
 
-# Install dependencies (CPU-only PyTorch and transitive pins via pip-tools)
-python -m pip install -r backend/requirements.txt
-python -m pip install -r backend/requirements-test.txt
-
-# Verify installation health
-python -m pip check
+# Verify environment health
+uv pip check --project backend
 
 # Compile backend
-python -m compileall -q backend
+uv run --project backend python -m compileall -q backend
 
 # Verify CPU-only PyTorch
-python -c "import torch; assert '+cpu' in torch.__version__"
-python -c "import torch; assert torch.cuda.is_available() is False"
+uv run --project backend python -c "import torch; assert '+cpu' in torch.__version__"
+uv run --project backend python -c "import torch; assert torch.cuda.is_available() is False"
 
 # Run backend tests globally in isolated single process
-PYTHONPATH=. HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python -m pytest backend/tests
+PYTHONPATH=. HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+  uv run --project backend python -m pytest backend/tests
 ```
 
-### Requirements Management
-
-Dependencies are managed using `pip-tools`. To regenerate the lock files:
+### Lock Maintenance
 ```bash
-python -m pip install pip-tools
-pip-compile backend/requirements.in -o backend/requirements.txt
-pip-compile backend/requirements-test.in -o backend/requirements-test.txt
+cd backend
+uv lock --check   # verify lock without modifying it (CI gate)
+# after deliberate dependency changes:
+uv lock
+uv export --frozen --no-emit-project --no-hashes \
+    --emit-index-url --no-group test --output-file requirements.txt
 ```
 
 ### Frontend Setup and Verification

@@ -1,0 +1,90 @@
+[project]
+name = "katherine-backend"
+version = "0.1.0"
+description = "Katherine Bot Python backend (runtime + dev dependency graph authority, #353)"
+# The backend is run from the repository (python -m backend.serve, uv run) and is
+# never built or published as a distribution; pyproject.toml exists so that
+# uv (pyproject + uv.lock) is the single authoritative dependency source.
+requires-python = ">=3.12,<3.13"
+
+# Runtime dependencies. Pins mirror the previously validated pip-tools lock
+# (backend/requirements.in as of PR #354); the first uv lock must preserve the
+# same versions. No opportunistic upgrades in the migration (#353).
+dependencies = [
+    "fastapi==0.139.0",
+    "uvicorn==0.51.0",
+    "groq==1.5.0",
+    "python-dotenv==1.2.2",
+    "supabase==2.31.0",
+    "sentence-transformers==5.6.0",
+    "pydantic==2.13.4",
+    "torch==2.13.0+cpu",
+    "pywebview==6.2.1",
+]
+
+[dependency-groups]
+# Test/development dependencies (was backend/requirements-test.in).
+# httpx: the old test lock pinned 0.27.0 while the runtime closure required
+# 0.28.1 (via groq/supabase); pip only tolerated this by installing the two
+# locks sequentially. uv resolves one graph, so the test group follows the
+# runtime-validated 0.28.1 — a documented, minimal forced change (#353).
+test = [
+    "pytest==8.2.1",
+    "pytest-asyncio==0.23.8",
+    "httpx==0.28.1",
+    "pytest-cov==5.0.0",
+]
+
+[[tool.uv.index]]
+# CPU-only PyTorch wheels. `explicit = true` keeps this index NARROW: only
+# packages whose source explicitly selects it (torch below) are fetched from
+# here; it can never become an indiscriminate extra index for other packages.
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+# torch is the only package routed to the CPU-only index, preserving the
+# validated CPU-only build contract (no CUDA/NVIDIA deps, cuda unavailable).
+torch = { index = "pytorch-cpu" }
+
+[tool.uv]
+# `uv sync` (the documented dev + CI workflow) provisions the runtime
+# dependencies AND the test group, matching what the old pip flow installed
+# (requirements.txt + requirements-test.txt) in one step.
+default-groups = ["test"]
+# Transitive pins preserved from the previously validated pip-tools lock
+# (backend/requirements.txt at PR #354). uv resolves ONE unified graph and
+# would otherwise pick newer transitive versions; these constraints keep the
+# first uv lock equivalent to the validated dependency set (#353: no
+# opportunistic upgrades). Adjust entries only deliberately, together with
+# `uv lock` and the compatibility export regeneration.
+constraint-dependencies = [
+    "annotated-doc==0.0.4",
+    "annotated-types==0.7.0",
+    "anyio==4.14.1",
+    "certifi==2026.6.17",
+    "cffi==2.1.0",
+    "click==8.4.2",
+    "cryptography==49.0.0",
+    "filelock==3.29.7",
+    "fsspec==2026.6.0",
+    "h2==4.3.0",
+    "hf-xet==1.5.1",
+    "huggingface-hub==1.23.0",
+    "idna==3.18",
+    "joblib==1.5.3",
+    "narwhals==2.23.0",
+    "numpy==2.5.1",
+    "packaging==26.2",
+    "pygments==2.20.0",
+    "regex==2026.7.10",
+    "scipy==1.18.0",
+    "starlette==1.3.1",
+    "tokenizers==0.22.2",
+    "tqdm==4.68.4",
+    "transformers==5.13.0",
+    "typer==0.26.8",
+    "typing-inspection==0.4.2",
+    "yarl==1.24.2",
+]

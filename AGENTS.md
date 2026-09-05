@@ -50,14 +50,36 @@ O comentário inicial/corpo da PR deve conter:
 
 Use Conventional Commits e títulos como `feat(emotion): ...`, `fix(auth): ...` ou `test(emotion): ...`.
 
-## Freeze de roadmap (Gate PROD-0)
+## Liberação de issues
 
-Até a aprovação do Gate PROD-0 (issue #264), as seguintes regras se aplicam:
+- Somente issues explicitamente liberadas pelo mantenedor podem receber
+  branch ou pull request.
+- Nenhuma PR concluída autoriza iniciar outra issue automaticamente; a
+  próxima tarefa precisa de liberação explícita do mantenedor.
 
-- Somente issues da recuperação #264 explicitamente marcadas como `status:ready`
-  podem ser implementadas.
-- Somente o mantenedor pode liberar uma issue para implementação.
-- As issues #251, #252, #253, #254, #255, #256, #257, #258, #259, #260, #261,
-  #262, #263, #226 e #241 **não podem** receber branch ou pull request.
-- Concluir a PR #266 não autoriza iniciar a issue #267 ou qualquer outra fora
-  da recuperação #264.
+## Tooling Python (workflow `uv`)
+
+O backend Python usa `uv` como fonte autoritativa de dependências.
+
+- A autoridade do grafo é `backend/pyproject.toml` + `backend/uv.lock`.
+- Provisionar o ambiente: `uv sync --project backend` (CI usa `--frozen`,
+  que falha se o lock divergir e nunca o reescreve).
+- Executar comandos Python: sempre `uv run --project backend ...`
+  (testes: `uv run --project backend python -m pytest backend/tests`).
+- Adicionar dependência: `uv add "pkg==x.y.z"` (runtime) ou
+  `uv add --group test "pkg==x.y.z"` (teste).
+- Remover dependência: `uv remove "pkg"` (ou `uv remove --group test "pkg"`).
+- Atualizar o lock conscientemente: `uv lock` e depois regenerar o export
+  de compatibilidade do Docker:
+  `uv export --frozen --no-emit-project --no-hashes --emit-index-url --no-group test --output-file requirements.txt`.
+- Verificar o lock sem modificá-lo: `uv lock --check`.
+- Não use `pip install` no Python global, `pip-compile`, `pip-tools` nem
+  `python -m venv` para o fluxo normal do backend. `backend/requirements.txt`
+  é um artefato GERADO (export do lock) consumido apenas pelo Docker;
+  nunca o edite à mão.
+- PyTorch permanece CPU-only: o índice do PyTorch é configurado como
+  `explicit` e só o `torch` roteia para ele. Não introduza GPU como
+  requisito.
+- O pacote desktop (`packaging/requirements-desktop.*`) tem lock
+  deliberadamente separado e mínimo; não o una ao grafo do backend nem
+  faça o `.deb` exigir `uv` na máquina do usuário.
