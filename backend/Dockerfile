@@ -9,6 +9,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# backend/requirements.txt is a GENERATED compatibility export from
+# backend/pyproject.toml + backend/uv.lock (#353). The image build does not
+# need uv: it consumes the checked-in export, which CI proves is never
+# drifted from the lock (backend/tests/test_uv_workflow.py). Never edit it
+# by hand — regenerate with the command in its header.
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 

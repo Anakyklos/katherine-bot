@@ -23,7 +23,7 @@ O ambiente validado usa o PyGObject do **sistema**, não do pip:
 
 - **PyGObject ≥ 3.48** — no Ubuntu 24.04 vem do pacote `python3-gi`
   (validado com 3.48.2). Ele não é instalável via pip sem build deps
-  nativos e **não** faz parte do `requirements.in`/lock: a venv é
+  nativos e **não** faz parte do `pyproject.toml`/`uv.lock`: a venv é
   criada com `--system-site-packages` e o importa de
   `/usr/lib/python3/dist-packages`.
 - WebKit2GTK 4.1 (`libwebkit2gtk-4.1-0`; validado com 2.52.3 no
@@ -35,24 +35,20 @@ O ambiente validado usa o PyGObject do **sistema**, não do pip:
   syscalls de rede durante a janela idle; ambos são dependências do smoke,
   não do aplicativo instalado.
 
-Instalação do lado Python: o `requirements.in` trava `pywebview==6.2.1`
+Instalação do lado Python: o lock trava `pywebview==6.2.1`
 (**sem** o extra `[gtk]`). O backend GTK é selecionado automaticamente
 pelo pywebview no Linux quando o PyGObject do sistema e o WebKitGTK
 estão disponíveis; o extra `[gtk]` do pip (que traria
 `PyGObject==3.50.0` do PyPI) **não** é usado nem validado. Instalação
-reproduzível do ambiente validado:
+reproduzível do ambiente validado (workflow `uv`, #353):
 
 ```bash
 sudo apt install python3-gi gir1.2-webkit2-4.1 libgtk-3-0 \
-  xvfb xdotool strace python3.12-venv
-# venv com acesso aos pacotes Python do sistema (python3-gi):
-python3 -m venv .venv --system-site-packages
-source .venv/bin/activate
-pip install -r backend/requirements.txt   # instala pywebview==6.2.1 (sem extra)
-# alternativa com uv (reproduzida): 
-#   uv venv .venv --system-site-packages --python /usr/bin/python3.12
-#   uv pip install -r backend/requirements.txt --index-strategy unsafe-best-match
-#   (--index-strategy por causa do --extra-index-url do torch no lock)
+  xvfb xdotool strace
+# venv gerenciada pelo uv com acesso aos pacotes Python do sistema
+# (python3-gi), sincronizada a partir de backend/uv.lock:
+uv venv backend/.venv --system-site-packages --python /usr/bin/python3.12
+uv sync --project backend --frozen --reinstall
 ```
 
 Sem display (`$DISPLAY` vazio) o shell termina com exit code 1 e um
@@ -115,7 +111,7 @@ cd frontend && npm ci && npm run build && cd ..
 
 # smoke headless
 xvfb-run -a -s "-screen 0 1280x800x24" \
-  .venv/bin/python scripts/desktop_smoke.py
+  uv run --project backend python scripts/desktop_smoke.py
 ```
 
 Sucesso: todas as linhas `[PASS]` e `SMOKE_OK` no final.

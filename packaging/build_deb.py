@@ -445,10 +445,36 @@ def guard_vendor(vendor_dir: Path) -> None:
                 )
 
 
+def ensure_pip(python: str) -> list[str]:
+    """Return a pip invocation, seeding pip into the venv if needed (#353).
+
+    The wheel-download step shells out to ``python -m pip download``.
+    venvs created by ``uv sync`` ship WITHOUT pip by default (uv installs
+    everything itself), so a fresh CI/desktop environment under the uv
+    workflow would break here. Seeding pip via ``uv pip install`` into the
+    existing venv is idempotent and does not change the desktop package's
+    dependency closure: pip is only a build tool used to FETCH the locked
+    wheels, never vendored into the .deb.
+    """
+    try:
+        run([python, "-m", "pip", "--version"], stdout=subprocess.DEVNULL)
+        return [python, "-m", "pip"]
+    except subprocess.CalledProcessError:
+        uv = shutil.which("uv")
+        if uv is None:
+            fail(
+                "the desktop build needs pip in its venv to download wheels; "
+                "uv is not available to seed it. Create the venv with "
+                "`uv venv --seed` or install pip into it."
+            )
+        run([uv, "pip", "install", "--python", python, "pip"])
+        return [python, "-m", "pip"]
+
+
 def build(
     version: str,
     out_dir: Path,
-    pip: list[str],
+    pip: list[str] | None = None,
     keep_stage: Path | None = None,
 ) -> Path:
     validate_target()
@@ -461,6 +487,9 @@ def build(
             "frontend/ first (the production build is packaged, never a stub)"
         )
     lock = parse_lock(REPO_ROOT / "packaging" / "requirements-desktop.txt")
+
+    # ── pip for wheel download (uv-managed venvs ship without it, #353) ─
+    pip_cmd = ensure_pip(pip[0] if pip else sys.executable)
 
     stage = keep_stage or Path(tempfile.mkdtemp(prefix="katherine-deb-"))
     stage.mkdir(parents=True, exist_ok=True)
@@ -492,7 +521,7 @@ def build(
 
     # ── vendored wheels (deps-only closure) ─────────────────────────
     with tempfile.TemporaryDirectory(prefix="katherine-wheels-") as wd:
-        wheels = download_wheels(lock, Path(wd), pip)
+        wheels = download_wheels(lock, Path(wd), pip_cmd)
         vendor = stage / APP_DIR / "vendor"
         vendor.mkdir()
         for f in wheels:
@@ -612,7 +641,7 @@ def main(argv: list[str] | None = None) -> int:
     if not out.is_absolute():
         out = REPO_ROOT / out
     keep = Path(args.keep_stage) if args.keep_stage else None
-    build(args.version, out, [args.pip, "-m", "pip"], keep)
+    build(args.version, out, [args.pip], keep)
     return 0
 
 

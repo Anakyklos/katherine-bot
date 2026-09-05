@@ -1,13 +1,15 @@
 # Desktop runtime dependencies for the Katherine .deb (#338).
 #
-# This is a DELIBERATELY SEPARATE lock from backend/requirements.in:
-# the .deb ships only what the desktop runtime imports (the companion
-# graph + the lazy remote provider), not the cloud/web stack (FastAPI,
-# uvicorn, Supabase, torch, sentence-transformers) that the desktop
-# never loads (proven by backend/tests/test_desktop_import_isolation.py).
+# This is a DELIBERATELY SEPARATE lock from the backend's authoritative
+# pyproject.toml + uv.lock (#353): the .deb ships only what the desktop
+# runtime imports (the companion graph + the lazy remote provider), not
+# the cloud/web stack (FastAPI, uvicorn, Supabase, torch,
+# sentence-transformers) that the desktop never loads (proven by
+# backend/tests/test_desktop_import_isolation.py).
 #
-# Versions mirror backend/requirements.txt pins so the packaged app
-# runs the same code as the checkout.
+# Versions mirror the backend lock pins (uv.lock) so the packaged app
+# runs the same code as the checkout; the consistency is enforced by
+# packaging/test_build_deb.py and backend/tests/test_uv_workflow.py.
 #
 # Native/system dependencies (NOT pip): python3-gi, WebKitGTK 4.1,
 # GTK 3 — provided by the .deb Depends field, matching the validated
@@ -17,7 +19,7 @@ pywebview==6.2.1
 python-dotenv==1.2.2
 groq==1.5.0
 
-# Transitive pins mirroring backend/requirements.txt exactly, so the
+# Transitive pins mirroring the backend uv.lock exactly, so the
 # packaged dependency closure is byte-identical to the validated one.
 annotated-types==0.7.0
 anyio==4.14.1

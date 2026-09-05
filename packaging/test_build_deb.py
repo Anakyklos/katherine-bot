@@ -58,7 +58,20 @@ def test_desktop_lock_contains_only_pinned_runtime_dependencies() -> None:
 
 
 def test_shared_desktop_pins_match_backend_runtime_lock() -> None:
-    backend = _normalized_pins(REPO_ROOT / "backend/requirements.txt")
+    """Desktop pins shared with the backend must match backend/uv.lock.
+
+    The backend's authoritative graph is pyproject.toml + uv.lock since
+    #353 (backend/requirements.txt is only a uv-generated Docker export);
+    this guard keeps the packaged desktop closure pinned to the same
+    versions the checkout runs.
+    """
+    import tomllib
+
+    with (REPO_ROOT / "backend" / "uv.lock").open("rb") as stream:
+        lock = tomllib.load(stream)
+    backend = {
+        entry["name"]: entry["version"] for entry in lock["package"]
+    }
     for path in (
         REPO_ROOT / "packaging/requirements-desktop.in",
         REPO_ROOT / "packaging/requirements-desktop.txt",
