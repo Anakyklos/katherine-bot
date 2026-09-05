@@ -346,6 +346,16 @@ test('validateEmotionState: unknown emotion name returns null', () => {
     assert.strictEqual(validateEmotionState(payload), null);
 });
 
+test('validateEmotionState: inherited property names are not canonical emotions', () => {
+    for (const name of ['constructor', 'toString', '__proto__']) {
+        const payload = {
+            ...VALID_PAYLOAD,
+            dominant_emotions: [{ name, intensity: 0.5 }],
+        };
+        assert.strictEqual(validateEmotionState(payload), null, name);
+    }
+});
+
 test('validateEmotionState: duplicate emotion names returns null', () => {
     const payload = {
         ...VALID_PAYLOAD,

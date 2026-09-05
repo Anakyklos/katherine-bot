@@ -116,6 +116,59 @@ describe('vendored bfce lifecycle boundary', () => {
         );
     });
 
+    it('keeps pointer tracking cleanup correct when track is toggled through set', () => {
+        vi.stubGlobal('requestAnimationFrame', vi.fn(() => 1));
+        vi.stubGlobal('cancelAnimationFrame', vi.fn());
+        const addEventListener = vi.spyOn(window, 'addEventListener');
+        const removeEventListener = vi.spyOn(window, 'removeEventListener');
+        const host = makeHost();
+
+        const face = createFace(host, {
+            expression: 'idle',
+            track: false,
+            blink: false,
+            idle: false,
+        });
+        face.set({ track: true });
+        face.set({ track: false });
+        face.destroy();
+
+        for (const eventName of ['pointermove', 'pointerdown', 'blur']) {
+            expect(addEventListener).toHaveBeenCalledWith(
+                eventName,
+                expect.any(Function),
+                expect.anything(),
+            );
+            expect(removeEventListener).toHaveBeenCalledWith(
+                eventName,
+                expect.any(Function),
+                expect.anything(),
+            );
+        }
+    });
+
+    it('does not reactivate pointer tracking after destroy', () => {
+        vi.stubGlobal('requestAnimationFrame', vi.fn(() => 1));
+        vi.stubGlobal('cancelAnimationFrame', vi.fn());
+        const addEventListener = vi.spyOn(window, 'addEventListener');
+        const host = makeHost();
+
+        const face = createFace(host, {
+            expression: 'idle',
+            track: false,
+            blink: false,
+            idle: false,
+        });
+        face.destroy();
+        face.set({ track: true });
+
+        expect(addEventListener).not.toHaveBeenCalledWith(
+            'pointermove',
+            expect.any(Function),
+            expect.anything(),
+        );
+    });
+
     it('consults prefers-reduced-motion and avoids network activity', () => {
         const requestFrame = vi.fn(() => 1);
         vi.stubGlobal('requestAnimationFrame', requestFrame);

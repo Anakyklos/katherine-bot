@@ -19,6 +19,7 @@ vi.mock('../src/vendor/bfce/Face.jsx', () => ({
 }));
 
 import KatherineFace from '../src/features/katherine-face/KatherineFace.jsx';
+import * as bfcePublic from '../src/vendor/bfce/index.js';
 
 const stateFor = (name, intensity = 0.2) => ({
     schema_version: 1,
@@ -104,5 +105,12 @@ describe('KatherineFace', () => {
 
         fetchSpy.mockRestore();
         xhrOpen.mockRestore();
+    });
+
+    it('keeps unsupported bfce expression presets out of the public vendor surface', () => {
+        expect(bfcePublic).not.toHaveProperty('EXPRESSIONS');
+        expect(bfcePublic).not.toHaveProperty('EXPRESSION_NAMES');
+        expect(bfcePublic).not.toHaveProperty('REACTIONS');
+        expect(bfcePublic).not.toHaveProperty('REACTION_NAMES');
     });
 });

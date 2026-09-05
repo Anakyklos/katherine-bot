@@ -265,6 +265,7 @@ export function createFace(host, options = {}) {
   let boxAt = 0
   let seenAt = 0
   let alive = true
+  let pointerTrackingAcquired = false
 
   const invalidate = () => { box = null }
   window.addEventListener('scroll', invalidate, { passive: true, capture: true })
@@ -491,7 +492,17 @@ export function createFace(host, options = {}) {
     },
 
     set(options) {
+      if (!alive) return api
+      const wasTracking = pointerTrackingAcquired
       Object.assign(opt, options)
+      const shouldTrack = Boolean(opt.track && !reduced)
+      if (!wasTracking && shouldTrack) {
+        acquirePointerTracking()
+        pointerTrackingAcquired = true
+      } else if (wasTracking && !shouldTrack) {
+        releasePointerTracking()
+        pointerTrackingAcquired = false
+      }
       return api
     },
 
@@ -502,7 +513,10 @@ export function createFace(host, options = {}) {
       if (observer) observer.disconnect()
       window.removeEventListener('scroll', invalidate, { capture: true })
       window.removeEventListener('resize', invalidate)
-      if (opt.track && !reduced) releasePointerTracking()
+      if (pointerTrackingAcquired) {
+        releasePointerTracking()
+        pointerTrackingAcquired = false
+      }
       root.remove()
     },
   }
@@ -511,7 +525,10 @@ export function createFace(host, options = {}) {
     for (const key in shape) settle(shape[key])
   }
 
-  if (opt.track && !reduced) acquirePointerTracking()
+  if (opt.track && !reduced) {
+    acquirePointerTracking()
+    pointerTrackingAcquired = true
+  }
   if (!reduced) join(api)
   frame(1 / 60, performance.now())
 

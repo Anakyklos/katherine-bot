@@ -31,6 +31,8 @@ export const intensityToPercent = (val) => {
  */
 export const toPercent = (val) => intensityToPercent(val);
 
+const hasOwn = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
+
 /**
  * Validate the public emotion state payload from the backend.
  * Returns the validated payload object, or null if invalid.
@@ -73,7 +75,7 @@ export const validateEmotionState = (payload) => {
         if (!item || typeof item !== 'object' || Array.isArray(item)) return null;
         if (typeof item.name !== 'string' || item.name.length === 0) return null;
         // Reject unknown canonical names
-        if (!(item.name in EMOTION_LABELS)) return null;
+        if (!hasOwn(EMOTION_LABELS, item.name)) return null;
         // Reject duplicates
         if (seenNames.has(item.name)) return null;
         seenNames.add(item.name);
@@ -107,7 +109,7 @@ export const validateEmotionState = (payload) => {
 /**
  * Map canonical emotion names to Portuguese display labels.
  */
-export const EMOTION_LABELS = {
+export const EMOTION_LABELS = Object.freeze({
     joy: 'Alegria',
     sadness: 'Tristeza',
     anger: 'Raiva',
@@ -121,7 +123,7 @@ export const EMOTION_LABELS = {
     pride: 'Orgulho',
     jealousy: 'Ciúmes',
     gratitude: 'Gratidão',
-};
+});
 
 /**
  * Get the display label for a canonical emotion name.
@@ -130,5 +132,5 @@ export const EMOTION_LABELS = {
  */
 export const getEmotionLabel = (name) => {
     if (!name || typeof name !== 'string') return null;
-    return EMOTION_LABELS[name] || null;
+    return hasOwn(EMOTION_LABELS, name) ? EMOTION_LABELS[name] : null;
 };
