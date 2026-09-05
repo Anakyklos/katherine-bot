@@ -76,7 +76,7 @@ jobs:
         with:
           version: "0.12.5"
           enable-cache: true
-          cache-dependency-path: backend/uv.lock
+          cache-dependency-glob: backend/uv.lock
 
       - name: Sync locked backend environment (fails on lock drift)
         working-directory: backend
@@ -398,13 +398,13 @@ jobs:
         with:
           version: "0.12.5"
           enable-cache: true
-          cache-dependency-path: backend/uv.lock
+          cache-dependency-glob: backend/uv.lock
 
       - name: Sync locked backend environment (fails on lock drift)
         working-directory: backend
         run: |
           uv sync --frozen
-          uv pip check --project backend
+          uv pip check
 
       - name: Verify CPU-only Torch
         run: |
@@ -599,7 +599,7 @@ jobs:
         with:
           version: "0.12.5"
           enable-cache: true
-          cache-dependency-path: backend/uv.lock
+          cache-dependency-glob: backend/uv.lock
 
       - name: Set up Node
         uses: actions/setup-node@v4
