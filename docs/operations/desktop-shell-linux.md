@@ -304,8 +304,9 @@ nenhum processo remanescente, nenhum listener TCP e `idle_internet_syscalls=0`.
 Ambiente da medição: Linux Mint 22.3, kernel 7.0.0-30-generic, x86_64,
 Python 3.12.3, PyGObject 3.48.2, WebKitGTK 2.52.3, Node.js 22.23.2,
 12 CPUs. O pacote foi construído com `SOURCE_DATE_EPOCH=1700000000`.
-Uma reconstrução do mesmo commit e versão produziu o mesmo SHA-256:
-`9d5b9f27952ff84be1ffd6d36368895bc806a646f4460f867a7b1110ed78b00f`.
+As duas reconstruções da versão medida `0.1.0~final2` produziram o mesmo
+SHA-256:
+`e525a8a38a42fa8e5df3576602975306c548107af254bd5e451b33a795632085`.
 O builder fixa `SOURCE_DATE_EPOCH` e verifica os hashes dos 18 artefatos
 Python antes de desempacotá-los, incluindo o wheel nativo do `pydantic-core`.
 
@@ -314,7 +315,7 @@ Os números abaixo são uma execução real do `GUI_RESULTS`, em Xvfb
 processos do app na amostra, PSS é a soma proporcional de `smaps_rollup`, e
 os picos são acompanhados durante cada janela. O tracer `strace` é excluído
 dos agregados de recursos, mas o grupo dedicado continua sendo verificado no
-shutdown. Idle foi amostrado por 5.39 s e o turno de UI por 3 s. Eles são
+shutdown. Idle foi amostrado por 5.33 s e o turno de UI por 3 s. Eles são
 evidência do ambiente acima, não limites de aceitação:
 
 | Medida | Resultado |
@@ -325,26 +326,26 @@ evidência do ambiente acima, não limites de aceitação:
 | Árvore instalada (`du -sk`) | 13,748 KiB |
 | Bundle frontend (`dist`) | 632,210 bytes (617.4 KiB) |
 | Banco inicial `katherine.db` | 4,096 bytes |
-| Startup até janela GTK | 1,041.5 ms |
-| Pico RSS durante startup | 257,572 KiB |
-| Pico PSS durante startup | 125,836 KiB |
-| RSS idle, pico agregado | 602,664 KiB |
-| PSS idle, pico agregado | 352,689 KiB |
-| RSS idle, snapshot breakdown | 598,772 KiB |
-| PSS idle, snapshot breakdown | 348,733 KiB |
-| CPU idle, janela de 5.39 s | 0.19% |
+| Startup até janela GTK | 1,042.4 ms |
+| Pico RSS durante startup | 408,600 KiB |
+| Pico PSS durante startup | 195,707 KiB |
+| RSS idle, pico agregado | 602,968 KiB |
+| PSS idle, pico agregado | 353,031 KiB |
+| RSS idle, snapshot breakdown | 598,692 KiB |
+| PSS idle, snapshot breakdown | 348,692 KiB |
+| CPU idle, janela de 5.33 s | 0.19% |
 | Processos idle do app | 3 |
-| Threads idle do app | 93 |
-| Pico RSS durante turno de UI | 641,568 KiB |
-| Pico PSS durante turno de UI | 391,402 KiB |
-| CPU durante turno UI/bridge, janela de 3 s | 43.95% |
-| Shutdown após fechar a janela | 163.8 ms |
+| Threads idle do app | 95 |
+| Pico RSS durante turno de UI | 650,520 KiB |
+| Pico PSS durante turno de UI | 400,373 KiB |
+| CPU durante turno UI/bridge, janela de 3 s | 12.79% |
+| Shutdown após fechar a janela | 113.8 ms |
 | Syscalls de rede idle | 0 |
 | Syscalls Internet idle (`AF_INET/AF_INET6`) | 0 |
 | Sockets TCP/UDP idle observados | 0 |
 | Listeners TCP observados | 0 |
 | Crescimento de logs na sessão | 0 bytes |
-| Crescimento de cache na sessão | 164,560 bytes |
+| Crescimento de cache na sessão | 166,682 bytes |
 
 A variação de startup e CPU entre execuções depende da carga do host e do
 backend WebKitGTK. Por isso o projeto registra os números observados e o
@@ -354,14 +355,14 @@ método, sem transformar esta amostra em um threshold artificial.
 
 | Processo/role | RSS | PSS | Threads |
 | --- | ---: | ---: | ---: |
-| Python principal | 219,124 KiB | 101,938 KiB | 36 |
-| WebKit network process | 52,252 KiB | 18,495 KiB | 8 |
-| WebKit web process | 327,396 KiB | 228,300 KiB | 49 |
-| **Total no snapshot** | **598,772 KiB** | **348,733 KiB** | **93** |
+| Python principal | 218,960 KiB | 101,643 KiB | 36 |
+| WebKit network process | 52,408 KiB | 18,526 KiB | 8 |
+| WebKit web process | 327,324 KiB | 228,523 KiB | 51 |
+| **Total no snapshot** | **598,692 KiB** | **348,692 KiB** | **95** |
 
 Os cerca de 603 MiB de RSS não são um único processo Python: a maior parte
-vem do `WebKitWebProcess` (327,396 KiB RSS) e do Python principal (219,124
-KiB), com mais 52,252 KiB do processo de rede WebKit. O RSS soma páginas
+vem do `WebKitWebProcess` (327,324 KiB RSS) e do Python principal (218,960
+KiB), com mais 52,408 KiB do processo de rede WebKit. O RSS soma páginas
 compartilhadas mais de uma vez entre processos; o PSS de `smaps_rollup`,
 348,733 KiB no snapshot, é a medida apropriada para custo proporcional. O
 resultado representa o custo real do modelo multiprocessado WebKitGTK usado
@@ -371,9 +372,9 @@ não produziu syscall `AF_INET/AF_INET6` e não houve tráfego de saída
 observado.
 
 O turno de provider controlado, separado do benchmark gráfico, registrou
-`provider_turn_duration_ms=44.1`, `provider_turn_rss_before_kib=51,584`,
-`provider_turn_rss_peak_kib=51,868`, `provider_turn_pss_peak_kib=40,718` e
-`provider_turn_cpu_percent=19.35`. Esse número mede o caminho real do
+`provider_turn_duration_ms=42.5`, `provider_turn_rss_before_kib=51,664`,
+`provider_turn_rss_peak_kib=51,948`, `provider_turn_pss_peak_kib=40,771` e
+`provider_turn_cpu_percent=12.4`. Esse número mede o caminho real do
 runtime/adapter com transporte determinístico, sem fingir uma chamada de
 rede real.
 
