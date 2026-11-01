@@ -3,11 +3,11 @@
 **Issues:** [#370](https://github.com/Anakyklos/Katherine-bot/issues/370), [#332](https://github.com/Anakyklos/Katherine-bot/issues/332)
 
 **Conclusão:** **INCONCLUSIVE**
-**Execuções completas:** 2 × 20 frases, CPU, 1º de novembro de 2026
+**Execuções completas:** 3 × 20 frases, CPU, 1º de novembro de 2026 (duas medições iniciais e uma reexecução após a correção P1)
 
 ## Decisão
 
-A síntese real local está comprovada neste host: o Kokoro-82M v1.0 com a voz `pf_dora` gerou 20 WAVs válidos em cada uma de duas execuções completas, usando a fonemização `pt-br` e PyTorch CPU. O RTF agregado ficou abaixo de 1 nas duas execuções.
+A síntese real local está comprovada neste host: o Kokoro-82M v1.0 com a voz `pf_dora` gerou 20 WAVs válidos em cada uma de três execuções completas, usando a fonemização `pt-br` e PyTorch CPU. O RTF agregado ficou abaixo de 1 nas três execuções.
 
 O resultado é **INCONCLUSIVE** porque nenhuma pessoa avaliou as amostras. Os arquivos comprovam formato, duração, finitude e ausência de clipping amostrado; não comprovam inteligibilidade, pronúncia brasileira adequada, naturalidade, timbre agradável ou ausência perceptiva de cortes e distorções. Além disso, não foi aprovado um limite de memória ou latência para o desktop. Este relatório não recomenda integração nem substitui a decisão do mantenedor.
 
@@ -87,7 +87,7 @@ As três respostas curtas (`Sim.`, `Entendi.`, `Claro!`) geraram WAVs de 0,75–
 
 O snapshot do desktop instalado documentado em [`desktop-shell-linux.md`](../operations/desktop-shell-linux.md) mede PSS agregado de 348.577 KiB em idle e 396.229 KiB durante turno de UI. O PSS incremental deste worker separado ficou em cerca de 5,0–5,2 vezes o pico PSS do turno de UI. É uma comparação de escala entre medições documentadas no mesmo perfil de host, não uma execução simultânea ou um orçamento de aceitação. A soma de memória do app + TTS não foi medida e não deve ser inferida como valor de integração.
 
-Os aproximadamente 82 milhões de parâmetros não predizem esse consumo: o PSS pico observado ficou entre 1,88 e 1,97 GiB. As duas rodadas também mostram que frases mais longas elevam o pico amostrado.
+Os aproximadamente 82 milhões de parâmetros não predizem esse consumo: o PSS pico observado nas três execuções completas ficou entre 1,88 e 2,05 GiB. As duas medições iniciais também mostram que frases mais longas elevam o pico amostrado.
 
 ### Disco e saída
 
@@ -158,17 +158,27 @@ Os `metrics.json` medidos ficaram em `diagnostic-01`, `diagnostic-02`, `full-01`
 
 ## Testes e limites de aceite
 
-- Harness isolado: **25 passed**; sintaxe verificada por `py_compile`.
+- Harness isolado: **31 passed** após a correção P1 da PR #371; sintaxe verificada por `py_compile`.
 - `uv lock --project benchmarks/kokoro_ptbr --check`: passou.
 - `uv lock --project backend --check`: passou; nenhum arquivo de lock do backend foi alterado.
 - Backend, comando unitário do CI com os módulos de banco real explicitamente excluídos: **2.985 passed, 1 warning**, em 27,83 s.
 - `git diff --check`: registrado na entrega da PR.
 - A execução exploratória sem exclusões do CI coletou testes de integração de banco fora do ambiente Supabase: **2.985 passed, 25 failed, 210 errors**; as falhas ficaram nos módulos DB-only/preflight que o workflow do CI exclui. A execução final acima usa o filtro oficial do job unitário; nenhuma variável `SUPABASE_URL` estava configurada.
 
+### Verificação da correção P1 da PR #371
+
+A revisão apontou que `completed` não garantia cobertura integral do corpus nem consistência dos WAVs. A classificação agora exige contagem exata, IDs completos e únicos, acordo com `synthesized_count`, e existência, hash, cabeçalho, dados PCM e metadados consistentes para cada WAV. Inconsistências produzem erro fixo e sanitizado; `metrics.json` conserva as contagens, IDs divergentes e diagnóstico por artefato.
+
+- Testes negativos cobrem amostra ausente, ID duplicado, divergência da contagem do worker e WAV ausente ou corrompido; todos confirmam `status=failed` e evidência de validação preservada em `metrics.json`.
+- Inferência real em CPU após a correção: corpus completo de 20 frases, saída externa em `$CACHE_ROOT/runs/p1-validation-full-01`, pelo comando `run` de reprodução acima sem `--limit`, `--threads 4`, modelo `hexgrad/Kokoro-82M` na revisão `f3ff3571791e39611d31c381e3a41a3af07b4987` e voz `pf_dora`. Assets já verificados; a execução não baixou artefatos.
+- `metrics.json` registrou `status=completed`, contagens esperada/eventos/worker de **20/20/20**, IDs sem ausência, duplicação ou excedentes e 20/20 WAVs íntegros. Cabeçalho/dados e metadados passaram em todos; hashes SHA-256 individuais foram preservados nos registros de cada artefato no próprio `metrics.json`.
+- A reexecução gerou 83,825 s de áudio em 61,892 s de G2P + inferência (RTF 0,738; throughput 1,354× realtime). O pico amostrado foi 2.106 MiB RSS e 2.094 MiB PSS, incluindo baseline inferior a 1 MiB; primeiro WAV pronto em 6.718 s, encerramento do worker após shutdown em 982 ms e nenhum arquivo parcial ou processo persistente.
+- A execução completa comprova o caminho corrigido para o corpus integral. Ainda não houve avaliação auditiva; a conclusão de qualidade segue **INCONCLUSIVE**.
+
 Não há critério aprovado de RAM, latência, qualidade subjetiva ou custo de instalação para declarar o candidato apto. Não classificar como PASS sem avaliação auditiva e decisão do mantenedor. Nenhum limite novo foi criado neste experimento.
 
 ## Escopo, risco e rollback
 
-O risco medido mais relevante é a memória standalone: aproximadamente 1,9–2,0 GiB PSS de pico e cerca de 1,0 GiB PSS no idle carregado. A avaliação de qualidade brasileira ainda depende de escuta. A distribuição transitive GPL também requer análise antes de eventual integração no produto.
+O risco medido mais relevante é a memória standalone: aproximadamente 1,9–2,1 GiB PSS de pico nas três execuções completas e cerca de 1,0 GiB PSS no idle carregado nas duas medições iniciais. A avaliação de qualidade brasileira ainda depende de escuta. A distribuição transitive GPL também requer análise antes de eventual integração no produto.
 
 O trabalho adiciona somente uma ferramenta, corpus, lock isolado, testes e este relatório. `ConversationEngine`, `LanguageModel`, backend de produção, locks do backend, bundle React, SQLite, sistema emocional, microfone/STT, empacotamento e interface desktop não foram alterados. Não há migração. Rollback consiste em reverter esta PR; os arquivos de modelo, cache e áudio são externos ao repositório e podem ser removidos separadamente pelo mantenedor conforme a política local.

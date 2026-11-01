@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -32,6 +33,139 @@ def candidate_args(**overrides):
     }
     values.update(overrides)
     return argparse.Namespace(**values)
+
+
+def _make_test_sample(tmp_path: Path, sample_id: str) -> dict:
+    source_dir = tmp_path / "sample-source"
+    source_dir.mkdir(exist_ok=True)
+    source_path = source_dir / f"{sample_id}.wav"
+    wav_info = benchmark._atomic_write_wav(
+        source_path,
+        np.array([0.1, -0.1, 0.2, -0.2], dtype=np.float32),
+        sf,
+        np,
+        benchmark.SAMPLE_RATE_HZ,
+    )
+    generation_ms = 4.0
+    return {
+        "event": "sample_complete",
+        "id": sample_id,
+        "category": "synthetic",
+        "text_chars": 4,
+        "phoneme_chars": 4,
+        "phonemization_ms": 1.0,
+        "inference_ms": 3.0,
+        "generation_ms": generation_ms,
+        "cpu_seconds": 0.004,
+        "cpu_mean_percent": 100.0,
+        "audio_duration_seconds": round(wav_info["audio_duration_seconds"], 6),
+        "real_time_factor": round(generation_ms / 1000 / wav_info["audio_duration_seconds"], 6),
+        **wav_info,
+    }
+
+
+def _run_fake_worker(
+    tmp_path: Path,
+    monkeypatch,
+    sample_ids: list[str],
+    worker_count: int,
+    *,
+    missing_wavs: set[str] | None = None,
+    corrupt_wavs: set[str] | None = None,
+):
+    model_dir = tmp_path / "model"
+    model_dir.mkdir()
+    asset = model_dir / "placeholder.asset"
+    asset.write_bytes(b"test asset")
+    asset_paths = {item["path"]: asset for item in benchmark._read_spec()["assets"]}
+    monkeypatch.setattr(benchmark, "verify_assets", lambda _model_dir: asset_paths)
+
+    corpus = tmp_path / "corpus.jsonl"
+    corpus.write_text(
+        json.dumps({"id": "sample_a", "category": "synthetic", "text": "A."}) + "\n"
+        + json.dumps({"id": "sample_b", "category": "synthetic", "text": "B."}) + "\n",
+        encoding="utf-8",
+    )
+    output_dir = tmp_path / "output"
+    args = candidate_args(
+        model_dir=model_dir,
+        corpus=corpus,
+        output_dir=output_dir,
+        cache_dir=tmp_path / "hf-cache",
+        uv_cache_dir=tmp_path / "uv-cache",
+        limit=None,
+        idle_seconds=0,
+        threads=1,
+    )
+    sample_events = [_make_test_sample(tmp_path, sample_id) for sample_id in sample_ids]
+    missing_wavs = missing_wavs or set()
+    corrupt_wavs = corrupt_wavs or set()
+
+    class FakeSampler:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def set_phase(self, _phase):
+            pass
+
+        def stop(self):
+            return {
+                "rss_baseline_kib": 1,
+                "pss_baseline_kib": 1,
+                "rss_peak_kib": 1,
+                "pss_peak_kib": 1,
+                "rss_incremental_peak_kib": 0,
+                "pss_incremental_peak_kib": 0,
+                "phases": {},
+            }
+
+    class FakeProcess:
+        pid = 123456
+
+        def __init__(self, events):
+            self.stdout = io.StringIO("".join(json.dumps(event) + "\n" for event in events))
+            self.stderr = io.StringIO("")
+
+        @staticmethod
+        def wait(timeout=None):
+            return 0
+
+        @staticmethod
+        def poll():
+            return 0
+
+    def fake_popen(*_args, **_kwargs):
+        for sample_id in set(sample_ids):
+            source_path = tmp_path / "sample-source" / f"{sample_id}.wav"
+            target_path = output_dir / f"{sample_id}.wav"
+            if sample_id in missing_wavs:
+                continue
+            target_path.write_bytes(source_path.read_bytes())
+            if sample_id in corrupt_wavs:
+                target_path.write_bytes(b"corrupt wav")
+        events = [
+            {"event": "model_ready", "model_load_ms": 1.0, "runtime": {}},
+            {"event": "phase", "phase": "loaded_idle"},
+            *sample_events,
+            {"event": "phase", "phase": "shutdown"},
+            {
+                "event": "worker_result",
+                "model_load_ms": 1.0,
+                "model_load_cpu_seconds": 0.0,
+                "loaded_idle": {"cpu_seconds": 0.0, "cpu_mean_percent": 0.0},
+                "runtime": {},
+                "synthesized_count": worker_count,
+            },
+        ]
+        return FakeProcess(events)
+
+    monkeypatch.setattr(benchmark, "ProcessSampler", FakeSampler)
+    monkeypatch.setattr(benchmark.platform, "platform", lambda: "test-linux-x86_64")
+    monkeypatch.setattr(benchmark.subprocess, "Popen", fake_popen)
+    return args
 
 
 def test_versioned_synthetic_corpus_has_twenty_items_and_short_responses():
@@ -149,6 +283,65 @@ def test_run_missing_assets_does_not_start_worker_or_download(tmp_path, monkeypa
         benchmark.run_benchmark(args)
     assert raised.value.code == "asset_missing"
     assert not args.output_dir.exists()
+
+
+def test_run_completes_only_when_events_worker_count_and_wavs_match(tmp_path, monkeypatch):
+    args = _run_fake_worker(tmp_path, monkeypatch, ["sample_a", "sample_b"], 2)
+
+    metrics = benchmark.run_benchmark(args)
+
+    assert metrics["status"] == "completed"
+    assert metrics["result_validation"]["valid"] is True
+    assert metrics["result_validation"]["expected_count"] == 2
+    assert metrics["result_validation"]["event_count"] == 2
+    assert metrics["result_validation"]["worker_synthesized_count"] == 2
+    assert [artifact["valid"] for artifact in metrics["result_validation"]["artifacts"]] == [True, True]
+
+
+@pytest.mark.parametrize(
+    ("sample_ids", "worker_count", "missing_wavs", "corrupt_wavs", "error_code", "issue_code"),
+    [
+        (["sample_a"], 1, set(), set(), "result_incomplete", "sample_count_mismatch"),
+        (["sample_a", "sample_a"], 2, set(), set(), "result_incomplete", "sample_id_duplicate"),
+        (["sample_a", "sample_b"], 1, set(), set(), "result_incomplete", "worker_count_mismatch"),
+        (["sample_a", "sample_b"], 2, {"sample_b"}, set(), "artifact_invalid", "artifact_file_set_mismatch"),
+        (["sample_a", "sample_b"], 2, set(), {"sample_b"}, "artifact_invalid", "artifact_invalid"),
+    ],
+    ids=["missing-sample", "duplicate-sample", "worker-count-diverges", "wav-missing", "wav-corrupt"],
+)
+def test_inconsistent_results_fail_and_preserve_metrics(
+    tmp_path,
+    monkeypatch,
+    sample_ids,
+    worker_count,
+    missing_wavs,
+    corrupt_wavs,
+    error_code,
+    issue_code,
+):
+    args = _run_fake_worker(
+        tmp_path,
+        monkeypatch,
+        sample_ids,
+        worker_count,
+        missing_wavs=missing_wavs,
+        corrupt_wavs=corrupt_wavs,
+    )
+
+    with pytest.raises(benchmark.BenchmarkError) as raised:
+        benchmark.run_benchmark(args)
+
+    assert raised.value.code == error_code
+    assert str(raised.value) == benchmark.ERROR_MESSAGES[error_code]
+    metrics = json.loads((args.output_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert metrics["status"] == "failed"
+    assert metrics["error_code"] == error_code
+    assert metrics["result_validation"]["valid"] is False
+    assert issue_code in metrics["result_validation"]["issue_codes"]
+    assert len(metrics["samples"]) == len(sample_ids)
+    assert metrics["process"]["partial_files_remaining"] is False
+    if error_code == "artifact_invalid":
+        assert "sample_b" in metrics["result_validation"]["invalid_wav_ids"]
 
 
 def test_corpus_rejects_invalid_duplicate_and_oversized_entries(tmp_path):
@@ -327,6 +520,23 @@ def test_metrics_schema_requires_structured_timing_resources_and_samples():
         "disk": {"model_assets_apparent_bytes": 1, "huggingface_cache_apparent_bytes": 1, "uv_cache_apparent_bytes": 1, "installed_benchmark_environment_apparent_bytes": 1, "generated_wav_apparent_bytes": 1},
         "audio_output": {},
         "samples": [{"id": "short", "audio_file": "short.wav", "audio_duration_seconds": 1, "generation_ms": 1, "cpu_seconds": 1, "cpu_mean_percent": 100, "real_time_factor": 1, "wav_sha256": "0" * 64}],
+        "result_validation": {
+            "valid": True,
+            "error_code": None,
+            "expected_count": 1,
+            "event_count": 1,
+            "worker_synthesized_count": 1,
+            "expected_ids": ["short"],
+            "observed_ids": ["short"],
+            "missing_ids": [],
+            "duplicate_ids": [],
+            "unexpected_ids": [],
+            "missing_wav_ids": [],
+            "invalid_wav_ids": [],
+            "unexpected_wav_count": 0,
+            "artifacts": [],
+            "issue_codes": [],
+        },
         "process": {},
         "method": {},
     }

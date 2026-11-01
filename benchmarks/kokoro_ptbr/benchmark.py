@@ -20,6 +20,7 @@ import sys
 import tempfile
 import threading
 import time
+import wave
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -52,6 +53,8 @@ ERROR_MESSAGES = {
     "synthesis_failed": "CPU inference failed for a corpus item.",
     "audio_invalid": "Kokoro returned empty, non-finite, or invalid audio.",
     "audio_write_failed": "The generated WAV could not be written and validated.",
+    "result_incomplete": "Worker results do not match the requested corpus; see metrics.json.",
+    "artifact_invalid": "A generated WAV is missing or inconsistent; see metrics.json.",
     "worker_protocol_failed": "The benchmark worker returned an invalid event stream.",
     "interrupted": "The benchmark was interrupted; partial files were removed.",
     "benchmark_failed": "The benchmark could not be completed.",
@@ -529,6 +532,209 @@ def _mean_cpu_percent(cpu_seconds: float, wall_seconds: float) -> float:
     return round(cpu_seconds / wall_seconds * 100.0, 3) if wall_seconds > 0 else 0.0
 
 
+def _inspect_result_wav(path: Path, event: dict[str, Any] | None, sample_id: str) -> dict[str, Any]:
+    filename = f"{sample_id}.wav"
+    exists = path.is_file() and not path.is_symlink()
+    actual_size: int | None = None
+    actual_hash: str | None = None
+    header_valid = False
+    event_valid = event is not None
+    size_matches = False
+    hash_matches = False
+    reported_file_matches = False
+
+    if exists:
+        try:
+            actual_size = path.stat().st_size
+            actual_hash = _sha256(path)
+            with wave.open(str(path), "rb") as wav:
+                channels = wav.getnchannels()
+                sample_width = wav.getsampwidth()
+                sample_rate = wav.getframerate()
+                frame_count = wav.getnframes()
+                header_valid = (
+                    wav.getcomptype() == "NONE"
+                    and channels == 1
+                    and sample_width == 2
+                    and sample_rate == SAMPLE_RATE_HZ
+                    and frame_count > 0
+                )
+                remaining_frames = frame_count
+                while header_valid and remaining_frames > 0:
+                    chunk = wav.readframes(min(8192, remaining_frames))
+                    frame_bytes = channels * sample_width
+                    if not chunk or len(chunk) % frame_bytes != 0:
+                        header_valid = False
+                        break
+                    remaining_frames -= len(chunk) // frame_bytes
+                header_valid = header_valid and remaining_frames == 0
+        except (EOFError, OSError, ValueError, wave.Error):
+            header_valid = False
+
+    if event is not None:
+        reported_file_matches = event.get("audio_file") == filename
+        reported_size = event.get("wav_bytes")
+        size_matches = (
+            isinstance(reported_size, int)
+            and not isinstance(reported_size, bool)
+            and actual_size == reported_size
+        )
+        reported_hash = event.get("wav_sha256")
+        hash_matches = (
+            isinstance(reported_hash, str)
+            and re.fullmatch(r"[0-9a-f]{64}", reported_hash) is not None
+            and actual_hash == reported_hash
+        )
+        try:
+            reported_frames = event.get("frames")
+            reported_rate = event.get("sample_rate_hz")
+            reported_channels = event.get("channels")
+            reported_duration = float(event.get("audio_duration_seconds"))
+            metadata_matches = (
+                isinstance(reported_frames, int)
+                and not isinstance(reported_frames, bool)
+                and isinstance(reported_rate, int)
+                and not isinstance(reported_rate, bool)
+                and isinstance(reported_channels, int)
+                and not isinstance(reported_channels, bool)
+                and reported_rate == SAMPLE_RATE_HZ
+                and reported_channels == 1
+                and event.get("subtype") == "PCM_16"
+                and math.isfinite(reported_duration)
+                and round(reported_frames / SAMPLE_RATE_HZ, 6) == round(reported_duration, 6)
+            )
+        except (TypeError, ValueError, OverflowError):
+            metadata_matches = False
+    else:
+        metadata_matches = False
+
+    valid = exists and event_valid and reported_file_matches and size_matches and hash_matches and header_valid and metadata_matches
+    return {
+        "id": sample_id,
+        "file": filename,
+        "exists": exists,
+        "event_present": event_valid,
+        "reported_file_matches": reported_file_matches,
+        "actual_size_bytes": actual_size,
+        "reported_size_matches": size_matches,
+        "actual_sha256": actual_hash,
+        "reported_sha256_matches": hash_matches,
+        "wav_header_and_data_valid": header_valid,
+        "reported_metadata_matches": metadata_matches,
+        "valid": valid,
+    }
+
+
+def validate_synthesis_result(
+    corpus: list[dict[str, str]],
+    sample_events: list[dict[str, Any]],
+    worker_result: dict[str, Any] | None,
+    output_dir: Path,
+) -> dict[str, Any]:
+    expected_ids = [item["id"] for item in corpus]
+    expected_id_set = set(expected_ids)
+    observed_ids: list[str | None] = []
+    for event in sample_events:
+        sample_id = event.get("id")
+        if isinstance(sample_id, str) and re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,47}", sample_id):
+            observed_ids.append(sample_id)
+        else:
+            observed_ids.append(None)
+
+    observed_valid_ids = [sample_id for sample_id in observed_ids if sample_id is not None]
+    id_counts: dict[str, int] = {}
+    for sample_id in observed_valid_ids:
+        id_counts[sample_id] = id_counts.get(sample_id, 0) + 1
+    duplicate_ids = sorted(sample_id for sample_id, count in id_counts.items() if count > 1)
+    missing_ids = [sample_id for sample_id in expected_ids if id_counts.get(sample_id, 0) == 0]
+    unexpected_ids = sorted(set(observed_valid_ids) - expected_id_set)
+
+    issue_codes: list[str] = []
+
+    def add_issue(code: str) -> None:
+        if code not in issue_codes:
+            issue_codes.append(code)
+
+    if len(sample_events) != len(corpus):
+        add_issue("sample_count_mismatch")
+    if any(sample_id is None for sample_id in observed_ids):
+        add_issue("sample_id_invalid")
+    if duplicate_ids:
+        add_issue("sample_id_duplicate")
+    if missing_ids or unexpected_ids:
+        add_issue("sample_id_mismatch")
+
+    worker_count = worker_result.get("synthesized_count") if worker_result else None
+    worker_count_valid = (
+        isinstance(worker_count, int)
+        and not isinstance(worker_count, bool)
+        and worker_count == len(corpus)
+        and worker_count == len(sample_events)
+    )
+    if not worker_count_valid:
+        add_issue("worker_count_mismatch")
+
+    expected_wav_names = {f"{sample_id}.wav" for sample_id in expected_ids}
+    actual_wav_paths = list(output_dir.glob("*.wav"))
+    actual_wav_names = {path.name for path in actual_wav_paths}
+    missing_file_ids = [sample_id for sample_id in expected_ids if f"{sample_id}.wav" not in actual_wav_names]
+    unexpected_wav_count = len(actual_wav_names - expected_wav_names)
+    if missing_file_ids or unexpected_wav_count or len(actual_wav_paths) != len(expected_ids):
+        add_issue("artifact_file_set_mismatch")
+
+    event_by_id: dict[str, list[dict[str, Any]]] = {}
+    for event, sample_id in zip(sample_events, observed_ids, strict=True):
+        if sample_id is not None and sample_id in expected_id_set:
+            event_by_id.setdefault(sample_id, []).append(event)
+
+    artifacts: list[dict[str, Any]] = []
+    invalid_file_ids: list[str] = []
+    for sample_id in expected_ids:
+        matching_events = event_by_id.get(sample_id, [])
+        event = matching_events[0] if len(matching_events) == 1 else None
+        artifact = _inspect_result_wav(output_dir / f"{sample_id}.wav", event, sample_id)
+        artifact["event_count"] = len(matching_events)
+        if len(matching_events) != 1:
+            artifact["valid"] = False
+        if not artifact["valid"]:
+            invalid_file_ids.append(sample_id)
+        artifacts.append(artifact)
+    if invalid_file_ids or unexpected_wav_count:
+        add_issue("artifact_invalid")
+
+    structural_issues = {
+        "sample_count_mismatch",
+        "sample_id_invalid",
+        "sample_id_duplicate",
+        "sample_id_mismatch",
+        "worker_count_mismatch",
+    }
+    if any(code in structural_issues for code in issue_codes):
+        error_code = "result_incomplete"
+    elif "artifact_file_set_mismatch" in issue_codes or "artifact_invalid" in issue_codes:
+        error_code = "artifact_invalid"
+    else:
+        error_code = None
+
+    return {
+        "valid": not issue_codes,
+        "error_code": error_code,
+        "expected_count": len(corpus),
+        "event_count": len(sample_events),
+        "worker_synthesized_count": worker_count if isinstance(worker_count, int) and not isinstance(worker_count, bool) else None,
+        "expected_ids": expected_ids,
+        "observed_ids": observed_ids,
+        "missing_ids": missing_ids,
+        "duplicate_ids": duplicate_ids,
+        "unexpected_ids": unexpected_ids,
+        "missing_wav_ids": missing_file_ids,
+        "invalid_wav_ids": invalid_file_ids,
+        "unexpected_wav_count": unexpected_wav_count,
+        "artifacts": artifacts,
+        "issue_codes": issue_codes,
+    }
+
+
 def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     _validate_candidate(args)
     asset_paths = verify_assets(args.model_dir)
@@ -622,6 +828,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     worker_result = next((item for item in events if item.get("event") == "worker_result"), None)
     worker_error = next((item for item in events if item.get("event") == "worker_error"), None)
     shutdown_event = next((item for item in events if item.get("event") == "phase" and item.get("phase") == "shutdown"), None)
+    result_validation = validate_synthesis_result(corpus, sample_events, worker_result, args.output_dir)
     if interrupted:
         status = "interrupted"
         error_code = "interrupted"
@@ -633,6 +840,9 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
         error_code = (worker_error or {}).get("code", "benchmark_failed")
         if error_code not in ERROR_MESSAGES:
             error_code = "benchmark_failed"
+    elif not result_validation["valid"]:
+        status = "failed"
+        error_code = result_validation["error_code"] or "benchmark_failed"
     else:
         status = "completed"
         error_code = None
@@ -725,6 +935,7 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             {key: value for key, value in item.items() if key not in {"event", "received_ns", "parent_received_ns", "at_ns"}}
             for item in sample_events
         ],
+        "result_validation": result_validation,
         "process": {
             "worker_exit_code": exit_code,
             "worker_process_exited": exit_code is not None,
@@ -774,7 +985,7 @@ def _atomic_json_write(path: Path, payload: Any) -> None:
 
 
 def validate_metrics_schema(metrics: Any) -> None:
-    required = {"schema_version", "status", "error_code", "host", "candidate", "timing", "resources", "disk", "audio_output", "samples", "process", "method"}
+    required = {"schema_version", "status", "error_code", "host", "candidate", "timing", "resources", "disk", "audio_output", "samples", "process", "method", "result_validation"}
     if not isinstance(metrics, dict) or not required.issubset(metrics):
         raise BenchmarkError("worker_protocol_failed")
     if metrics["schema_version"] != 1 or metrics["status"] not in {"completed", "failed", "interrupted"}:
@@ -788,6 +999,12 @@ def validate_metrics_schema(metrics: Any) -> None:
         if not isinstance(metrics.get(section), dict) or not keys.issubset(metrics[section]):
             raise BenchmarkError("worker_protocol_failed")
     if not isinstance(metrics["samples"], list):
+        raise BenchmarkError("worker_protocol_failed")
+    if not isinstance(metrics["result_validation"], dict) or not {
+        "valid", "error_code", "expected_count", "event_count", "worker_synthesized_count",
+        "expected_ids", "observed_ids", "missing_ids", "duplicate_ids", "unexpected_ids",
+        "missing_wav_ids", "invalid_wav_ids", "unexpected_wav_count", "artifacts", "issue_codes",
+    }.issubset(metrics["result_validation"]):
         raise BenchmarkError("worker_protocol_failed")
     for sample in metrics["samples"]:
         if not isinstance(sample, dict) or not {"id", "audio_file", "audio_duration_seconds", "generation_ms", "cpu_seconds", "cpu_mean_percent", "real_time_factor", "wav_sha256"}.issubset(sample):
