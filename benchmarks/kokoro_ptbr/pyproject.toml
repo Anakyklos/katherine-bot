@@ -1,0 +1,25 @@
+[project]
+name = "katherine-kokoro-ptbr-benchmark"
+version = "0.1.0"
+description = "Isolated, CPU-only Kokoro PT-BR benchmark for Katherine"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "kokoro==0.9.4",
+    "numpy==2.5.1",
+    "soundfile==0.13.1",
+    "torch==2.13.0+cpu",
+]
+
+[dependency-groups]
+test = ["pytest==8.2.1", "pytest-asyncio==0.23.8"]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[tool.uv]
+default-groups = ["test"]

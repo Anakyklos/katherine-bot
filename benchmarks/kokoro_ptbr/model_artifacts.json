@@ -1,0 +1,25 @@
+{
+  "model_id": "hexgrad/Kokoro-82M",
+  "model_revision": "f3ff3571791e39611d31c381e3a41a3af07b4987",
+  "model_release": "v1.0",
+  "voice": "pf_dora",
+  "license": "Apache-2.0",
+  "sample_rate_hz": 24000,
+  "assets": [
+    {
+      "path": "config.json",
+      "sha256": "5abb01e2403b072bf03d04fde160443e209d7a0dad49a423be15196b9b43c17f",
+      "size_bytes": 2351
+    },
+    {
+      "path": "kokoro-v1_0.pth",
+      "sha256": "496dba118d1a58f5f3db2efc88dbdc216e0483fc89fe6e47ee1f2c53f18ad1e4",
+      "size_bytes": 327212226
+    },
+    {
+      "path": "voices/pf_dora.pt",
+      "sha256": "07e4ff987c5d5a8c3995efd15cc4f0db7c4c15e881b198d8ab7f67ecf51f5eb7",
+      "size_bytes": 523425
+    }
+  ]
+}
