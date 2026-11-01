@@ -1,0 +1,20 @@
+{"id":"short_sim","category":"resposta_curta","text":"Sim."}
+{"id":"short_entendi","category":"resposta_curta","text":"Entendi."}
+{"id":"short_claro","category":"resposta_curta","text":"Claro!"}
+{"id":"greeting","category":"saudacao","text":"Oi, Ana! Como você está hoje?"}
+{"id":"farewell","category":"despedida","text":"Até logo, João. Tenha uma boa noite!"}
+{"id":"question_help","category":"pergunta","text":"Como posso ajudar você agora?"}
+{"id":"question_plan","category":"pergunta","text":"Você prefere conversar sobre isso hoje ou deixar para amanhã?"}
+{"id":"expressive_happy","category":"expressiva","text":"Que notícia boa! Fico muito feliz por você."}
+{"id":"expressive_empathy","category":"expressiva","text":"Poxa, sinto muito que seu dia tenha sido tão difícil."}
+{"id":"number_price","category":"numeros","text":"O valor total ficou em mil duzentos e trinta e quatro reais e cinquenta e seis centavos: R$ 1.234,56."}
+{"id":"number_time","category":"horario","text":"A reunião começa às 14 horas e 30 minutos."}
+{"id":"number_date","category":"data","text":"O prazo termina em 5 de agosto de 2026."}
+{"id":"proper_names","category":"nomes_proprios","text":"Mariana e Luís encontraram a professora Cecília em São Paulo."}
+{"id":"acronyms","category":"siglas","text":"A API da CPU enviou o relatório em PDF para o RH."}
+{"id":"mixed_english","category":"ingles_misturado","text":"O deploy do backend foi concluído, mas o dashboard ainda está loading."}
+{"id":"technical_sqlite","category":"termo_tecnico","text":"O processo local grava os dados no SQLite e valida cada transação antes de confirmar a resposta."}
+{"id":"technical_python","category":"termo_tecnico","text":"No Python, execute o comando uv sync para preparar o ambiente isolado do benchmark."}
+{"id":"long_companion","category":"frase_longa","text":"Quando você tiver um momento, podemos revisar com calma as opções, comparar os prós e contras e escolher um próximo passo que pareça viável para esta semana."}
+{"id":"long_daily","category":"frase_longa","text":"Hoje eu organizei algumas tarefas, respondi mensagens importantes e ainda consegui reservar um tempo para descansar antes do fim da tarde."}
+{"id":"long_numbers_names","category":"frase_longa","text":"Na terça-feira, às 9 horas, Beatriz e Rafael vão apresentar a versão 2.4 do projeto para a equipe de tecnologia."}
