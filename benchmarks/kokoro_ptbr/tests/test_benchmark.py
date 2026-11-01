@@ -35,13 +35,13 @@ def candidate_args(**overrides):
     return argparse.Namespace(**values)
 
 
-def _make_test_sample(tmp_path: Path, sample_id: str) -> dict:
+def _make_test_sample(tmp_path: Path, sample_id: str, frame_count: int = 4) -> dict:
     source_dir = tmp_path / "sample-source"
     source_dir.mkdir(exist_ok=True)
     source_path = source_dir / f"{sample_id}.wav"
     wav_info = benchmark._atomic_write_wav(
         source_path,
-        np.array([0.1, -0.1, 0.2, -0.2], dtype=np.float32),
+        np.resize(np.array([0.1, -0.1, 0.2, -0.2], dtype=np.float32), frame_count),
         sf,
         np,
         benchmark.SAMPLE_RATE_HZ,
@@ -72,6 +72,7 @@ def _run_fake_worker(
     *,
     missing_wavs: set[str] | None = None,
     corrupt_wavs: set[str] | None = None,
+    frame_mismatches: dict[str, tuple[int, int]] | None = None,
 ):
     model_dir = tmp_path / "model"
     model_dir.mkdir()
@@ -97,7 +98,16 @@ def _run_fake_worker(
         idle_seconds=0,
         threads=1,
     )
-    sample_events = [_make_test_sample(tmp_path, sample_id) for sample_id in sample_ids]
+    frame_mismatches = frame_mismatches or {}
+    sample_events = [
+        _make_test_sample(tmp_path, sample_id, frame_mismatches.get(sample_id, (4, 4))[0])
+        for sample_id in sample_ids
+    ]
+    for event in sample_events:
+        if event["id"] in frame_mismatches:
+            _actual_frames, reported_frames = frame_mismatches[event["id"]]
+            event["frames"] = reported_frames
+            event["audio_duration_seconds"] = round(reported_frames / benchmark.SAMPLE_RATE_HZ, 6)
     missing_wavs = missing_wavs or set()
     corrupt_wavs = corrupt_wavs or set()
 
@@ -296,6 +306,39 @@ def test_run_completes_only_when_events_worker_count_and_wavs_match(tmp_path, mo
     assert metrics["result_validation"]["event_count"] == 2
     assert metrics["result_validation"]["worker_synthesized_count"] == 2
     assert [artifact["valid"] for artifact in metrics["result_validation"]["artifacts"]] == [True, True]
+
+
+def test_reported_frames_matching_reported_duration_but_not_wav_fails_closed(tmp_path, monkeypatch):
+    args = _run_fake_worker(
+        tmp_path,
+        monkeypatch,
+        ["sample_a", "sample_b"],
+        2,
+        frame_mismatches={"sample_a": (8, 4)},
+    )
+
+    with pytest.raises(benchmark.BenchmarkError) as raised:
+        benchmark.run_benchmark(args)
+
+    assert raised.value.code == "artifact_invalid"
+    assert str(raised.value) == benchmark.ERROR_MESSAGES["artifact_invalid"]
+    metrics = json.loads((args.output_dir / "metrics.json").read_text(encoding="utf-8"))
+    assert metrics["status"] == "failed"
+    assert metrics["error_code"] == "artifact_invalid"
+    assert metrics["result_validation"]["valid"] is False
+    assert "artifact_invalid" in metrics["result_validation"]["issue_codes"]
+    assert "sample_a" in metrics["result_validation"]["invalid_wav_ids"]
+
+    artifact = next(item for item in metrics["result_validation"]["artifacts"] if item["id"] == "sample_a")
+    sample = next(item for item in metrics["samples"] if item["id"] == "sample_a")
+    assert sf.info(args.output_dir / "sample_a.wav").frames == 8
+    assert sample["frames"] == 4
+    assert sample["audio_duration_seconds"] == round(4 / benchmark.SAMPLE_RATE_HZ, 6)
+    assert artifact["actual_size_bytes"] == sample["wav_bytes"]
+    assert artifact["reported_size_matches"] is True
+    assert artifact["actual_sha256"] == sample["wav_sha256"]
+    assert artifact["reported_sha256_matches"] is True
+    assert artifact["reported_metadata_matches"] is False
 
 
 @pytest.mark.parametrize(

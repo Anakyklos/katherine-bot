@@ -537,6 +537,8 @@ def _inspect_result_wav(path: Path, event: dict[str, Any] | None, sample_id: str
     exists = path.is_file() and not path.is_symlink()
     actual_size: int | None = None
     actual_hash: str | None = None
+    actual_frames: int | None = None
+    actual_sample_rate: int | None = None
     header_valid = False
     event_valid = event is not None
     size_matches = False
@@ -551,15 +553,16 @@ def _inspect_result_wav(path: Path, event: dict[str, Any] | None, sample_id: str
                 channels = wav.getnchannels()
                 sample_width = wav.getsampwidth()
                 sample_rate = wav.getframerate()
-                frame_count = wav.getnframes()
+                actual_sample_rate = sample_rate
+                actual_frames = wav.getnframes()
                 header_valid = (
                     wav.getcomptype() == "NONE"
                     and channels == 1
                     and sample_width == 2
                     and sample_rate == SAMPLE_RATE_HZ
-                    and frame_count > 0
+                    and actual_frames > 0
                 )
-                remaining_frames = frame_count
+                remaining_frames = actual_frames
                 while header_valid and remaining_frames > 0:
                     chunk = wav.readframes(min(8192, remaining_frames))
                     frame_bytes = channels * sample_width
@@ -601,7 +604,11 @@ def _inspect_result_wav(path: Path, event: dict[str, Any] | None, sample_id: str
                 and reported_channels == 1
                 and event.get("subtype") == "PCM_16"
                 and math.isfinite(reported_duration)
-                and round(reported_frames / SAMPLE_RATE_HZ, 6) == round(reported_duration, 6)
+                and actual_frames is not None
+                and reported_frames == actual_frames
+                and actual_sample_rate is not None
+                and actual_sample_rate > 0
+                and round(actual_frames / actual_sample_rate, 6) == round(reported_duration, 6)
             )
         except (TypeError, ValueError, OverflowError):
             metadata_matches = False
