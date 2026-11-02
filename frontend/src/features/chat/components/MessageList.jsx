@@ -2,7 +2,23 @@ import React from 'react';
 import { Loader2 } from 'lucide-react';
 import MessageBubble from './MessageBubble';
 
-const MessageList = ({ messages, isLoading, messagesEndRef, loadingLabel = 'Katherine está digitando...' }) => {
+export function getMessageReactKey(message) {
+    if (message.serverId !== null && message.serverId !== undefined) {
+        return `server:${typeof message.serverId}:${String(message.serverId)}`;
+    }
+    if (message.id !== null && message.id !== undefined) {
+        return `server:${typeof message.id}:${String(message.id)}`;
+    }
+    return `local:${message.localId}`;
+}
+
+const MessageList = ({
+    messages,
+    isLoading,
+    messagesEndRef,
+    onRetry,
+    loadingLabel = 'Katherine está digitando...',
+}) => {
     return (
         <div className="flex-1 overflow-y-auto p-4 md:p-8 space-y-6 scroll-smooth">
             {messages.length === 0 && (
@@ -11,17 +27,45 @@ const MessageList = ({ messages, isLoading, messagesEndRef, loadingLabel = 'Kath
                 </div>
             )}
 
-            {messages.map((msg, idx) => (
-                msg.role === 'system' ? (
-                    <div key={idx} className="text-center text-red-400 text-sm py-2">
-                        {msg.content}
+            {messages.map(message => (
+                message.role === 'system' ? (
+                    <div key={getMessageReactKey(message)} className="text-center text-red-400 text-sm py-2">
+                        {message.content}
                     </div>
                 ) : (
-                    <MessageBubble
-                        key={idx}
-                        message={msg.content}
-                        isUser={msg.role === 'user'}
-                    />
+                    <div key={getMessageReactKey(message)} className="space-y-1">
+                        <MessageBubble
+                            message={message.content}
+                            isUser={message.role === 'user'}
+                        />
+                        {message.role === 'user' && message.deliveryStatus && message.deliveryStatus !== 'sent' && (
+                            <div
+                                className={`flex items-center gap-3 px-4 text-xs ${
+                                    message.deliveryStatus === 'pending'
+                                        ? 'justify-end text-gray-400'
+                                        : 'justify-end text-red-300'
+                                }`}
+                                role={message.deliveryStatus === 'pending' ? 'status' : 'alert'}
+                                aria-live={message.deliveryStatus === 'pending' ? 'polite' : 'assertive'}
+                            >
+                                <span>
+                                    {message.deliveryStatus === 'pending'
+                                        ? 'Enviando…'
+                                        : message.errorMessage || 'Não foi possível confirmar este envio.'}
+                                </span>
+                                {message.retryable && message.deliveryStatus !== 'pending' && (
+                                    <button
+                                        type="button"
+                                        onClick={() => onRetry?.(message.localId)}
+                                        disabled={isLoading}
+                                        className="rounded px-2 py-1 text-gray-200 underline underline-offset-2 hover:text-white focus-visible:outline focus-visible:outline-2 focus-visible:outline-blue-400 disabled:cursor-not-allowed disabled:opacity-50"
+                                    >
+                                        Tentar novamente
+                                    </button>
+                                )}
+                            </div>
+                        )}
+                    </div>
                 )
             ))}
 

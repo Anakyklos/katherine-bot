@@ -38,7 +38,7 @@ const OPERATIONS = [
     },
 ];
 
-export default function PrivacyPanel({ transport }) {
+export default function PrivacyPanel({ transport, onHistoryDeleted }) {
     const desktop = isDesktopTransport(transport);
 
     const [confirming, setConfirming] = useState(null);
@@ -54,6 +54,7 @@ export default function PrivacyPanel({ transport }) {
         const result = await runOp(operation.op);
         setConfirming(null);
         if (result.ok) {
+            if (operation.op === 'delete_history') onHistoryDeleted?.();
             setStatusMessage('Operação concluída.');
         } else if (result.message) {
             setStatusMessage(result.message);

@@ -43,7 +43,7 @@ function makeDesktopTransport() {
         mode: 'desktop',
         fetchHistory: vi.fn(async ({ signal } = {}) => {
             calls.history.push(signal);
-            return { data: [{ role: 'user', content: 'old msg' }] };
+            return { data: [{ id: 7, role: 'user', content: 'old msg' }] };
         }),
         sendMessage: vi.fn(async (message, options, requestId) => {
             calls.send.push([message, requestId]);
@@ -75,7 +75,14 @@ describe('useChat with desktop transport', () => {
 
         await waitFor(() => expect(transport.fetchHistory).toHaveBeenCalledTimes(1));
         await waitFor(() =>
-            expect(result.current.messages).toEqual([{ role: 'user', content: 'old msg' }]),
+            expect(result.current.messages).toEqual([expect.objectContaining({
+                id: 7,
+                localId: 'server:number:7',
+                serverId: 7,
+                role: 'user',
+                content: 'old msg',
+                deliveryStatus: 'sent',
+            })]),
         );
     });
 
@@ -126,7 +133,7 @@ describe('useChat with desktop transport', () => {
         expect(result.current.messages.filter(m => m.role === 'user').length).toBe(2);
     });
 
-    it('surfaces a ChatError message from the bridge as a system message', async () => {
+    it('attaches a sanitized bridge error to the original desktop message', async () => {
         const { transport } = makeDesktopTransport();
         const { ChatError } = await import('../src/features/chat/services/chatService');
         const error = new ChatError(
@@ -141,9 +148,11 @@ describe('useChat with desktop transport', () => {
         await act(async () => { result.current.handleSend(); });
 
         await waitFor(() => expect(result.current.isLoading).toBe(false));
-        const system = result.current.messages.filter(m => m.role === 'system');
-        expect(system.length).toBe(1);
-        expect(system[0].content).toContain('provedor remoto');
+        const user = result.current.messages.find(m => m.role === 'user' && m.content === 'oi');
+        expect(user.deliveryStatus).toBe('failed');
+        expect(user.retryable).toBe(false);
+        expect(user.errorMessage).toContain('provedor remoto');
+        expect(result.current.messages.filter(m => m.role === 'system')).toHaveLength(0);
     });
 
     it('clears the 50s guard timer on resolve (desktop)', async () => {
@@ -174,7 +183,7 @@ describe('useChat with desktop transport', () => {
         expect(bot.length).toBe(1);
     });
 
-    it('50s timeout on a hung bridge settles the UI with a timeout error (never-resolving call)', async () => {
+    it('50s timeout on a hung bridge marks the original message uncertain (never-resolving call)', async () => {
         // Review blocker 2: the desktop transport must give the caller
         // a BOUNDED result even when the bridge call never resolves.
         // The real desktop transport is used (createTransport with
@@ -218,8 +227,10 @@ describe('useChat with desktop transport', () => {
         await act(async () => { await p; });
 
         expect(result.current.isLoading).toBe(false);
-        const system = result.current.messages.filter(m => m.role === 'system');
-        expect(system.length).toBe(1);
-        expect(system[0].content).toContain('tempo limite');
+        const user = result.current.messages.find(m => m.role === 'user');
+        expect(user.deliveryStatus).toBe('unknown');
+        expect(user.retryable).toBe(true);
+        expect(user.errorMessage).toContain('tempo limite');
+        expect(result.current.messages.filter(m => m.role === 'system')).toHaveLength(0);
     });
 });

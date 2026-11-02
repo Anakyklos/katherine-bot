@@ -107,7 +107,7 @@ const CHAT_ERROR_MESSAGES = Object.freeze({
     service_unavailable: 'Serviço temporariamente indisponível. Tente novamente mais tarde.',
     validation: 'Dados inválidos enviados.',
     request_replay: 'Este envio já foi recebido, mas a resposta não pode ser recuperada.',
-    request_conflict: 'Este envio não pôde ser reconciliado. Envie a mensagem novamente.',
+    request_conflict: 'Este envio não pôde ser reconciliado. Tentar novamente reutilizará o mesmo envio.',
     configuration: 'O provedor remoto não está configurado neste ambiente.',
     unknown: 'Erro ao falar com a Katherine. Tente novamente.',
 });

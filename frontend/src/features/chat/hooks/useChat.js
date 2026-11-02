@@ -4,19 +4,70 @@ import { createDefaultTransport } from '../services/chatTransport';
 import { SYSTEM_MESSAGES } from '../constants';
 import { validateEmotionState } from '../../../shared/utils/formatters';
 
+const REQUEST_TIMEOUT_MS = 50_000;
+const NON_RETRYABLE_DESKTOP_ERRORS = new Set([
+    'configuration',
+    'request_replay',
+    'validation',
+]);
+
+function isPersistedId(value) {
+    return (
+        (typeof value === 'string' && value.length > 0)
+        || (typeof value === 'number' && Number.isSafeInteger(value))
+    );
+}
+
+function persistedLocalId(id) {
+    return `server:${typeof id}:${String(id)}`;
+}
+
+function normalizeHistory(messages, { desktop, nextLocalId }) {
+    const seen = new Set();
+    const normalized = [];
+
+    for (const message of messages) {
+        const serverId = isPersistedId(message?.id) ? message.id : null;
+        if (desktop && serverId !== null) {
+            const identity = `${typeof serverId}:${String(serverId)}`;
+            if (seen.has(identity)) continue;
+            seen.add(identity);
+        }
+
+        normalized.push({
+            ...message,
+            localId: serverId === null ? nextLocalId('history') : persistedLocalId(serverId),
+            serverId,
+            ...(desktop ? { deliveryStatus: 'sent' } : {}),
+        });
+    }
+
+    return normalized;
+}
+
+function upsertMessage(messages, candidate) {
+    const existingIndex = messages.findIndex(message => (
+        message.localId === candidate.localId
+        || (
+            candidate.serverId !== null
+            && candidate.serverId !== undefined
+            && message.serverId === candidate.serverId
+        )
+    ));
+
+    if (existingIndex === -1) return [...messages, candidate];
+    return messages.map((message, index) => (
+        index === existingIndex ? { ...message, ...candidate } : message
+    ));
+}
+
 /**
- * Hook for managing chat state with AbortController-based timeout.
+ * Hook for managing chat state over the mode-aware transport.
  *
- * Each accepted logical send creates exactly one Web Crypto UUID and one
- * request. Single-flight, ownership, history, timeout, and unmount guards are
- * preserved.
- *
- * #336: history and sends are routed through an injected transport
- * (default: the mode-aware `chatTransport`). Web mode delegates to the
- * Axios-based chatService exactly as before; desktop mode goes through
- * the pywebview bridge. The invariants (single-flight, request token,
- * unmount guard, 50s guard timer cleared on resolve) apply to both
- * branches identically.
+ * Desktop sends keep one request id and one local message identity for the
+ * full logical intent. A failed or uncertain attempt stays attached to that
+ * message; explicit retry reuses its original content and request id. The
+ * web branch keeps its previous error presentation and transport behavior.
  */
 export const useChat = ({ transport: injectedTransport } = {}) => {
     const transportRef = useRef(null);
@@ -24,6 +75,7 @@ export const useChat = ({ transport: injectedTransport } = {}) => {
         transportRef.current = injectedTransport ?? createDefaultTransport();
     }
     const transport = transportRef.current;
+    const isDesktop = transport.mode === 'desktop';
     const [messages, setMessages] = useState([]);
     const [input, setInput] = useState('');
     const [isLoading, setIsLoading] = useState(false);
@@ -37,6 +89,14 @@ export const useChat = ({ transport: injectedTransport } = {}) => {
     const focusTimerRef = useRef(null);
     const inFlightRef = useRef(false);
     const localMessagesVersionRef = useRef(0);
+    const localMessageSequenceRef = useRef(0);
+    const screenGenerationRef = useRef(0);
+    const intentGenerationRef = useRef(new Map());
+
+    const nextLocalId = useCallback((kind) => {
+        localMessageSequenceRef.current += 1;
+        return `local:${kind}:${localMessageSequenceRef.current}`;
+    }, []);
 
     const cleanupRequest = useCallback(() => {
         if (timerIdRef.current !== null) {
@@ -80,24 +140,27 @@ export const useChat = ({ transport: injectedTransport } = {}) => {
                 });
 
                 if (
-                    !active ||
-                    !mountedRef.current ||
-                    versionAtStart !== localMessagesVersionRef.current
+                    !active
+                    || !mountedRef.current
+                    || versionAtStart !== localMessagesVersionRef.current
                 ) {
                     return;
                 }
 
                 if (Array.isArray(response.data)) {
-                    setMessages(response.data);
+                    setMessages(normalizeHistory(response.data, {
+                        desktop: isDesktop,
+                        nextLocalId,
+                    }));
                 }
-            } catch (error) {
+            } catch {
                 if (!active || controller.signal.aborted) {
                     return;
                 }
 
                 if (
-                    typeof import.meta !== 'undefined' &&
-                    import.meta.env?.MODE !== 'test'
+                    typeof import.meta !== 'undefined'
+                    && import.meta.env?.MODE !== 'test'
                 ) {
                     console.warn('Failed to fetch history');
                 }
@@ -110,48 +173,25 @@ export const useChat = ({ transport: injectedTransport } = {}) => {
             active = false;
             controller.abort();
         };
-        // transport is a stable per-mount reference (constructed once in
-        // the ref above); listing it satisfies the rule without changing
-        // when the effect runs.
-    }, [transport]);
+    }, [transport, isDesktop, nextLocalId]);
 
     useEffect(() => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
     }, [messages, isLoading]);
 
-    const handleSend = useCallback(async () => {
-        if (!input.trim() || isLoading || inFlightRef.current) return;
+    const sendIntent = useCallback(async (intent) => {
+        if (!mountedRef.current || inFlightRef.current) return;
 
-        const userMessageText = input.trim();
-        const randomUUID = globalThis.crypto?.randomUUID;
-        if (typeof randomUUID !== 'function') {
-            localMessagesVersionRef.current += 1;
-            setMessages(prev => [...prev, {
-                role: 'system',
-                content: SYSTEM_MESSAGES.REQUEST_ID_UNAVAILABLE,
-            }]);
-            return;
-        }
-
-        let requestId;
-        try {
-            requestId = randomUUID.call(globalThis.crypto);
-        } catch {
-            localMessagesVersionRef.current += 1;
-            setMessages(prev => [...prev, {
-                role: 'system',
-                content: SYSTEM_MESSAGES.REQUEST_ID_UNAVAILABLE,
-            }]);
-            return;
-        }
-
-        const newUserMessage = { role: 'user', content: userMessageText };
+        const generation = intentGenerationRef.current.get(intent.localId);
+        if (generation === undefined || generation !== screenGenerationRef.current) return;
 
         inFlightRef.current = true;
         localMessagesVersionRef.current += 1;
-
-        setMessages(prev => [...prev, newUserMessage]);
-        setInput('');
+        setMessages(prev => (
+            intent.deliveryStatus === undefined
+                ? upsertMessage(prev, intent)
+                : upsertMessage(prev, { ...intent, deliveryStatus: 'pending', retryable: false, errorMessage: null })
+        ));
         setIsLoading(true);
 
         cleanupRequest();
@@ -160,53 +200,95 @@ export const useChat = ({ transport: injectedTransport } = {}) => {
         const controller = new AbortController();
         abortControllerRef.current = controller;
 
-        const timeoutMs = 50000;
         const timerId = setTimeout(() => {
             controller.abort();
-        }, timeoutMs);
+        }, REQUEST_TIMEOUT_MS);
         timerIdRef.current = timerId;
 
+        const ownsVisibleIntent = () => (
+            mountedRef.current
+            && token === requestTokenRef.current
+            && generation === screenGenerationRef.current
+        );
+
         try {
-            // #336: the transport decides web (Axios, honors the abort
-            // signal) vs desktop (bridge, guarded by the same 50s timer
-            // which clears on resolve below).
             const data = await transport.sendMessage(
-                userMessageText,
+                intent.content,
                 {
                     signal: controller.signal,
-                    timeout: timeoutMs,
+                    timeout: REQUEST_TIMEOUT_MS,
                 },
-                requestId,
+                intent.requestId,
             );
 
-            if (!mountedRef.current || token !== requestTokenRef.current) return;
+            if (!ownsVisibleIntent()) return;
 
             clearTimeout(timerId);
             timerIdRef.current = null;
 
-            const botMessage = { role: 'assistant', content: data.response };
-            setMessages(prev => [...prev, botMessage]);
+            const assistantMessage = {
+                localId: `local:${intent.requestId}:assistant`,
+                serverId: isPersistedId(data.message_id) ? data.message_id : null,
+                requestId: intent.requestId,
+                role: 'assistant',
+                content: data.response,
+                ...(isDesktop ? { deliveryStatus: 'sent' } : {}),
+            };
+
+            setMessages(prev => {
+                const userUpdated = isDesktop
+                    ? prev.map(message => (
+                        message.localId === intent.localId
+                            ? {
+                                ...message,
+                                deliveryStatus: 'sent',
+                                retryable: false,
+                                errorMessage: null,
+                            }
+                            : message
+                    ))
+                    : prev;
+                return upsertMessage(userUpdated, assistantMessage);
+            });
+            intentGenerationRef.current.delete(intent.localId);
 
             const validated = validateEmotionState(data.emotion_state);
             setEmotionState(validated);
         } catch (error) {
-            if (!mountedRef.current || token !== requestTokenRef.current) return;
+            if (!ownsVisibleIntent()) return;
 
             clearTimeout(timerId);
             timerIdRef.current = null;
 
-            if (error instanceof ChatError) {
-                const errorMessage = {
-                    role: 'system',
-                    content: error.message,
-                };
-                setMessages(prev => [...prev, errorMessage]);
+            if (isDesktop) {
+                const errorType = error instanceof ChatError ? error.type : 'unknown';
+                const retryable = !NON_RETRYABLE_DESKTOP_ERRORS.has(errorType);
+                const deliveryStatus = (
+                    errorType === 'timeout'
+                    || errorType === 'unknown'
+                    || errorType === 'service_unavailable'
+                    || errorType === 'request_conflict'
+                ) ? 'unknown' : 'failed';
+                const errorMessage = error instanceof ChatError
+                    ? error.message
+                    : SYSTEM_MESSAGES.ERROR_SENDING;
+
+                setMessages(prev => prev.map(message => (
+                    message.localId === intent.localId
+                        ? { ...message, deliveryStatus, retryable, errorMessage }
+                        : message
+                )));
+                if (!retryable) intentGenerationRef.current.delete(intent.localId);
             } else {
-                const errorMessage = {
+                const systemMessage = {
+                    localId: nextLocalId('system'),
+                    serverId: null,
                     role: 'system',
-                    content: SYSTEM_MESSAGES.ERROR_SENDING,
+                    content: error instanceof ChatError
+                        ? error.message
+                        : SYSTEM_MESSAGES.ERROR_SENDING,
                 };
-                setMessages(prev => [...prev, errorMessage]);
+                setMessages(prev => [...prev, systemMessage]);
             }
         } finally {
             if (mountedRef.current && token === requestTokenRef.current) {
@@ -218,17 +300,81 @@ export const useChat = ({ transport: injectedTransport } = {}) => {
                 focusTimerRef.current = setTimeout(() => inputRef.current?.focus(), 100);
             }
         }
-    }, [input, isLoading, transport, cleanupRequest, cleanupFocusTimer]);
+    }, [
+        cleanupFocusTimer,
+        cleanupRequest,
+        isDesktop,
+        nextLocalId,
+        transport,
+    ]);
 
-    /**
-     * Clears the local chat screen only.
-     *
-     * This removes the in-memory `messages` and `emotionState` from the React
-     * state. It never touches persisted data: the server-side history remains
-     * intact and is reloaded on the next mount.
-     */
+    const handleSend = useCallback(() => {
+        if (!input.trim() || isLoading || inFlightRef.current) return;
+
+        const requestIdFactory = globalThis.crypto?.randomUUID;
+        if (typeof requestIdFactory !== 'function') {
+            localMessagesVersionRef.current += 1;
+            const systemMessage = {
+                localId: nextLocalId('system'),
+                serverId: null,
+                role: 'system',
+                content: SYSTEM_MESSAGES.REQUEST_ID_UNAVAILABLE,
+            };
+            setMessages(prev => [...prev, systemMessage]);
+            return;
+        }
+
+        let requestId;
+        try {
+            requestId = requestIdFactory.call(globalThis.crypto);
+        } catch {
+            localMessagesVersionRef.current += 1;
+            const systemMessage = {
+                localId: nextLocalId('system'),
+                serverId: null,
+                role: 'system',
+                content: SYSTEM_MESSAGES.REQUEST_ID_UNAVAILABLE,
+            };
+            setMessages(prev => [...prev, systemMessage]);
+            return;
+        }
+
+        const content = input.trim();
+        const localId = `local:${requestId}:user`;
+        const intent = {
+            localId,
+            serverId: null,
+            requestId,
+            role: 'user',
+            content,
+            ...(isDesktop ? {
+                deliveryStatus: 'pending',
+                retryable: false,
+                errorMessage: null,
+            } : {}),
+        };
+        intentGenerationRef.current.set(localId, screenGenerationRef.current);
+        setInput('');
+        return sendIntent(intent);
+    }, [input, isLoading, isDesktop, nextLocalId, sendIntent]);
+
+    const retryMessage = useCallback((localId) => {
+        if (!isDesktop || isLoading || inFlightRef.current) return;
+        const intent = messages.find(message => (
+            message.localId === localId
+            && message.role === 'user'
+            && (message.deliveryStatus === 'failed' || message.deliveryStatus === 'unknown')
+            && message.retryable === true
+        ));
+        if (!intent) return;
+        return sendIntent(intent);
+    }, [isDesktop, isLoading, messages, sendIntent]);
+
+    /** Clears the local chat screen only; persisted history remains untouched. */
     const clearScreen = useCallback(() => {
         localMessagesVersionRef.current += 1;
+        screenGenerationRef.current += 1;
+        intentGenerationRef.current.clear();
         setMessages([]);
         setEmotionState(null);
     }, []);
@@ -242,9 +388,8 @@ export const useChat = ({ transport: injectedTransport } = {}) => {
         messagesEndRef,
         inputRef,
         handleSend,
+        retryMessage,
         clearScreen,
-        // #336: the mode-aware transport, consumed by desktop-only UI
-        // (privacy panel). A web transport makes that panel inert.
-        transport
+        transport,
     };
 };

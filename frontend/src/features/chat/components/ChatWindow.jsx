@@ -22,6 +22,7 @@ const ChatWindow = ({ faceSlot = null, renderLayout = null }) => {
         messagesEndRef,
         inputRef,
         handleSend,
+        retryMessage,
         clearScreen,
         transport
     } = chatModel;
@@ -46,6 +47,7 @@ const ChatWindow = ({ faceSlot = null, renderLayout = null }) => {
                     <MessageList
                         messages={messages}
                         isLoading={isLoading}
+                        onRetry={retryMessage}
                         messagesEndRef={messagesEndRef}
                     />
 
@@ -72,7 +74,7 @@ const ChatWindow = ({ faceSlot = null, renderLayout = null }) => {
                      before the first turn so the user can always erase
                      local data. */}
                 <aside className="hidden md:block border-l border-gray-800 bg-gray-900 p-4 overflow-y-auto">
-                    <PrivacyPanel transport={transport} />
+                    <PrivacyPanel transport={transport} onHistoryDeleted={clearScreen} />
                 </aside>
             </div>
 

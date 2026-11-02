@@ -29,6 +29,7 @@ export default function CompanionLayout({
     messagesEndRef,
     inputRef,
     handleSend,
+    retryMessage,
     clearScreen,
     transport,
     auxiliarySlot = null,
@@ -102,6 +103,7 @@ export default function CompanionLayout({
                         <MessageList
                             messages={messages}
                             isLoading={isLoading}
+                            onRetry={retryMessage}
                             messagesEndRef={messagesEndRef}
                             loadingLabel="Preparando resposta…"
                         />
@@ -124,7 +126,7 @@ export default function CompanionLayout({
                             <details data-testid="companion-privacy-details">
                                 <summary>Privacidade local</summary>
                                 <div className="companion-layout__utility-content">
-                                    <PrivacyPanel transport={transport} />
+                                <PrivacyPanel transport={transport} onHistoryDeleted={clearScreen} />
                                 </div>
                             </details>
                         )}
