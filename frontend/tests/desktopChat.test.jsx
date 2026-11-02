@@ -133,6 +133,42 @@ describe('useChat with desktop transport', () => {
         expect(result.current.messages.filter(m => m.role === 'user').length).toBe(2);
     });
 
+    it('does not restore an in-flight response after history deletion clears the screen', async () => {
+        let resolveSend;
+        const pendingSend = new Promise(resolve => { resolveSend = resolve; });
+        const { transport } = makeDesktopTransport();
+        transport.fetchHistory.mockResolvedValue({ data: [] });
+        transport.sendMessage.mockReturnValueOnce(pendingSend);
+
+        const { result } = renderHook(() => useChat({ transport }));
+        await act(async () => { result.current.setInput('private in-flight turn'); });
+
+        let sendPromise;
+        await act(async () => { sendPromise = result.current.handleSend(); });
+        await waitFor(() => expect(result.current.messages).toEqual([
+            expect.objectContaining({
+                role: 'user',
+                content: 'private in-flight turn',
+                deliveryStatus: 'pending',
+            }),
+        ]));
+
+        await act(async () => {
+            const deleted = await transport.runPrivacyOp('delete_history');
+            expect(deleted.status).toBe('applied');
+            result.current.clearScreen();
+        });
+        expect(result.current.messages).toEqual([]);
+
+        await act(async () => {
+            resolveSend(validEmotionResponse('late private response'));
+            await sendPromise;
+        });
+
+        expect(result.current.messages).toEqual([]);
+        expect(result.current.emotionState).toBeNull();
+    });
+
     it('attaches a sanitized bridge error to the original desktop message', async () => {
         const { transport } = makeDesktopTransport();
         const { ChatError } = await import('../src/features/chat/services/chatService');

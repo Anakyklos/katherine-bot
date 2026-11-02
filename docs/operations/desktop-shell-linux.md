@@ -95,7 +95,12 @@ O smoke abre a janela real em `file://` e verifica, com probes
     geração do provider;
 17. privacidade REAL pela UI: clicar "Apagar histórico" → confirmação
     explícita → status "Operação concluída" renderizado e conversa
-    removida da tela (o painel real, não chamadas diretas de bridge).
+    removida da tela (o painel real, não chamadas diretas de bridge);
+18. corrida de privacidade (#375): o provider scriptado suspende um
+    envio real da UI depois da reserva SQLite; a exclusão é confirmada
+    pelo painel; ao liberar o provider, o commit é rejeitado, o callback
+    tardio não repovoa a tela e uma leitura SQLite independente confirma
+    que mensagens e reservas continuam ausentes.
 
 **Prova do provider real (bloqueio registrado):** o smoke usa provider
 scriptado porque a rede Groq não é determinística nem gratuita. A perna
@@ -138,6 +143,13 @@ e um de resposta e que uma leitura SQLite independente encontra duas linhas
 em `chat_logs` e uma solicitação concluída em `turn_requests`. A injeção de
 falha existe somente neste harness; o frontend de produção não ganha uma
 rota ou método de bridge adicional.
+
+O mesmo shell suspende outra geração depois da reserva, confirma `delete_history`
+pela UI e só então libera o provider. A leitura independente verifica zero
+linhas em `chat_logs` e `turn_requests` antes e depois da resposta tardia; a
+bridge devolve um conflito sanitizado e a tela permanece limpa. Esse cenário
+usa o provider e a SQLite descartável reais do smoke e não substitui o teste de
+retry pós-commit acima.
 
 ### Nota sobre o check "remote navigation"
 

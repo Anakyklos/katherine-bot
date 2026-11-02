@@ -73,6 +73,7 @@ semaphore, making it safe to call from the worker thread.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import subprocess
@@ -216,6 +217,46 @@ _PROBE_UI_SEND = r"""
 
 _PROBE_COLLECT_UI_SEND = "(() => window.__smokeUiSend)()"
 
+_DELETE_RACE_USER_MESSAGE = "Mensagem em geração durante exclusão #375"
+
+# Start a second UI send and return while the bridge's provider generation
+# is suspended. The worker confirms this point through the scripted
+# provider event before it drives the privacy panel.
+_PROBE_UI_DELETE_RACE_SEND = r"""
+(() => {
+  window.__smokeDeleteRaceSend = 'pending';
+  try {
+    const input = document.querySelector('textarea[aria-label="Sua mensagem"]');
+    const send = document.querySelector('button[aria-label="Enviar mensagem (Enter)"]');
+    if (!input || !send) {
+      window.__smokeDeleteRaceSend = { started: false, error: 'chat input unavailable' };
+      return 'started';
+    }
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value').set;
+    setter.call(input, 'Mensagem em geração durante exclusão #375');
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    send.click();
+    window.__smokeDeleteRaceSend = { started: true };
+  } catch (e) {
+    window.__smokeDeleteRaceSend = { started: false, error: String(e).slice(0, 120) };
+  }
+  return 'started';
+})()
+"""
+
+_PROBE_COLLECT_DELETE_RACE_SEND = "(() => window.__smokeDeleteRaceSend)()"
+
+_PROBE_COLLECT_DELETE_RACE_UI = r"""
+(() => {
+  const text = document.body.innerText || '';
+  return {
+    userMessageVisible: text.includes('Mensagem em geração durante exclusão #375'),
+    lateResponseVisible: text.includes('Resposta de teste do smoke local'),
+    emptyStateVisible: text.includes('Comece uma conversa'),
+  };
+})()
+"""
+
 #: #336: exercise the PRIVACY PANEL through the real UI. Clicks the
 #: button, confirms the explicit confirmation dialog, and collects the
 #: rendered success status. This is the destructive-op acceptance path
@@ -326,12 +367,26 @@ def _make_scripted_provider():
     class ScriptedSmokeProvider:
         def __init__(self) -> None:
             self.generate_calls = 0
+            self._suspend_next_generation = False
+            self.generation_started = threading.Event()
+            self.release_generation = threading.Event()
+
+        def suspend_next_generation(self) -> None:
+            self.generation_started.clear()
+            self.release_generation.clear()
+            self._suspend_next_generation = True
 
         async def appraise(self, message, budget):
             return AppraisalV1.neutral()
 
         async def generate(self, messages, budget):
             self.generate_calls += 1
+            if self._suspend_next_generation:
+                self._suspend_next_generation = False
+                self.generation_started.set()
+                released = await asyncio.to_thread(self.release_generation.wait, 45)
+                if not released:
+                    raise TimeoutError("smoke provider release timed out")
             return "Resposta de teste do smoke local (#336)."
 
         async def extract_archival(self, messages, budget):
@@ -513,6 +568,8 @@ def run_smoke() -> tuple[bool, list[str]]:
     scripted_provider = _make_scripted_provider()
     ui_request_ids: list[str] = []
     dropped_ui_response = {"value": False}
+    delete_race_bridge_returned = threading.Event()
+    delete_race_result: dict[str, object] = {}
 
     window_holder: list = []
     loaded = threading.Event()
@@ -546,6 +603,13 @@ def run_smoke() -> tuple[bool, list[str]]:
             send_handler = bridge_facade._handlers["send_message"]
 
             def _drop_first_ui_response(request_id: str, message: str):
+                if message == _DELETE_RACE_USER_MESSAGE:
+                    try:
+                        result = send_handler(request_id, message)
+                        delete_race_result["payload"] = result
+                        return result
+                    finally:
+                        delete_race_bridge_returned.set()
                 result = send_handler(request_id, message)
                 if message == "Mensagem real do smoke #374 via UI":
                     ui_request_ids.append(request_id)
@@ -793,6 +857,116 @@ def run_smoke() -> tuple[bool, list[str]]:
                 "UI send turn ledger holds exactly one completed request",
                 bool(ui_send_ledger == [("completed", 1)]),
                 f"turn_requests by status={ui_send_ledger!r}",
+            )
+
+            # 3b-ii. #375 privacy race: suspend a real UI send inside
+            #     provider.generate(), confirm history deletion through
+            #     the real privacy panel, then release the provider. The
+            #     runtime must reject the stale commit, and the late
+            #     bridge callback must not repopulate the cleared UI.
+            scripted_provider.suspend_next_generation()
+            window.evaluate_js(_PROBE_UI_DELETE_RACE_SEND)
+            race_send_started = _poll_probe(
+                window, _PROBE_COLLECT_DELETE_RACE_SEND, timeout=10
+            )
+            report.check(
+                "real UI starts a send for the history-delete race",
+                bool(race_send_started and race_send_started.get("started") is True),
+                json.dumps(race_send_started)[:160] if race_send_started else "no result",
+            )
+            provider_suspended = scripted_provider.generation_started.wait(timeout=30)
+            report.check(
+                "scripted provider is suspended after SQLite reservation",
+                provider_suspended,
+                f"generate_calls={scripted_provider.generate_calls}",
+            )
+            pending_during_generation = _sqlite_fetch_all(
+                smoke_db_path,
+                "select status, count(*) from turn_requests "
+                "where status = 'pending' group by status",
+            )
+            report.check(
+                "SQLite shows one pending reservation while generation is suspended",
+                provider_suspended and pending_during_generation == [("pending", 1)],
+                f"turn_requests by status={pending_during_generation!r}",
+            )
+
+            ui_delete_race = None
+            if provider_suspended:
+                window.evaluate_js(_PROBE_UI_PRIVACY)
+                ui_delete_race = _poll_probe(
+                    window, _PROBE_COLLECT_UI_PRIVACY, timeout=45
+                )
+            race_delete_confirmed = bool(
+                ui_delete_race
+                and isinstance(ui_delete_race, dict)
+                and ui_delete_race.get("confirmed") is True
+                and "Operação concluída" in str(ui_delete_race.get("status", ""))
+            )
+            report.check(
+                "history deletion succeeds while provider generation is suspended",
+                race_delete_confirmed,
+                json.dumps(ui_delete_race)[:240] if ui_delete_race else "provider did not suspend",
+            )
+
+            rows_after_race_delete = _sqlite_row_count(smoke_db_path, "chat_logs")
+            turns_after_race_delete = _sqlite_row_count(smoke_db_path, "turn_requests")
+            report.check(
+                "independent SQLite read is empty immediately after race deletion",
+                race_delete_confirmed
+                and rows_after_race_delete == 0
+                and turns_after_race_delete == 0,
+                f"chat_logs={rows_after_race_delete}, turn_requests={turns_after_race_delete}",
+            )
+
+            # Always release the scripted provider, including on a failed
+            # privacy assertion, so the smoke cannot leave a blocked call.
+            scripted_provider.release_generation.set()
+            bridge_returned = (
+                delete_race_bridge_returned.wait(timeout=30)
+                if provider_suspended
+                else False
+            )
+            if bridge_returned:
+                # Let pywebview deliver the already-returned promise and
+                # React process its guarded completion before inspection.
+                time.sleep(0.5)
+            race_ui_after_callback = window.evaluate_js(_PROBE_COLLECT_DELETE_RACE_UI)
+            late_payload = delete_race_result.get("payload")
+            report.check(
+                "late invalidated bridge result is a sanitized request conflict",
+                bool(
+                    bridge_returned
+                    and isinstance(late_payload, dict)
+                    and late_payload.get("success") is False
+                    and late_payload.get("error_code") == "request_conflict"
+                    and "Traceback" not in json.dumps(late_payload)
+                    and "/tmp/" not in json.dumps(late_payload)
+                    and ".sqlite" not in json.dumps(late_payload)
+                ),
+                json.dumps(late_payload)[:220] if late_payload else "bridge did not return",
+            )
+            report.check(
+                "late callback leaves the cleared desktop UI empty",
+                bool(
+                    bridge_returned
+                    and isinstance(race_ui_after_callback, dict)
+                    and race_ui_after_callback.get("userMessageVisible") is False
+                    and race_ui_after_callback.get("lateResponseVisible") is False
+                ),
+                json.dumps(race_ui_after_callback)[:200],
+            )
+            rows_after_late_callback = _sqlite_row_count(smoke_db_path, "chat_logs")
+            turns_after_late_callback = _sqlite_row_count(smoke_db_path, "turn_requests")
+            report.check(
+                "SQLite remains empty after the suspended turn returns",
+                rows_after_late_callback == 0 and turns_after_late_callback == 0,
+                f"chat_logs={rows_after_late_callback}, turn_requests={turns_after_late_callback}",
+            )
+            report.check(
+                "the invalidated turn generated once and did not auto-retry",
+                scripted_provider.generate_calls == 2,
+                f"provider_generate_calls={scripted_provider.generate_calls}",
             )
 
             # 3c. #336: destructive-op acceptance path through the REAL
@@ -1111,6 +1285,7 @@ def run_smoke() -> tuple[bool, list[str]]:
         except Exception as exc:  # noqa: BLE001 (report and bail out)
             worker_error.append(f"{type(exc).__name__}: {exc}")
         finally:
+            scripted_provider.release_generation.set()
             worker.set()
             # Close the window from the worker if it is still open.
             try:

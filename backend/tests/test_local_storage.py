@@ -62,10 +62,32 @@ def _neutral_relationship() -> dict:
     return RelationshipStateV1.neutral(timestamp=1000.0).to_dict()
 
 
-def _commit_kwargs(store: LocalStorage, request_id: str, response: str = "ok") -> dict:
+def _reserve_history_generation(
+    store: LocalStorage, request_id: str, user_message: str
+) -> int:
+    reservation = store.reserve_request(request_id, user_message)
+    assert reservation.status == "reserved"
+    assert reservation.history_generation is not None
+    return reservation.history_generation
+
+
+def _commit_kwargs(
+    store: LocalStorage,
+    request_id: str,
+    response: str = "ok",
+    user_message: str = "oi",
+) -> dict:
+    reservation = store.reserve_request(request_id, user_message)
+    history_generation = reservation.history_generation
+    if history_generation is None:
+        history_generation = store._connection_for_tests_only().execute(
+            "select count(*) from privacy_operations "
+            "where operation = 'delete_history'"
+        ).fetchone()[0]
     return {
         "request_id": request_id,
-        "user_message": "oi",
+        "history_generation": history_generation,
+        "user_message": user_message,
         "assistant_message": response,
         "emotional_state": _neutral_emotional(),
         "relationship_state": _neutral_relationship(),
@@ -242,8 +264,11 @@ class TestAtomicTurnCommit:
             store.commit_turn(**_commit_kwargs(store, "req-fail"))
         after_logs = conn.execute("select count(*) from chat_logs").fetchone()[0]
         assert before_logs == after_logs  # user row rolled back too
-        # no turn_requests row, no revision bump
-        assert conn.execute("select count(*) from turn_requests").fetchone()[0] == 0
+        # The admission is a separate durable reservation; the failed
+        # atomic commit leaves it pending but writes no turn or revision.
+        assert conn.execute(
+            "select status from turn_requests where request_id = 'req-fail'"
+        ).fetchone() == ("pending",)
         assert store.load_user_state().revision == 0
         store.close()
 
@@ -269,7 +294,7 @@ class TestAtomicTurnCommit:
         history = store.load_recent_history(limit=10)
         assert [m["content"] for m in history] == ["oi", "r1"]
         outcome = store.replay("req-2")
-        assert outcome.status == "request_replay_unavailable"
+        assert outcome.status == "request_in_progress"
         store.close()
 
     def test_revision_cas_rejects_stale_expected_revision(self, tmp_path: Path) -> None:
@@ -698,6 +723,49 @@ class TestReplayContract:
         assert row is not None and row[0] == "pending"
         store.close()
 
+    def test_delete_history_fences_old_commit_and_release_for_reused_request_id(
+        self, tmp_path: Path
+    ) -> None:
+        store = open_local_storage(tmp_path / "katherine.db")
+        old_reservation = store.reserve_request("req-reused", "old intent")
+        assert old_reservation.status == "reserved"
+        assert old_reservation.history_generation == 0
+
+        store.delete_history()
+        new_reservation = store.reserve_request("req-reused", "new intent")
+        assert new_reservation.status == "reserved"
+        assert new_reservation.history_generation == 1
+
+        old_kwargs = _commit_kwargs(
+            store, "req-reused", "late old response", user_message="old intent"
+        )
+        old_kwargs["history_generation"] = old_reservation.history_generation
+        with pytest.raises(ConflictError) as excinfo:
+            store.commit_turn(**old_kwargs)
+        assert excinfo.value.code == "request_reservation_invalidated"
+
+        # Cleanup from the old callback is fenced too: it cannot delete
+        # the post-delete reservation using only the reused request id.
+        store.release_request(
+            "req-reused", history_generation=old_reservation.history_generation
+        )
+        row = store._connection_for_tests_only().execute(
+            "select status, payload_hash_sha256 from turn_requests "
+            "where request_id = 'req-reused'"
+        ).fetchone()
+        assert row == ("pending", "reserved:history:1")
+
+        new_kwargs = _commit_kwargs(
+            store, "req-reused", "new response", user_message="new intent"
+        )
+        committed = store.commit_turn(**new_kwargs)
+        assert committed.response == "new response"
+        assert [row["content"] for row in store.load_recent_history(limit=10)] == [
+            "new intent",
+            "new response",
+        ]
+        store.close()
+
     def test_reserve_request_second_concurrent_call_is_conflict(
         self, tmp_path: Path
     ) -> None:
@@ -898,8 +966,12 @@ class TestRealDomainTurnCycle:
             RelationshipTransitionConfig.defaults(),
         )
 
+        first_generation = _reserve_history_generation(
+            store, "req-cycle-1", "oi Katherine"
+        )
         committed = store.commit_turn(
             request_id="req-cycle-1",
+            history_generation=first_generation,
             user_message="oi Katherine",
             assistant_message="olá!",
             emotional_state=emotional_result.state.to_dict(),
@@ -941,8 +1013,12 @@ class TestRealDomainTurnCycle:
         emotional_result_2 = transition(
             roundtrip_emotional, appraisal_2, t2, TransitionConfig.defaults()
         )
+        second_generation = _reserve_history_generation(
+            store, "req-cycle-2", "tudo bem?"
+        )
         committed_2 = store.commit_turn(
             request_id="req-cycle-2",
+            history_generation=second_generation,
             user_message="tudo bem?",
             assistant_message="tudo ótimo",
             emotional_state=emotional_result_2.state.to_dict(),
@@ -959,9 +1035,11 @@ class TestRealDomainTurnCycle:
         assert committed_2.revision == committed.revision + 1
 
         # ── stale CAS from turn 1 must be rejected with the real error ──
+        stale_generation = _reserve_history_generation(store, "req-cycle-stale", "x")
         with pytest.raises(ConflictError) as excinfo:
             store.commit_turn(
                 request_id="req-cycle-stale",
+                history_generation=stale_generation,
                 user_message="x",
                 assistant_message="y",
                 emotional_state=emotional_result.state.to_dict(),
@@ -1046,7 +1124,9 @@ class TestRequestIdempotencyConflict:
         # Nothing was written by the rejected commit.
         conn = store._connection_for_tests_only()
         assert conn.execute("select count(*) from chat_logs").fetchone()[0] == 0
-        assert conn.execute("select count(*) from turn_requests").fetchone()[0] == 0
+        assert conn.execute(
+            "select status from turn_requests where request_id = 'req-foreign'"
+        ).fetchone() == ("pending",)
         # The matching request_id commits normally.
         kw["replay_payload"]["request_id"] = "req-foreign"
         committed = store.commit_turn(**kw)
@@ -1226,8 +1306,10 @@ class TestNeutralResets:
 
         store = open_local_storage(tmp_path / "katherine.db")
         emotional, relationship = self._non_neutral_state()
+        history_generation = _reserve_history_generation(store, "req-neutral-1", "oi")
         store.commit_turn(
             request_id="req-neutral-1",
+            history_generation=history_generation,
             user_message="oi",
             assistant_message="olá",
             emotional_state=emotional.to_dict(),
@@ -1261,8 +1343,10 @@ class TestNeutralResets:
 
         store = open_local_storage(tmp_path / "katherine.db")
         emotional, relationship = self._non_neutral_state()
+        history_generation = _reserve_history_generation(store, "req-neutral-2", "oi")
         store.commit_turn(
             request_id="req-neutral-2",
+            history_generation=history_generation,
             user_message="oi",
             assistant_message="olá",
             emotional_state=emotional.to_dict(),
@@ -1290,8 +1374,10 @@ class TestNeutralResets:
 
         store = open_local_storage(tmp_path / "katherine.db")
         emotional, relationship = self._non_neutral_state()
+        history_generation = _reserve_history_generation(store, "req-neutral-3", "oi")
         store.commit_turn(
             request_id="req-neutral-3",
+            history_generation=history_generation,
             user_message="oi",
             assistant_message="olá",
             emotional_state=emotional.to_dict(),
@@ -1314,8 +1400,10 @@ class TestNeutralResets:
     def test_stale_commit_after_reset_hits_revision_mismatch(self, tmp_path: Path) -> None:
         store = open_local_storage(tmp_path / "katherine.db")
         emotional, relationship = self._non_neutral_state()
+        history_generation = _reserve_history_generation(store, "req-neutral-4", "oi")
         committed = store.commit_turn(
             request_id="req-neutral-4",
+            history_generation=history_generation,
             user_message="oi",
             assistant_message="olá",
             emotional_state=emotional.to_dict(),
@@ -1331,9 +1419,13 @@ class TestNeutralResets:
 
         # A commit prepared on the pre-reset revision must not overwrite
         # the reset: CAS rejects it deterministically.
+        stale_generation = _reserve_history_generation(
+            store, "req-neutral-5", "de novo"
+        )
         with pytest.raises(ConflictError) as excinfo:
             store.commit_turn(
                 request_id="req-neutral-5",
+                history_generation=stale_generation,
                 user_message="de novo",
                 assistant_message="resposta",
                 emotional_state=emotional.to_dict(),
