@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sqlite3
 import time as _time
 from pathlib import Path
 
@@ -242,6 +243,94 @@ async def test_commit_turn_is_idempotent_for_the_same_request_id(tmp_path):
     assert second.response == first.response
     assert second.message_id == first.message_id
     assert second.replayed is True
+    runtime.close()
+
+
+async def test_delete_history_fences_a_turn_suspended_in_provider(tmp_path):
+    """A turn admitted before a confirmed delete cannot recreate any
+    history or mutate profile state when its provider later returns.
+
+    The provider is the only scripted boundary. Assertions after the
+    callback use a second SQLite connection, independently of the
+    runtime's storage facade.
+    """
+
+    class SuspendedProvider(ScriptedProvider):
+        def __init__(self):
+            super().__init__(response="late response")
+            self.generation_started = asyncio.Event()
+            self.release_generation = asyncio.Event()
+            self.suspend = False
+
+        async def generate(self, messages, budget):
+            self.calls += 1
+            if self.suspend:
+                self.generation_started.set()
+                await self.release_generation.wait()
+            return self.response
+
+    database_path = tmp_path / "katherine.db"
+    provider = SuspendedProvider()
+    runtime = CompanionRuntime(
+        storage_path=database_path,
+        language_model=provider,
+        now_provider=_test_clock,
+    )
+
+    seed = await runtime.commit_turn_async(request_id="seed", message="keep state")
+    assert seed.success is True
+    with sqlite3.connect(database_path) as independent_db:
+        profile_before = independent_db.execute(
+            "select emotional_state, relationship_state, revision from profiles where id = 1"
+        ).fetchone()
+    assert profile_before is not None
+
+    provider.suspend = True
+    old_turn = asyncio.create_task(
+        runtime.commit_turn_async(request_id="before-delete", message="private turn")
+    )
+    await provider.generation_started.wait()
+
+    deleted = runtime.delete_history()
+    assert deleted["success"] is True
+    assert runtime.load_history(limit=50) == []
+    with sqlite3.connect(database_path) as independent_db:
+        assert independent_db.execute("select count(*) from chat_logs").fetchone()[0] == 0
+        assert independent_db.execute("select count(*) from turn_requests").fetchone()[0] == 0
+        assert independent_db.execute("select count(*) from outbox_events").fetchone()[0] == 0
+
+    provider.release_generation.set()
+    old_result = await old_turn
+    assert old_result.success is False
+    assert old_result.error_code == LocalErrorCode.REQUEST_CONFLICT
+    assert "private turn" not in (old_result.error_message or "")
+    assert "Traceback" not in (old_result.error_message or "")
+
+    with sqlite3.connect(database_path) as independent_db:
+        assert independent_db.execute("select count(*) from chat_logs").fetchone()[0] == 0
+        assert independent_db.execute("select count(*) from turn_requests").fetchone()[0] == 0
+        assert independent_db.execute("select count(*) from outbox_events").fetchone()[0] == 0
+        profile_after_old_turn = independent_db.execute(
+            "select emotional_state, relationship_state, revision from profiles where id = 1"
+        ).fetchone()
+        assert profile_after_old_turn == profile_before
+
+    # A fresh, explicit post-delete intent remains admissible.
+    provider.suspend = False
+    new_result = await runtime.commit_turn_async(
+        request_id="after-delete", message="new private turn"
+    )
+    assert new_result.success is True
+    with sqlite3.connect(database_path) as independent_db:
+        assert independent_db.execute("select count(*) from chat_logs").fetchone()[0] == 2
+        assert independent_db.execute(
+            "select count(*) from turn_requests where status = 'completed'"
+        ).fetchone()[0] == 1
+        profile_after_new_turn = independent_db.execute(
+            "select emotional_state, relationship_state, revision from profiles where id = 1"
+        ).fetchone()
+        assert profile_after_new_turn[2] == profile_before[2] + 1
+    assert provider.calls == 3
     runtime.close()
 
 

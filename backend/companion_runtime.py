@@ -633,11 +633,16 @@ class CompanionRuntime:
         if pre.status != "reserved":
             # reserve_request only returns reserved/replay/conflict.
             raise StorageValidationError("invalid_request_id", "admission invalid")
+        if pre.history_generation is None:
+            raise StorageValidationError(
+                "invalid_history_generation", "admission generation invalid"
+            )
 
         try:
             return await self._execute_reserved_turn(
                 storage=storage,
                 request_id=request_id,
+                history_generation=pre.history_generation,
                 message=message,
             )
         except BaseException:
@@ -646,7 +651,9 @@ class CompanionRuntime:
             # this live session (crash recovery only runs at open
             # time). Completed rows are never touched — only pending.
             try:
-                storage.release_request(request_id)
+                storage.release_request(
+                    request_id, history_generation=pre.history_generation
+                )
             except Exception:  # noqa: BLE001 (best-effort release)
                 pass
             raise
@@ -656,6 +663,7 @@ class CompanionRuntime:
         *,
         storage,
         request_id: str,
+        history_generation: int,
         message: str,
     ) -> TurnResult:
         budget = TurnBudget(
@@ -723,6 +731,7 @@ class CompanionRuntime:
 
         committed = storage.commit_turn(
             request_id=request_id,
+            history_generation=history_generation,
             user_message=message,
             assistant_message=response_text,
             emotional_state=new_emotional.to_dict(),

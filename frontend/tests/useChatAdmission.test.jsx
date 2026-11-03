@@ -109,12 +109,12 @@ describe('useChat admission identity', () => {
         await act(async () => { await result.current.handleSend(); });
 
         expect(mockSendMessage).not.toHaveBeenCalled();
-        expect(result.current.messages).toEqual([
-            {
-                role: 'system',
-                content: SYSTEM_MESSAGES.REQUEST_ID_UNAVAILABLE,
-            },
-        ]);
+        expect(result.current.messages).toHaveLength(1);
+        expect(result.current.messages[0]).toMatchObject({
+            role: 'system',
+            content: SYSTEM_MESSAGES.REQUEST_ID_UNAVAILABLE,
+            serverId: null,
+        });
         expect(result.current.isLoading).toBe(false);
         expect(result.current.input).toBe('hello');
     });
@@ -132,12 +132,12 @@ describe('useChat admission identity', () => {
 
         expect(failingRandomUUID).toHaveBeenCalledTimes(1);
         expect(mockSendMessage).not.toHaveBeenCalled();
-        expect(result.current.messages).toEqual([
-            {
-                role: 'system',
-                content: SYSTEM_MESSAGES.REQUEST_ID_UNAVAILABLE,
-            },
-        ]);
+        expect(result.current.messages).toHaveLength(1);
+        expect(result.current.messages[0]).toMatchObject({
+            role: 'system',
+            content: SYSTEM_MESSAGES.REQUEST_ID_UNAVAILABLE,
+            serverId: null,
+        });
         expect(result.current.isLoading).toBe(false);
         expect(result.current.input).toBe('hello');
     });
@@ -157,12 +157,12 @@ describe('useChat admission identity', () => {
         });
         await act(async () => {});
 
-        expect(result.current.messages).toEqual([
-            {
-                role: 'system',
-                content: SYSTEM_MESSAGES.REQUEST_ID_UNAVAILABLE,
-            },
-        ]);
+        expect(result.current.messages).toHaveLength(1);
+        expect(result.current.messages[0]).toMatchObject({
+            role: 'system',
+            content: SYSTEM_MESSAGES.REQUEST_ID_UNAVAILABLE,
+            serverId: null,
+        });
         expect(result.current.input).toBe('hello');
     });
 });

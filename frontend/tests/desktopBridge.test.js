@@ -191,7 +191,7 @@ test('sendMessageViaBridge returns the consumed shape on success', async () => {
 test('sendMessageViaBridge throws ChatError with the stable bridge code', async () => {
     const cases = [
         ['configuration', 'configuration', 'O provedor remoto não está configurado neste ambiente.'],
-        ['request_conflict', 'request_conflict', 'Este envio não pôde ser reconciliado. Envie a mensagem novamente.'],
+        ['request_conflict', 'request_conflict', 'Este envio não pôde ser reconciliado. Tentar novamente reutilizará o mesmo envio.'],
         ['rate_limited', 'rate_limited', 'Muitas requisições. Aguarde um momento e tente novamente.'],
         ['timeout', 'timeout', 'A requisição excedeu o tempo limite.'],
         ['validation', 'validation', 'Dados inválidos enviados.'],

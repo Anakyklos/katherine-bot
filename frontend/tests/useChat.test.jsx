@@ -402,7 +402,8 @@ describe('useChat', () => {
         const { result } = renderHook(() => useChat());
 
         await waitFor(() => {
-            expect(result.current.messages).toEqual(historyData);
+            expect(result.current.messages.map(({ role, content }) => ({ role, content })))
+                .toEqual(historyData);
         });
     });
 
@@ -485,7 +486,8 @@ describe('useChat', () => {
 
         const first = renderHook(() => useChat());
         await waitFor(() => {
-            expect(first.result.current.messages).toEqual(historyData);
+            expect(first.result.current.messages.map(({ role, content }) => ({ role, content })))
+                .toEqual(historyData);
         });
 
         // Clear the screen: local view is emptied, nothing is deleted server-side.
@@ -500,7 +502,8 @@ describe('useChat', () => {
 
         const second = renderHook(() => useChat());
         await waitFor(() => {
-            expect(second.result.current.messages).toEqual(historyData);
+            expect(second.result.current.messages.map(({ role, content }) => ({ role, content })))
+                .toEqual(historyData);
         });
 
         // The persisted history was never removed: /history returns it again.

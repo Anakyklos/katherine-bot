@@ -118,6 +118,18 @@ describe('PrivacyPanel', () => {
         expect(await screen.findByText(/operação concluída/i)).toBeInTheDocument();
     });
 
+    it('notifies the chat after confirmed history deletion succeeds', async () => {
+        const transport = makeTransport();
+        const onHistoryDeleted = vi.fn();
+        render(<PrivacyPanel transport={transport} onHistoryDeleted={onHistoryDeleted} />);
+
+        fireEvent.click(screen.getByRole('button', { name: /apagar histórico/i }));
+        fireEvent.click(screen.getByRole('button', { name: /confirmar/i }));
+
+        await screen.findByText(/operação concluída/i);
+        expect(onHistoryDeleted).toHaveBeenCalledTimes(1);
+    });
+
     it('cancel dismisses the confirmation without running anything', () => {
         const transport = makeTransport();
         render(<PrivacyPanel transport={transport} />);

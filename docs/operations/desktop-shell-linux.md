@@ -89,12 +89,18 @@ O smoke abre a janela real em `file://` e verifica, com probes
 
 **Caminho de aceitação do usuário (#336, mesmo smoke):**
 
-16. envio REAL pela UI: digitar no textarea → clicar em enviar →
-    ChatWindow renderiza a resposta (useChat → transport → bridge →
-    runtime → SQLite, sem chamar a bridge diretamente);
+16. retry REAL pela UI (#374): o primeiro resultado é descartado após
+    o commit SQLite; a mensagem permanece incerta, o usuário aciona
+    "Tentar novamente" e o replay renderiza um único turno sem nova
+    geração do provider;
 17. privacidade REAL pela UI: clicar "Apagar histórico" → confirmação
-    explícita → status "Operação concluída" renderizado (o painel
-    real, não chamadas diretas de bridge).
+    explícita → status "Operação concluída" renderizado e conversa
+    removida da tela (o painel real, não chamadas diretas de bridge);
+18. corrida de privacidade (#375): o provider scriptado suspende um
+    envio real da UI depois da reserva SQLite; a exclusão é confirmada
+    pelo painel; ao liberar o provider, o commit é rejeitado, o callback
+    tardio não repovoa a tela e uma leitura SQLite independente confirma
+    que mensagens e reservas continuam ausentes.
 
 **Prova do provider real (bloqueio registrado):** o smoke usa provider
 scriptado porque a rede Groq não é determinística nem gratuita. A perna
@@ -124,6 +130,26 @@ nenhuma cota Groq é gasta. O ciclo de vida exercitado é o de produção
 (bridge → runtime → LocalStorage → SQLite). A prova de persistência
 não confia na leitura do próprio runtime: uma conexão `sqlite3`
 independente (read-only) inspeciona o arquivo.
+
+### Nota sobre reconciliação de retry (#374)
+
+O smoke executa a primeira chamada pelo caminho real da UI. No limite da
+bridge, o harness chama o handler real até o runtime concluir o commit em
+SQLite e descarta o resultado uma única vez antes de devolvê-lo ao
+JavaScript. A bridge expõe apenas seu erro sanitizado. O smoke clica no
+retry visível na mesma mensagem e confere que as duas chamadas carregam o
+mesmo `request_id`, que o provider gerou uma vez, que há um balão de usuário
+e um de resposta e que uma leitura SQLite independente encontra duas linhas
+em `chat_logs` e uma solicitação concluída em `turn_requests`. A injeção de
+falha existe somente neste harness; o frontend de produção não ganha uma
+rota ou método de bridge adicional.
+
+O mesmo shell suspende outra geração depois da reserva, confirma `delete_history`
+pela UI e só então libera o provider. A leitura independente verifica zero
+linhas em `chat_logs` e `turn_requests` antes e depois da resposta tardia; a
+bridge devolve um conflito sanitizado e a tela permanece limpa. Esse cenário
+usa o provider e a SQLite descartável reais do smoke e não substitui o teste de
+retry pós-commit acima.
 
 ### Nota sobre o check "remote navigation"
 

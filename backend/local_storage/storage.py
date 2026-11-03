@@ -133,10 +133,16 @@ class CommittedTurn:
 
 @dataclass(frozen=True)
 class ReplayOutcome:
-    """Structured replay lookup result (web contract parity)."""
+    """Replay/admission outcome; generation is present only for new reservations."""
 
     status: str
     committed: Optional[CommittedTurn] = None
+    history_generation: Optional[int] = None
+
+
+def _reservation_marker(history_generation: int) -> str:
+    """Return the non-sensitive ledger marker for an admitted turn."""
+    return f"reserved:history:{history_generation}"
 
 
 def _validate_request_id(request_id: Any) -> str:
@@ -476,6 +482,7 @@ class LocalStorage:
         self,
         *,
         request_id: str,
+        history_generation: int,
         user_message: str,
         assistant_message: str,
         emotional_state: Mapping[str, Any],
@@ -496,14 +503,23 @@ class LocalStorage:
            canonical payload replays without writing anything; the same
            ``request_id`` with ANY divergent determinative input raises
            ``ConflictError("request_payload_conflict")`` without writing;
-        3. inside ``BEGIN IMMEDIATE`` … ``COMMIT``: insert both chat
-           messages, upsert the single profile row with a revision CAS,
+        3. inside ``BEGIN IMMEDIATE`` … ``COMMIT``: verify that the
+           reservation still belongs to the current history generation,
+           then insert both chat messages, upsert the profile row with a CAS,
            insert the turn ledger row, insert the outbox events.
 
-        Any failure between steps rolls the entire turn back: messages
-        and snapshots can never diverge (issue #335, tests 3 and 4).
+        Any failure in the commit transaction rolls its writes back:
+        messages and snapshots can never diverge (issue #335, tests 3 and 4).
         """
         request_id = _validate_request_id(request_id)
+        if (
+            isinstance(history_generation, bool)
+            or not isinstance(history_generation, int)
+            or history_generation < 0
+        ):
+            raise ValidationError(
+                "invalid_history_generation", "history generation must be non-negative"
+            )
         user_message = _validate_message(user_message, "user_message")
         assistant_message = _validate_message(assistant_message, "assistant_message")
         if not isinstance(public_response, str) or not public_response:
@@ -567,12 +583,9 @@ class LocalStorage:
             if existing is not None:
                 status, stored_hash = existing[0], existing[1]
                 if status == "pending":
-                    # #336 review blocker 4: pending = the caller's own
-                    # atomic reservation (reserve_request), not another
-                    # writer's turn. Proceed: the transactional commit
-                    # upserts this exact row to completed. Concurrent
-                    # DUPLICATE callers never reach commit_turn at all —
-                    # reserve_request already classified them.
+                    # A pending row is only a candidate reservation.
+                    # The transactional read below checks its history
+                    # generation before any state or message write.
                     pass
                 if status == "completed":
                     # Same request + same canonical payload → replay the
@@ -593,20 +606,15 @@ class LocalStorage:
                         request_id, existing[2], existing[3], existing[4], existing[5]
                     )
                 if status == "failed":
-                    # failed: replay is unavailable, but a retry with the same
-                    # canonical payload may proceed as a fresh attempt; a
-                    # divergent payload for the same request id is still a
-                    # conflict (deterministic rejection, no silent reuse).
-                    if stored_hash != payload_hash:
-                        raise ConflictError(
-                            "request_payload_conflict",
-                            "Request id already exists with a different payload.",
-                            expected_revision=(
-                                expected_revision if expected_revision is not None else 0
-                            ),
-                            actual_revision=None,
-                            request_id=request_id,
-                        )
+                    raise ConflictError(
+                        "request_replay_unavailable",
+                        "Request cannot be replayed or recommitted.",
+                        expected_revision=(
+                            expected_revision if expected_revision is not None else 0
+                        ),
+                        actual_revision=None,
+                        request_id=request_id,
+                    )
 
             try:
                 conn.execute("BEGIN IMMEDIATE")
@@ -620,9 +628,12 @@ class LocalStorage:
                     "from turn_requests where request_id = ?",
                     (request_id,),
                 ).fetchone()
-                if existing is not None:
-                    status, stored_hash = existing[0], existing[1]
-                    if status != "pending" and stored_hash != payload_hash:
+                current_generation = conn.execute(
+                    "select count(*) from privacy_operations "
+                    "where operation = 'delete_history'"
+                ).fetchone()[0]
+                if existing is not None and existing[0] == "completed":
+                    if existing[1] != payload_hash:
                         conn.execute("ROLLBACK")
                         raise ConflictError(
                             "request_payload_conflict",
@@ -633,20 +644,27 @@ class LocalStorage:
                             actual_revision=None,
                             request_id=request_id,
                         )
-                    if status == "completed":
-                        conn.execute("ROLLBACK")
-                        return self._committed_from_row(
-                            request_id, existing[2], existing[3], existing[4], existing[5]
-                        )
-                    if status == "pending":
-                        # #336 review blocker 4: a pending row is the
-                        # CALLER'S OWN reservation (reserve_request
-                        # inserted it atomically before the provider
-                        # call). The completed-commit below flips it to
-                        # completed with the real payload hash inside
-                        # this same write transaction — the upsert
-                        # targets the reserved row instead of failing.
-                        pass
+                    conn.execute("ROLLBACK")
+                    return self._committed_from_row(
+                        request_id, existing[2], existing[3], existing[4], existing[5]
+                    )
+
+                if (
+                    current_generation != history_generation
+                    or existing is None
+                    or existing[0] != "pending"
+                    or existing[1] != _reservation_marker(history_generation)
+                ):
+                    conn.execute("ROLLBACK")
+                    raise ConflictError(
+                        "request_reservation_invalidated",
+                        "Request reservation is no longer valid.",
+                        expected_revision=(
+                            expected_revision if expected_revision is not None else 0
+                        ),
+                        actual_revision=None,
+                        request_id=request_id,
+                    )
 
                 profile_row = conn.execute(
                     "select revision from profiles where id = 1"
@@ -865,7 +883,7 @@ class LocalStorage:
             ),
         )
 
-    def release_request(self, request_id: str) -> None:
+    def release_request(self, request_id: str, *, history_generation: int) -> None:
         """Release a pending reservation after a live failure.
 
         The counterpart of ``reserve_request`` for the ERROR path of a
@@ -880,16 +898,27 @@ class LocalStorage:
 
         Only ``pending`` rows are ever deleted: completed replays and
         crash-recovered ``failed`` rows are durable history and stay.
+        The supplied history generation prevents a late failure callback
+        from releasing a newer reservation that reused the same request id.
         """
         request_id = _validate_request_id(request_id)
+        if (
+            isinstance(history_generation, bool)
+            or not isinstance(history_generation, int)
+            or history_generation < 0
+        ):
+            raise ValidationError(
+                "invalid_history_generation", "history generation must be non-negative"
+            )
         with self._lock:
             conn = self._connection()
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 conn.execute(
                     "delete from turn_requests "
-                    "where request_id = ? and status = 'pending'",
-                    (request_id,),
+                    "where request_id = ? and status = 'pending' "
+                    "and payload_hash_sha256 = ?",
+                    (request_id, _reservation_marker(history_generation)),
                 )
                 conn.execute("COMMIT")
             except sqlite3.Error:
@@ -927,27 +956,37 @@ class LocalStorage:
             conn = self._connection()
             try:
                 conn.execute("BEGIN IMMEDIATE")
+                history_generation = conn.execute(
+                    "select count(*) from privacy_operations "
+                    "where operation = 'delete_history'"
+                ).fetchone()[0]
                 # The reservation insert's uniqueness (request_id is
                 # the primary key) IS the admission: the writer lock
                 # plus BEGIN IMMEDIATE make check-then-insert atomic.
+                # The delete-history count is a durable fencing token:
+                # delete_history appends its audit row in the same
+                # transaction that erases reservations and history.
                 inserted = conn.execute(
                     "insert into turn_requests "
                     "(request_id, payload_hash_sha256, status) "
                     "values (?, ?, 'pending') "
                     "on conflict (request_id) do nothing",
-                    # Placeholder hash: the completed commit below
-                    # overwrites it with the canonical payload hash
-                    # inside the same transaction. A pending row never
-                    # advertises a real hash (it is not comparable —
-                    # the payload does not exist yet).
-                    (request_id, "reserved:" + request_id),
+                    # This placeholder binds the pending reservation to
+                    # the history generation in which it was admitted.
+                    # The completed commit replaces it with the
+                    # canonical payload hash.
+                    (request_id, _reservation_marker(history_generation)),
                 )
                 # rowcount 1 → this call created the reservation (we
                 # own it). rowcount 0 → a row already existed: every
                 # path below must decide by ITS state, never ours.
                 if inserted.rowcount == 1:
                     conn.execute("COMMIT")
-                    return ReplayOutcome(status="reserved", committed=None)
+                    return ReplayOutcome(
+                        status="reserved",
+                        committed=None,
+                        history_generation=history_generation,
+                    )
                 row = conn.execute(
                     "select status, user_message_chat_log_id, "
                     "committed_revision, assistant_message_chat_log_id, "
@@ -969,7 +1008,10 @@ class LocalStorage:
                         (user_msg_id,),
                     ).fetchone()
                     if stored is None or stored[0] != user_message:
-                        return ReplayOutcome(status="conflict", committed=None)
+                        return ReplayOutcome(
+                            status="conflict",
+                            committed=None,
+                        )
                     return ReplayOutcome(
                         status="replay",
                         committed=self._committed_from_row(

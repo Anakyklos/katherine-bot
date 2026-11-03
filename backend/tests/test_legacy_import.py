@@ -236,8 +236,10 @@ class TestLegacyFixtureImport:
         imports the legacy install — both coexist; neither duplicates."""
         store = open_local_storage(tmp_path / "katherine.db")
         # one local turn
+        reservation = store.reserve_request("local-1", "olá local")
         store.commit_turn(
             request_id="local-1",
+            history_generation=reservation.history_generation,
             user_message="olá local",
             assistant_message="olá!",
             emotional_state=_neutral_emotional(),
