@@ -1050,10 +1050,15 @@ class LocalStorage:
                 # conflict so the caller surfaces reconciliation.
                 conn.execute("ROLLBACK")
                 return ReplayOutcome(status="conflict", committed=None)
-            except sqlite3.Error:
+            except Exception as exc:
                 if conn.in_transaction:
-                    conn.execute("ROLLBACK")
-                raise PersistenceError("database_error", "persistence error") from None
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                if isinstance(exc, sqlite3.Error):
+                    raise PersistenceError("database_error", "persistence error") from None
+                raise
 
     # ── Memory ──────────────────────────────────────────────────────────
 
