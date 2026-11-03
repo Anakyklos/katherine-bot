@@ -806,3 +806,102 @@ async def test_close_flushes_and_data_survives_immediately(tmp_path):
     rows = conn.execute("select count(*) from chat_logs").fetchall()
     conn.close()
     assert rows[0][0] == 2
+
+
+async def test_corrupted_history_fence_fails_closed_without_calling_provider(tmp_path):
+    class RecordingProvider(ScriptedProvider):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        async def appraise(self, message, budget):
+            self.calls += 1
+            return await super().appraise(message, budget)
+
+        async def generate(self, messages, budget):
+            self.calls += 1
+            return await super().generate(messages, budget)
+
+    db_path = tmp_path / "katherine.db"
+    provider = RecordingProvider()
+    runtime = CompanionRuntime(
+        storage_path=db_path,
+        language_model=provider,
+        now_provider=_test_clock,
+    )
+    # Prime storage so tables are created
+    runtime._ensure_storage()
+
+    # Corrupt history_fence by deleting the single row
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("delete from history_fence")
+        conn.commit()
+
+    result = await runtime.commit_turn_async(request_id="req-corrupt", message="hi")
+    assert result.success is False
+    assert result.error_code == LocalErrorCode.STORAGE
+    assert provider.calls == 0
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("select count(*) from chat_logs").fetchone()[0] == 0
+        assert conn.execute("select count(*) from turn_requests").fetchone()[0] == 0
+    runtime.close()
+
+
+async def test_runtime_fencing_independent_of_privacy_operations_ledger(tmp_path):
+    class SuspendedProvider(ScriptedProvider):
+        def __init__(self):
+            super().__init__(response="resp")
+            self.generation_started = asyncio.Event()
+            self.release_generation = asyncio.Event()
+            self.suspend = False
+
+        async def generate(self, messages, budget):
+            self.calls += 1
+            if self.suspend:
+                self.generation_started.set()
+                await self.release_generation.wait()
+            return self.response
+
+    db_path = tmp_path / "katherine.db"
+    provider = SuspendedProvider()
+    runtime = CompanionRuntime(
+        storage_path=db_path,
+        language_model=provider,
+        now_provider=_test_clock,
+    )
+
+    # Turn 1 + delete_history -> generation 1
+    t1 = await runtime.commit_turn_async(request_id="t-1", message="m1")
+    assert t1.success is True
+    d1 = runtime.delete_history()
+    assert d1["success"] is True
+
+    # Purge privacy_operations completely
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("select count(*) from privacy_operations").fetchone()[0] >= 1
+        conn.execute("delete from privacy_operations")
+        conn.commit()
+        assert conn.execute("select count(*) from privacy_operations").fetchone()[0] == 0
+
+    # Turn 2 runs while ledger is empty
+    provider.suspend = True
+    turn_task = asyncio.create_task(
+        runtime.commit_turn_async(request_id="t-2", message="m2")
+    )
+    await provider.generation_started.wait()
+
+    # Delete history confirmed while turn 2 is suspended -> generation 2
+    d2 = runtime.delete_history()
+    assert d2["success"] is True
+
+    # Release turn 2
+    provider.release_generation.set()
+    res2 = await turn_task
+    assert res2.success is False
+    assert res2.error_code == LocalErrorCode.REQUEST_CONFLICT
+
+    with sqlite3.connect(db_path) as conn:
+        assert conn.execute("select count(*) from chat_logs").fetchone()[0] == 0
+        assert conn.execute("select count(*) from turn_requests").fetchone()[0] == 0
+        assert conn.execute("select generation from history_fence where id = 1").fetchone()[0] == 2
+    runtime.close()

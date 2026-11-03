@@ -110,9 +110,24 @@ create table privacy_operations (
 );
 """
 
+#: Migration 2 — independent, monotonic history generation fence table (#376).
+#: Decouples the late-commit history fence from privacy_operations audit ledger count.
+_MIGRATION_0002 = """
+create table history_fence (
+    id integer primary key check (id = 1),
+    generation integer not null check (generation >= 0)
+);
+
+insert into history_fence (id, generation)
+select 1, coalesce(count(*), 0)
+from privacy_operations
+where operation = 'delete_history';
+"""
+
 #: The ordered migration list. Append-only by convention.
 MIGRATIONS: tuple[tuple[int, str], ...] = (
     (1, _MIGRATION_0001),
+    (2, _MIGRATION_0002),
 )
 
 #: SQL that guarantees the bookkeeping table exists before any version

@@ -80,10 +80,7 @@ def _commit_kwargs(
     reservation = store.reserve_request(request_id, user_message)
     history_generation = reservation.history_generation
     if history_generation is None:
-        history_generation = store._connection_for_tests_only().execute(
-            "select count(*) from privacy_operations "
-            "where operation = 'delete_history'"
-        ).fetchone()[0]
+        history_generation = store.history_generation()
     return {
         "request_id": request_id,
         "history_generation": history_generation,
@@ -118,6 +115,7 @@ class TestMigrations:
             "outbox_events",
             "memories",
             "schema_migrations",
+            "history_fence",
         ):
             exists = conn.execute(
                 "select count(*) from sqlite_master where type='table' and name=?",
@@ -1602,4 +1600,438 @@ class TestClosedLifecycle:
     def test_close_is_idempotent_and_safe(self, tmp_path: Path) -> None:
         store = open_local_storage(tmp_path / "katherine.db")
         store.close()
+        store.close()
+
+
+class TestDurableHistoryFence:
+    """Slice P1: independent, monotonic, durable history generation fence (#376).
+
+    Proves invariants I1–I10 through tests T1–T11 with real SQLite files.
+    """
+
+    def test_t1_fresh_database_initializes_generation_to_zero(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "katherine.db"
+        store = open_local_storage(db_path)
+        assert store.history_generation() == 0
+        assert store.schema_version() == 2
+        with sqlite3.connect(db_path) as conn:
+            rows = conn.execute("select id, generation from history_fence").fetchall()
+            assert rows == [(1, 0)]
+        store.close()
+
+    def test_t2_migration_from_schema_1_with_existing_deletions(
+        self, tmp_path: Path
+    ) -> None:
+        from backend.local_storage.migrations import (
+            BOOTSTRAP_SQL,
+            _MIGRATION_0001,
+        )
+
+        db_path = tmp_path / "katherine.db"
+        # Seed a database with schema 1 only
+        with sqlite3.connect(db_path) as conn:
+            conn.executescript(BOOTSTRAP_SQL)
+            conn.executescript(_MIGRATION_0001)
+            conn.execute("insert into schema_migrations (version) values (1)")
+            # Add existing profile, messages, memories, and 4 delete_history audit rows
+            conn.execute(
+                "insert into profiles (id, user_profile, emotional_state, "
+                "relationship_state, revision) values (1, '{}', '{}', '{}', 5)"
+            )
+            conn.execute(
+                "insert into chat_logs (role, content) values ('user', 'mensagem existente')"
+            )
+            conn.execute(
+                "insert into memories (content, metadata) values ('memoria', '{\"schema_version\": 1}')"
+            )
+            for i in range(4):
+                conn.execute(
+                    "insert into privacy_operations (operation, status, result) "
+                    "values ('delete_history', 'applied', ?)",
+                    (json.dumps({"deleted_messages": i}),),
+                )
+            conn.execute(
+                "insert into privacy_operations (operation, status, result) "
+                "values ('delete_memories', 'applied', '{}')"
+            )
+            conn.commit()
+
+        # Open through LocalStorage — migration 2 runs
+        store = open_local_storage(db_path)
+        assert store.schema_version() == 2
+        # Generation initialized deterministically from existing count of 4
+        assert store.history_generation() == 4
+
+        # Existing data preserved completely
+        state = store.load_user_state()
+        assert state.revision == 5
+        history = store.load_recent_history(limit=10)
+        assert len(history) == 1
+        assert history[0]["content"] == "mensagem existente"
+        with sqlite3.connect(db_path) as conn:
+            assert conn.execute("select count(*) from memories").fetchone()[0] == 1
+            assert conn.execute("select count(*) from privacy_operations").fetchone()[0] == 5
+            fence = conn.execute("select id, generation from history_fence").fetchall()
+            assert fence == [(1, 4)]
+        store.close()
+
+    def test_t3_delete_history_increments_generation_monotonically_even_when_empty(
+        self, tmp_path: Path
+    ) -> None:
+        store = open_local_storage(tmp_path / "katherine.db")
+        assert store.history_generation() == 0
+
+        # Increment 1: delete with turn present
+        store.commit_turn(**_commit_kwargs(store, "req-t3-1", "resp-1"))
+        res1 = store.delete_history()
+        assert res1["status"] == "applied"
+        assert store.history_generation() == 1
+
+        # Increment 2: delete on already empty history
+        res2 = store.delete_history()
+        assert res2["status"] == "applied"
+        assert res2["deleted_messages"] == 0
+        assert store.history_generation() == 2
+
+        # Increment 3: delete on empty history again
+        res3 = store.delete_history()
+        assert res3["status"] == "applied"
+        assert res3["deleted_messages"] == 0
+        assert store.history_generation() == 3
+        store.close()
+
+    def test_t4_delete_history_rollback_preserves_history_and_generation(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "katherine.db"
+        store = open_local_storage(db_path)
+        store.commit_turn(**_commit_kwargs(store, "req-t4-1", "resp-1"))
+        store.commit_turn(**_commit_kwargs(store, "req-t4-2", "resp-2"))
+        assert len(store.load_recent_history(limit=10)) == 4
+        assert store.history_generation() == 0
+
+        # Inject real failure into delete_history transaction via a failing trigger on turn_requests
+        conn = store._connection_for_tests_only()
+        conn.execute(
+            "create trigger abort_del before delete on turn_requests "
+            "begin select raise(ABORT, 'injected delete failure'); end;"
+        )
+
+        with pytest.raises(PersistenceError):
+            store.delete_history()
+
+        # Remove trigger and verify complete rollback:
+        # history, turn_requests and generation are unmodified
+        conn.execute("drop trigger abort_del")
+        assert len(store.load_recent_history(limit=10)) == 4
+        assert store.history_generation() == 0
+        with sqlite3.connect(db_path) as independent_db:
+            assert independent_db.execute("select count(*) from chat_logs").fetchone()[0] == 4
+            assert independent_db.execute("select count(*) from turn_requests").fetchone()[0] == 2
+            assert independent_db.execute("select generation from history_fence where id = 1").fetchone()[0] == 0
+        store.close()
+
+    def test_t5_stale_commit_rejected_after_delete_history(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "katherine.db"
+        store = open_local_storage(db_path)
+        reservation = store.reserve_request("req-stale-t5", "stale message")
+        assert reservation.status == "reserved"
+        assert reservation.history_generation == 0
+
+        # History is deleted while turn is in-flight
+        store.delete_history()
+        assert store.history_generation() == 1
+
+        # Attempt to commit old turn with stale generation without re-reserving
+        commit_args = {
+            "request_id": "req-stale-t5",
+            "history_generation": reservation.history_generation,
+            "user_message": "stale message",
+            "assistant_message": "late response",
+            "emotional_state": _neutral_emotional(),
+            "relationship_state": _neutral_relationship(),
+            "public_response": "late response",
+            "replay_payload": _emotion_payload("late response"),
+        }
+        with pytest.raises(ConflictError) as excinfo:
+            store.commit_turn(**commit_args)
+        assert excinfo.value.code == "request_reservation_invalidated"
+
+        # Verification: nothing was recreated or committed
+        with sqlite3.connect(db_path) as independent_db:
+            assert independent_db.execute("select count(*) from chat_logs").fetchone()[0] == 0
+            assert independent_db.execute("select count(*) from turn_requests").fetchone()[0] == 0
+            assert independent_db.execute("select count(*) from outbox_events").fetchone()[0] == 0
+        store.close()
+
+    def test_t6_request_id_reuse_after_delete_history(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "katherine.db"
+        store = open_local_storage(db_path)
+        old_res = store.reserve_request("req-reused-t6", "first message")
+        assert old_res.status == "reserved"
+        assert old_res.history_generation == 0
+
+        store.delete_history()
+        assert store.history_generation() == 1
+
+        new_res = store.reserve_request("req-reused-t6", "second message")
+        assert new_res.status == "reserved"
+        assert new_res.history_generation == 1
+
+        # Late commit from old generation fails
+        old_commit_args = {
+            "request_id": "req-reused-t6",
+            "history_generation": old_res.history_generation,
+            "user_message": "first message",
+            "assistant_message": "old response",
+            "emotional_state": _neutral_emotional(),
+            "relationship_state": _neutral_relationship(),
+            "public_response": "old response",
+            "replay_payload": _emotion_payload("old response"),
+        }
+        with pytest.raises(ConflictError) as excinfo:
+            store.commit_turn(**old_commit_args)
+        assert excinfo.value.code == "request_reservation_invalidated"
+
+        # Old release with old generation must not release the new reservation
+        store.release_request("req-reused-t6", history_generation=old_res.history_generation)
+        with sqlite3.connect(db_path) as independent_db:
+            row = independent_db.execute(
+                "select status, payload_hash_sha256 from turn_requests where request_id = 'req-reused-t6'"
+            ).fetchone()
+            assert row == ("pending", "reserved:history:1")
+
+        # New turn commits successfully
+        new_commit_args = {
+            "request_id": "req-reused-t6",
+            "history_generation": new_res.history_generation,
+            "user_message": "second message",
+            "assistant_message": "new response",
+            "emotional_state": _neutral_emotional(),
+            "relationship_state": _neutral_relationship(),
+            "public_response": "new response",
+            "replay_payload": _emotion_payload("new response"),
+        }
+        committed = store.commit_turn(**new_commit_args)
+        assert committed.response == "new response"
+        assert [r["content"] for r in store.load_recent_history(limit=10)] == [
+            "second message",
+            "new response",
+        ]
+        store.close()
+
+    def test_t7_ledger_independence_purging_privacy_operations_preserves_generation(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "katherine.db"
+        store = open_local_storage(db_path)
+        store.commit_turn(**_commit_kwargs(store, "req-t7-1", "r1"))
+        store.delete_history()
+        store.commit_turn(**_commit_kwargs(store, "req-t7-2", "r2"))
+        store.delete_history()
+        assert store.history_generation() == 2
+
+        with sqlite3.connect(db_path) as independent_db:
+            assert independent_db.execute("select count(*) from privacy_operations").fetchone()[0] == 2
+            # Purge the privacy_operations ledger completely
+            independent_db.execute("delete from privacy_operations")
+            independent_db.commit()
+            assert independent_db.execute("select count(*) from privacy_operations").fetchone()[0] == 0
+
+        # Generation is intact and does not drop to 0
+        assert store.history_generation() == 2
+
+        # Commit at generation 2 succeeds
+        store.commit_turn(**_commit_kwargs(store, "req-t7-3", "r3"))
+        assert len(store.load_recent_history(limit=10)) == 2
+
+        # Reserve at generation 2
+        stale_res = store.reserve_request("req-t7-stale", "msg stale")
+        assert stale_res.history_generation == 2
+
+        # delete_history advances generation from 2 to 3 regardless of ledger rows
+        store.delete_history()
+        assert store.history_generation() == 3
+
+        # Stale commit is rejected
+        stale_args = {
+            "request_id": "req-t7-stale",
+            "history_generation": stale_res.history_generation,
+            "user_message": "msg stale",
+            "assistant_message": "late",
+            "emotional_state": _neutral_emotional(),
+            "relationship_state": _neutral_relationship(),
+            "public_response": "late",
+            "replay_payload": _emotion_payload("late"),
+        }
+        with pytest.raises(ConflictError) as excinfo:
+            store.commit_turn(**stale_args)
+        assert excinfo.value.code == "request_reservation_invalidated"
+        store.close()
+
+    def test_t8_restart_preserves_generation_and_fencing(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "katherine.db"
+        store = open_local_storage(db_path)
+        for i in range(5):
+            store.commit_turn(**_commit_kwargs(store, f"req-t8-{i}", f"r-{i}"))
+            store.delete_history()
+        assert store.history_generation() == 5
+        store.close()
+
+        # Reopen from disk
+        reopened = open_local_storage(db_path)
+        assert reopened.history_generation() == 5
+
+        # Normal turn works at generation 5
+        committed = reopened.commit_turn(**_commit_kwargs(reopened, "req-t8-live", "live"))
+        assert committed.response == "live"
+        assert len(reopened.load_recent_history(limit=10)) == 2
+
+        # Next delete advances to 6
+        reopened.delete_history()
+        assert reopened.history_generation() == 6
+        reopened.close()
+
+    def test_t9_crash_recovery_leaves_pending_reservations_unexecutable(
+        self, tmp_path: Path
+    ) -> None:
+        db_path = tmp_path / "katherine.db"
+        store = open_local_storage(db_path)
+        res = store.reserve_request("req-interrupted-t9", "interrupted msg")
+        assert res.status == "reserved"
+        assert res.history_generation == 0
+        store.close()
+
+        # Reopen triggers _recover_interrupted_turns
+        reopened = open_local_storage(db_path)
+        with sqlite3.connect(db_path) as independent_db:
+            row = independent_db.execute(
+                "select status, error_code from turn_requests where request_id = 'req-interrupted-t9'"
+            ).fetchone()
+            assert row == ("failed", "interrupted")
+
+        # Cannot commit an interrupted turn
+        commit_args = {
+            "request_id": "req-interrupted-t9",
+            "history_generation": res.history_generation,
+            "user_message": "interrupted msg",
+            "assistant_message": "res",
+            "emotional_state": _neutral_emotional(),
+            "relationship_state": _neutral_relationship(),
+            "public_response": "res",
+            "replay_payload": _emotion_payload("res"),
+        }
+        with pytest.raises(ConflictError) as excinfo:
+            reopened.commit_turn(**commit_args)
+        assert excinfo.value.code in (
+            "request_replay_unavailable",
+            "request_reservation_invalidated",
+        )
+
+        # Replay/reservation check returns conflict
+        chk = reopened.check_request("req-interrupted-t9", "interrupted msg")
+        assert chk.status == "conflict"
+        reopened.close()
+
+    def test_t10_corrupted_or_missing_history_fence_fails_closed(
+        self, tmp_path: Path
+    ) -> None:
+        # Scenario A: missing row in history_fence
+        db_a = tmp_path / "katherine_a.db"
+        store_a = open_local_storage(db_a)
+        with sqlite3.connect(db_a) as conn:
+            conn.execute("delete from history_fence")
+            conn.commit()
+        with pytest.raises(PersistenceError):
+            store_a.history_generation()
+        with pytest.raises(PersistenceError):
+            store_a.reserve_request("req-t10-a", "msg")
+        store_a.close()
+
+        # Scenario B: invalid generation value (negative)
+        db_b = tmp_path / "katherine_b.db"
+        store_b = open_local_storage(db_b)
+        with sqlite3.connect(db_b) as conn:
+            conn.execute("drop table history_fence")
+            conn.execute("create table history_fence (id integer, generation integer)")
+            conn.execute("insert into history_fence (id, generation) values (1, -1)")
+            conn.commit()
+        with pytest.raises(PersistenceError):
+            store_b.history_generation()
+        with pytest.raises(PersistenceError):
+            store_b.reserve_request("req-t10-b", "msg")
+        store_b.close()
+
+        # Scenario C: multiple rows
+        db_c = tmp_path / "katherine_c.db"
+        store_c = open_local_storage(db_c)
+        with sqlite3.connect(db_c) as conn:
+            conn.execute("drop table history_fence")
+            conn.execute("create table history_fence (id integer, generation integer)")
+            conn.execute("insert into history_fence (id, generation) values (1, 1), (2, 2)")
+            conn.commit()
+        with pytest.raises(PersistenceError):
+            store_c.history_generation()
+        with pytest.raises(PersistenceError):
+            store_c.reserve_request("req-t10-c", "msg")
+        store_c.close()
+
+    def test_t11_real_thread_concurrency_race(self, tmp_path: Path) -> None:
+        db_path = tmp_path / "katherine.db"
+        store = open_local_storage(db_path)
+        barrier_start = threading.Barrier(2, timeout=10)
+        barrier_deleted = threading.Barrier(2, timeout=10)
+        outcome: dict[str, Any] = {}
+
+        def thread_a_turn() -> None:
+            try:
+                res = store.reserve_request("req-race-t11", "race message")
+                barrier_start.wait()
+                # Simulating provider execution while waiting for delete
+                barrier_deleted.wait()
+                commit_args = {
+                    "request_id": "req-race-t11",
+                    "history_generation": res.history_generation,
+                    "user_message": "race message",
+                    "assistant_message": "race response",
+                    "emotional_state": _neutral_emotional(),
+                    "relationship_state": _neutral_relationship(),
+                    "public_response": "race response",
+                    "replay_payload": _emotion_payload("race response"),
+                }
+                store.commit_turn(**commit_args)
+                outcome["error"] = None
+            except Exception as exc:
+                outcome["error"] = exc
+
+        def thread_b_delete() -> None:
+            barrier_start.wait()
+            del_result = store.delete_history()
+            outcome["deleted"] = del_result
+            barrier_deleted.wait()
+
+        t_a = threading.Thread(target=thread_a_turn)
+        t_b = threading.Thread(target=thread_b_delete)
+        t_a.start()
+        t_b.start()
+        t_a.join(timeout=10)
+        t_b.join(timeout=10)
+
+        assert outcome.get("deleted", {}).get("status") == "applied"
+        assert isinstance(outcome.get("error"), ConflictError)
+        assert outcome["error"].code == "request_reservation_invalidated"
+
+        # Independent verification: nothing remained or was recreated
+        with sqlite3.connect(db_path) as independent_db:
+            assert independent_db.execute("select count(*) from chat_logs").fetchone()[0] == 0
+            assert independent_db.execute("select count(*) from turn_requests").fetchone()[0] == 0
+            assert independent_db.execute("select count(*) from outbox_events").fetchone()[0] == 0
         store.close()
