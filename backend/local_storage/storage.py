@@ -145,6 +145,32 @@ def _reservation_marker(history_generation: int) -> str:
     return f"reserved:history:{history_generation}"
 
 
+def _read_history_generation(conn: sqlite3.Connection) -> int:
+    """Read the authoritative history generation from history_fence.
+
+    Fail-closed: raises PersistenceError if the row is missing, duplicated,
+    or contains an invalid generation value (I10).
+    """
+    try:
+        rows = conn.execute(
+            "select id, generation from history_fence"
+        ).fetchall()
+    except sqlite3.Error:
+        raise PersistenceError("database_error", "persistence error") from None
+    if len(rows) != 1:
+        raise PersistenceError("database_error", "persistence error")
+    row_id, generation = rows[0]
+    if row_id != 1:
+        raise PersistenceError("database_error", "persistence error")
+    if (
+        isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation < 0
+    ):
+        raise PersistenceError("database_error", "persistence error")
+    return int(generation)
+
+
 def _validate_request_id(request_id: Any) -> str:
     if not isinstance(request_id, str) or not request_id:
         raise ValidationError("invalid_request_id", "request id must be a non-empty string")
@@ -363,6 +389,12 @@ class LocalStorage:
             "select coalesce(max(version), 0) from schema_migrations"
         ).fetchone()
         return int(row[0])
+
+    def history_generation(self) -> int:
+        """Authoritative monotonic history generation."""
+        with self._lock:
+            conn = self._connection()
+            return _read_history_generation(conn)
 
     # ── State load ──────────────────────────────────────────────────────
 
@@ -628,10 +660,7 @@ class LocalStorage:
                     "from turn_requests where request_id = ?",
                     (request_id,),
                 ).fetchone()
-                current_generation = conn.execute(
-                    "select count(*) from privacy_operations "
-                    "where operation = 'delete_history'"
-                ).fetchone()[0]
+                current_generation = _read_history_generation(conn)
                 if existing is not None and existing[0] == "completed":
                     if existing[1] != payload_hash:
                         conn.execute("ROLLBACK")
@@ -956,16 +985,13 @@ class LocalStorage:
             conn = self._connection()
             try:
                 conn.execute("BEGIN IMMEDIATE")
-                history_generation = conn.execute(
-                    "select count(*) from privacy_operations "
-                    "where operation = 'delete_history'"
-                ).fetchone()[0]
+                history_generation = _read_history_generation(conn)
                 # The reservation insert's uniqueness (request_id is
                 # the primary key) IS the admission: the writer lock
                 # plus BEGIN IMMEDIATE make check-then-insert atomic.
-                # The delete-history count is a durable fencing token:
-                # delete_history appends its audit row in the same
-                # transaction that erases reservations and history.
+                # The history_fence generation is a durable fencing token:
+                # delete_history advances it in the same transaction
+                # that erases reservations and history.
                 inserted = conn.execute(
                     "insert into turn_requests "
                     "(request_id, payload_hash_sha256, status) "
@@ -1024,10 +1050,15 @@ class LocalStorage:
                 # conflict so the caller surfaces reconciliation.
                 conn.execute("ROLLBACK")
                 return ReplayOutcome(status="conflict", committed=None)
-            except sqlite3.Error:
+            except Exception as exc:
                 if conn.in_transaction:
-                    conn.execute("ROLLBACK")
-                raise PersistenceError("database_error", "persistence error") from None
+                    try:
+                        conn.execute("ROLLBACK")
+                    except sqlite3.Error:
+                        pass
+                if isinstance(exc, sqlite3.Error):
+                    raise PersistenceError("database_error", "persistence error") from None
+                raise
 
     # ── Memory ──────────────────────────────────────────────────────────
 
@@ -1064,13 +1095,21 @@ class LocalStorage:
         rows are removed together with their messages (no orphaned
         replay data may survive the user's "delete history").
 
+        The authoritative history generation in ``history_fence`` is
+        incremented by 1 in the same transaction, fencing any in-flight
+        reservations against late commits.
+
         The ``privacy_operations`` ledger row is kept for audit, carrying
-        only aggregate counts — no private content.
+        only aggregate counts — no private content, and no longer used as
+        the source of the history generation.
         """
         with self._lock:
             conn = self._connection()
             conn.execute("BEGIN IMMEDIATE")
             try:
+                # Validate the history fence row before mutation (I10).
+                _read_history_generation(conn)
+
                 chat_count = conn.execute(
                     "select count(*) from chat_logs"
                 ).fetchone()[0]
@@ -1092,6 +1131,13 @@ class LocalStorage:
                 ).fetchone()[0]
                 if remaining != 0:
                     raise PersistenceError("database_error", "persistence error")
+
+                cursor = conn.execute(
+                    "update history_fence set generation = generation + 1 where id = 1"
+                )
+                if cursor.rowcount != 1:
+                    raise PersistenceError("database_error", "persistence error")
+
                 result = {
                     "status": "applied",
                     "deleted_messages": int(chat_count),
@@ -1108,6 +1154,10 @@ class LocalStorage:
                 if conn.in_transaction:
                     conn.execute("ROLLBACK")
                 raise PersistenceError("database_error", "persistence error") from None
+            except Exception:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise
         return result
 
     def delete_memories(self) -> dict[str, Any]:

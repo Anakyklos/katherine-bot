@@ -185,17 +185,48 @@ identidade remota):
 - Em código: lista frozen ``(version, sql)`` em
   ``backend/local_storage/migrations.py`` — ordenadas, reprodutíveis,
   sem dependência nova e sem arquivos soltos. **Append-only após o
-  merge**: a migration inicial 0001 ainda não está na `main`, então é
-  ela própria que carrega as FKs `ON DELETE CASCADE` e a unicidade
-  composta do outbox exigidas pela semântica de privacidade do
-  `delete_history`; após o merge, mudanças de schema entram como novas
-  migrations, e migrations aplicadas nunca são editadas.
+  merge**: a migration 0001 cria o schema inicial local-first; a
+  migration 0002 introduz a tabela autoritativa `history_fence`.
 - ``schema_migrations(version PK, applied_at)`` registra as aplicadas;
   reabrir pula as existentes (idempotente).
 - **Atomicidade por migration**: cada migration roda em sua própria
   transação junto com a inserção da sua linha de versão — uma migration
   que falha no meio não fica nem aplicada nem marcada (teste 8). A
   próxima abertura a retria do início.
+- **Migration 0002 (#376)**: cria a tabela `history_fence (id INTEGER PRIMARY KEY CHECK (id = 1), generation INTEGER NOT NULL CHECK (generation >= 0))`
+  e inicializa deterministicamente a geração autoritativa através da
+  contagem de operações `delete_history` existentes em `privacy_operations`
+  (0 para bancos novos). Preserva integralmente os dados pré-existentes.
+- **Limitação de downgrade**: um banco migrado para schema 2 não pode ser
+  aberto por binários legados que suportem apenas o schema 1; o runner
+  detecta versão desconhecida e falha fechado com `PersistenceError("schema_too_new")`
+  sem modificar ou apagar o arquivo de banco de dados.
+
+## History Fence Durável e Desacoplado (#376)
+
+- **Fonte autoritativa**: a tabela `history_fence` contém exatamente uma
+  linha autoritativa (`id = 1`) com o valor inteiro monotônico `generation`.
+- **Independência do ledger de auditoria**: a geração não depende da contagem,
+  idade ou conservação de registros em `privacy_operations`. O ledger de
+  auditoria permanece puramente informativo e pronto para futuras políticas
+  de retenção operacional, sem enfraquecer o fencing.
+- **Garantia de fencing**: na admissão (`reserve_request`), a geração atual
+  é gravada na reserva sob o marcador `reserved:history:<generation>`. No
+  commit do turno (`commit_turn`), a geração autoritativa é revalidada
+  dentro do `BEGIN IMMEDIATE`. Reservas feitas na geração N são rejeitadas
+  com `ConflictError("request_reservation_invalidated")` se o histórico foi
+  excluído e a geração avançou para N+1.
+- **Atomicidade de exclusão**: `delete_history()` apaga `chat_logs`,
+  `turn_requests` e `outbox_events`, e incrementa `generation = generation + 1`
+  em `history_fence` na mesma transação SQLite. Se qualquer etapa falhar, o
+  rollback desfaz tanto a exclusão quanto o avanço da geração.
+- **Falha fechada (fail-closed)**: ausência, inconsistência ou valores
+  inválidos no registro autoritativo levantam `PersistenceError("database_error")`,
+  interrompendo a admissão antes de qualquer chamada a provedores ou escrita
+  de histórico (I10).
+- **Recuperação e rollback**: interrupções mantêm reservas antigas como
+  `failed/interrupted`, sem permitir que sejam executadas após reinicialização.
+  Rollbacks transacionais garantem consistência sem ressuscitação de dados.
 
 ## Mapeamento de dados (PostgreSQL → SQLite)
 
@@ -206,7 +237,8 @@ identidade remota):
 | `turn_requests` | `turn_requests` | Ledger de idempotência/replay com hash canônico do payload completo; FKs para `chat_logs` `ON DELETE CASCADE` (o ledger morre com as mensagens — nada de replay sobrevive ao delete_history) |
 | `outbox_events` | `outbox_events` | Unicidade `(idempotency_key, event_type)`; payload estrito de referências (sem conteúdo), validado em código; FK para `turn_requests` `ON DELETE CASCADE` (eventos derivados são removidos com o turno) |
 | `memories` | `memories` | Metadados JSON com o mesmo contrato de versão/aprovação |
-| `privacy_operations` | `privacy_operations` | Auditoria local (operação, status, result) sem conteúdo privado |
+| `privacy_operations` | `privacy_operations` | Auditoria local (operação, status, result) sem conteúdo privado; desacoplado da geração de histórico (#376) |
+| (novo #376) | `history_fence` | Geração monotônica de histórico durável (1 linha, `id=1`); fonte autoritativa independente do ledger de auditoria |
 | `account_deletion_jobs` / worker | **removido nesta fundação** | Destruição de conta é o equivalente local a apagar o arquivo do banco; a operação é documentada, o worker distribuído não se aplica |
 | `admission_reservations` / HMAC de identidade | **removido nesta fundação** | Admissão/rate-limit e correlação HMAC eram proteções do serviço multiusuário remoto; o runtime desktop decide o uso deles na próxima folha |
 
@@ -223,6 +255,7 @@ identidade remota):
 | Contratos de payload (allowlists, chaves proibidas, limites, JSON finito) | **Preservado** | `backend/local_storage/contracts.py` + testes adversariais |
 | Recuperação previsível pós-interrupção | **Preservado** | WAL auto-recovery + pending→failed fail-closed |
 | Retenção e exclusão reais | **Preservado** | `delete_history` remove `chat_logs` + `turn_requests` (replay incluso) + outbox derivado numa única transação; `delete_memories`/`trim_history` + auditoria sem conteúdo privado |
+| Fencing monotônico de histórico | **Preservado e desacoplado (#376)** | `history_fence` durável e independente do ledger de auditoria; incremento transacional no `delete_history()`, validação no `commit_turn()` |
 | Reset neutro canônico v1 | **Preservado** | Snapshot neutro produzido por `EmotionalStateV1.neutral` / `RelationshipStateV1.neutral`; revision incrementada coerentemente |
 | Lifecycle da store | **Preservado** | `close()` terminal: nenhuma nova conexão, nenhuma operação silenciosa, erro estável `storage_closed` em qualquer thread |
 | Limites de tamanho/crescimento | **Preservado** | `MAX_MESSAGE_LENGTH`, limites de bytes por payload (replay/outbox/snapshot 8 KB, paridade web), trim por contagem, métricas |
